@@ -11,7 +11,8 @@ The page lets you:
 - tune while you drive;
 - let each motor tune itself;
 - keep backups and per-game profiles;
-- find out why when something goes wrong.
+- see the seat's real angles with an optional motion sensor;
+- find out why when something goes wrong, and where the rig struggles under load.
 
 SimHub keeps driving the rig over USB exactly as before. The page talks to the board over WiFi, so both run at
 the same time. You can open it from any browser, including your phone.
@@ -24,7 +25,7 @@ the same time. You can open it from any browser, including your phone.
 
 | Folder | What it is |
 |---|---|
-| [`firmware/SMC3_R4`](firmware/SMC3_R4) | Firmware for the **Arduino UNO R4 WiFi**. It speaks the SMC3 v0.70 protocol, so SimHub, SimTools, FlyPT Mover and SMC3Utils work unchanged. It adds a 4 kHz control loop, 14-bit pot readings, quiet 25 kHz PWM, target smoothing, a fixed PID, an LED matrix status display, and WiFi telemetry at 100 samples a second. |
+| [`firmware/SMC3_R4`](firmware/SMC3_R4) | Firmware for the **Arduino UNO R4 WiFi**. It speaks the SMC3 v0.70 protocol, so SimHub, SimTools, FlyPT Mover and SMC3Utils work unchanged. It adds a 4 kHz control loop, 14-bit pot readings, quiet 25 kHz PWM, target smoothing, a fixed PID, WiFi telemetry at 100 samples a second, an LED matrix that shows live motor bars and problems in words, and an optional WT901C motion sensor with a tilt-limit cut-off. |
 | [`scope/`](scope) | `smc3_scope.py`: the page server. It's one file using only the Python standard library, with a Dockerfile and compose file for a NAS or any PC. |
 | [`tools/simboard.py`](tools/simboard.py) | A simulated rig. You can try everything without hardware, and inject faults (reversed motor, swapped wiring, glitchy pot and more). |
 | [`firmware/SMC3_smooth`](firmware/SMC3_smooth) | The original SMC3 for the **UNO R3**, with target smoothing and the PID fixes, for anyone staying on an R3. |
@@ -68,6 +69,15 @@ The expand button opens the graphs full width; pressing it again returns to the 
 
 ![Live graphs, 10 second window](docs/img/live-graphs.png)
 
+### Seat angle (motion sensor)
+
+With a WitMotion **WT901C** on the seat, wired to the board (see [Hardware](#hardware)), Live Graphs gets a **Seat
+angle** chart: roll and pitch in real degrees, the range the seat has reached, its fastest movement, and a small
+horizon. A smooth slope while the seat moves is good; steps, wobbles, or a slope that slows down in one direction
+show load, play or flex.
+
+![Seat angle chart](docs/img/seat-chart.png)
+
 ### Tuning
 
 Every SMC3Utils setting is here, per motor: Kp, Ki, Kd, Ks, PWMmin, PWMmax, PWMrev, dead zone, the safety
@@ -93,6 +103,9 @@ Auto-tune works on one motor at a time:
 2. It raises Kp step by step until the motor stops tracking any better, and picks the sweet spot.
 3. It checks small, road-texture-sized moves.
 4. It adds Ki and Kd only if they clearly help.
+
+With the motion sensor, auto-tune also watches the **seat**: the seat's own overshoot and ringing count, so it
+won't pick a Kp that keeps the motor calm but makes a flexing frame bounce.
 
 There are three styles: **Gentle**, **Normal** and **Firm**. It stops by itself if SimHub moves the rig or
 anything looks wrong, such as the motor moving the wrong way or running away. Nothing is saved until you press
@@ -148,6 +161,35 @@ SimHub's outputs and the LED matrix codes go by number.
 
 ![Settings with motor names](docs/img/settings.png)
 
+**LED matrix** and **Motion sensor** (firmware 1.8) are set here too, and saved on the board at once:
+
+- what the matrix shows;
+- switching the sensor on;
+- how it is mounted;
+- **Level now**;
+- the **tilt limit**, which stops every motor if the seat tilts further than it should;
+- **Set sensor to 100 Hz** (it leaves the factory at 10 Hz).
+
+The status line says whether the sensor is found, at what baud rate and how fast it sends.
+
+![LED matrix and motion sensor settings](docs/img/settings-board.png)
+
+### LED matrix
+
+The board's 12x8 matrix shows one thing at a time, readable from across the room. These previews are rendered from
+the firmware's own drawing code:
+
+| Power-up: the address | Motor bars | Seat horizon (sensor) | Idle | A problem |
+|---|---|---|---|---|
+| <img src="docs/img/matrix-boot.gif" width="160"> | <img src="docs/img/matrix-bars.gif" width="160"> | <img src="docs/img/matrix-horizon.gif" width="160"> | <img src="docs/img/matrix-idle.gif" width="160"> | <img src="docs/img/matrix-error-cutoff.gif" width="160"> |
+
+- **Motor bars:** each motor's position, live. A dot blinks where a motor should be when it falls behind. A dash
+  at the bottom means it's switched off on purpose.
+- **Problems** scroll in words, again and again while they last: `ERROR E3 MOTOR 3 CUTOFF`, `ERROR E4 TILT LIMIT`,
+  `ERROR E9 NO WIFI` and so on. The page's Help explains every code and what to do:
+
+![LED matrix error codes in Help](docs/img/help-errors.png)
+
 ### Diagnostics
 
 For when something isn't right: a motor going the wrong way, sudden jerks, a motor that won't move, the rig
@@ -184,9 +226,20 @@ The results come in plain words, each with **what to do**, naming the wire and p
 - a motor moving away from its target;
 - a motor pushed hard that doesn't move;
 - hunting at rest;
-- motors switching themselves off;
+- motors switching themselves off, including the tilt limit;
 - board restarts;
-- gaps in the data.
+- gaps in the data;
+- the motion sensor going quiet.
+
+**Where the rig struggles.** While SimHub drives, the page also keeps a **load map** for each motor: in eight
+bands across its travel, and in each direction, how far it runs behind and how often it's at full power. Lifting a
+heavy driver shows up as one direction falling behind at full power while the other keeps up. The quick check names
+the band and, with the sensor, the seat angles there:
+
+![Quick check: motor 1 struggles lifting](docs/img/diag-load.png)
+
+With the motion sensor, the full check also measures what the **seat** does on each step: how many degrees each
+motor tilts it, whether it **bounces** after the motor stops (flex), and whether there is **play** in a linkage.
 
 Each one keeps a few seconds of data from before and after. A badge and a System Status line tell you about it,
 and the **event log** shows what led up to it.
@@ -195,13 +248,13 @@ and the **event log** shows what led up to it.
 
 See [docs/DIAGNOSTICS.md](docs/DIAGNOSTICS.md) for every check and the file format, and
 [docs/examples/diagnostics-full-check.json](docs/examples/diagnostics-full-check.json) for a real file from the
-simulated rig with a reversed motor and a glitchy pot.
+simulated rig with a reversed motor, a glitchy pot and play in a linkage.
 
 ### On a phone
 
 <img src="docs/img/phone-dashboard.png" width="300" alt="Phone dashboard"> <img src="docs/img/phone-diagnostics.png" width="300" alt="Phone diagnostics">
 
-The Help section in the page sums everything up, including what the LED matrix codes mean.
+The Help section in the page sums everything up, including every LED matrix code.
 
 ![Help](docs/img/help.png)
 
@@ -214,7 +267,11 @@ The Help section in the page sums everything up, including what the LED matrix c
   (`MODE1`).
 - Up to three DC motors with feedback pots, such as worm-gear wiper motors on crank arms or linear actuators, and
   a motor supply that suits them.
-- Optional: a WitMotion **WT901C** IMU through a MAX3232 on D0, shown as a bubble level on the LED matrix.
+- Optional: a WitMotion **WT901C** motion sensor on the seat. The -232 model connects through a MAX3232 module
+  (RS-232 to TTL) to D0, and optionally D1. It gives seat angles, a tilt-limit safety cut-off, and seat
+  measurements in auto-tune and diagnostics. It is set up from the page.
+
+<img src="docs/img/sensor-wiring.svg" width="760" alt="WT901C wiring through a MAX3232">
 
 Wiring is the same as the original SMC3 on an UNO, so existing rigs need no changes:
 
@@ -298,6 +355,10 @@ noise. To see what the diagnostics find, add a fault:
 | `--simhub` | a fake SimHub driving all three motors |
 | `--reboot-at 30` | the board restarting |
 | `--fw 16` | older firmware behaviour |
+| `--imu 100` (or `10`) | a WT901C on the seat, sending 100 (or the factory 10) angles per second; `--sensor-on` switches it on |
+| `--flex` / `--slop 2:24` | a bouncy seat frame / 24 counts of play in motor 2's linkage |
+| `--heavy 1` | a heavy load on motor 1: lifting needs much more drive, worse near the top |
+| `--imu-lost-at 30` | the sensor goes quiet after 30 s |
 
 ## Compatibility
 
@@ -307,7 +368,8 @@ noise. To see what the diagnostics find, add a fault:
   - 1.4: auto-tune;
   - 1.5: Disable Motors;
   - 1.6: smoothing settings;
-  - 1.7: full diagnostics.
+  - 1.7: full diagnostics;
+  - 1.8: the LED matrix in words, and the motion sensor.
 
   See the [CHANGELOG](CHANGELOG.md).
 - New commands are documented in [docs/PROTOCOL.md](docs/PROTOCOL.md). They go over WiFi; USB stays plain SMC3.

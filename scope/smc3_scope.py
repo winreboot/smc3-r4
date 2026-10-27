@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-smc3_scope v1.8.1 - live scope, tuner and auto-tuner for the SMC3_R4 motion controller (Arduino UNO R4 WiFi).
+smc3_scope v1.9.1 - live scope, tuner and auto-tuner for the SMC3_R4 motion controller (Arduino UNO R4 WiFi).
 
 Connects to the board's TCP telemetry port, keeps a rolling buffer of samples and serves a web page with live
 charts, a parameter editor (sends ordinary SMC3 commands back to the board), test signals and a per-motor
@@ -12,6 +12,12 @@ Every option can also come from the environment (Docker): SMC3_HOST, SMC3_PORT, 
 SMC3_DATA_DIR.  Settings changed in the page (board address, theme, auto-find) are saved to
 <data dir>/config.json and survive restarts and upgrades.  Standard-library Python 3.8+ only.
 
+v1.9.1: same page as 1.9, shipped with firmware 1.8.1 (1.8 didn't compile in the Arduino IDE).
+v1.9: firmware 1.8 support - LED matrix settings (motor bars / seat horizon / quiet, idle trace) and the WT901C
+      motion sensor (Settings): seat angle chart, levelling, mounting, tilt-limit safety cut-off, set to 100 Hz.
+      Diagnostics: sensor findings, the seat's own response in the full check (degrees per count, bounce, play),
+      and a load map while SimHub drives (where a motor falls behind or runs at full power, each way). Auto-tune
+      watches the seat too when the sensor sends. Help explains every LED matrix error code.
 v1.8.1: single-sample pot glitches no longer distort step measurements (full check, auto-tune); wider
       test-signal motor menu; a browser closing mid-request no longer prints a traceback.
 v1.8: motor names (Settings): call the motors by where they sit (Left, Right, Rear, ... or your own words);
@@ -35,7 +41,7 @@ v1.4: settings dialog (board address, port, find-board scan, auto-find), day/nig
       fixed a thread race that made the page flash "not reachable".
 """
 
-VERSION = "1.8.1"
+VERSION = "1.9.1"
 
 import argparse
 import base64
@@ -144,6 +150,8 @@ PARAM_CODES = {
     "Y": ("STATUS", "p"), "~": ("PWMFREQ", "p"), "$": ("ISRUS", "w"),
     "!": ("FW", "p"),                                                    # (flags, version*10) - firmware 1.4+
     "f": ("FILT", "p"),                                                  # (smoothing shift, max speed/100) - 1.6+
+    "l": ("LED", "p"),                                                   # (matrix view, flags) - 1.8+
+    "i": ("SENSOR", "p"),                                                # (sensor state, tilt limit) - 1.8+
 }
 
 
@@ -214,6 +222,15 @@ class Board:
             time.sleep(0.02)
         return None
 
+    def board_settings(self, timeout=1.5):
+        """Firmware 1.8: LED matrix and motion sensor settings and state, from one diagnostics frame."""
+        if (self.fw_cache or [0, 0])[1] < 18:
+            return None
+        d = self.read_diag(timeout)
+        if not d or "sensor" not in d:
+            return None
+        return {"sensor": d["sensor"], "matrix": d["matrix"], "saved": decode_board_block(d["eeprom"])}
+
     def ping(self, timeout=1.5):
         """Round trip of one read command in ms (firmware 1.4+), None if no answer."""
         self.params.pop("FW", None)
@@ -232,7 +249,7 @@ class Board:
             self.send(b"[rd" + code.encode() + b"]")
             time.sleep(0.03)
         deadline = time.time() + timeout
-        expected = len(PARAM_CODES) - 2          # "!" (1.4+) and "f" (1.6+) are missing on older firmware
+        expected = len(PARAM_CODES) - 4          # "!" (1.4+), "f" (1.6+), "l" and "i" (1.8+) are missing on older firmware
         while time.time() < deadline and len(self.params) < len(PARAM_CODES):
             if len(self.params) >= expected and time.time() > deadline - timeout + 1.0:
                 break
@@ -320,7 +337,7 @@ class Board:
                 need = 6 + buf[5]
                 if len(buf) < need:
                     return buf
-                d = decode_diag(buf[6:need])
+                d = decode_diag(buf[6:need], buf[4])
                 if d:
                     self.diag = d
                     self.diag_seq += 1
@@ -337,13 +354,17 @@ class Board:
             t, g, f, p = u[1 + m * 4: 5 + m * 4]
             motors.append({"t": t, "g": g / 16.0, "f": f / 16.0, "p": p / 16.0})
         status, power, roll, pitch, yaw, isr = u[13:19]
+        # seat angles: firmware 1.8 sends -32768 when the sensor is silent; older firmware sends 0 without one
+        if roll == -32768 or (roll == 0 and pitch == 0 and yaw == 0 and (self.fw_cache or [0, 0])[1] < 18):
+            roll = pitch = yaw = None
         with self.slock:
             self.seq += 1
             self.samples.append({
                 "seq": self.seq, "ms": u[0], "m": motors,
                 "dis": [bool(status & 1), bool(status & 2), bool(status & 4)],
                 "div": status >> 4, "low": power == 9,
-                "roll": roll / 100.0, "pitch": pitch / 100.0, "yaw": yaw / 100.0, "isr": isr,
+                "roll": None if roll is None else roll / 100.0, "pitch": None if pitch is None else pitch / 100.0,
+                "yaw": None if yaw is None else yaw / 100.0, "isr": isr,
             })
 
     def _add_reply(self, code, a, b):
@@ -596,8 +617,15 @@ def worst(a, b):
 
 def fmt(r):
     rise = f"{r['rise']:.0f} ms" if r["rise"] is not None else "never got to 90%"
-    return (f"rise {rise}, overshoot {r['os']:.0f}%, settle {r['settle']:.0f} ms, "
-            f"off by {r['sse']:.1f}, ringing {r['osc']}, hold noise {r['fb_std']:.2f}, pid noise {r['pid_std']:.1f}")
+    seat = ""
+    if r.get("seat_os") is not None:
+        seat = f" | seat {r['seat_deg']:.2f}°, overshoot {r['seat_os']:.0f}%, ringing {r['seat_osc']}"
+    return (f"rise {rise}, overshoot {r.get('motor_os', r['os']):.0f}%, settle {r['settle']:.0f} ms, "
+            f"off by {r['sse']:.1f}, ringing {r.get('motor_osc', r['osc'])}, hold noise {r['fb_std']:.2f}, "
+            f"pid noise {r['pid_std']:.1f}{seat}")
+
+
+SEAT_OS_SLACK = 10      # % the seat may overshoot beyond the motor before it counts against a setting
 
 
 class Tuner:
@@ -784,10 +812,14 @@ class Tuner:
         self.set_target(x)
         self.wait(hold)
         self.wait(0.15)                       # let the last telemetry burst arrive
-        r = analyze_step(despike(self.board.since(seq0), self.motor), self.motor, t_old, p["pwmmin"], p["pwmmax"],
-                         hold * 1000 - 100)
+        got = despike(self.board.since(seq0), self.motor)
+        r = analyze_step(got, self.motor, t_old, p["pwmmin"], p["pwmmax"], hold * 1000 - 100)
         if r is None:
             raise TuneAbort("Couldn't see the step in the telemetry (WiFi too slow?). Try again.")
+        seat = seat_step(self.board.since(seq0 - 20), self.motor, t_old)   # motion sensor: what the seat did
+        if seat and not seat.get("small") and seat.get("overshoot") is not None:
+            r.update(seat_os=seat["overshoot"], seat_osc=seat["ringing"], seat_deg=seat["deg"],
+                     seat_dpc=seat.get("deg_per_count"))
         if r["wrong"]:
             raise TuneAbort(f"Motor {self.motor + 1} moved the wrong way. The motor or the pot is wired "
                             f"backwards.", "unsafe")
@@ -796,7 +828,17 @@ class Tuner:
     def _step_pair(self, hi, lo, p, hold=2.0):
         a = self._step(hi, hold, p)
         b = self._step(lo, hold, p)
-        return worst(a, b)
+        r = worst(a, b)
+        seats = [x for x in (a, b) if x.get("seat_os") is not None]
+        if seats:
+            # with the motion sensor, the seat's own overshoot and ringing count too: a setting that keeps the motor
+            # calm but makes the frame bounce isn't calm
+            r.update(motor_os=r["os"], motor_osc=r["osc"], seat_os=max(x["seat_os"] for x in seats),
+                     seat_osc=max(x["seat_osc"] for x in seats), seat_deg=max(x["seat_deg"] for x in seats),
+                     seat_dpc=next((x["seat_dpc"] for x in seats if x.get("seat_dpc")), None))
+            r["os"] = max(r["os"], r["seat_os"] - SEAT_OS_SLACK)
+            r["osc"] = max(r["osc"], r["seat_osc"])
+        return r
 
     def _safe_stop(self):
         p = dict(self.original or {})
@@ -952,6 +994,9 @@ class Tuner:
             self._settle(c, 3.0)
 
         # 3. Kp sweep
+        s_now = self.board.latest()
+        if s_now and s_now.get("roll") is not None:
+            self.say("Motion sensor is sending: the seat's own overshoot and ringing count too.")
         self.stage, self.progress = "Sweeping Kp", 30
         p.update(ki=0, kd=0, ks=1, kp=KP_START)
         self._apply(p)
@@ -1070,9 +1115,11 @@ class Tuner:
                 big, small = measure()
                 self.say(f"Ki {ki}: big {big['os']:.0f}% over / off by {big['sse']:.1f}, "
                          f"small {small['os']:.0f}% over / off by {small['sse']:.1f}")
-                # judged against what was already there, so a springy linkage's normal ringing doesn't veto it
-                if (big["os"] > r_base["os"] + 8 or big["osc"] > max(2, r_base["osc"] + 1)
-                        or small["osc"] > max(2, r_small["osc"] + 1) or small["os"] > max(35.0, r_small["os"] + 15)):
+                # judged against what was already there, so a springy linkage's normal ringing doesn't veto it;
+                # ringing on the motor only - holding position (Ki) isn't what makes a flexing frame ring
+                mo = lambda r: r.get("motor_osc", r["osc"])
+                if (big["os"] > r_base["os"] + 8 or mo(big) > max(2, mo(r_base) + 1)
+                        or mo(small) > max(2, mo(r_small) + 1) or small["os"] > max(35.0, r_small["os"] + 15)):
                     self.say("Ki starts causing overshoot - stopping.")
                     break
                 best = (ki, big, small)
@@ -1127,6 +1174,11 @@ class Tuner:
         self._ramp_to(c)
         self._settle(c, 3.0)
         keys = ["kp", "ki", "kd", "ks", "pwmmin", "dz"]
+        if r_final.get("seat_os") is not None:
+            if r_final["seat_os"] >= 25 and r_final["seat_os"] >= r_final.get("motor_os", 0) + 20:
+                notes.append(f"The seat itself still bounces ({r_final['seat_os']:.0f}% overshoot) after the motor "
+                             f"stops - the frame, seat mounts or linkage flex. More target smoothing softens it; "
+                             f"stiffening the frame fixes it.")
         self.result = {"motor": n, "before": {k: orig[k] for k in keys}, "after": {k: p[k] for k in keys},
                        "final": r_final, "notes": notes}
         for note in notes:
@@ -1405,22 +1457,28 @@ class Profiles:
             return self._write()
 
 # --------------------------------------------------------------------------------------------------------------
-# Diagnostics (v1.7): an event log of everything that happens, a watcher that notices problems while you drive
-# (keeping a few seconds of data around each one), a quick check (no movement) and a full check (moves each motor
-# a little), and one self-describing file to hand to whoever helps you - or to Claude.
+# Diagnostics (v1.7, motion sensor and load map in v1.9): an event log of everything that happens, a watcher that
+# notices problems while you drive (keeping a few seconds of data around each one), a quick check (no movement) and
+# a full check (moves each motor a little), and one self-describing file to hand to whoever helps you - or to Claude.
 # --------------------------------------------------------------------------------------------------------------
 
 DIAG_HEAD = struct.Struct("<I3BB4I2HIbBB")       # firmware 1.7 [rdd] frame, see SendDiag() in SMC3_R4.ino (1.7+)
 DIAG_MOTOR = struct.Struct("<BHhHHHH")
-OFF_REASONS = {0: "on", 1: "safety cutoff", 2: "switched off by command", 3: "not enabled since power-up"}
+DIAG_SENSOR = struct.Struct("<BBBIHIHHhhhhhHBBB")  # firmware 1.8 (frame version 2): after the EEPROM copy
+OFF_REASONS = {0: "on", 1: "safety cutoff", 2: "switched off by command", 3: "not enabled since power-up",
+               4: "tilt limit"}
+LED_VIEWS = {0: "motor bars", 1: "seat horizon", 2: "quiet"}
+MATRIX_ERRORS = {0: "E0 WIFI MODULE", 1: "E1 MOTOR 1 CUTOFF", 2: "E2 MOTOR 2 CUTOFF", 3: "E3 MOTOR 3 CUTOFF",
+                 4: "E4 TILT LIMIT", 5: "E5 NO SENSOR", 8: "E8 NO IP ADDRESS", 9: "E9 NO WIFI"}
 GLITCH_COUNTS = 60          # pot change within one 10 ms telemetry sample that no motor can make (6000 counts/s)
 INC_KEEP = 40               # incident recordings kept on the NAS
 NOTE_LIMIT = {"pot_glitch": 60, "pot_glitch_fw": 300, "hunting": 120, "wrong_direction": 20, "stall": 30,
-              "motor_off": 0, "reboot": 0, "telemetry_gap": 120}
+              "motor_off": 0, "reboot": 0, "telemetry_gap": 120, "tilt_limit": 5, "sensor_lost": 300}
 INC_TITLES = {"pot_glitch": "Pot reading jumped", "pot_glitch_fw": "Pot glitches (firmware count)",
               "hunting": "Swinging around its target", "wrong_direction": "Moved away from its target",
               "stall": "Pushed hard but not moving", "motor_off": "Motor switched off",
-              "reboot": "Board restarted", "telemetry_gap": "No data from the board"}
+              "reboot": "Board restarted", "telemetry_gap": "No data from the board",
+              "tilt_limit": "Tilt limit stopped the motors", "sensor_lost": "Motion sensor went quiet"}
 
 
 def name_text(s, names):
@@ -1450,8 +1508,8 @@ def _ago(sec):
     return f"{sec // 86400} days"
 
 
-def decode_diag(pl):
-    """Firmware 1.7 diagnostics frame -> dict (None if it is too short)."""
+def decode_diag(pl, ver=1):
+    """Firmware 1.7/1.8 diagnostics frame -> dict (None if it is too short)."""
     need = DIAG_HEAD.size + 3 * DIAG_MOTOR.size + 1
     if len(pl) < need:
         return None
@@ -1468,10 +1526,25 @@ def decode_diag(pl):
                        "pot_max": round(fmax / 16.0, 1)})
     n = pl[off]
     ee = list(pl[off + 1: off + 1 + n])
-    return {"rx": time.time(), "uptime_ms": ms, "reset_flags": [r0, r1, r2], "cwsf_ok": bool(fl & 1),
-            "monitor_mode": (fl >> 1) & 3, "usb_ok": usb_ok, "usb_targets": usb_tgt, "usb_bad_bytes": usb_bad,
-            "wifi_cmds": tcp_ok, "ms_since_usb": since_usb, "ms_since_usb_target": since_tgt,
-            "loop_max_us": loop_us, "rssi": rssi, "build": build, "fw": fwn, "motors": motors, "eeprom": ee}
+    d = {"rx": time.time(), "uptime_ms": ms, "reset_flags": [r0, r1, r2], "cwsf_ok": bool(fl & 1),
+         "monitor_mode": (fl >> 1) & 3, "usb_ok": usb_ok, "usb_targets": usb_tgt, "usb_bad_bytes": usb_bad,
+         "wifi_cmds": tcp_ok, "ms_since_usb": since_usb, "ms_since_usb_target": since_tgt,
+         "loop_max_us": loop_us, "rssi": rssi, "build": build, "fw": fwn, "motors": motors, "eeprom": ee}
+    off += 1 + n
+    if ver >= 2 and len(pl) >= off + DIAG_SENSOR.size:
+        (st, tilt, bidx, baud, rate, pk, bad, age, rr, rp, yw, lr, lp, trips, view, lf,
+         err) = DIAG_SENSOR.unpack_from(pl, off)
+        d["sensor"] = {"switched_on": bool(st & 1), "swap_roll_pitch": bool(st & 2), "invert_roll": bool(st & 4),
+                       "invert_pitch": bool(st & 8), "receiving": bool(st & 0x10), "found": bool(st & 0x20),
+                       "setting_up": bool(st & 0x40), "tilt_limit_deg": tilt or None,
+                       "baud": baud if st & 0x20 else None, "baud_trying": baud, "angles_per_s": rate,
+                       "good_packets": pk, "bad_checksums": bad, "ms_since_angles": None if age == 65535 else age,
+                       "raw_roll": rr / 100.0, "raw_pitch": rp / 100.0, "yaw": yw / 100.0,
+                       "level_offset": [lr / 100.0, lp / 100.0], "tilt_trips": trips}
+        d["matrix"] = {"view": LED_VIEWS.get(view, str(view)), "idle_trace": bool(lf & 1),
+                       "repeat_address": bool(lf & 2), "showing": None if err == 255 else MATRIX_ERRORS.get(err, f"E{err}"),
+                       "error_code": None if err == 255 else err}
+    return d
 
 
 def reset_cause(d):
@@ -1513,6 +1586,17 @@ def decode_eeprom(ee):
     if ee[55] == 0x5A:
         p["FILT"] = [min(8, ee[53]), ee[54]]
     return p
+
+
+def decode_board_block(ee):
+    """Firmware 1.8 sensor / matrix settings (EEPROM 56-65) -> dict, None if never set."""
+    if len(ee) < 66 or ee[56] != 0xA6:
+        return None
+    s16 = lambda a: struct.unpack(">h", bytes(ee[a:a + 2]))[0] / 100.0
+    return {"matrix_view": LED_VIEWS.get(ee[57], str(ee[57])), "idle_trace": bool(ee[58] & 1),
+            "repeat_address": bool(ee[58] & 2), "sensor_on": bool(ee[59] & 1), "swap_roll_pitch": bool(ee[59] & 2),
+            "invert_roll": bool(ee[59] & 4), "invert_pitch": bool(ee[59] & 8), "tilt_limit_deg": ee[60] or None,
+            "level_offset": [s16(61), s16(63)]}
 
 
 SETTING_NAMES = [("Kp", "Kp", None), ("Ki", "Ki", None), ("Kd", "Kd", None), ("Ks", "Ks", None),
@@ -1557,6 +1641,9 @@ def trace_csv(samples, motor=None, motors=(1, 2, 3), every=1):
     else:
         main, others = [motor], [k for k in motors if k != motor]
     cols = ["ms"] + [f"{k}{n}" for n in main for k in ("t", "g", "f", "p")] + [f"f{n}" for n in others] + ["off", "low"]
+    seat = any(s.get("roll") is not None for s in samples)
+    if seat:
+        cols += ["roll", "pitch"]
     rows = []
     for i, s in enumerate(samples):
         if every > 1 and i % every:
@@ -1568,6 +1655,8 @@ def trace_csv(samples, motor=None, motors=(1, 2, 3), every=1):
         r += [_n1(s["m"][n - 1]["f"]) for n in others]
         r.append("".join("1" if d else "0" for d in s["dis"][:3]))
         r.append("1" if s["low"] else "0")
+        if seat:
+            r += ["", ""] if s.get("roll") is None else [f"{s['roll']:.2f}", f"{s['pitch']:.2f}"]
         rows.append(",".join(r))
     return {"columns": ",".join(cols), "rate_hz": 100 // max(1, every), "rows": "\n".join(rows)}
 
@@ -1603,6 +1692,73 @@ def rest_noise(fs):
         return None
     resid = [fs[i] - _mean(fs[i - 2:i + 3]) for i in range(2, len(fs) - 2)]
     return robust_sigma(resid) * 1.12
+
+
+def sensor_rate(samples):
+    """Angle updates per second the sensor really delivers (the telemetry repeats the last one at 100 Hz)."""
+    seat = [s for s in samples if s.get("roll") is not None]
+    if len(seat) < 20:
+        return None
+    changes = sum(1 for a, b in zip(seat, seat[1:]) if (a["roll"], a["pitch"]) != (b["roll"], b["pitch"]))
+    span = (seat[-1]["ms"] - seat[0]["ms"]) / 1000.0
+    return round(changes / span) if span > 0.2 else None
+
+
+def seat_step(samples, m, t_old):
+    """What the SEAT did (motion sensor) when motor m stepped away from t_old: how far it tilted, which way, its own
+    overshoot and ringing next to the motor's, how long it lagged, and how far the motor turned before the seat
+    started to follow (play in the linkage). None without sensor data."""
+    idx = next((i for i, x in enumerate(samples) if x["m"][m]["t"] != t_old), None)
+    if idx is None or idx < 3:
+        return None
+    t_new, t0 = samples[idx]["m"][m]["t"], samples[idx]["ms"]
+    pre = [x for x in samples[max(0, idx - 15):idx] if x.get("roll") is not None]
+    post = [x for x in samples[idx:] if x.get("roll") is not None and x["m"][m]["t"] == t_new]
+    if len(pre) < 3 or len(post) < 25:
+        return None
+    r0, p0 = _mean([x["roll"] for x in pre]), _mean([x["pitch"] for x in pre])
+    tail = post[-25:]
+    dr, dp = _mean([x["roll"] for x in tail]) - r0, _mean([x["pitch"] for x in tail]) - p0
+    mag = math.hypot(dr, dp)
+    f0 = samples[idx - 1]["m"][m]["f"]
+    dpot = _mean([x["m"][m]["f"] for x in tail]) - f0
+    hz = sensor_rate(samples[max(0, idx - 15):])
+    out = {"deg": round(mag, 2), "roll": round(dr, 2), "pitch": round(dp, 2),
+           "axis": "roll" if abs(dr) > 2 * abs(dp) else ("pitch" if abs(dp) > 2 * abs(dr) else "roll and pitch"),
+           "deg_per_count": round(mag / abs(dpot), 4) if abs(dpot) >= 5 else None, "sensor_hz": hz}
+    # sensor noise along the direction of movement, from the settled end of the step
+    proj = [((x["roll"] - r0) * dr + (x["pitch"] - p0) * dp) / mag for x in tail]
+    sigma = robust_sigma(proj) or 0.0
+    out["noise_deg"] = round(sigma, 3)
+    if mag < max(0.25, 12 * sigma) or abs(dpot) < 5:   # too small next to the noise to judge the seat's response
+        out["small"] = True
+        return out
+    band = max(0.06, 4 * sigma / mag)
+    ys = []
+    for x in post:
+        y = ((x["roll"] - r0) * dr + (x["pitch"] - p0) * dp) / (mag * mag)
+        yp = (x["m"][m]["f"] - f0) / dpot
+        ys.append((y, yp, x["ms"] - t0))
+    peak, ppeak = max(y for y, _, _ in ys), max(yp for _, yp, _ in ys)
+    out["overshoot"] = round(max(0.0, peak - 1.0 - 2 * sigma / mag) * 100)   # minus what noise alone shows
+    out["motor_overshoot"] = round(max(0.0, ppeak - 1.0) * 100)
+    t50 = next((t for y, _, t in ys if y >= 0.5), None)
+    p50 = next((t for _, yp, t in ys if yp >= 0.5), None)
+    out["lag_ms"] = (t50 - p50) if (t50 is not None and p50 is not None) else None
+    i10 = next((i for i, (y, _, _) in enumerate(ys) if y >= 0.1), None)
+    if i10 is not None and hz and hz >= 50:
+        out["play_counts"] = round(max(0.0, ys[i10][1] - 0.1) * abs(dpot), 1)
+    crossings, state = 0, 0
+    for y, _, t in ys:
+        if t50 is None or t < t50:
+            continue
+        st = 1 if y > 1 + band else (-1 if y < 1 - band else 0)
+        if st and state and st != state:
+            crossings += 1
+        if st:
+            state = st
+    out["ringing"] = crossings
+    return out
 
 
 class EventLog:
@@ -1698,6 +1854,8 @@ class Monitor:
         self.usb_rate = None
         self.gaps = 0
         self.was_connected = False
+        self.seat_on = None                       # motion sensor data arriving? (firmware 1.8)
+        self.seat_prev = None
         threading.Thread(target=self._loop, daemon=True).start()
 
     # ---- incidents on disk ----
@@ -1782,9 +1940,14 @@ class Monitor:
         if not self.minutes or self.minutes[-1]["k"] != key:
             self.minutes.append({"k": key, "t": time.strftime("%Y-%m-%d %H:%M", time.localtime(key * 60)), "n": 0,
                                  "gaps": 0, "low": 0, "sim": 0,
+                                 "seat": {"n": 0, "rmin": 999.0, "rmax": -999.0, "pmin": 999.0, "pmax": -999.0,
+                                          "vmax": 0.0},
+                                 # load: 2 directions x 8 position bands: [samples, lag sum, at full power,
+                                 #        roll sum, pitch sum, samples with angles]
                                  "m": [{"act": 0, "sat": 0, "esum": 0.0, "emax": 0.0, "hist": [0] * 9,
                                         "fmin": 9999.0, "fmax": -1.0, "tmin": 9999, "tmax": -1, "vmax": 0.0,
-                                        "glitch": 0} for _ in range(3)]})
+                                        "glitch": 0, "load": [[0, 0.0, 0, 0.0, 0.0, 0] for _ in range(16)]}
+                                       for _ in range(3)]})
         return self.minutes[-1]
 
     def _busy(self, m, now):
@@ -1816,6 +1979,7 @@ class Monitor:
             self.events.add("power", "Low power: no position commands for 15 s, so the board runs at a quarter of "
                             "its drive." if s["low"] else "Full power: position commands are arriving again.",
                             quiet=True)
+        self._seat(s, bk)
         nm = int(self.cfg.get("motors"))
         drive = [self._busy(m, now) for m in range(3)]
         if self.prev is not None:
@@ -1841,6 +2005,34 @@ class Monitor:
             self._motor(m, s, now, drive[m], sim, bk, heavy)
         self.prev = s
 
+    def _seat(self, s, bk):
+        """Seat angle statistics, and the sensor's data starting or stopping (firmware 1.8)."""
+        on = s.get("roll") is not None
+        if on != self.seat_on:
+            was, self.seat_on = self.seat_on, on
+            sens = self.board.params.get("SENSOR") or [0, 0]
+            if on and was is not None:
+                self.events.add("sensor", "Motion sensor data is arriving.", quiet=True)
+            elif not on and was:
+                if sens[0] & 1:
+                    self._note("sensor_lost", None, s, "The motion sensor stopped sending - the tilt limit can't "
+                               "protect the rig until it is back.")
+                else:
+                    self.events.add("sensor", "Motion sensor data stopped.", quiet=True)
+        if not on:
+            self.seat_prev = None
+            return
+        st = bk["seat"]
+        st["n"] += 1
+        st["rmin"], st["rmax"] = min(st["rmin"], s["roll"]), max(st["rmax"], s["roll"])
+        st["pmin"], st["pmax"] = min(st["pmin"], s["pitch"]), max(st["pmax"], s["pitch"])
+        pv = self.seat_prev
+        if pv and 0 < s["ms"] - pv["ms"] <= 120 and (s["roll"], s["pitch"]) != (pv["roll"], pv["pitch"]):
+            v = math.hypot(s["roll"] - pv["roll"], s["pitch"] - pv["pitch"]) * 1000.0 / (s["ms"] - pv["ms"])
+            st["vmax"] = max(st["vmax"], v)
+        if not pv or (s["roll"], s["pitch"]) != (pv["roll"], pv["pitch"]):
+            self.seat_prev = s
+
     def _reboot(self, before, after, s):
         self.events.add("board", f"The board restarted: it had been running {_ago(before / 1000)}, now "
                         f"{_ago(after / 1000)}.", uptime_before_s=round(before / 1000), uptime_after_s=round(after / 1000))
@@ -1861,6 +2053,13 @@ class Monitor:
             return
         if m >= nm:
             self.events.add("motor", f"Motor {n} (not in use) switched off.", motor=n, quiet=True)
+            return
+        tilt = (self.board.params.get("SENSOR") or [0, 0])[1]
+        if tilt and s.get("roll") is not None and max(abs(s["roll"]), abs(s["pitch"])) >= tilt - 1.0:
+            self._note("tilt_limit", None, s, f"The tilt limit stopped every motor: the seat was at roll "
+                       f"{s['roll']:.1f}°, pitch {s['pitch']:.1f}° (limit {tilt}°).", roll=s["roll"], pitch=s["pitch"],
+                       limit=tilt)
+            self.want_cause = True
             return
         f = s["m"][m]["f"]
         lim = (self.board.params.get(f"LIM{n}") or [23, 100])[0]
@@ -1904,8 +2103,19 @@ class Monitor:
             st["esum"] += e
             st["emax"] = max(st["emax"], e)
             st["hist"][sum(1 for edge in (2, 5, 10, 20, 40, 80, 160, 320) if e >= edge)] += 1
-            if pwm and abs(p) + pwm[0] >= pwm[1] - 1 and e > dz:
+            full = bool(pwm and abs(p) + pwm[0] >= pwm[1] - 1 and e > dz)
+            if full:
                 st["sat"] += 1
+            # load map: while SimHub moves this motor, how far behind it runs in each position band, each way
+            if last and 0 < s["ms"] - last[0] <= 15 and abs(g - last[2]) >= 0.4:
+                up = g > last[2]
+                band = min(7, max(0, int((f - clip) * 8 / max(1, 1023 - 2 * clip))))
+                cell = st["load"][(8 if up else 0) + band]
+                cell[0] += 1
+                cell[1] += (g - f) if up else (f - g)
+                cell[2] += 1 if full else 0
+                if s.get("roll") is not None:
+                    cell[3] += s["roll"]; cell[4] += s["pitch"]; cell[5] += 1
         if busy or not heavy:
             return
         inside = lambda v: clip <= v <= 1023 - clip
@@ -2087,8 +2297,41 @@ class Monitor:
                 "speed_max_counts_s": round(max((x["vmax"] for x in ms), default=0.0)),
                 "pot_glitches": sum(x["glitch"] for x in ms),
                 "noise_at_rest": None if self.noise[m] is None else round(self.noise[m], 2),
-                "pid_noise_at_rest": None if self.pid_noise[m] is None else round(self.pid_noise[m], 2)})
+                "pid_noise_at_rest": None if self.pid_noise[m] is None else round(self.pid_noise[m], 2),
+                "load_map": self._load_map(m, ms)})
+        seat = [b["seat"] for b in bks if b.get("seat", {}).get("n")]
+        if seat:
+            tot["seat"] = {"samples": sum(x["n"] for x in seat),
+                           "roll_range": [round(min(x["rmin"] for x in seat), 1), round(max(x["rmax"] for x in seat), 1)],
+                           "pitch_range": [round(min(x["pmin"] for x in seat), 1), round(max(x["pmax"] for x in seat), 1)],
+                           "speed_max_deg_s": round(max(x["vmax"] for x in seat), 1)}
         return tot
+
+    def _load_map(self, m, ms):
+        """Per position band (8 across the Clip window): moving towards higher / lower numbers, how far behind
+        SimHub the motor runs and how often at full allowed power - plus the seat angle there (motion sensor)."""
+        cells = [[0, 0.0, 0, 0.0, 0.0, 0] for _ in range(16)]
+        for x in ms:
+            for i, c in enumerate(x.get("load") or []):
+                for k in range(6):
+                    cells[i][k] += c[k]
+        if sum(c[0] for c in cells) < 200:
+            return None
+        clip = (self.board.params.get(f"LIM{m + 1}") or [23, 100])[1]
+        w = (1023 - 2 * clip) / 8.0
+        out = []
+        for b in range(8):
+            row = {"pot": [round(clip + b * w), round(clip + (b + 1) * w)]}
+            for key, c in (("higher", cells[8 + b]), ("lower", cells[b])):
+                row[key] = None if c[0] < 30 else {"seconds": round(c[0] / 100.0, 1), "lag": round(c[1] / c[0], 1),
+                                                   "full_power_pct": round(100.0 * c[2] / c[0])}
+            nseat = cells[b][5] + cells[8 + b][5]
+            if nseat >= 30:
+                row["seat_roll"] = round((cells[b][3] + cells[8 + b][3]) / nseat, 1)
+                row["seat_pitch"] = round((cells[b][4] + cells[8 + b][4]) / nseat, 1)
+            if row["higher"] or row["lower"]:
+                out.append(row)
+        return out
 
     def minute_table(self, minutes=60):
         cut = time.time() // 60 - minutes
@@ -2419,6 +2662,7 @@ class MotionCheck:
                 self.wait(0.15)
                 got = despike(b.since(seq0), m)
                 res = analyze_step(got, m, t_old, o["pwmmin"], o["pwmmax"], 1500)
+                seat = seat_step(b.since(seq0 - 20), m, t_old)   # needs a few samples from before the step
                 vmax = 0.0
                 for i in range(1, len(got)):
                     dt = got[i]["ms"] - got[i - 1]["ms"]
@@ -2427,6 +2671,8 @@ class MotionCheck:
                 if res:
                     res = {k: (round(v, 1) if isinstance(v, float) else v) for k, v in res.items()}
                     res["speed_max"] = round(vmax)
+                    if seat:
+                        res["seat"] = seat
                 steps.append(res)
             r["step"] = {"size": abs(a), "first_direction": "up" if a > 0 else "down", "away": steps[0],
                          "back": steps[1]}
@@ -2545,11 +2791,24 @@ ABOUT = {
         "Clip": "counts from each end that bound the usable target window; PWMrev pushes back if the pot is outside.",
         "Dead zone": "counts; inside it the motor brakes instead of driving.",
         "ms": "board uptime in milliseconds",
+        "roll, pitch": "seat angles in degrees from the WT901C motion sensor (firmware 1.8), levelled with 'Level now' "
+                       "and turned to how the sensor is mounted; empty when the sensor sends nothing.",
     },
     "traces": "CSV text: header in 'columns', one row per sample at 'rate_hz'. off = three 0/1 flags (motors 1-3 "
-              "switched off), low = 1 when the board runs at quarter power (no position commands for 15 s).",
+              "switched off), low = 1 when the board runs at quarter power (no position commands for 15 s). roll / "
+              "pitch columns appear when the motion sensor sends; the sensor may update slower than 100 Hz, so values "
+              "repeat in between.",
+    "load_map": "watch.last_60_min.motors[].load_map: while SimHub drives, per position band of the Clip window and "
+                "per direction (towards higher / lower counts): seconds spent moving, mean lag behind the goal (counts, "
+                "positive = behind), and % of that time at full allowed power - plus the seat angle there. Lifting a "
+                "heavy load shows as one direction lagging and at full power while the other keeps up.",
+    "sensor": "board.sensor (firmware 1.8): the WT901C on the board's Serial1 - switched on, receiving, baud found, "
+              "angles per second, tilt limit and trips, level offsets, raw angles. check[].step.*.seat: the seat's "
+              "own response to each step - degrees moved, degrees per count, overshoot and ringing next to the "
+              "motor's, lag, and play (counts the motor turns before the seat follows).",
     "wiring (firmware defaults)": "motor n: PWM on D9/D10/D11, bridge enable pins D2+D3 / D4+D5 / D6+D7, pots on "
-                                  "A0/A1/A2. MODE2 = IBT-2 bridges.",
+                                  "A0/A1/A2. MODE2 = IBT-2 bridges. Motion sensor (optional): WT901C-232 TX -> "
+                                  "MAX3232 -> D0, D1 -> MAX3232 -> sensor RX, 5 V.",
 }
 
 
@@ -2784,6 +3043,9 @@ class Diagnostics:
                                   "smc3utils_monitor_mode": dg["monitor_mode"]},
                           "wifi_commands_ok": dg["wifi_cmds"],
                           "motors": [dict(x, motor=k + 1) for k, x in enumerate(dg["motors"])]})
+            if "sensor" in dg:
+                board["sensor"] = dg["sensor"]
+                board["led_matrix"] = dg["matrix"]
         rep["board"] = board
         names = list(cfg.get("motor_names") or ["", "", ""])
         rep["rig"] = {"motors_in_use": nm, "switch_off_unused_motors": bool(cfg.get("disable_unused")),
@@ -2798,6 +3060,8 @@ class Diagnostics:
             st["not_saved"] = settings_diff(params, stored, motors) if params.get("Kp1") is not None else None
         elif dg:
             st["saved_in_eeprom"] = None
+        if dg and fw[1] >= 18:
+            st["board_settings_saved"] = decode_board_block(dg["eeprom"])
         last_save = next((x for x in self.backups.list() if x["kind"] == "eeprom"), None)
         if last_save:
             st["last_save_from_page"] = {"when": last_save["when"],
@@ -2829,6 +3093,13 @@ class Diagnostics:
                 row["noise_at_rest"] = None if rest_noise(fs) is None else round(rest_noise(fs), 2)
                 row["pid_noise_at_rest"] = round(robust_sigma(ps) or 0.0, 2)
             live["motors"].append(row)
+        seat = [x for x in got if x.get("roll") is not None]
+        still = bool(live["motors"]) and all(r["target_still"] for r in live["motors"])
+        if len(seat) >= 30:
+            rs, ps = [x["roll"] for x in seat], [x["pitch"] for x in seat]
+            live["seat"] = {"roll": round(_mean(rs), 2), "pitch": round(_mean(ps), 2), "motors_still": still,
+                            "wobble_deg": round(max(robust_sigma(rs) or 0.0, robust_sigma(ps) or 0.0), 3) if still else None,
+                            "sensor_hz": sensor_rate(got), "share_of_samples": round(len(seat) / max(1, len(got)), 2)}
         rep["live"] = live
         # full check: move each motor a little
         if kind == "full":
@@ -2970,10 +3241,17 @@ def analyze(rep):
             "and the full check - and the page can't read most of what it needs to diagnose.",
             "Flash firmware 1.7 or newer (SMC3_R4.ino - put your WiFi name and password in first).", code="fw_old")
     elif fwn and fwn < 17:
-        add("info", f"Firmware {board.get('firmware')} - flash 1.7 for complete diagnostics",
-            "1.7 adds: why the board last restarted, SimHub's USB command counters, pot glitches seen at the full "
-            "4 kHz loop rate, why each motor is off, and a copy of the EEPROM to spot unsaved settings.",
-            "Flash firmware 1.7 or newer (SMC3_R4.ino - put your WiFi name and password in first).", code="fw")
+        add("info", f"Firmware {board.get('firmware')} - flash 1.8 for complete diagnostics",
+            "1.7 added: why the board last restarted, SimHub's USB command counters, pot glitches seen at the full "
+            "4 kHz loop rate, why each motor is off, and a copy of the EEPROM to spot unsaved settings. 1.8 adds the "
+            "LED matrix in words and the motion sensor.",
+            "Flash the newest SMC3_R4.ino (put your WiFi name and password in first).", code="fw")
+    elif fwn == 17:
+        add("info", "Firmware 1.7 - 1.8 is available",
+            "1.8 shows problems on the LED matrix in words (ERROR E3 MOTOR 3 CUTOFF) instead of status dots, adds live "
+            "motor bars and a seat horizon, and runs the WT901C motion sensor (seat angles, tilt limit) with no "
+            "recompiling. Nothing changes for SimHub.", "Flash the newest SMC3_R4.ino when convenient (put your WiFi "
+            "name and password in first).", code="fw18")
     if board.get("isr_max_us") and board["isr_max_us"] > 200:
         add("warn", f"Control loop close to its time budget ({board['isr_max_us']} µs of 250)",
             "If it goes over, the motors get jerky.", "Set Fpid divider 2 (Tuning section) or turn the LED matrix off "
@@ -3086,10 +3364,27 @@ def analyze(rep):
                       + f" (limits {cut} / {1023 - cut}).",
                       "switched off by command": "It was switched off by a command (Disable Motors, an unused motor, "
                                                  "or a safety stop by auto-tune / the full check).",
-                      "not enabled since power-up": "It hasn't been enabled since power-up."}.get(why, "It is off.")
-            add("fail", f"Motor {n} is switched off", detail,
-                "Find out why first (pot slipped on its shaft, wired backwards, a mechanical end stop), then press "
-                "Enable Motors. The LED matrix shows E" + str(n) + " while it is off.", n, "off")
+                      "not enabled since power-up": "It hasn't been enabled since power-up.",
+                      "tilt limit": "The motion sensor's tilt limit stopped every motor: the seat tilted further than "
+                                    "the limit set under Settings, Motion sensor."}.get(why, "It is off.")
+            if why == "tilt limit":
+                fix = ("Find out why the seat tilted so far (a pot slipped or came loose, a motor wired backwards, "
+                       "SimHub's output too strong), then press Enable Motors. If the limit is simply too tight for "
+                       "your games, raise it a little. The LED matrix scrolls ERROR E4 TILT LIMIT meanwhile.")
+            elif why == "safety cutoff" or fwn < 18:
+                fix = ("Find out why first (pot slipped on its shaft, wired backwards, a mechanical end stop), then "
+                       "press Enable Motors. The LED matrix " + (f"scrolls ERROR E{n} MOTOR {n} CUTOFF" if fwn >= 18
+                                                                 else f"shows E{n}") + " while it is off.")
+            else:
+                fix = "Press Enable Motors when you want it back."
+            if why == "tilt limit":
+                if not any(f["code"] == "off_tilt" for f in F):    # one finding for all motors it stopped
+                    off_t = [k for k in motors if livem.get(k, {}).get("off") and
+                             dgm.get(k, {}).get("off_reason") == "tilt limit"]
+                    add("fail", "The tilt limit stopped " + ("every motor" if len(off_t) == len(motors) else
+                        "motors " + ", ".join(str(k) for k in off_t)), detail, fix, None, "off_tilt")
+            else:
+                add("fail", f"Motor {n} is switched off", detail, fix, n, "off")
         pot = lm.get("pot")
         if pot is not None and (pot < 5 or pot > 1018):
             add("fail", f"Motor {n}'s pot reads {pot:.0f} - the very end of its range",
@@ -3170,6 +3465,106 @@ def analyze(rep):
                 add("info", f"Motor {n} often runs more than {p95 // 2} counts behind SimHub",
                     "It isn't at its power limit, so the settings are soft (low Kp, long smoothing or a speed cap).",
                     "Run auto-tune or try the Circuit racing recommendation.", n, "lag")
+    # ---- load across the travel (watcher, while SimHub drives) ----
+    for n in motors:
+        lmap = (w60.get(n) or {}).get("load_map")
+        if not lmap or any(f["motor"] == n and f["level"] == "fail" for f in F):
+            continue                     # a motor that is broken or wired wrong doesn't say anything about load
+        worst_ = None
+        for d, other in (("higher", "lower"), ("lower", "higher")):
+            bad = [b for b in lmap if b.get(d) and b.get(other) and b[d]["seconds"] >= 0.5 and
+                   b[d]["lag"] >= 15 and b[d]["lag"] >= 2 * max(0.0, b[other]["lag"]) + 5]
+            bad += [b for b in lmap if b.get(d) and b not in bad and b[d]["seconds"] >= 0.5 and
+                    b[d]["full_power_pct"] >= 30 and (not b.get(other) or b[other]["full_power_pct"] < 10)]
+            if bad and (worst_ is None or len(bad) > len(worst_[1])):
+                worst_ = (d, bad, other)
+        if worst_:
+            d, bad, other = worst_
+            bad.sort(key=lambda b: b["pot"][0])
+            lo, hi = bad[0]["pot"][0], bad[-1]["pot"][1]
+            lag = max(b[d]["lag"] for b in bad)
+            fp = max(b[d]["full_power_pct"] for b in bad)
+            lag_o = max((b[other]["lag"] for b in bad if b.get(other)), default=None)
+            seat_txt = ""
+            seat_b = [b for b in bad if "seat_roll" in b]
+            if seat_b:
+                seat_txt = (f" The seat is at roll {min(b['seat_roll'] for b in seat_b):+.1f}° to "
+                            f"{max(b['seat_roll'] for b in seat_b):+.1f}°, pitch {min(b['seat_pitch'] for b in seat_b):+.1f}° "
+                            f"to {max(b['seat_pitch'] for b in seat_b):+.1f}° there.")
+            add("warn", f"Motor {n} struggles moving towards {d} numbers around pot {lo}-{hi}",
+                f"While SimHub drives, going that way it falls up to {lag:.0f} counts behind and runs at full allowed "
+                f"power up to {fp}% of the time there" + (f"; the other way it keeps up ({lag_o:.0f} counts)" if
+                lag_o is not None else "") + ". That is what lifting a heavy load looks like - a heavier driver, or "
+                "the seat's weight on that corner." + seat_txt,
+                "More drive for that direction: raise PWMmax 10-20 at a time and check the motor supply holds its "
+                "voltage under load; a little Ki helps hold against the weight (auto-tune adds it when it helps). "
+                "Mechanically: a longer lever, a spring or gas strut to carry the seat's weight, lubrication. Look at "
+                "it again after a session - the load map fills while you drive.", n, "load")
+    # ---- motion sensor (firmware 1.8) ----
+    sen = board.get("sensor")
+    seat_live = live.get("seat")
+    seat_w = watch.get("last_60_min", {}).get("seat")
+    if sen:
+        rate = sen.get("angles_per_s") or (seat_live or {}).get("sensor_hz") or 0
+        if sen["switched_on"] and not sen["receiving"]:
+            add("fail", "The motion sensor is switched on, but nothing arrives from it",
+                ("The board found it earlier but it went quiet." if sen.get("good_packets") else
+                 f"The board has been trying the usual baud rates (now {sen.get('baud_trying')}) without a single good "
+                 "packet.") + " The tilt limit can't protect the rig meanwhile, and the matrix scrolls ERROR E5 NO "
+                 "SENSOR.",
+                "Check: sensor VCC to 5V and GND to GND; the sensor's TX (yellow) through the MAX3232 to D0 - a -232 "
+                "sensor must not go to D0 directly; the MAX3232's TTL side powered from 5V; RX and TX not swapped on "
+                "the RS-232 side. If you don't use a sensor, switch it off under Settings, Motion sensor.",
+                code="sensor_silent")
+        elif sen["receiving"] and not sen["switched_on"]:
+            add("info", "A motion sensor is connected but not switched on",
+                f"It sends {rate} angles per second, so the seat angle shows on the page, but the tilt limit is off "
+                "and a lost sensor isn't reported.", "Settings, Motion sensor: switch it on and set a tilt limit.",
+                code="sensor_off")
+        if sen["receiving"]:
+            if rate and rate < 40:
+                add("warn", f"The motion sensor sends only {rate} angles per second",
+                    "The WT901C leaves the factory at 10 per second (9600 baud) - too coarse to see how the seat "
+                    "moves, and slow for the tilt limit.",
+                    "Settings, Motion sensor: Set sensor to 100 Hz (needs the board's D1 wired through the MAX3232 "
+                    "to the sensor's RX). If SimHub shares the sensor, set 100 Hz / 115200 baud in WitMotion's PC "
+                    "software instead - the board finds the new baud rate by itself.", code="sensor_rate")
+            else:
+                add("ok", f"Motion sensor: {rate} angles per second at {sen.get('baud')} baud", code="sensor_ok")
+            if sen.get("bad_checksums", 0) > max(50, 0.01 * sen.get("good_packets", 0)):
+                add("warn", f"Garbled data from the motion sensor ({sen['bad_checksums']} bad packets since power-up)",
+                    "Noise on the wires, a loose ground, or a second device talking on the same line.",
+                    "Short wires, a solid shared ground between sensor, MAX3232 and board; keep them away from the "
+                    "motor cables.", code="sensor_bad")
+            if sen["switched_on"] and not sen.get("tilt_limit_deg"):
+                rng = ""
+                if seat_w:
+                    big = max(abs(v) for v in seat_w["roll_range"] + seat_w["pitch_range"])
+                    rng = f" In the last hour the seat reached {big:.1f}°."
+                add("info", "Tilt limit is off", "With a limit, the board stops every motor if the seat tilts further "
+                    "than it should - a slipped pot or a motor running away can't throw the seat to its end stops."
+                    + rng, "Settings, Motion sensor: set the limit a few degrees above the most your seat tilts in "
+                    "games.", code="tilt_off")
+            if sen.get("tilt_trips"):
+                add("warn", f"The tilt limit stopped the motors {sen['tilt_trips']}x since the board started",
+                    f"The seat tilted past {sen.get('tilt_limit_deg')}°.", "If nothing was wrong, the limit is too "
+                    "tight for your games - raise it a little. Otherwise look for a slipped pot or a motor that ran "
+                    "away (the recorded problems show what happened just before).", code="tilt_trips")
+            if seat_live and seat_live.get("motors_still") and sen["level_offset"] == [0.0, 0.0] and max(abs(seat_live["roll"]),
+                                                                      abs(seat_live["pitch"])) > 1.5:
+                add("info", f"The seat reads roll {seat_live['roll']:+.1f}°, pitch {seat_live['pitch']:+.1f}° at rest",
+                    "The sensor isn't mounted perfectly level, so the angles are off by that much.",
+                    "Put the seat at its normal centre position, then Settings, Motion sensor: Level now.",
+                    code="sensor_level")
+            if seat_live and (seat_live.get("wobble_deg") or 0) > 0.15:
+                add("info", f"The seat angle wobbles ±{seat_live['wobble_deg']:.2f}° while the motors hold still",
+                    "Vibration reaching the sensor (fans, motors buzzing) or a loose mount.",
+                    "Fix the sensor firmly to the seat frame; check for buzzing motors.", code="sensor_wobble")
+        if seat_w and seat_w.get("samples", 0) > 3000:
+            add("info", f"Seat movement in the last hour: roll {seat_w['roll_range'][0]:+.1f}° to "
+                f"{seat_w['roll_range'][1]:+.1f}°, pitch {seat_w['pitch_range'][0]:+.1f}° to "
+                f"{seat_w['pitch_range'][1]:+.1f}°", f"Fastest movement {seat_w['speed_max_deg_s']:.0f}°/s.",
+                code="seat_range")
     # ---- full check ----
     if isinstance(rep.get("check"), dict) and rep["check"].get("skipped"):
         add("info", "Motors were not moved", "Reason: " + rep["check"]["skipped"] + ".", code="check_skipped")
@@ -3219,6 +3614,46 @@ def analyze(rep):
                     add("warn", f"Motor {n} didn't reach a small step's target within 1.5 s", "Too weak for the load, "
                         "or PWMmax too low.", "Raise PWMmax / Kp, check the supply.", n, "slow")
                     break
+            seats = [r["seat"] for r in (a, bk) if r and r.get("seat")]
+            if seats:
+                clip = (ck.get("settings") or {}).get("clip") or 100
+                dpc = [x["deg_per_count"] for x in seats if x.get("deg_per_count")]
+                if all(x.get("small") for x in seats):
+                    add("warn", f"The seat hardly moved when motor {n} moved",
+                        f"A {stp.get('size')}-count step tilted the seat only {max(x['deg'] for x in seats):.2f}°.",
+                        "Is the sensor fixed to the moving seat (not to the base frame)? Otherwise look for a loose or "
+                        "broken link between this motor and the seat.", n, "seat_small")
+                elif dpc:
+                    k = _mean(dpc)
+                    rng = k * (1023 - 2 * clip) / 2.0
+                    add("info", f"Motor {n} tilts the seat {k:.3f}° per count ({seats[0]['axis']})",
+                        f"A {stp.get('size')}-count step moved the seat {seats[0]['deg']:.2f}°. Over its whole Clip "
+                        f"window that is about ±{rng:.1f}°.", motor=n, code="seat_geom")
+                    sos = max(x.get("overshoot", 0) for x in seats)
+                    mos = max(x.get("motor_overshoot", 0) for x in seats)
+                    ring = max(x.get("ringing", 0) for x in seats)
+                    bounce = (sos >= 25 and sos >= mos + 20) or (ring >= 4 and sos >= 15)
+                    if bounce:
+                        add("warn", f"The seat bounces after motor {n} stops",
+                            f"The seat overshoots {sos}% and swings {ring} times while the motor itself overshoots "
+                            f"{mos}%: the frame, the seat mounts or the linkage flex, and the seat keeps moving after "
+                            f"the motor has stopped.", "Stiffen what flexes (frame, seat mounts, rod ends). In the page, "
+                            "more target smoothing or a lower Kp calms it - auto-tune with the sensor picks a Kp that "
+                            "keeps the seat itself calm.", n, "seat_bounce")
+                    # a springy frame also starts late - only a seat that doesn't bounce shows play cleanly
+                    play = max((x.get("play_counts") or 0) for x in seats if x.get("overshoot", 0) < 20) \
+                        if any(x.get("overshoot", 0) < 20 for x in seats) else 0
+                    if play >= 10 and not bounce:
+                        add("warn", f"Play in motor {n}'s linkage: it turns {play:.0f} counts before the seat follows",
+                            f"About {play * k:.2f}° of the seat's movement is lost each time the motor changes "
+                            "direction - small, quick movements (road texture) disappear and direction changes clunk.",
+                            "Check rod ends and ball joints, the lever on the motor shaft (set screw, key) and worn "
+                            "bushings.", n, "seat_play")
+                    lag = max((x.get("lag_ms") or 0) for x in seats)
+                    if lag >= 60 and play < 10 and not bounce:
+                        add("info", f"The seat follows motor {n} {lag:.0f} ms late",
+                            "Some flex or play between the motor and the seat.", "Usually mechanical: stiffen the "
+                            "linkage.", n, "seat_lag")
         elif res == "reversed":
             add("fail", f"Motor {n} moves the WRONG way", msg + " With its pot it pushes away from where it should go, "
                 "so in normal use it runs to the end until the safety cutoff stops it.",
@@ -3404,11 +3839,13 @@ PAGE = r"""<!doctype html>
 html[data-theme=dark]{color-scheme:dark;
  --bg:#070c13; --card:#111a24; --card-2:#0d151e; --line:#223041; --line-2:#2c3b4f; --text:#e7edf5; --dim:#8a98aa; --faint:#5f6d80;
  --input:#060c12; --input-line:#283648; --chart:#03080e; --grid:#142030; --axis:#6f7d90;
- --c-t:#7f8da3; --c-g:#3d8bff; --c-f:#3ddc5a; --c-p:#ff8a1f; --tip:#0d1724; --tip-line:#2c3b4f; --tip-text:#e7edf5}
+ --c-t:#7f8da3; --c-g:#3d8bff; --c-f:#3ddc5a; --c-p:#ff8a1f; --tip:#0d1724; --tip-line:#2c3b4f; --tip-text:#e7edf5;
+ --c-roll:#b98bff; --c-pitch:#2fd0e0; --seat:#8f6bff}
 html[data-theme=light]{color-scheme:light;
  --bg:#eef2f7; --card:#ffffff; --card-2:#f5f8fb; --line:#d9e1ea; --line-2:#c7d2df; --text:#0f1b2d; --dim:#56677d; --faint:#8a99ab;
  --input:#f7f9fc; --input-line:#c9d4e1; --chart:#fbfcfe; --grid:#e6ebf1; --axis:#7c8a9c;
- --c-t:#9aa6b6; --c-g:#1f6fe5; --c-f:#14a046; --c-p:#e8780e; --tip:#ffffff; --tip-line:#c7d2df; --tip-text:#0f1b2d}
+ --c-t:#9aa6b6; --c-g:#1f6fe5; --c-f:#14a046; --c-p:#e8780e; --tip:#ffffff; --tip-line:#c7d2df; --tip-text:#0f1b2d;
+ --c-roll:#7646d8; --c-pitch:#0a8f9e; --seat:#7a52e8}
 *{box-sizing:border-box}
 html,body{margin:0;background:var(--bg);color:var(--text);font:14px/1.4 var(--sans)}
 button,input,select{font:inherit;color:inherit}
@@ -3460,7 +3897,7 @@ main[data-view=tools]{grid-template-columns:minmax(0,1.75fr) minmax(0,1fr);grid-
 main[data-view=profiles]{grid-template-columns:minmax(0,1fr) minmax(360px,430px);grid-template-areas:"genres pid" "profiles pid"}
 main[data-view=autotune]{grid-template-columns:minmax(360px,430px) minmax(0,1fr);grid-template-areas:"tune tunelog" "graphs graphs"}
 main[data-view=eeprom]{grid-template-columns:minmax(0,1fr) minmax(360px,430px);grid-template-areas:"eeprom pid" "backups pid"}
-main[data-view=settings]{grid-template-columns:repeat(2,minmax(0,1fr));grid-template-areas:"settings global" "settings mnames" "diag diag"}
+main[data-view=settings]{grid-template-columns:repeat(2,minmax(0,1fr));grid-template-areas:"settings global" "settings mnames" "led sensor" "diag diag"}
 main[data-view=help]{grid-template-columns:1fr;grid-template-areas:"help"}
 main[data-view] > [data-views]{align-self:stretch}
 .mrow{display:grid;grid-template-columns:repeat(var(--n,3),minmax(0,1fr));gap:14px;min-width:0}
@@ -3542,6 +3979,19 @@ html[data-theme=light] .mimg{background:#111a24}
 .chart .tab em{font-style:normal;font-weight:600;margin-left:8px;padding:0 6px;border-radius:4px;background:rgba(0,0,0,.22);font-size:12px}
 .chart .tab em:empty{display:none}
 #charts.focus .chart:not(.sel){opacity:.5}
+.chart.seatc{--mc:var(--seat);cursor:default}
+.chart.seatc .tab{color:#fff;display:flex;align-items:center;gap:8px}
+.chart.seatc .tab svg{width:40px;height:20px;border-radius:3px;background:#2e74c9;display:block;box-shadow:0 0 0 1px rgba(255,255,255,.35)}
+.sstat{display:flex;align-items:center;gap:8px;font-size:14px;margin:4px 0 10px;flex-wrap:wrap}
+.sstat .dot{flex:none}.sstat .ang{font-family:var(--mono);font-size:13px;color:var(--dim)}
+.sbtns{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+.etab{width:100%;border-collapse:collapse;font-size:13.5px;margin:6px 0 4px}
+.etab td,.etab th{border-top:1px solid var(--line);padding:6px 8px 6px 0;vertical-align:top;text-align:left}
+.etab th{font-weight:600;color:var(--dim);font-size:12.5px}
+.etab td:first-child{font-family:var(--mono);font-weight:700;white-space:nowrap;color:var(--red)}
+.etab code{font-family:var(--mono);font-size:12px}
+.hwide{border-top:1px solid var(--line);margin-top:18px;padding-top:4px;max-width:1180px}
+.hwide .etab td:nth-child(2){width:42%}
 .motor.sel{border-color:var(--mc);box-shadow:0 0 0 2px color-mix(in srgb,var(--mc) 40%,transparent)}
 .pid .c0{--mc:var(--blue)}.pid .c1{--mc:var(--orange)}.pid .c2{--mc:var(--green)}
 .pid th.sel{box-shadow:0 0 0 2px var(--mc)}
@@ -3716,7 +4166,7 @@ details.oks .flist{margin-top:6px}
  .pill>span{border-left:0}
  .test .frow{grid-template-columns:1fr 1fr}
  .presets{grid-template-columns:repeat(3,1fr)}
- .chart{grid-template-columns:1fr}.ro{grid-template-columns:repeat(4,auto 1fr);padding:6px 8px}
+ .chart{grid-template-columns:minmax(0,1fr)}.ro{grid-template-columns:repeat(4,auto minmax(0,1fr));padding:6px 8px;gap:3px 6px}.ro b{overflow:hidden;white-space:nowrap}
  .field{grid-template-columns:1fr}
  .dgrid{grid-template-columns:1fr}
  .nrow{grid-template-columns:31px minmax(0,1fr)}.nrow input{grid-column:2}
@@ -3952,6 +4402,34 @@ details.oks .flist{margin-top:6px}
   </div>
  </section>
 
+ <!-- LED matrix (firmware 1.8) -->
+ <section class="card" style="grid-area:led" data-views="settings" id="ledcard">
+  <div class="ct"><svg class="i" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M7 15v-3M10 15V9M13 15v-5M16 15v-2"/></svg>LED matrix <small>on the board</small></div>
+  <p class="note">After power-up the board's address scrolls; problems always scroll in words, e.g. <b>ERROR E3 MOTOR 3 CUTOFF</b> - Help lists every code. Saved on the board at once.</p>
+  <div class="field" data-k="l_view"><span>Normally shows</span><select id="l_view"><option value="0">Motor bars - each motor's position, live</option><option value="1">Seat horizon - needs the motion sensor</option><option value="2">Quiet - only problems and the address</option></select></div>
+  <div class="field" data-k="l_idle"><span>While idle</span><label class="chk"><input type="checkbox" id="l_idle"><span>Oscilloscope trace when SimHub isn't sending</span></label></div>
+  <div class="field" data-k="l_rep"><span>Address</span><label class="chk"><input type="checkbox" id="l_rep"><span>Scroll it every minute while this page isn't connected</span></label></div>
+  <div class="sbtns"><button class="btn b-blue" id="l_save" data-k="l_save" onclick="saveLed()">Apply</button></div>
+  <div class="msg" id="l_msg"></div>
+ </section>
+
+ <!-- motion sensor (firmware 1.8) -->
+ <section class="card" style="grid-area:sensor" data-views="settings" id="sencard">
+  <div class="ct"><svg class="i" viewBox="0 0 24 24"><path d="M3 15l9-4 9 4"/><path d="M12 11V4M9 7l3-3 3 3"/><path d="M5 19h14"/></svg>Motion sensor <small>WT901C on the board</small></div>
+  <div class="sstat" id="sn_stat"><i class="dot off"></i><span>Not read yet</span></div>
+  <div class="field" data-k="sn_on"><span>Use the sensor</span><label class="chk"><input type="checkbox" id="sn_on"><span>A WT901C is fitted to the seat</span></label></div>
+  <div class="field" data-k="sn_tilt"><span>Tilt limit</span><select id="sn_tilt"><option value="0">Off</option><option value="6">6°</option><option value="8">8°</option><option value="10">10°</option><option value="12">12°</option><option value="15">15°</option><option value="18">18°</option><option value="20">20°</option><option value="25">25°</option><option value="30">30°</option></select></div>
+  <div class="field" data-k="sn_mount"><span>Mounting</span><div><label class="chk"><input type="checkbox" id="sn_swap"><span>Swap roll / pitch</span></label><label class="chk"><input type="checkbox" id="sn_ir"><span>Invert roll</span></label><label class="chk"><input type="checkbox" id="sn_ip"><span>Invert pitch</span></label></div></div>
+  <div class="sbtns">
+   <button class="btn b-blue sn" data-k="sn_save" onclick="saveSensor()">Apply</button>
+   <button class="btn b-grey sn" data-k="sn_level" onclick="sensorAct('level')">Level now</button>
+   <button class="btn b-grey sn" data-k="sn_setup" onclick="sensorAct('setup')">Set sensor to 100 Hz</button>
+   <button class="btn b-grey sn" data-k="sn_search" onclick="sensorAct('search')">Search again</button>
+  </div>
+  <p class="note" id="sn_note" style="margin-top:10px">Check the mounting: lift the seat's front - pitch should go <b>+</b>; lower its right side - roll should go <b>+</b>. Tick a box if one goes the other way. Level now: put the seat at its normal centre first.</p>
+  <div class="msg" id="sn_msg"></div>
+ </section>
+
  <!-- diagnostics -->
  <section class="card wide" id="diagcard" style="grid-area:diag" data-views="settings">
   <div class="ct"><svg class="i" viewBox="0 0 24 24"><path d="M3 12h4l2-5 4 10 2-5h6"/><circle cx="20" cy="12" r="1.2"/></svg>Diagnostics</div>
@@ -3986,15 +4464,25 @@ details.oks .flist{margin-top:6px}
   <div class="cols">
    <div><h3>Every control explains itself</h3><p>Hold the mouse over any setting, button, legend entry or status item for a short note on what it does on the rig, what too low and too high feel like, and where to start.</p>
     <h3>Tuning by hand</h3><ol><li>Stop SimHub's motion output.</li><li>Set Ki 0, Kd 0, PWMmin 10-15, dead zone 2-4 and press Apply.</li><li>Run a Square test on one motor and raise Kp until the green line just stops overshooting the blue one.</li><li>Add a little Ki (5-20) only if the seat settles short of the target.</li><li>Save to EEPROM.</li></ol></div>
-   <div><h3>Auto-tune</h3><p>Measures friction (PWMmin) and pot noise (dead zone), raises Kp until it stops tracking any better, checks small road-sized moves, then adds Ki and Kd only if they help. It stops by itself and restores the previous settings if SimHub moves the rig or anything looks wrong. Nothing is saved until you press Save to EEPROM.</p>
+   <div><h3>Auto-tune</h3><p>Measures friction (PWMmin) and pot noise (dead zone), raises Kp until it stops tracking any better, checks small road-sized moves, then adds Ki and Kd only if they help. With the motion sensor it also watches the seat, so a setting that makes the frame bounce doesn't count as calm. It stops by itself and restores the previous settings if SimHub moves the rig or anything looks wrong. Nothing is saved until you press Save to EEPROM.</p>
     <h3>Profiles and recommendations</h3><p>Save the settings that suit a car or game under a name and load them later. The recommendations (circuit, rally, flight, space, trucks) adjust your own tuned settings for that kind of sim and list the SimHub settings that matter most for it. Loading applies live; save to EEPROM to make it the power-on default.</p>
     <h3>Backups</h3><p>Every Save to EEPROM, and every bigger change, keeps a copy on the NAS (EEPROM section). Switch back to any of them live, or switch and save in one go.</p></div>
-   <div><h3>LED matrix on the board</h3><ul><li>Boot: R4, then the IP address scrolls.</li><li>E0 WiFi module not answering, E9 can't join the network, E8 no address from the router yet.</li><li>E1 / E2 / E3: that motor is off - its safety cutoff tripped or you pressed Disable Motors. Enable Motors re-arms it.</li><li>Bottom row: commands arriving, timeout, motors on, loop overrun, IMU, WiFi, heartbeat.</li></ul>
-    <h3>Motor names</h3><p>Settings, Motor names: call the motors Left, Right, Rear (or anything you like). The names appear everywhere in the page and in diagnostics files; the number stays alongside because the wiring, SimHub and the LED matrix use numbers.</p>
+   <div><h3>Motor names</h3><p>Settings, Motor names: call the motors Left, Right, Rear (or anything you like). The names appear everywhere in the page and in diagnostics files; the number stays alongside because the wiring, SimHub and the LED matrix use numbers.</p>
     <h3>Selected motor</h3><p>Click a motor card or chart, or choose a motor in Test Signal or Auto-Tune: the same motor is highlighted everywhere. While a test signal or auto-tune runs, its chart is marked and the others fade.</p>
-    <h3>Diagnostics</h3><p>Settings section. <b>Quick check</b> reads the board and listens for a few seconds; <b>Full check</b> also moves each motor a little to see which way it goes, how much drive it needs, whether the wiring is swapped and how it answers a small step - and can ask you what you saw. Both make one file (saved on the NAS too) to download and give to whoever helps you. The page also watches while you drive and notes pot glitches, a motor moving the wrong way or stalling, hunting, cutoffs and board restarts.</p>
+    <h3>Diagnostics</h3><p>Settings section. <b>Quick check</b> reads the board and listens for a few seconds; <b>Full check</b> also moves each motor a little to see which way it goes, how much drive it needs, whether the wiring is swapped and how it answers a small step - and can ask you what you saw. Both make one file (saved on the NAS too) to download and give to whoever helps you. The page also watches while you drive and notes pot glitches, a motor moving the wrong way or stalling, hunting, cutoffs, the tilt limit and board restarts. It also keeps a <b>load map</b>: where each motor falls behind or runs at full power, each way across its travel - a quick check after a session names where the rig struggles (lifting a heavy driver, say). With the motion sensor, the full check also measures the seat itself: degrees per count, bounce and play in the linkage.</p>
     <h3>Status bar</h3><p>LOW POWER means no position commands for 15 s, so the board runs at quarter drive until SimHub or this page sends targets again.</p></div>
   </div>
+  <div class="hwide"><h3>LED matrix on the board (firmware 1.8)</h3><p>After power-up <b>R4</b> shows while WiFi connects, then the board's address scrolls. After that it shows what you picked under Settings, LED matrix: <b>motor bars</b> (each motor's position; a dot blinks where a motor should be when it falls behind; a dash at the bottom = switched off on purpose), the <b>seat horizon</b> (motion sensor) or nothing. While SimHub is idle, a slow oscilloscope trace. Problems scroll in words, again and again while they last:</p>
+    <table class="etab"><tr><th>Code</th><th>Means</th><th>What to do</th></tr>
+     <tr><td>E1 E2 E3</td><td><code>ERROR E2 MOTOR 2 CUTOFF</code> - that motor's pot went past its safety cutoff (Max limit), so the board switched the motor off. Its bar blinks.</td><td>Look for the cause: pot slipped on its shaft or came loose, motor wired backwards (it ran to the end), broken pot wire, Max limit too close to the real travel. Then Enable Motors. The Diagnostics full check pinpoints most of these.</td></tr>
+     <tr><td>E4</td><td><code>ERROR E4 TILT LIMIT</code> - the motion sensor saw the seat tilt past your tilt limit, so every motor stopped.</td><td>Find why the seat went that far (a slipped pot, a motor that ran away, SimHub's output too strong), then Enable Motors. If nothing was wrong, the limit is too tight for your games - raise it under Settings, Motion sensor.</td></tr>
+     <tr><td>E5</td><td><code>ERROR E5 NO SENSOR</code> - the sensor is switched on, but nothing arrives from it, so the tilt limit can't protect the rig.</td><td>Sensor VCC to 5V, GND to GND, the sensor's TX (yellow) through the MAX3232 to D0, the MAX3232 powered from 5V. Or switch the sensor off in Settings if you removed it.</td></tr>
+     <tr><td>E9</td><td><code>ERROR E9 NO WIFI</code> - can't join the network, or the WiFi dropped. It retries every 30 s while SimHub is idle.</td><td>WIFI_SSID / WIFI_PASS in the firmware; the network must be 2.4 GHz with WPA2 (not WPA3-only); signal strength where the rig is. SimHub over USB keeps working.</td></tr>
+     <tr><td>E8</td><td><code>ERROR E8 NO IP ADDRESS</code> - joined the network, but the router hasn't given it an address yet. It keeps asking.</td><td>Check the router's DHCP; reserve an address for the board (it shows as smc3-r4). SimHub over USB keeps working.</td></tr>
+     <tr><td>E0</td><td><code>ERROR E0 WIFI MODULE</code> - the board's WiFi chip doesn't answer.</td><td>Unplug the board for 10 s. Update the UNO R4 WiFi's radio firmware (Arduino IDE: Tools, Firmware Updater). SimHub over USB keeps working.</td></tr>
+    </table><p class="muted" style="font-size:12.5px">Firmware 1.7 and older show dots along the bottom row and "E" plus motor numbers instead.</p>
+    <h3>Motion sensor</h3><p>A WitMotion WT901C on the seat, wired to the board: sensor TX (yellow) through a MAX3232 RS-232-to-TTL module to <b>D0</b>, and optionally <b>D1</b> through the MAX3232 to the sensor's RX (green) so this page can set it to 100 Hz. Power from <b>5V</b> and <b>GND</b>. A -232 sensor must not go to D0/D1 directly - RS-232 levels damage the board. Then Settings, Motion sensor: switch it on, check the mounting, Level now, and set a tilt limit. You get a Seat angle chart (real degrees), the seat's own movement in auto-tune and the full check (bounce, play, degrees per count), the seat horizon on the matrix, and the tilt-limit cut-off.</p></div>
+ 
  </section>
 </main>
 </div>
@@ -4070,6 +4558,18 @@ const TIPS={
  expand:"Opens the charts full width (Live Graphs section).",
  collapse:"Back to the layout you came from.",
  chartsel:"Click to select this motor - the test signal, auto-tune and PID column follow the selection.",
+ seatchart:"Seat angle from the motion sensor (firmware 1.8): roll and pitch in degrees, levelled with Level now. A smooth slope while the seat moves is good; steps, wobbles or a slope that slows down in one direction show load, play or flex. The small picture is the horizon the board's matrix can show.",
+ l_view:"What the board's 12x8 matrix shows when nothing is wrong. Motor bars: each motor's position live - a blinking dot marks where a motor should be when it falls behind; a dash = switched off on purpose. Seat horizon: tilts with the seat (needs the motion sensor; shows motor bars while the sensor sends nothing). Quiet: dark except problems and the address.",
+ l_idle:"When SimHub (or this page) hasn't sent a position for 20 s, the motor-bars view turns into a slow oscilloscope trace - the board is alive and waiting.",
+ l_rep:"Scroll the board's IP address once a minute while this page isn't connected - handy to find the board. Problems always scroll.",
+ l_save:"Sends the matrix settings to the board; they are saved there at once (no Save to EEPROM needed).",
+ sn_on:"Tick when a WT901C motion sensor is fitted. Then a silent sensor is reported (matrix: ERROR E5 NO SENSOR) and the tilt limit works. The seat angle shows whenever the sensor sends, ticked or not.",
+ sn_tilt:"Safety cut-off: if the seat tilts further than this (roll or pitch, after levelling), the board stops every motor at once and scrolls ERROR E4 TILT LIMIT - a slipped pot or a runaway motor can't throw the seat to its end stops. Set it a few degrees above the most your seat tilts in games (the Seat angle chart shows the range). Enable Motors re-arms it.",
+ sn_mount:"How the sensor sits on the seat. Lift the seat's front: pitch should rise; lower its right side: roll should rise. Swap if roll and pitch are the wrong way round, invert one that goes the wrong way.",
+ sn_save:"Sends sensor on/off, tilt limit and mounting to the board; saved there at once.",
+ sn_level:"Put the seat at its normal centre position first. The board then takes the current angles as 0° / 0° (the sensor is never mounted perfectly level).",
+ sn_setup:"The WT901C leaves the factory at 10 angles per second. This sets it to 100 per second at 115200 baud and saves that in the sensor. Needs the board's D1 wired through the MAX3232 to the sensor's RX (green). If SimHub also reads the sensor, set it in WitMotion's PC software instead.",
+ sn_search:"The board tries the usual baud rates until the sensor answers - normally by itself while the sensor is switched on. This makes it look again for 30 s.",
  smooth:"<b>Target smoothing</b> - how softly the motor eases into each new position SimHub sends (a low-pass filter on the target).<br><br><b>Off / 4 ms:</b> raw, every bump and kerb comes through - rally.<br><b>8-16 ms:</b> crisp but not jagged - circuit racing.<br><b>32-64 ms:</b> soft and floaty - flight, space, trucks.<br><br>Times are at Fpid/1 (double them at Fpid/2). Needs firmware 1.6.",
  maxrate:"<b>Max speed</b> - the fastest the target may move, in counts per second (full travel is about 820 counts). 0 = no limit.<br><br>A cap like 1500-2000 stops sudden lurches (crashes, game resets) and makes flight feel calmer. Needs firmware 1.6.",
  applyFilt:"Sends smoothing and max speed to the board now (not saved until Save to EEPROM).",
@@ -4166,7 +4666,9 @@ function buildMotorCards(){document.querySelectorAll('.motor').forEach(c=>{const
  <div class="track"><div class="fill" id="mf${m}"></div><div class="fb" id="mt${m}"></div><div class="knob" id="mk${m}"></div></div>
  <div class="scale"><span>0</span><span>1023</span></div>
  <div class="rows"><div data-k="lg_f"><span>Feedback (fb)</span><b id="mfb${m}">-</b></div><div><span>Error (err)</span><b id="me${m}">-</b></div><div data-k="lg_p"><span>PID Out</span><b id="mo${m}">-</b></div></div>`;});}
-function buildCharts(){let h='';for(let m=0;m<3;m++)h+=`<div class="chart" data-m="${m}" data-k="chartsel" onclick="setSel(${m})"><span class="tab"><span id="ct${m}">Motor ${m+1}</span><em id="tag${m}"></em></span><canvas id="c${m}"></canvas><div class="ro"><span>goal</span><b id="rg${m}">-</b><span>fb</span><b id="rf${m}">-</b><span>err</span><b id="re${m}">-</b><span>pid</span><b id="rp${m}">-</b></div></div>`;$('charts').innerHTML=h;}
+function buildCharts(){let h='';for(let m=0;m<3;m++)h+=`<div class="chart" data-m="${m}" data-k="chartsel" onclick="setSel(${m})"><span class="tab"><span id="ct${m}">Motor ${m+1}</span><em id="tag${m}"></em></span><canvas id="c${m}"></canvas><div class="ro"><span>goal</span><b id="rg${m}">-</b><span>fb</span><b id="rf${m}">-</b><span>err</span><b id="re${m}">-</b><span>pid</span><b id="rp${m}">-</b></div></div>`;
+ h+=`<div class="chart seatc" id="seatc" data-k="seatchart" hidden><span class="tab"><svg id="hz" viewBox="0 0 34 18"><path id="hzg" fill="#8a5a24"/><line id="hzl" stroke="#fff" stroke-width="1.4"/><path d="M12 9h4M18 9h4" stroke="#ffd34d" stroke-width="1.6"/></svg><span>Seat angle</span></span><canvas id="c3"></canvas><div class="ro"><span>roll</span><b id="sr">-</b><span>pitch</span><b id="sp">-</b><span>range</span><b id="srng">-</b><span>speed</span><b id="sv">-</b></div></div>`;
+ $('charts').innerHTML=h;}
 function buildPid(n){n=n||3;let h='<colgroup><col class="l">'+'<col>'.repeat(n)+'</colgroup><tr><th></th>'+[0,1,2].slice(0,n).map(m=>`<th class="h${m} c${m}" title="${esc(mfull(m))}">${mname(m)?(m+1)+' '+esc(mname(m)):'M'+(m+1)}</th>`).join('')+'</tr>';
  for(const [k,label,id] of ROWS){h+=`<tr data-k="${k}"><td>${label}</td>`;for(let m=1;m<=n;m++)h+=`<td class="c${m-1}"><input type="number" id="${id}${m}"></td>`;h+='</tr>';}
  h+='<tr><td></td>'+[1,2,3].slice(0,n).map(m=>`<td class="c${m-1}"><button class="btn ${COLOR[m-1]} ap" data-k="apply" onclick="apply(${m})" title="Apply ${esc(mfull(m-1))}"><span class="bl">Apply ${esc(mshort(m-1))}</span></button></td>`).join('')+'</tr>';
@@ -4194,7 +4696,7 @@ function updateSelUI(){const busy=genMotor!=null||tuneMotor!=null||diagMotor!=nu
 function applyMotorCount(){NM=Math.max(1,Math.min(3,+cfg.motors||3));
  $('mrow').style.setProperty('--n',NM);
  document.querySelectorAll('.motor').forEach(c=>c.hidden=+c.dataset.m>=NM);
- document.querySelectorAll('.chart').forEach(c=>c.hidden=+c.dataset.m>=NM);
+ document.querySelectorAll('.chart[data-m]').forEach(c=>c.hidden=+c.dataset.m>=NM);
  const opts=[0,1,2].slice(0,NM).map(m=>`<option value="${m}">${esc(mname(m)?(m+1)+' '+mname(m):String(m+1))}</option>`).join('');
  for(let m=0;m<3;m++){$('mn'+m).innerHTML=esc(mtitle(m))+(mname(m)?`<span class="num">motor ${m+1}</span>`:'');$('ct'+m).textContent=mtab(m);}
  document.querySelectorAll('.msel').forEach(e=>e.innerHTML=opts);
@@ -4212,7 +4714,7 @@ function showView(){let v=location.hash.slice(1);if(!VIEWS.includes(v))v='dashbo
  document.querySelectorAll('#nav a').forEach(a=>a.classList.toggle('on',a.getAttribute('href')==='#'+v));
  const eb=$('expBtn');eb.dataset.k=v==='graphs'?'collapse':'expand';eb.dataset.tip=TIPS[eb.dataset.k];
  eb.innerHTML=v==='graphs'?'<svg class="i" viewBox="0 0 24 24"><path d="M4 14h6v6M20 10h-6V4M14 10l7-7M3 21l7-7"/></svg>':'<svg class="i" viewBox="0 0 24 24"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>';
- if(v==='profiles'){loadProfiles();loadGenres();} if(v==='settings'){fillSettings();diagLists();} if(v==='eeprom')loadBackups();
+ if(v==='profiles'){loadProfiles();loadGenres();} if(v==='settings'){fillSettings();diagLists();loadBoard(true);} if(v==='eeprom')loadBackups();
  chartHeight();}
 window.addEventListener('hashchange',showView);
 
@@ -4238,6 +4740,40 @@ async function scan(){$('scanBtn').disabled=true;$('s_msg').textContent='Searchi
   else $('s_msg').innerHTML='Found: '+r.found.map(h=>'<button class="btn b-blue" onclick="useHost(\''+esc(h)+'\')">Use '+esc(h)+'</button>').join(' ');
  }finally{$('scanBtn').disabled=false;}}
 function useHost(h){$('s_host').value=h;saveSettings();}
+
+// ---------- board settings (firmware 1.8): LED matrix and motion sensor ----------
+let boardSet=null;
+async function loadBoard(fillInputs){try{const r=await (await fetch('/board/settings')).json();boardSet=r;showBoard(r,fillInputs);}catch(e){}}
+function showBoard(r,fillInputs){const ok=r.ok;
+ document.querySelectorAll('#ledcard select,#ledcard input,#l_save,#sencard select,#sencard input,#sencard .sn').forEach(e=>e.disabled=!ok);
+ const need=!r.connected?'The board is not connected.':(r.fwnum&&r.fwnum<18?'Needs firmware 1.8 on the board (yours: '+(r.fwnum/10).toFixed(1)+').':(!ok?'No answer from the board - try again.':''));
+ $('l_msg').innerHTML=need?'<span class="muted">'+esc(need)+'</span>':'';
+ const st=$('sn_stat');
+ if(!ok){st.innerHTML='<i class="dot off"></i><span>'+esc(need)+'</span>';return;}
+ const m=r.matrix,s=r.sensor;
+ if(fillInputs){$('l_view').value=String(['motor bars','seat horizon','quiet'].indexOf(m.view));$('l_idle').checked=m.idle_trace;$('l_rep').checked=m.repeat_address;
+  $('sn_on').checked=s.switched_on;const t=String(s.tilt_limit_deg||0),sel=$('sn_tilt');if(![...sel.options].some(o=>o.value===t))sel.insertAdjacentHTML('beforeend',`<option value="${t}">${t}°</option>`);sel.value=t;
+  $('sn_swap').checked=s.swap_roll_pitch;$('sn_ir').checked=s.invert_roll;$('sn_ip').checked=s.invert_pitch;}
+ let h,cls;
+ if(s.setting_up){cls='warn';h='Setting the sensor up…';}
+ else if(s.receiving){cls=s.angles_per_s>=40?'on':'warn';h=`Receiving ${s.angles_per_s} angles/s at ${s.baud} baud`+(s.angles_per_s<40?' - press Set sensor to 100 Hz':'');}
+ else if(s.found){cls='warn';h='Found, but no angles right now';}
+ else{cls=s.switched_on?'off':'idle';h=s.switched_on?`Switched on, but nothing arrives - checking ${s.baud_trying} baud (ERROR E5 on the matrix)`:'No sensor found - fit one and tick Use the sensor';}
+ const lv=s.level_offset&&(s.level_offset[0]||s.level_offset[1])?'levelled':'not levelled';
+ const ls=data.length?data[data.length-1]:null;
+ const ang=ls&&ls.roll!=null?`<span class="ang">roll ${ls.roll>=0?'+':''}${ls.roll.toFixed(1)}° · pitch ${ls.pitch>=0?'+':''}${ls.pitch.toFixed(1)}° · ${lv}${s.tilt_trips?` · tilt limit tripped ${s.tilt_trips}x`:''}</span>`:'';
+ st.innerHTML=`<i class="dot ${cls==='on'?'on':(cls==='idle'?'':'off')}"></i><span>${esc(h)}</span>${ang}`;
+ if(m.showing)$('l_msg').innerHTML=`<span class="badc">The matrix is scrolling ERROR ${esc(m.showing)}</span> - see Help for what it means.`;}
+async function saveLed(){const r=await post('/board/led',{view:+$('l_view').value,idle:$('l_idle').checked,repeat:$('l_rep').checked});
+ if(!r.ok){$('l_msg').innerHTML='<span class="badc">'+esc(r.error)+'</span>';return;}showBoard(r,true);if(!r.matrix.showing)$('l_msg').innerHTML='<span class="okc">Sent - saved on the board.</span>';}
+async function saveSensor(){const r=await post('/board/sensor',{on:$('sn_on').checked,tilt:+$('sn_tilt').value,swap:$('sn_swap').checked,inv_roll:$('sn_ir').checked,inv_pitch:$('sn_ip').checked});
+ if(!r.ok){$('sn_msg').innerHTML='<span class="badc">'+esc(r.error)+'</span>';return;}showBoard(r,true);$('sn_msg').innerHTML='<span class="okc">Sent - saved on the board.</span>';}
+async function sensorAct(a){if(a==='setup'&&!confirm('Set the sensor to 100 angles per second at 115200 baud? Needs the board\'s D1 wired to the sensor\'s RX through the MAX3232. If SimHub also reads this sensor, change it in WitMotion\'s software instead.'))return;
+ $('sn_msg').textContent={level:'Levelling…',setup:'Setting the sensor up…',search:'Looking for the sensor…'}[a];
+ const r=await post('/board/sensor/action',{action:a});if(!r.ok){$('sn_msg').innerHTML='<span class="badc">'+esc(r.error)+'</span>';return;}showBoard(r,false);
+ $('sn_msg').innerHTML='<span class="okc">'+{level:'Levelled: this seat position now reads 0° / 0°.',setup:'Sent. If the rate doesn\'t change within a few seconds, the board\'s TX (D1) isn\'t reaching the sensor - set it in WitMotion\'s software instead.',search:'Looking for the sensor for 30 s.'}[a]+'</span>';
+ if(a==='setup')setTimeout(()=>loadBoard(false),4000);}
+setInterval(()=>{if(curView==='settings'&&document.visibilityState==='visible')loadBoard(false);},3000);
 function fillNames(){let h='';
  for(let m=0;m<3;m++){const v=MNAMES[m]||'',preset=!v||NAMEOPTS.includes(v);
   h+=`<div class="nrow" data-m="${m}"${m>=NM?' hidden':''}><span class="badge">${m+1}</span><select id="nsel${m}" data-k="n_name" onchange="nameSel(${m})"><option value="">Not named (Motor ${m+1})</option>`+
@@ -4271,7 +4807,7 @@ function updateStatus(j){const s=data[data.length-1];const fresh_inc=watch.newes
  let h=connected?'<span data-k="st_conn"><i class="dot on"></i>Board Connected</span>':`<span data-k="st_conn"><i class="dot off"></i>Not connected <span class="muted" style="font-weight:400">(${esc(j.host||'no address set')})</span></span>`;
  if(j.fw)h+=`<span data-k="st_fw">fw v${esc(j.fw)}</span>`;
  if(s&&connected){h+=`<span data-k="st_isr">ISR max ${s.isr} µs</span><span data-k="st_div">Fpid/${s.div}</span>`+(s.low?'<span class="bad" data-k="st_low">LOW POWER (no position commands)</span>':'<span class="ok" data-k="st_full">Full power</span>');
-  if(s.roll||s.pitch)h+=`<span>IMU ${s.roll.toFixed(1)}° / ${s.pitch.toFixed(1)}°</span>`;}
+  if(s.roll!=null)h+=`<span data-k="seatchart">Seat ${s.roll.toFixed(1)}° / ${s.pitch.toFixed(1)}°</span>`;}
  if(j.scanning)h+='<span>searching for the board…</span>';
  if(tuneRunning)h+='<span class="ok">auto-tune running</span>';
  $('pill').innerHTML=h;tipAttach($('pill'));
@@ -4316,7 +4852,34 @@ function draw(){
   g.save();g.beginPath();g.rect(L,T-2,PW,PH+4);g.clip();
   const line=(key,color,yf,w)=>{g.strokeStyle=color;g.lineWidth=w;g.beginPath();let first=true;
    for(const s of data){if(s.ms<t0)continue;const x=X(s.ms),y=yf(s.m[m][key]);first?g.moveTo(x,y):g.lineTo(x,y);first=false;}g.stroke();};
-  line('p',col.p,YP,1.4);line('t',col.t,Y,1.1);line('g',col.g,Y,1.8);line('f',col.f,Y,1.6);g.restore();}}
+  line('p',col.p,YP,1.4);line('t',col.t,Y,1.1);line('g',col.g,Y,1.8);line('f',col.f,Y,1.6);g.restore();}
+ drawSeat(win,tEnd,t0,dpr,col);}
+let seatSeen=0;
+function drawSeat(win,tEnd,t0,dpr,col){const box=$('seatc');const pts=data.filter(s=>s.roll!=null&&s.ms>=t0);
+ if(pts.length)seatSeen=Date.now();const show=Date.now()-seatSeen<4000;if(box.hidden===show)box.hidden=!show;if(!show)return;
+ const last=pts[pts.length-1];
+ if(last){$('sr').textContent=(last.roll>=0?'+':'')+last.roll.toFixed(1)+'°';$('sp').textContent=(last.pitch>=0?'+':'')+last.pitch.toFixed(1)+'°';
+  const all=data.filter(s=>s.roll!=null);let mx=0,v=0;for(const s of all)mx=Math.max(mx,Math.abs(s.roll),Math.abs(s.pitch));
+  let prev=null;for(const s of all){if(prev&&s.ms-prev.ms>0&&s.ms-prev.ms<=120&&(s.roll!==prev.roll||s.pitch!==prev.pitch)){v=Math.max(v,Math.hypot(s.roll-prev.roll,s.pitch-prev.pitch)*1000/(s.ms-prev.ms));}if(!prev||s.roll!==prev.roll||s.pitch!==prev.pitch)prev=s;}
+  $('srng').textContent='±'+mx.toFixed(1)+'°';$('sv').textContent=v.toFixed(0)+'°/s';
+  // mini horizon, as on the board's matrix: the edge moves up with pitch and tilts with roll
+  const fs=10,p=Math.max(-fs,Math.min(fs,last.pitch)),r=Math.max(-fs,Math.min(fs,last.roll)),yc=9-p/fs*9,sl=r/fs*0.6*(18/8)*(12/34);
+  const yl=yc+sl*(-17),yr=yc+sl*17;$('hzg').setAttribute('d',`M0 ${yl}L34 ${yr}L34 18L0 18Z`);
+  ['x1','y1','x2','y2'].forEach((k,i)=>$('hzl').setAttribute(k,[0,yl,34,yr][i]));}
+ const cv=$('c3');if(!cv.offsetParent)return;
+ const W=cv.clientWidth,H=cv.clientHeight;cv.width=W*dpr;cv.height=H*dpr;const g=cv.getContext('2d');g.setTransform(dpr,0,0,dpr,0,0);g.clearRect(0,0,W,H);
+ const L=74,B=20,T=10,PW=W-L-8,PH=H-B-T;let fs=5;for(const s of pts)fs=Math.max(fs,Math.ceil(Math.max(Math.abs(s.roll),Math.abs(s.pitch))+1));
+ g.font='11.5px '+getComputedStyle(document.body).fontFamily;g.textBaseline='middle';
+ g.strokeStyle=col.grid;g.lineWidth=1;g.beginPath();for(let i=0;i<=4;i++){const y=T+PH*i/4;g.moveTo(L,y);g.lineTo(L+PW,y);}g.stroke();
+ [['+'+fs+'°',0],['0°',.5],['-'+fs+'°',1]].forEach(([a,f])=>{g.textAlign='right';g.fillStyle=col.axis;g.fillText(a,L-8,T+PH*f);});
+ g.textAlign='center';const secs=win/1000,step=secs<=2?0.5:(secs<=5?1:(secs<=10?2:5));
+ for(let s=0;s<=secs+1e-6;s+=step){const x=L+PW*(1-s/secs);g.fillText(s===0?'0s':'-'+(+s.toFixed(1))+'s',x,T+PH+B/2+2);}
+ const X=t=>L+(t-t0)/win*PW,Y=v=>T+PH/2-(v/fs)*(PH/2);
+ g.save();g.beginPath();g.rect(L,T-2,PW,PH+4);g.clip();
+ for(const [k,c] of [['pitch',cssv('--c-pitch')],['roll',cssv('--c-roll')]]){g.strokeStyle=c;g.lineWidth=1.8;g.beginPath();let first=true;
+  for(const s of pts){const x=X(s.ms),y=Y(s[k]);first?g.moveTo(x,y):g.lineTo(x,y);first=false;}g.stroke();}
+ g.font='600 12px '+getComputedStyle(document.body).fontFamily;g.textAlign='left';g.fillStyle=cssv('--c-roll');g.fillText('roll',L+6,T+8);g.fillStyle=cssv('--c-pitch');g.fillText('pitch',L+36,T+8);
+ g.restore();}
 function togglePause(){paused=!paused;$('pauseBtn').innerHTML=paused?'<svg class="i" viewBox="0 0 24 24"><path d="M7 4l13 8-13 8z" fill="currentColor"/></svg>Resume':'<svg class="i" viewBox="0 0 24 24"><path d="M8 5v14M16 5v14"/></svg>Pause';}
 
 // ---------- parameters ----------
@@ -4606,6 +5169,11 @@ class Handler(BaseHTTPRequestHandler):
                                  "prompt": self.diag.prompt is not None}})
         elif u.path == "/config":
             self._json(self.cfg.public())
+        elif u.path == "/board/settings":
+            fwn = (self.board.fw_cache or [0, 0])[1]
+            st = self.board.board_settings() if self.board.connected else None
+            self._json({"connected": self.board.connected, "fwnum": fwn, "ok": st is not None,
+                        **(st or {})})
         elif (u.path.startswith("/img/") and u.path[5:] in ASSETS) or u.path[1:] in ("favicon.svg", "favicon-32.png",
                                                                                      "apple-touch-icon.png", "favicon.ico"):
             name = u.path[5:] if u.path.startswith("/img/") else ("favicon-32.png" if u.path == "/favicon.ico" else u.path[1:])
@@ -4663,6 +5231,53 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._json({"error": "not found"}, 404)
 
+    def _board_setting(self, p, req):
+        """Firmware 1.8 settings that live on the board: LED matrix view and the motion sensor."""
+        b = self.board
+        if (b.fw_cache or [0, 0])[1] < 18 or not b.connected:
+            self._json({"ok": False, "error": "This needs firmware 1.8 on the board."})
+            return
+        try:
+            if p == "/board/led":
+                view = max(0, min(2, int(req.get("view", 0))))
+                flags = (1 if req.get("idle", True) else 0) | (2 if req.get("repeat", True) else 0)
+                b.cmd_pair("l", view, flags)
+                self.events.add("setting", f"LED matrix: {LED_VIEWS[view]}, idle trace "
+                                f"{'on' if flags & 1 else 'off'}, address every minute {'on' if flags & 2 else 'off'}.",
+                                quiet=True)
+            elif p == "/board/sensor":
+                tilt = max(0, min(60, int(req.get("tilt", 0))))
+                flags = (1 if req.get("on") else 0) | (2 if req.get("swap") else 0) | \
+                    (4 if req.get("inv_roll") else 0) | (8 if req.get("inv_pitch") else 0)
+                b.cmd_pair("i", flags, tilt)
+                b.params["SENSOR"] = [flags, tilt]
+                self.events.add("setting", f"Motion sensor {'switched on' if flags & 1 else 'switched off'}, tilt limit "
+                                f"{str(tilt) + '°' if tilt else 'off'}" + (", roll/pitch swapped" if flags & 2 else "")
+                                + (", roll inverted" if flags & 4 else "") + (", pitch inverted" if flags & 8 else "")
+                                + ".", quiet=False)
+            else:
+                act = str(req.get("action", ""))
+                code = {"level": ord("L"), "clear": ord("C"), "setup": ord("S"), "search": ord("R")}.get(act)
+                if code is None:
+                    self._json({"ok": False, "error": "unknown action"})
+                    return
+                if act == "level":
+                    s = b.latest()
+                    if not s or s.get("roll") is None:
+                        self._json({"ok": False, "error": "No angles from the sensor right now."})
+                        return
+                b.cmd_pair("i", code, 0x09 if act == "setup" else 0)
+                self.events.add("setting", {"level": "Motion sensor levelled: this seat position now reads 0° / 0°.",
+                                            "clear": "Motion sensor level cleared (raw sensor angles).",
+                                            "setup": "Motion sensor set to 100 angles per second at 115200 baud.",
+                                            "search": "Looking for the motion sensor again."}[act], quiet=True)
+        except (TypeError, ValueError):
+            self._json({"ok": False, "error": "Check the values."})
+            return
+        time.sleep(0.25 if p != "/board/sensor/action" or req.get("action") != "setup" else 1.6)
+        st = b.board_settings()
+        self._json({"ok": True, **(st or {})})
+
     def do_POST(self):
         n = int(self.headers.get("Content-Length", "0") or 0)
         try:
@@ -4709,6 +5324,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"ok": False, "error": "Check the test-signal numbers."})
                 return
             self._json({"ok": True})
+        elif p in ("/board/led", "/board/sensor", "/board/sensor/action"):
+            self._board_setting(p, req)
         elif p == "/diag/start":
             kind = "full" if req.get("kind") == "full" else "quick"
             ok, msg = self.diag.start(kind, str(req.get("problem", "")).strip(), bool(req.get("ask", True)))

@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 520" width="960" height="520" font-family="Inter, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <defs>
+    <style>
+      .box{fill:#f7f9fc;stroke:#2b3a4e;stroke-width:2;rx:10}
+      .t{font-size:17px;font-weight:700;fill:#0f1b2d}
+      .s{font-size:12.5px;fill:#4a5a70}
+      .pin{font-size:13.5px;font-weight:600;fill:#0f1b2d}
+      .pn{font-size:12px;fill:#4a5a70}
+      .w{fill:none;stroke-width:3.2;stroke-linecap:round;stroke-linejoin:round}
+      .opt{stroke-dasharray:9 6}
+      .note{font-size:13px;fill:#2b3a4e}
+      .warn{font-size:13px;fill:#b3261e;font-weight:600}
+    </style>
+  </defs>
+  <rect x="0" y="0" width="960" height="520" fill="#ffffff"/>
+  <text x="24" y="34" class="t" style="font-size:20px">WT901C-232 motion sensor on the UNO R4 WiFi</text>
+  <text x="24" y="56" class="s">Solid wires are needed. Dashed: only so the page can set the sensor to 100 Hz (Settings, Motion sensor).</text>
+
+  <!-- sensor -->
+  <rect class="box" x="24" y="96" width="210" height="250"/>
+  <text x="40" y="124" class="t">WT901C-232</text>
+  <text x="40" y="143" class="s">on the seat frame</text>
+  <g class="pin"><text x="40" y="184">VCC</text><text x="40" y="226">GND</text><text x="40" y="268">TX</text><text x="40" y="310">RX</text></g>
+  <g class="pn"><text x="90" y="184">red, 5-36 V</text><text x="90" y="226">black</text><text x="90" y="268">yellow</text><text x="90" y="310">green</text></g>
+
+  <!-- MAX3232 -->
+  <rect class="box" x="374" y="150" width="212" height="196"/>
+  <text x="390" y="176" class="t">MAX3232 module</text>
+  <text x="390" y="194" class="s">RS-232 ⇄ TTL, at 5 V</text>
+  <g class="pin"><text x="390" y="268">RX</text><text x="390" y="310">TX</text><text x="548" y="268" text-anchor="end">TX</text><text x="548" y="310" text-anchor="end">RX</text></g>
+  <text x="390" y="336" class="pn">RS-232 side</text><text x="572" y="336" class="pn" text-anchor="end">TTL side</text>
+  <text x="572" y="223" class="pin" text-anchor="end">VCC</text><text x="572" y="243" class="pin" text-anchor="end">GND</text>
+
+  <!-- board -->
+  <rect class="box" x="722" y="96" width="214" height="250"/>
+  <text x="738" y="124" class="t">UNO R4 WiFi</text>
+  <text x="738" y="143" class="s">SMC3_R4 firmware 1.8</text>
+  <g class="pin"><text x="920" y="184" text-anchor="end">5V</text><text x="920" y="226" text-anchor="end">GND</text><text x="920" y="268" text-anchor="end">D0  (RX)</text><text x="920" y="310" text-anchor="end">D1  (TX)</text></g>
+
+  <!-- wires -->
+  <path class="w" stroke="#d32f2f" d="M234 178 H300 V120 H660 V178 H722"/>
+  <path class="w" stroke="#d32f2f" d="M660 120 V218 H586"/>
+  <path class="w" stroke="#222" d="M234 220 H316 V106 H676 V220 H722"/>
+  <path class="w" stroke="#222" d="M676 220 V238 H586"/>
+  <path class="w" stroke="#e0b000" d="M234 262 H374"/>
+  <path class="w" stroke="#e0b000" d="M586 262 H722"/>
+  <path class="w opt" stroke="#2e9e44" d="M234 304 H374"/>
+  <path class="w opt" stroke="#2e9e44" d="M586 304 H722"/>
+  <g fill="#2b3a4e"><circle cx="660" cy="178" r="4.5"/><circle cx="676" cy="220" r="4.5"/></g>
+
+  <!-- notes -->
+  <text x="24" y="392" class="warn">A -232 sensor must never go to D0 / D1 directly - RS-232 levels (up to ±12 V) damage the board.</text>
+  <text x="24" y="418" class="note">Module labels differ: on most, the TTL side's TX is the module's output (to D0) and RX its input (from D1).</text>
+  <text x="24" y="438" class="note">If the page finds nothing, try the two TTL wires the other way round. The board tries the baud rates by itself.</text>
+  <text x="24" y="470" class="note" font-weight="600">Sharing the sensor with SimHub (VR motion compensation)?</text>
+  <text x="24" y="490" class="note">Keep the sensor on the PC's USB adapter as it is, and add only its TX (yellow) and GND to the MAX3232 - no VCC, no D1.</text>
+  <text x="24" y="510" class="note">The board just listens. Set 100 Hz / 115200 baud in WitMotion's PC software.</text>
+</svg>

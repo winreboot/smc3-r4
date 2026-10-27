@@ -40,6 +40,9 @@ python3 smc3_scope.py --host 192.168.1.50 --bind 0.0.0.0 --web 8198
 
 To upgrade, rebuild with the new `smc3_scope.py`. Keep the data folder, and everything carries over.
 
+The LED matrix and motion sensor settings (firmware 1.8) are not in the data folder: they live on the board itself,
+so they stay with the rig.
+
 ## Security
 
 The page has no login, and it can move the rig and change its settings. Keep it on your home network; don't

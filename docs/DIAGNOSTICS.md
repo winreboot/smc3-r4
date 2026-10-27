@@ -1,7 +1,7 @@
 # Diagnostics
 
 Diagnostics is in Settings. It's for when something isn't right and you don't know why. It works with any firmware
-from 1.3 on; firmware 1.7 adds the board's own counters.
+from 1.3 on; firmware 1.7 adds the board's own counters, and 1.8 the motion sensor.
 
 ## Quick check
 
@@ -16,7 +16,10 @@ Nothing moves, so it's safe while SimHub runs. It takes about 5 seconds.
   - the longest main-loop pause;
   - WiFi signal strength;
   - **the EEPROM**, so settings that are running but not saved show up.
-- Listens to the motors for 3 seconds: pot noise at rest, buzz (PID jitter), positions.
+- With 1.8, also reads the motion sensor: found or not, baud rate, angles per second, bad packets, tilt limit and
+  how often it tripped, level offsets, and what the LED matrix shows.
+- Listens to the motors for 3 seconds: pot noise at rest, buzz (PID jitter), positions, and with the sensor the
+  seat's angle and how much it wobbles while the motors hold still.
 - Adds what the page recorded: the last hour of per-minute statistics (how often each motor ran at its power
   limit, how far it lagged behind SimHub), the problems it noticed, and the event log.
 
@@ -29,6 +32,9 @@ Stop SimHub's motion output and keep the seat empty. Each motor in turn, with th
    pot moves instead** (swapped wiring), it stops at once and leaves that motor off.
 2. **Step with its own settings.** A 50-count step and back, measuring rise time, overshoot, settling, the error
    left over and top speed. If the motor swings out of control, the check calms it with gentle settings.
+   With the motion sensor, the same steps also show what the **seat** did: how many degrees it moved (degrees per
+   count, and the whole range that gives), whether it **bounces** after the motor has stopped (frame, mounts or
+   linkage flexing), and whether there is **play** - the motor turning before the seat follows.
 3. **What you saw.** The motor nudges towards higher numbers and you answer: up, down, didn't move, or not sure,
    and where on the seat it is. If a motor doesn't move at all, you're asked whether it moved, hummed, or did
    nothing. That tells a slipped pot from a jammed motor from no power.
@@ -47,6 +53,17 @@ A background watcher checks every sample, all the time:
 | Motor switched itself off | Safety cutoff tripped (firmware 1.7 says where) |
 | Board restarted | Board uptime went backwards (firmware 1.7 says why) |
 | Data gap | No telemetry for more than 1.5 s |
+| Tilt limit | Every motor stopped with the seat at the tilt limit (firmware 1.8) |
+| Sensor went quiet | The motion sensor stopped sending while it is switched on |
+
+### Load map
+
+While SimHub drives, the watcher also keeps a **load map** for each motor: the Clip window is split into eight
+position bands, and for each band and each direction (towards higher or lower counts) it records how far the motor
+runs behind and how often it is at full allowed power - plus the seat's angle there when the sensor sends. Lifting a
+heavy load shows as one direction falling behind at full power while the other keeps up, often only in part of the
+travel. The finding names the band ("struggles moving towards higher numbers around pot 600-820") and, with the
+sensor, the seat angles there. It fills while you drive, so look at a quick check after a session.
 
 Each problem keeps about 4 seconds of data from before and 1.5 seconds after, in `diagnostics/incidents/`.
 
@@ -67,6 +84,9 @@ cover:
 - buzz and hunting;
 - motors at their power limit or lagging;
 - full-check results: reversed, swapped, not moving, moving one way only, unstable, PWMmin too low;
+- where a motor struggles under load (load map);
+- the motion sensor: silent, not switched on, too slow (factory 10 Hz), garbled data, tilt limit off or tripping,
+  not levelled, wobbling; the seat bouncing, play in a linkage, how many degrees each motor tilts the seat;
 - motors that don't agree on which way is up;
 - a motor whose name doesn't match where you saw it move.
 
@@ -81,21 +101,23 @@ The newest 20 are kept in `diagnostics/reports/` and can be downloaded from the 
 | `made`, `kind`, `problem` | When, quick or full, and what the owner typed |
 | `summary` | The findings as plain text |
 | `findings` | The findings, structured |
-| `board` | Connection, firmware, build options, uptime, last start cause, WiFi, USB counters, per-motor counters |
+| `board` | Connection, firmware, build options, uptime, last start cause, WiFi, USB counters, per-motor counters, motion sensor and LED matrix (1.8) |
 | `rig` | Motors in use, motor names |
 | `settings` | Running settings, saved settings (EEPROM), the differences, the last save made from the page |
 | `live` | The 3-second listen |
 | `check` | Full check: per motor the result, the drive needed, step metrics, what you saw, and a 50 Hz trace |
-| `watch` | Statistics for the last hour, per minute, and problem counts for 24 hours |
+| `watch` | Statistics for the last hour (including each motor's load map and the seat's range), per minute, and problem counts for 24 hours |
 | `incidents` | Recorded problems; the four newest include traces |
 | `events` | The last 250 events |
 | `telemetry` | The last 10 s at 100 Hz and the last 2 minutes at 5 Hz |
 | `scope`, `profiles`, `backups` | Page version and settings, profile names, recent backups |
 
 Traces are CSV text: a `columns` header and one row per sample. `t`, `g`, `f` and `p` are target, goal, feedback
-and PID output; `off` holds three 0/1 flags for motors switched off; `low` is 1 at quarter power.
+and PID output; `off` holds three 0/1 flags for motors switched off; `low` is 1 at quarter power; `roll` and
+`pitch` (degrees) appear when the motion sensor sends.
 
 The file contains no passwords. It does contain your board's network address and motor names.
 
 [examples/diagnostics-full-check.json](examples/diagnostics-full-check.json) is a full check from the simulated
-rig with motor 2 wired backwards and a glitchy pot on motor 3.
+rig with motor 2 wired backwards, a glitchy pot on motor 3, and the motion sensor finding play in motor 3's
+linkage.

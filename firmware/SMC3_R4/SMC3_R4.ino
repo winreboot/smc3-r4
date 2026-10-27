@@ -13,8 +13,10 @@
 //     their meaning, and the PID output keeps 4 fractional bits of PWM as well.
 //   * Target smoothing (low-pass + optional slew limit), real integrator with anti-windup, filtered
 //     derivative-on-measurement - same design as SMC3_smooth.ino.
-//   * 12x8 LED matrix status display (tracking view, drive bars, fault codes, optional IMU bubble level).
-//   * Serial1 (D0/D1) reserved for a WitMotion WT901C IMU through a MAX3232 (optional, off by default).
+//   * 12x8 LED matrix: scrolls the IP address, then live motor bars (or a seat horizon with the motion sensor)
+//     and an oscilloscope trace while idle; problems scroll as words ("ERROR E3 MOTOR 3 CUTOFF").
+//   * Optional WitMotion WT901C motion sensor on Serial1 (D0/D1, through a MAX3232 for the -232 model): seat
+//     angles in the telemetry, tilt-limit safety cut-off.  Switched on and set up from smc3_scope.
 //   * WiFi telemetry + live tuning: the board runs a small TCP server.  A PC tool (smc3_scope.py) connects,
 //     receives 100 Hz telemetry (target / goal / feedback / PID output per motor, status, IMU angles,
 //     loop timing) and sends ordinary SMC3 commands back - so you can tune Kp/Ki/Kd/PWMmin... live while
@@ -30,19 +32,35 @@
 //
 // WIRING (same as the UNO):   D2/D3 M1 ENA/ENB,  D4/D5 M2 ENA/ENB,  D6/D7 M3 ENA/ENB,
 //                             D9/D10/D11 M1/M2/M3 PWM,  A0/A1/A2 M1/M2/M3 feedback pots.
-//                             D0 (RX) <- MAX3232 <- WT901C TX  (only if IMU_SERIAL1 is 1)
+//                             D0 (RX) <- MAX3232 <- WT901C TX (yellow);  D1 (TX) -> MAX3232 -> WT901C RX (green,
+//                             optional: only needed to set the sensor up from the page).  Sensor VCC 5 V, GND.
 //
 // Pots: wiper must stay within 0-5 V (the R4 is a 5 V board, so existing wiring is fine).
 //****************************************************************************************************************
 
-#define FW_VERSION     "1.7"           // shown in the USB boot banner; [ver] still answers 70 for SMC3Utils
-#define FW_VERSION_NUM 17              // reported by [rd!] so smc3_scope can check what it is talking to
+#define FW_VERSION     "1.8.1"         // shown in the USB boot banner; [ver] still answers 70 for SMC3Utils
+#define FW_VERSION_NUM 18              // reported by [rd!] so smc3_scope can check what it is talking to (1.8.x = 18)
+
+// v1.8.1 changes: compiles in the Arduino IDE.  1.8 stopped with "'GlyphDef' does not name a type": the IDE copies
+//                every function's declaration to the top of the sketch, and FindGlyph() returned a GlyphDef pointer.
+//                It returns an index now.  Nothing else changed.
+
+// v1.8 changes:  LED matrix redone: no more status dots.  After the IP address it shows live motor bars (a dot
+//                blinks where a lagging motor should be), a seat horizon with the motion sensor, or nothing; a
+//                slow oscilloscope trace while SimHub is idle.  Problems scroll as words, e.g. "ERROR E3 MOTOR 3
+//                CUTOFF" - a motor switched off on purpose is no longer shown as an error.  Codes: E0 WiFi module,
+//                E1-E3 motor cutoff, E4 tilt limit, E5 no sensor, E8 no IP address, E9 no WiFi.
+//                WT901C motion sensor at run time (no recompiling): the board finds the sensor's baud rate by
+//                itself, [i f t] switches it on, sets the mounting and the tilt limit, [iL?] levels it, [iS?]
+//                sets the sensor to 100 Hz / 115200 baud.  Tilt limit: all motors stop (E4) if the seat tilts
+//                past it.  [l v f] picks the matrix view.  These settings are saved at once (EEPROM 56-65).
+//                [rdd] frame version 2 adds the sensor and matrix state.  Nothing changes for SimHub/SMC3Utils.
 
 // v1.7 changes:  diagnostics for smc3_scope's Diagnostics page.  New read code [rdd] (WiFi only) returns one
 //                "SM3D" frame: cause of the last reset, SimHub/USB command counters, longest loop() pass,
 //                WiFi signal, and per motor why it is off, safety-cutoff trips (and where), pot glitches seen
 //                at the full 4 kHz loop rate, pot range seen - plus a copy of EEPROM 0-63 so the page can
-//                tell running settings from saved ones.  [rd!] flags gain bit1 MODE2, bit2 IMU_SERIAL1,
+//                tell running settings from saved ones.  [rd!] flags gain bit1 MODE2, bit2 IMU_SERIAL1 (IMU_PORT in 1.8),
 //                bit3 LED_MATRIX, bit4 WIFI_STATIC_IP.  Nothing changes for SimHub or SMC3Utils.
 
 // v1.6 changes:  target smoothing and max speed are now settings instead of compile-time constants:
@@ -96,14 +114,15 @@
 //----------------------------------------------------------------------------------------------------------------
 
 #define LED_MATRIX 1               // 1 = use the 12x8 matrix, 0 = off
-#define LED_VIEW   0               // 0 = tracking view (target/feedback cursors + drive bars)
-                                   // 1 = IMU bubble level (needs IMU_SERIAL1 = 1)
 #define LED_FPS    20              // display refresh rate from loop()
+// The view (motor bars / seat horizon / quiet) and the idle trace are chosen in smc3_scope's Settings and saved
+// on the board; these are the values for a board that never had them set:
+#define LED_DEFAULT_VIEW  0        // 0 = motor bars, 1 = seat horizon (needs the sensor), 2 = quiet
+#define LED_DEFAULT_FLAGS 3        // bit0 = oscilloscope trace while idle, bit1 = repeat the IP address every minute
+#define LED_IDLE_AFTER_MS 20000    // idle = no position commands (SimHub or page) for this long
+#define LED_HORIZON_DEG   10.0f    // seat horizon: degrees that move/tilt the horizon to the edge of the matrix
 
-#define IMU_SERIAL1 0              // 1 = parse WitMotion WT901C angle packets on Serial1 (D0/D1)
-#define IMU_BAUD    115200         // must match what the sensor is configured for
-#define IMU_ROLL_FULL_SCALE  15.0f // degrees that put the bubble at the edge of the matrix
-#define IMU_PITCH_FULL_SCALE 15.0f
+#define IMU_PORT 1                 // 1 = listen for a WitMotion WT901C on Serial1 (D0 RX / D1 TX), 0 = leave D0/D1 alone
 
 //----------------------------------------------------------------------------------------------------------------
 //  WIFI / TELEMETRY OPTIONS   <<< put your network name and password here >>>
@@ -134,6 +153,7 @@
 // monitor at boot if a terminal has the port open.
 #define IP_SCROLL_REPEAT_MS 60000
 #define MARQUEE_STEP_MS     110            // ms per column; ~8 s for a full address
+#define ERROR_STEP_MS       90             // ms per column for "ERROR ..." text (1.8)
 
 //----------------------------------------------------------------------------------------------------------------
 //  INTERNALS - no need to touch
@@ -155,9 +175,6 @@
 #if TARGET_MAX_RATE > 30000
 #error "TARGET_MAX_RATE must be 30000 or less"
 #endif
-#if LED_VIEW == 1 && IMU_SERIAL1 == 0
-#error "LED_VIEW 1 (bubble level) needs IMU_SERIAL1 1"
-#endif
 
 //    COMMAND SET (unchanged):
 //
@@ -177,7 +194,11 @@
 //    [ena]/[en1]/[en2]/[en3]   Enable motors
 //    [dis]/[di1]/[di2]/[di3]   Disable motors (brake, stay off until enabled) - new in 1.5
 //    [fab]                     Smoothing shift a (0-8) and max speed b*100 counts/s - new in 1.6 ([rdf] reads)
-//    [rdd]                     Diagnostics frame "SM3D" (WiFi client only) - new in 1.7
+//    [rdd]                     Diagnostics frame "SM3D" (WiFi client only) - new in 1.7, version 2 in 1.8
+//    [lvf]                     Matrix view v (0 bars, 1 horizon, 2 quiet) and flags f - new in 1.8 ([rdl] reads)
+//    [ift]                     Sensor flags f (bit0 on, bit1 swap roll/pitch, bit2 invert roll, bit3 invert
+//                              pitch) and tilt limit t degrees (0 = off) - new in 1.8 ([rdi] reads)
+//    [iL?] [iC?] [iS?] [iR?]   Sensor: level now, clear level, set to 100 Hz/115200, search baud again - 1.8
 //    [sav]                     Save parameters to EEPROM
 //    [ver]                     Software version (replies 70 so SMC3Utils is happy)
 
@@ -271,6 +292,7 @@ volatile uint32_t IsrCyclesMax = 0;                            // worst-case ISR
 #define DIS_CUTOFF  1                                          // pot went past the safety cutoff (Max limit)
 #define DIS_COMMAND 2                                          // [dis]/[di1-3] - Disable Motors or unused motor
 #define DIS_BOOT    3                                          // not enabled yet after power-up
+#define DIS_TILT    4                                          // 1.8: the seat tilted past the tilt limit
 
 volatile uint8_t  DisableReason[NUM_MOTORS] = {DIS_BOOT, DIS_BOOT, DIS_BOOT};
 volatile uint16_t CutoffTrips[NUM_MOTORS]   = {0, 0, 0};       // since power-up
@@ -315,6 +337,7 @@ bool          ClientUp = false;
 char          WifiText[20] = "E9";             // IP address as text, or an E-code, for the display and the banner
 unsigned long WifiLastAttempt = 0;
 unsigned long LastIpScroll = 0;
+bool          PendingIpScroll = false;         // scroll the address once (it arrived late, or WiFi came back)
 unsigned long NetLastSample = 0, NetLastSend = 0, NetLastPoll = 0, NetLastCheck = 0, NetLastAccept = 0;
 int           TcpBufferEnd = -1;
 unsigned int  TcpRxBuffer[5] = {0};
@@ -326,11 +349,42 @@ uint8_t       TelCount = 0;
 #endif
 
 //----------------------------------------------------------------------------------------------------------------
-//  IMU state
+//  Motion sensor (WT901C) and LED matrix settings - 1.8.  Saved at once in EEPROM 56-65 (56 = 0xA6 "valid").
 //----------------------------------------------------------------------------------------------------------------
 
-float         ImuRoll = 0, ImuPitch = 0, ImuYaw = 0;
-unsigned long ImuLastMillis = 0;
+uint8_t       SensorFlags  = 0;               // bit0 sensor fitted (on), bit1 swap roll/pitch, bit2 invert roll, bit3 invert pitch
+uint8_t       TiltLimitDeg = 0;               // 0 = off; otherwise all motors stop if the seat tilts further than this
+int16_t       LevelRoll_x100 = 0, LevelPitch_x100 = 0;   // "Level now": raw sensor angles that count as level
+uint8_t       LedView  = LED_DEFAULT_VIEW;
+uint8_t       LedFlags = LED_DEFAULT_FLAGS;
+
+float         ImuRawRoll = 0, ImuRawPitch = 0, ImuYaw = 0;    // as the sensor sends them, degrees
+float         SeatRoll = 0, SeatPitch = 0;                     // levelled and turned the way the sensor is mounted
+unsigned long ImuLastMillis = 0;              // last angle packet
+unsigned long ImuLastValid  = 0;              // last packet of any kind with a good checksum
+uint32_t      ImuPackets = 0;                 // good packets since power-up
+uint16_t      ImuBadSums = 0;                 // packets with a bad checksum since power-up
+uint16_t      ImuAngleCount = 0, ImuRateHz = 0;   // angle packets this second / last second
+unsigned long ImuRateSince = 0;
+uint8_t       ImuBaudIdx = 0;                 // index into ImuBauds[]
+unsigned long ImuBaudSince = 0;               // when that baud rate was set
+unsigned long ImuScanUntil = 0;               // keep looking for the sensor until then even if it is not switched on
+uint8_t       TiltHits = 0;
+uint16_t      TiltTrips = 0;
+unsigned long TiltGraceUntil = 0;             // no tilt check for a moment after the motors are enabled
+unsigned long LastPosMillis = 0;              // last position command from SimHub or the page (idle trace)
+
+#if IMU_PORT
+const uint32_t ImuBauds[] = {9600, 115200, 230400, 57600, 38400, 19200, 4800};
+#define IMU_NBAUDS 7
+#define IMU_FAST_BAUD_IDX 1                   // 115200
+uint8_t       ImuCmd[10][5];                  // sensor set-up commands waiting to be sent, 120 ms apart
+uint8_t       ImuCmdN = 0, ImuCmdPos = 0;
+int8_t        ImuCmdBaudSwitchAt = -1;        // switch our own baud rate before sending this command
+unsigned long ImuCmdLast = 0;
+#endif
+
+static inline bool SensorFresh() { return ImuLastMillis != 0 && (millis() - ImuLastMillis) < 500; }
 
 //****************************************************************************************************************
 //    Small helpers
@@ -351,8 +405,8 @@ static inline int BuildFlags()
 #ifdef MODE2
     flags |= 2;                                // IBT-2 / BTS7960 wiring (MODE1 = PWM + two direction pins)
 #endif
-#if IMU_SERIAL1
-    flags |= 4;
+#if IMU_PORT
+    flags |= 4;                                // listens for the motion sensor on Serial1
 #endif
 #if LED_MATRIX
     flags |= 8;
@@ -437,6 +491,7 @@ void DisableMotor(uint8_t m)          // brakes on; may be called from the ISR
 
 void EnableMotor(uint8_t m)           // loop() only
 {
+    TiltGraceUntil = millis() + 1500;  // let the seat come back inside the tilt limit first
     DisableReason[m] = DIS_ON;
     Disable[m] = 0;
 #ifdef MODE2
@@ -783,6 +838,42 @@ void ReadEEProm()
     }
 }
 
+// 1.8: sensor and matrix settings.  Written as soon as they change (not by [sav]), so they survive a restart
+// without touching the SMC3 tuning; boards that never had them keep the defaults.
+static inline void EEPromPut16(int a, int16_t v) { EEPROM.update(a, (uint8_t)((uint16_t)v >> 8)); EEPROM.update(a + 1, (uint8_t)((uint16_t)v & 0xFF)); }
+static inline int16_t EEPromGet16(int a) { return (int16_t)(((uint16_t)EEPROM.read(a) << 8) | EEPROM.read(a + 1)); }
+
+void WriteBoardSettings()
+{
+    EEPROM.update(57, LedView);
+    EEPROM.update(58, LedFlags);
+    EEPROM.update(59, SensorFlags);
+    EEPROM.update(60, TiltLimitDeg);
+    EEPromPut16(61, LevelRoll_x100);
+    EEPromPut16(63, LevelPitch_x100);
+#if IMU_PORT
+    EEPROM.update(65, ImuBaudIdx);
+#endif
+    EEPROM.update(56, 0xA6);
+}
+
+void ReadBoardSettings()
+{
+    if (EEPROM.read(56) != 0xA6) { return; }
+    uint8_t v = EEPROM.read(57);
+    LedView = (v <= 2) ? v : LED_DEFAULT_VIEW;
+    LedFlags = EEPROM.read(58);
+    SensorFlags = EEPROM.read(59) & 0x0F;
+    v = EEPROM.read(60);
+    TiltLimitDeg = (v <= 60) ? v : 0;
+    LevelRoll_x100 = EEPromGet16(61);
+    LevelPitch_x100 = EEPromGet16(63);
+#if IMU_PORT
+    v = EEPROM.read(65);
+    ImuBaudIdx = (v < IMU_NBAUDS) ? v : 0;
+#endif
+}
+
 //****************************************************************************************************************
 //    Serial replies (byte format unchanged)
 //****************************************************************************************************************
@@ -870,6 +961,8 @@ void SetTarget(uint8_t m, int value)
 #if ENABLE_WIFI
 void SendDiag();
 #endif
+void ImuCommand(uint8_t a, uint8_t b);
+static inline uint8_t SensorState();
 
 // source 0 = USB (SimHub / SMC3Utils), 1 = TCP (smc3_scope.py).  Same command set on both.
 // "Host alive" for the comms-timeout power reduction = any USB packet, or a position command over TCP
@@ -880,6 +973,7 @@ void ParseCommand(const unsigned int *buf, uint8_t source)
 {
     bool isTarget = (buf[0] == 'A' || buf[0] == 'B' || buf[0] == 'C');
     if (source == 0 || isTarget) { LastPacketMillis = millis(); }
+    if (isTarget) { LastPosMillis = millis(); }
     if (source == 1 && isTarget) { TcpLastTargetMillis = millis(); }
     if (source == 0)
     {
@@ -946,6 +1040,8 @@ void ParseCommand(const unsigned int *buf, uint8_t source)
                     }
                     case 'f': SendTwoValues('f', SmoothShift, MaxRate / 100); break;   // 1.6: smoothing, max speed
                     case '!': SendTwoValues('!', BuildFlags(), FW_VERSION_NUM); break; // 1.4: build flags + version
+                    case 'l': SendTwoValues('l', LedView, LedFlags); break;            // 1.8: matrix view + flags
+                    case 'i': SendTwoValues('i', SensorState(), TiltLimitDeg); break;  // 1.8: sensor state + tilt limit
 #if ENABLE_WIFI
                     case 'd': if (source == 1) { SendDiag(); } break;      // 1.7: diagnostics frame (WiFi only)
 #endif
@@ -983,6 +1079,17 @@ void ParseCommand(const unsigned int *buf, uint8_t source)
             ApplyPwmFrequencies();
             break;
 
+        case 'l':                                                // 1.8: matrix view and flags, saved at once
+            if (b1 <= 2)
+            {
+                LedView = b1;
+                LedFlags = b2;
+                WriteBoardSettings();
+            }
+            break;
+        case 'i':                                                // 1.8: motion sensor
+            ImuCommand(b1, b2);
+            break;
         case 'm':
             if (b1 == 'o')
             {
@@ -1055,17 +1162,76 @@ void SendMonitorData()
 }
 
 //****************************************************************************************************************
-//    WitMotion WT901C parser (Serial1).  11-byte packets: 0x55, type, 8 data bytes, checksum.
-//    Type 0x53 = angles: roll, pitch, yaw as int16 / 32768 * 180 degrees.
+//    WitMotion WT901C motion sensor (Serial1, 1.8).  11-byte packets: 0x55, type, 8 data bytes, checksum (sum of
+//    the first 10).  Type 0x53 = angles: roll, pitch, yaw as int16 / 32768 * 180 degrees.  The board tries the
+//    usual baud rates until packets with good checksums arrive.  Set-up commands are FF AA reg lo hi, after an
+//    unlock (FF AA 69 88 B5), at least 100 ms apart.
 //****************************************************************************************************************
 
-#if IMU_SERIAL1
+static inline uint8_t SensorState()       // [rdi] byte 1
+{
+    uint8_t v = SensorFlags & 0x0F;
+    if (SensorFresh()) { v |= 0x10; }
+    if (ImuLastValid != 0 && (millis() - ImuLastValid) < 3000) { v |= 0x20; }
+#if IMU_PORT
+    if (ImuCmdN > 0) { v |= 0x40; }
+#endif
+    return v;
+}
+
+static inline float Wrap180(float a)
+{
+    while (a >= 180.0f) { a -= 360.0f; }
+    while (a < -180.0f) { a += 360.0f; }
+    return a;
+}
+
+void UpdateSeatAngles()
+{
+    float r = Wrap180(ImuRawRoll - LevelRoll_x100 / 100.0f);
+    float p = Wrap180(ImuRawPitch - LevelPitch_x100 / 100.0f);
+    if (SensorFlags & 2) { float t = r; r = p; p = t; }
+    if (SensorFlags & 4) { r = -r; }
+    if (SensorFlags & 8) { p = -p; }
+    SeatRoll = r;
+    SeatPitch = p;
+}
+
+// Tilt limit: three angle packets in a row past the limit stop every motor (E4).  Enable motors again from the
+// page (or [ena]) once the cause is fixed; the check pauses 1.5 s after enabling so the seat can come back.
+void CheckTilt(unsigned long now)
+{
+    if (!(SensorFlags & 1) || TiltLimitDeg == 0 || (long)(now - TiltGraceUntil) < 0) { TiltHits = 0; return; }
+    float lim = (float)TiltLimitDeg;
+    bool past = (SeatRoll > lim || SeatRoll < -lim || SeatPitch > lim || SeatPitch < -lim);
+    if (!past) { TiltHits = 0; return; }
+    if (++TiltHits < 3) { return; }
+    TiltHits = 0;
+    bool any = false;
+    for (uint8_t m = 0; m < NUM_MOTORS; m++)
+    {
+        if (Disable[m] == 0) { any = true; DisableReason[m] = DIS_TILT; DisableMotor(m); }
+    }
+    if (any && TiltTrips < 65535) { TiltTrips++; }
+}
+
+#if IMU_PORT
+void ImuSetBaud(uint8_t idx)
+{
+    ImuBaudIdx = idx % IMU_NBAUDS;
+    Serial1.end();
+    Serial1.begin(ImuBauds[ImuBaudIdx]);
+    ImuBaudSince = millis();
+}
+
 void PollImu()
 {
     static uint8_t buf[11];
     static uint8_t n = 0;
+    static uint8_t goodRun = 0;                 // good packets in a row: one alone could be noise at the wrong baud
+    int budget = 128;                           // never spend long here, whatever arrives
 
-    while (Serial1.available())
+    while (Serial1.available() && budget-- > 0)
     {
         uint8_t c = Serial1.read();
         if (n == 0)
@@ -1074,26 +1240,148 @@ void PollImu()
             continue;
         }
         buf[n++] = c;
+        if (n == 2 && (c < 0x50 || c > 0x5F)) { n = (c == 0x55) ? 1 : 0; continue; }   // not a packet type: resync
         if (n < 11) { continue; }
         n = 0;
 
         uint8_t sum = 0;
         for (uint8_t i = 0; i < 10; i++) { sum += buf[i]; }
-        if (sum != buf[10]) { continue; }
+        if (sum != buf[10]) { if (ImuBadSums < 65535) { ImuBadSums++; } goodRun = 0; continue; }
+        if (goodRun < 255) { goodRun++; }
+        if (goodRun < 2) { continue; }
 
+        unsigned long now = millis();
+        ImuLastValid = now;
+        ImuPackets++;
         if (buf[1] == 0x53)
         {
             int16_t r = (int16_t)((buf[3] << 8) | buf[2]);
             int16_t p = (int16_t)((buf[5] << 8) | buf[4]);
             int16_t y = (int16_t)((buf[7] << 8) | buf[6]);
-            ImuRoll  = r / 32768.0f * 180.0f;
-            ImuPitch = p / 32768.0f * 180.0f;
-            ImuYaw   = y / 32768.0f * 180.0f;
-            ImuLastMillis = millis();
+            ImuRawRoll  = r / 32768.0f * 180.0f;
+            ImuRawPitch = p / 32768.0f * 180.0f;
+            ImuYaw      = y / 32768.0f * 180.0f;
+            ImuLastMillis = now;
+            ImuAngleCount++;
+            UpdateSeatAngles();
+            CheckTilt(now);
         }
     }
 }
+
+void ImuQueue(uint8_t reg, uint16_t val)
+{
+    if (ImuCmdN >= 10) { return; }
+    uint8_t *c = ImuCmd[ImuCmdN++];
+    c[0] = 0xFF; c[1] = 0xAA; c[2] = reg; c[3] = (uint8_t)(val & 0xFF); c[4] = (uint8_t)(val >> 8);
+}
+
+// Output angles only (the board uses nothing else, and at 100 Hz that is 1100 bytes/s - well inside the 512-byte
+// receive buffer even when a WiFi call holds up loop() for 150 ms), rateCode (WitMotion: 0x06 10 Hz, 0x08 50 Hz,
+// 0x09 100 Hz, 0x0B 200 Hz), 115200 baud, saved in the sensor.  Needs D1 -> MAX3232 -> sensor RX.  Saved at the old baud and
+// again at the new one, because sensors differ in when the new baud rate takes effect.
+void ImuStartSetup(uint8_t rateCode)
+{
+    if (ImuCmdN > 0) { return; }
+    if (rateCode < 0x01 || rateCode > 0x0B) { rateCode = 0x09; }
+    ImuCmdPos = 0;
+    ImuQueue(0x69, 0xB588);                     // unlock
+    ImuQueue(0x02, 0x0008);                     // output: angles only
+    ImuQueue(0x03, rateCode);                   // output rate
+    ImuQueue(0x00, 0x0000);                     // save
+    ImuQueue(0x69, 0xB588);
+    ImuQueue(0x04, 0x0006);                     // 115200 baud
+    ImuQueue(0x00, 0x0000);                     // save (sensors that switch on save)
+    ImuCmdBaudSwitchAt = (int8_t)ImuCmdN;
+    ImuQueue(0x69, 0xB588);                     // ... and again at 115200 (sensors that switch at once)
+    ImuQueue(0x00, 0x0000);
+    ImuCmdLast = millis();
+}
+
+void ServiceImu(unsigned long now)
+{
+    if (now - ImuRateSince >= 1000)
+    {
+        ImuRateSince = now;
+        ImuRateHz = ImuAngleCount;
+        ImuAngleCount = 0;
+    }
+
+    if (ImuCmdN > 0)                            // set-up in progress
+    {
+        if (now - ImuCmdLast >= 120)
+        {
+            if ((int8_t)ImuCmdPos == ImuCmdBaudSwitchAt) { ImuSetBaud(IMU_FAST_BAUD_IDX); }
+            Serial1.write(ImuCmd[ImuCmdPos], 5);
+            ImuCmdPos++;
+            ImuCmdLast = now;
+            if (ImuCmdPos >= ImuCmdN)
+            {
+                ImuCmdN = 0;
+                ImuCmdPos = 0;
+                ImuCmdBaudSwitchAt = -1;
+                ImuScanUntil = now + 30000;     // if it didn't take, find the sensor again wherever it is
+                ImuBaudSince = now;
+            }
+        }
+        return;
+    }
+
+    bool locked = ImuLastValid != 0 && (now - ImuLastValid) < 3000 && (long)(ImuLastValid - ImuBaudSince) > 0;
+    if (locked)
+    {
+        static uint8_t savedIdx = 255;
+        if (savedIdx != ImuBaudIdx && EEPROM.read(65) != ImuBaudIdx && EEPROM.read(56) == 0xA6)
+        {
+            EEPROM.update(65, ImuBaudIdx);      // start at this baud rate next time
+        }
+        savedIdx = ImuBaudIdx;
+        return;
+    }
+    // Not receiving: try the next baud rate - while the sensor is switched on, for the first minute after
+    // power-up, or for 30 s after the page asked.
+    bool scan = (SensorFlags & 1) || now < 60000UL || (long)(ImuScanUntil - now) > 0;
+    if (scan && now - ImuBaudSince >= 1500) { ImuSetBaud(ImuBaudIdx + 1); }
+}
+#endif // IMU_PORT
+
+// [i a b]: a < 16 -> sensor flags a and tilt limit b (degrees, 0 = off).  a = 'L' level now, 'C' clear the
+// level, 'S' set the sensor to rate code b (0 = 100 Hz) at 115200 baud, 'R' search for the sensor again.
+void ImuCommand(uint8_t a, uint8_t b)
+{
+    if (a < 16)
+    {
+        SensorFlags = a;
+        TiltLimitDeg = (b <= 60) ? b : 60;
+        UpdateSeatAngles();
+        WriteBoardSettings();
+    }
+    else if (a == 'L')
+    {
+        if (!SensorFresh()) { return; }
+        LevelRoll_x100 = (int16_t)(ImuRawRoll * 100.0f);
+        LevelPitch_x100 = (int16_t)(ImuRawPitch * 100.0f);
+        UpdateSeatAngles();
+        WriteBoardSettings();
+    }
+    else if (a == 'C')
+    {
+        LevelRoll_x100 = 0;
+        LevelPitch_x100 = 0;
+        UpdateSeatAngles();
+        WriteBoardSettings();
+    }
+#if IMU_PORT
+    else if (a == 'S')
+    {
+        ImuStartSetup(b == 0 ? 0x09 : b);
+    }
+    else if (a == 'R')
+    {
+        ImuScanUntil = millis() + 30000;        // a sensor that is already found stays found
+    }
 #endif
+}
 
 //****************************************************************************************************************
 //    WiFi: TCP server for telemetry out / SMC3 commands in
@@ -1101,7 +1389,8 @@ void PollImu()
 //    Telemetry frame (little-endian):  'S' 'M' '3' 'T', uint8 version(1), uint8 sampleCount, then per sample:
 //      uint32 millis
 //      3 x { int16 target(0-1023), int16 goal(Q4), int16 feedback(Q4), int16 pid(Q4, signed, before PWMmin) }
-//      uint8 statusByte, uint8 powerScale, int16 roll*100, int16 pitch*100, int16 yaw*100, uint16 isrMaxMicros
+//      uint8 statusByte, uint8 powerScale, int16 roll*100, int16 pitch*100, int16 yaw*100 (seat angles from the
+//      motion sensor, levelled and turned to its mounting; -32768 = no data), uint16 isrMaxMicros
 //    = 38 bytes per sample.  Commands from the client use the exact SMC3 "[xyz]" format; replies to [rd?]
 //    go back over the same connection.
 //****************************************************************************************************************
@@ -1174,9 +1463,18 @@ void TelemetrySample(unsigned long now)
     }
     *p++ = (uint8_t)StatusByte();
     *p++ = PowerScale;
-    Put16(p, (int)(ImuRoll * 100.0f));  p += 2;
-    Put16(p, (int)(ImuPitch * 100.0f)); p += 2;
-    Put16(p, (int)(ImuYaw * 100.0f));   p += 2;
+    if (SensorFresh())                           // seat angles x100; -32768 = no sensor data (1.8)
+    {
+        Put16(p, (int)constrain(SeatRoll * 100.0f, -32767.0f, 32767.0f));  p += 2;
+        Put16(p, (int)constrain(SeatPitch * 100.0f, -32767.0f, 32767.0f)); p += 2;
+        Put16(p, (int)constrain(ImuYaw * 100.0f, -32767.0f, 32767.0f));    p += 2;
+    }
+    else
+    {
+        Put16(p, -32768); p += 2;
+        Put16(p, -32768); p += 2;
+        Put16(p, -32768); p += 2;
+    }
     uint32_t us = IsrCyclesMax / (F_CPU / 1000000UL);
     Put16(p, (int)(us > 65535 ? 65535 : us));
     TelCount++;
@@ -1202,10 +1500,17 @@ void TelemetrySend()
 //   3 boot), uint16 cutoff trips, int16 pot (0-1023) at the last trip or -1, uint16 pot glitches, uint16 biggest
 //   one-cycle pot change since the last [rdd] (Q4), uint16 lowest and highest pot reading since then (Q4) |
 //   uint8 n, then EEPROM bytes 0..n-1.
+//   Version 2 (1.8) adds, after the EEPROM copy:  uint8 sensor state ([rdi] byte 1), uint8 tilt limit, uint8 baud
+//   index, uint32 baud, uint16 angle packets in the last second, uint32 good packets, uint16 bad checksums,
+//   uint16 ms since the last angle packet (65535 = longer/never), int16 raw roll, raw pitch, yaw (x100),
+//   int16 level roll, level pitch (x100), uint16 tilt trips, uint8 matrix view, uint8 matrix flags,
+//   uint8 error code on the matrix (255 = none).
 // Only ever sent to the WiFi client, so SimHub and SMC3Utils on USB never see it.
+uint8_t MatrixError();
+
 void SendDiag()
 {
-    uint8_t buf[6 + 160];
+    uint8_t buf[6 + 220];
     uint8_t *p = buf + 6;
     unsigned long now = millis();
     Put32(p, (uint32_t)now); p += 4;
@@ -1240,11 +1545,34 @@ void SendDiag()
         FbMin_q[m] = fb;
         FbMax_q[m] = fb;
     }
-    *p++ = 64;
-    for (int i = 0; i < 64; i++) { *p++ = EEPROM.read(i); }
+    *p++ = 72;
+    for (int i = 0; i < 72; i++) { *p++ = EEPROM.read(i); }
+    *p++ = SensorState();
+    *p++ = TiltLimitDeg;
+#if IMU_PORT
+    *p++ = ImuBaudIdx;
+    Put32(p, ImuBauds[ImuBaudIdx]); p += 4;
+#else
+    *p++ = 255;
+    Put32(p, 0); p += 4;
+#endif
+    Put16(p, ImuRateHz); p += 2;
+    Put32(p, ImuPackets); p += 4;
+    Put16(p, ImuBadSums); p += 2;
+    unsigned long age = ImuLastMillis ? (now - ImuLastMillis) : 65535UL;
+    Put16(p, (int)(age > 65535UL ? 65535UL : age)); p += 2;
+    Put16(p, (int)constrain(ImuRawRoll * 100.0f, -32767.0f, 32767.0f));  p += 2;
+    Put16(p, (int)constrain(ImuRawPitch * 100.0f, -32767.0f, 32767.0f)); p += 2;
+    Put16(p, (int)constrain(ImuYaw * 100.0f, -32767.0f, 32767.0f));      p += 2;
+    Put16(p, LevelRoll_x100);  p += 2;
+    Put16(p, LevelPitch_x100); p += 2;
+    Put16(p, TiltTrips); p += 2;
+    *p++ = LedView;
+    *p++ = LedFlags;
+    *p++ = MatrixError();
     size_t len = (size_t)(p - (buf + 6));
     buf[0] = 'S'; buf[1] = 'M'; buf[2] = '3'; buf[3] = 'D';
-    buf[4] = 1;
+    buf[4] = 2;
     buf[5] = (uint8_t)len;
     if (TcpClient.write(buf, 6 + len) == 0) { ClientUp = false; }
 }
@@ -1272,7 +1600,10 @@ void ServiceNetwork(unsigned long now)
     {
         // Reconnect attempts block for up to WIFI_CONNECT_TIMEOUT_MS, so only try while SimHub is quiet.
         bool hostIdle = (now - LastPacketMillis) > 5000;
-        if (hostIdle && (now - WifiLastAttempt) > WIFI_RETRY_MS) { ConnectWifi(); }
+        if (hostIdle && (now - WifiLastAttempt) > WIFI_RETRY_MS)
+        {
+            if (ConnectWifi() && WifiText[0] != 'E') { PendingIpScroll = true; }   // back: show the address once
+        }
         return;
     }
 
@@ -1294,7 +1625,7 @@ void ServiceNetwork(unsigned long now)
             {
                 NetLastCheck = now;
                 if (WiFi.status() != WL_CONNECTED) { WifiUp = false; }
-                else if (WifiText[0] == 'E') { ReadIpText(); }   // E8: lease arrived late? pick it up
+                else if (WifiText[0] == 'E') { if (ReadIpText()) { PendingIpScroll = true; } }   // E8: lease arrived late
             }
         }
         return;
@@ -1342,42 +1673,73 @@ void ServiceNetwork(unsigned long now)
 #endif // ENABLE_WIFI
 
 //****************************************************************************************************************
-//    LED matrix
+//    LED matrix (1.8).  One thing at a time, readable from across the room:
+//      * the IP address scrolls after power-up (and every minute while the page isn't connected);
+//      * problems scroll as words, "ERROR E3 MOTOR 3 CUTOFF", again and again while they last;
+//      * otherwise the chosen view: motor bars, the seat horizon (motion sensor), or quiet;
+//      * motor bars view while SimHub is idle: a slow oscilloscope trace.
+//    The code between the BEGIN/END markers only uses the globals listed here, so the preview tool can build it on
+//    a PC: Frame, Disable, DisableReason, Feedback_q, Goal_q, InputClipMin/Max, SeatRoll/SeatPitch, SensorFresh(),
+//    SensorFlags, LedView, LedFlags, LastPosMillis, WifiText, WifiUp, ClientUp, PendingIpScroll, LastIpScroll.
 //****************************************************************************************************************
 
+// ==== LED MATRIX BEGIN ====
 #if LED_MATRIX
 
-// 3x5 glyphs, one byte per row, bit2 = left pixel.  Index: 0-9 = digits, 10 = 'E', 11 = 'R', 12 = '-', 13 = '.', 14+ = blank
-#define GL_E     10
-#define GL_R     11
-#define GL_DASH  12
-#define GL_DOT   13
-#define GL_BLANK 14
-const uint8_t Glyph[14][5] = {
-    {0b111, 0b101, 0b101, 0b101, 0b111},   // 0
-    {0b010, 0b110, 0b010, 0b010, 0b111},   // 1
-    {0b111, 0b001, 0b111, 0b100, 0b111},   // 2
-    {0b111, 0b001, 0b111, 0b001, 0b111},   // 3
-    {0b101, 0b101, 0b111, 0b001, 0b001},   // 4
-    {0b111, 0b100, 0b111, 0b001, 0b111},   // 5
-    {0b111, 0b100, 0b111, 0b101, 0b111},   // 6
-    {0b111, 0b001, 0b001, 0b010, 0b010},   // 7
-    {0b111, 0b101, 0b111, 0b101, 0b111},   // 8
-    {0b111, 0b101, 0b111, 0b001, 0b111},   // 9
-    {0b111, 0b100, 0b110, 0b100, 0b111},   // E
-    {0b110, 0b101, 0b110, 0b101, 0b101},   // R
-    {0b000, 0b000, 0b111, 0b000, 0b000},   // -
-    {0b000, 0b000, 0b000, 0b000, 0b010},   // .
+struct GlyphDef { char c; uint8_t w; uint8_t col[5]; };   // up to 5 columns, bit0 = top row
+const GlyphDef Font[] = {
+    {'0', 3, {0x1F, 0x11, 0x1F, 0x00, 0x00}},
+    {'1', 3, {0x12, 0x1F, 0x10, 0x00, 0x00}},
+    {'2', 3, {0x1D, 0x15, 0x17, 0x00, 0x00}},
+    {'3', 3, {0x11, 0x15, 0x1F, 0x00, 0x00}},
+    {'4', 3, {0x07, 0x04, 0x1F, 0x00, 0x00}},
+    {'5', 3, {0x17, 0x15, 0x1D, 0x00, 0x00}},
+    {'6', 3, {0x1F, 0x15, 0x1D, 0x00, 0x00}},
+    {'7', 3, {0x01, 0x19, 0x07, 0x00, 0x00}},
+    {'8', 3, {0x1F, 0x15, 0x1F, 0x00, 0x00}},
+    {'9', 3, {0x17, 0x15, 0x1F, 0x00, 0x00}},
+    {'A', 3, {0x1E, 0x05, 0x1E, 0x00, 0x00}},
+    {'B', 3, {0x1F, 0x15, 0x0A, 0x00, 0x00}},
+    {'C', 3, {0x0E, 0x11, 0x11, 0x00, 0x00}},
+    {'D', 3, {0x1F, 0x11, 0x0E, 0x00, 0x00}},
+    {'E', 3, {0x1F, 0x15, 0x11, 0x00, 0x00}},
+    {'F', 3, {0x1F, 0x05, 0x01, 0x00, 0x00}},
+    {'G', 3, {0x0E, 0x11, 0x1D, 0x00, 0x00}},
+    {'H', 3, {0x1F, 0x04, 0x1F, 0x00, 0x00}},
+    {'I', 3, {0x11, 0x1F, 0x11, 0x00, 0x00}},
+    {'J', 3, {0x08, 0x10, 0x0F, 0x00, 0x00}},
+    {'K', 3, {0x1F, 0x04, 0x1B, 0x00, 0x00}},
+    {'L', 3, {0x1F, 0x10, 0x10, 0x00, 0x00}},
+    {'M', 5, {0x1F, 0x02, 0x04, 0x02, 0x1F}},
+    {'N', 4, {0x1F, 0x02, 0x04, 0x1F, 0x00}},
+    {'O', 3, {0x0E, 0x11, 0x0E, 0x00, 0x00}},
+    {'P', 3, {0x1F, 0x05, 0x02, 0x00, 0x00}},
+    {'Q', 3, {0x0E, 0x19, 0x16, 0x00, 0x00}},
+    {'R', 3, {0x1F, 0x05, 0x1A, 0x00, 0x00}},
+    {'S', 3, {0x12, 0x15, 0x09, 0x00, 0x00}},
+    {'T', 3, {0x01, 0x1F, 0x01, 0x00, 0x00}},
+    {'U', 3, {0x1F, 0x10, 0x1F, 0x00, 0x00}},
+    {'V', 3, {0x0F, 0x10, 0x0F, 0x00, 0x00}},
+    {'W', 5, {0x1F, 0x08, 0x04, 0x08, 0x1F}},
+    {'X', 3, {0x1B, 0x04, 0x1B, 0x00, 0x00}},
+    {'Y', 3, {0x03, 0x1C, 0x03, 0x00, 0x00}},
+    {'Z', 3, {0x19, 0x15, 0x13, 0x00, 0x00}},
+    {'.', 1, {0x10, 0x00, 0x00, 0x00, 0x00}},
+    {':', 1, {0x0A, 0x00, 0x00, 0x00, 0x00}},
+    {'!', 1, {0x17, 0x00, 0x00, 0x00, 0x00}},
+    {'-', 2, {0x04, 0x04, 0x00, 0x00, 0x00}},
+    {'/', 3, {0x18, 0x04, 0x03, 0x00, 0x00}},
+    {' ', 2, {0x00, 0x00, 0x00, 0x00, 0x00}},
 };
+#define FONT_N (sizeof(Font) / sizeof(Font[0]))
 
-uint8_t GlyphIndex(char c)
+// Returns an index into Font[], not a pointer: the Arduino IDE copies every function's declaration to the top of
+// the sketch, where the GlyphDef type doesn't exist yet - so no sketch type may appear in a function signature.
+uint8_t FindGlyph(char c)
 {
-    if (c >= '0' && c <= '9') { return c - '0'; }
-    if (c == 'E') { return GL_E; }
-    if (c == 'R') { return GL_R; }
-    if (c == '-') { return GL_DASH; }
-    if (c == '.') { return GL_DOT; }
-    return GL_BLANK;
+    if (c >= 'a' && c <= 'z') { c = (char)(c - 32); }
+    for (uint8_t i = 0; i < FONT_N; i++) { if (Font[i].c == c) { return i; } }
+    return (uint8_t)(FONT_N - 1);               // unknown -> space (last entry)
 }
 
 void FrameClear()
@@ -1391,61 +1753,55 @@ void FramePixel(int row, int col, uint8_t on)
     Frame[row][col] = on ? 1 : 0;
 }
 
-void FrameGlyph(int row, int col, uint8_t g)
+void FrameToggle(int row, int col)
 {
-    if (g > GL_DOT) { return; }
-    for (int r = 0; r < 5; r++)
+    if (row < 0 || row > 7 || col < 0 || col > 11) { return; }
+    Frame[row][col] ^= 1;
+}
+
+// Text drawn at a fixed place (rows row..row+4)
+void DrawText(int col, int row, const char *s)
+{
+    for (; *s; s++)
     {
-        for (int c = 0; c < 3; c++)
+        const GlyphDef *g = &Font[FindGlyph(*s)];
+        for (int c = 0; c < g->w; c++)
         {
-            FramePixel(row + r, col + c, (Glyph[g][r] >> (2 - c)) & 1);
+            for (int r = 0; r < 5; r++) { if ((g->col[c] >> r) & 1) { FramePixel(row + r, col + c, 1); } }
         }
+        col += g->w + 1;
     }
 }
 
-// Up to three 3x5 glyphs side by side, starting at column 0 (cols 0-2, 4-6, 8-10)
-void FrameText3(uint8_t g0, uint8_t g1, uint8_t g2)
-{
-    FrameGlyph(1, 0, g0);
-    FrameGlyph(1, 4, g1);
-    FrameGlyph(1, 8, g2);
-}
+// ---- Scrolling text (non-blocking; rows 1-5) ----
 
-// ---- Scrolling text (non-blocking; rendered by UpdateMatrix() in rows 1-5) ----
-
-#define MARQUEE_MAX_COLS 100
+#define MARQUEE_MAX_COLS 200
 uint8_t       MarqueeBits[MARQUEE_MAX_COLS];   // one byte per column, bit r = pixel in text row r (0-4)
 int           MarqueeLen = 0;
 int           MarqueeOffset = 0;
 bool          MarqueeActive = false;
+uint8_t       MarqueeKind = 0;                 // 0 = address, 1 = urgent problem, 2 = other problem
 unsigned long MarqueeLastStep = 0;
 
-void MarqueeStart(const char *s)
+void MarqueeStart(const char *s, uint8_t kind)
 {
     MarqueeLen = 0;
     for (int i = 0; i < 12; i++) { MarqueeBits[MarqueeLen++] = 0; }        // lead-in: text enters from the right
-    for (const char *p = s; *p != 0; p++)
+    for (const char *p = s; *p != 0 && MarqueeLen < MARQUEE_MAX_COLS; p++)
     {
-        uint8_t g = GlyphIndex(*p);
-        for (int c = 0; c < 3 && MarqueeLen < MARQUEE_MAX_COLS; c++)
-        {
-            uint8_t bits = 0;
-            if (g <= GL_DOT)
-            {
-                for (int r = 0; r < 5; r++) { if ((Glyph[g][r] >> (2 - c)) & 1) { bits |= (1 << r); } }
-            }
-            MarqueeBits[MarqueeLen++] = bits;
-        }
-        if (MarqueeLen < MARQUEE_MAX_COLS) { MarqueeBits[MarqueeLen++] = 0; }   // one blank column between glyphs
+        const GlyphDef *g = &Font[FindGlyph(*p)];
+        for (int c = 0; c < g->w && MarqueeLen < MARQUEE_MAX_COLS; c++) { MarqueeBits[MarqueeLen++] = g->col[c]; }
+        if (MarqueeLen < MARQUEE_MAX_COLS) { MarqueeBits[MarqueeLen++] = 0; }   // one blank column between letters
     }
     MarqueeOffset = 0;
     MarqueeActive = true;
+    MarqueeKind = kind;
     MarqueeLastStep = millis();
 }
 
 void DrawMarquee(unsigned long now)
 {
-    if (now - MarqueeLastStep >= MARQUEE_STEP_MS)
+    if (now - MarqueeLastStep >= (MarqueeKind == 0 ? (unsigned long)MARQUEE_STEP_MS : (unsigned long)ERROR_STEP_MS))
     {
         MarqueeLastStep = now;
         MarqueeOffset++;
@@ -1459,90 +1815,131 @@ void DrawMarquee(unsigned long now)
     }
 }
 
-static inline int PosToCol(int q)
-{
-    int v = (q >> POS_SHIFT);                  // 0..1023
-    if (v < 0) { v = 0; } else if (v > 1023) { v = 1023; }
-    return (v * 12) / 1024;                    // 0..11
-}
+// ---- Problems ----
+// Codes: 0 WiFi module, 1-3 motor cutoff, 4 tilt limit, 5 sensor switched on but silent, 8 no IP address, 9 no WiFi.
 
-void DrawTrackingView(bool blink)
+#define ERR_MAX 8
+uint8_t       ErrCodes[ERR_MAX];
+uint8_t       ErrN = 0;
+uint8_t       ErrNext = 0;                     // round robin through several problems
+unsigned long ErrNextAt = 0;                   // next problem scroll not before this
+
+void CollectErrors(unsigned long now)
 {
-    // Rows 0-5: per motor, a target cursor row above a feedback cursor row.
+    ErrN = 0;
+    bool tilt = false;
     for (uint8_t m = 0; m < NUM_MOTORS; m++)
     {
-        int r = m * 2;
+        if (Disable[m] && DisableReason[m] == DIS_CUTOFF) { ErrCodes[ErrN++] = 1 + m; }
+        if (Disable[m] && DisableReason[m] == DIS_TILT) { tilt = true; }
+    }
+    if (tilt) { ErrCodes[ErrN++] = 4; }
+    if ((SensorFlags & 1) && !SensorFresh() && now > 8000) { ErrCodes[ErrN++] = 5; }
+#if ENABLE_WIFI
+    if (WifiText[0] == 'E') { ErrCodes[ErrN++] = (uint8_t)(WifiText[1] - '0'); }
+    else if (!WifiUp) { ErrCodes[ErrN++] = 9; }
+#endif
+}
+
+uint8_t MatrixError()                          // first problem, for [rdd] (255 = none)
+{
+    CollectErrors(millis());
+    return ErrN ? ErrCodes[0] : 255;
+}
+
+void ErrorText(uint8_t code, char *out, size_t n)
+{
+    switch (code)
+    {
+        case 0:  snprintf(out, n, "ERROR E0 WIFI MODULE"); break;
+        case 1: case 2: case 3: snprintf(out, n, "ERROR E%u MOTOR %u CUTOFF", (unsigned)code, (unsigned)code); break;
+        case 4:  snprintf(out, n, "ERROR E4 TILT LIMIT"); break;
+        case 5:  snprintf(out, n, "ERROR E5 NO SENSOR"); break;
+        case 8:  snprintf(out, n, "ERROR E8 NO IP ADDRESS"); break;
+        case 9:  snprintf(out, n, "ERROR E9 NO WIFI"); break;
+        default: snprintf(out, n, "ERROR E%u", (unsigned)code); break;
+    }
+}
+
+// ---- Views ----
+
+static inline int HalfSteps(uint8_t m, int q)   // position (Q4) -> bar height in half pixels, 2..16
+{
+    int lo = InputClipMin[m], hi = InputClipMax[m];
+    if (hi - lo < 16) { lo = 0; hi = 1023; }
+    long v = ((long)q * 16) >> POS_SHIFT;        // 1/16 count
+    long h = 2 + ((v - (long)lo * 16) * 14 + (long)(hi - lo) * 8) / ((long)(hi - lo) * 16);
+    if (h < 2) { h = 2; } else if (h > 16) { h = 16; }
+    return (int)h;
+}
+
+// Three bars (columns 1-2, 5-6, 9-10), as high as each motor is; the two columns of a bar differ by half a pixel
+// when the motor is in between.  A dot blinks where a motor should be when it is well behind.  A motor switched
+// off on purpose shows a dash at the bottom; one stopped by a cutoff or the tilt limit blinks full height.
+void DrawBars(bool blink)
+{
+    for (uint8_t m = 0; m < NUM_MOTORS; m++)
+    {
+        int x = 1 + 4 * m;
         if (Disable[m])
         {
-            // disabled motor: both rows blink solid
-            for (int c = 0; c < 12; c++) { FramePixel(r, c, blink); FramePixel(r + 1, c, blink); }
+            if (DisableReason[m] == DIS_CUTOFF || DisableReason[m] == DIS_TILT)
+            {
+                if (blink) { for (int r = 0; r < 8; r++) { FramePixel(r, x, 1); FramePixel(r, x + 1, 1); } }
+            }
+            else
+            {
+                FramePixel(7, x, 1); FramePixel(7, x + 1, 1);
+            }
+            continue;
         }
-        else
+        int h2 = HalfSteps(m, Feedback_q[m]);
+        int left = h2 / 2, right = (h2 + 1) / 2;
+        for (int r = 8 - left; r < 8; r++)  { FramePixel(r, x, 1); }
+        for (int r = 8 - right; r < 8; r++) { FramePixel(r, x + 1, 1); }
+        int t2 = HalfSteps(m, Goal_q[m]);
+        int d = t2 - h2;
+        if ((d >= 3 || d <= -3) && blink)
         {
-            FramePixel(r,     PosToCol(Goal_q[m]), 1);
-            FramePixel(r + 1, PosToCol(Feedback_q[m]), 1);
-        }
-    }
-
-    // Row 6: drive bars, 4 pixels per motor (M1 cols 0-3, M2 cols 4-7, M3 cols 8-11)
-    for (uint8_t m = 0; m < NUM_MOTORS; m++)
-    {
-        int pwm = ReportPWM(m);                                 // 0..255
-        int len = (pwm * 4 + 127) / 255;                        // 0..4
-        for (int i = 0; i < len; i++) { FramePixel(6, m * 4 + i, 1); }
-    }
-}
-
-#if IMU_SERIAL1
-void DrawBubbleView(bool blink)
-{
-    // crosshair
-    for (int c = 0; c < 12; c++) { FramePixel(3, c, 1); }
-    for (int r = 0; r < 8; r++)  { FramePixel(r, 5, 1); }
-
-    bool fresh = (millis() - ImuLastMillis) < 500;
-    if (!fresh)
-    {
-        // no data: blink the centre
-        FramePixel(3, 5, blink);
-        return;
-    }
-    float cx = 5.5f + (ImuRoll / IMU_ROLL_FULL_SCALE) * 5.5f;    // +roll -> right
-    float cy = 3.5f - (ImuPitch / IMU_PITCH_FULL_SCALE) * 3.5f;  // +pitch -> up
-    int col = (int)(cx + 0.5f); if (col < 0) { col = 0; } else if (col > 11) { col = 11; }
-    int row = (int)(cy + 0.5f); if (row < 0) { row = 0; } else if (row > 7)  { row = 7; }
-    // 2x2 bubble, inverted over the crosshair so it is always visible
-    for (int r = row - 1; r <= row; r++)
-    {
-        for (int c = col - 1; c <= col; c++)
-        {
-            if (r >= 0 && r <= 7 && c >= 0 && c <= 11) { Frame[r][c] = 1 - Frame[r][c]; }
+            int row = 8 - (t2 + 1) / 2;
+            FrameToggle(row, x); FrameToggle(row, x + 1);
         }
     }
 }
-#endif
 
-void DrawStatusRow(bool blink, unsigned long now)
+// Seat horizon: the edge between dark and lit is the seat - it moves up when the seat's front goes up and tilts
+// with the seat's roll (mounting and direction are set in the page).  LED_HORIZON_DEG puts it at the edge.
+void DrawHorizon()
 {
-    bool packets = (now - LastPacketMillis) < 250;
-    bool timeout = (now - LastPacketMillis) > COMMS_TIMEOUT_MS;
-    bool overrun = IsrCyclesMax > ((F_CPU / PID_RATE_HZ) * 85UL / 100UL);   // ISR used >85% of its slot
-
-    FramePixel(7, 0, packets);                 // SimHub / Utils packets arriving
-    FramePixel(7, 1, timeout ? blink : 0);     // comms timeout -> low power mode
-    FramePixel(7, 3, !Disable[0]);             // motor enable flags
-    FramePixel(7, 4, !Disable[1]);
-    FramePixel(7, 5, !Disable[2]);
-    FramePixel(7, 7, overrun ? blink : 0);     // control loop overrun warning
-#if IMU_SERIAL1
-    FramePixel(7, 9, (now - ImuLastMillis) < 500);
-#endif
-#if ENABLE_WIFI
-    FramePixel(7, 10, ClientUp ? 1 : (WifiUp ? blink : 0));   // solid = PC tool connected, blink = WiFi up, off = no WiFi
-#endif
-    FramePixel(7, 11, (now / 500) & 1);        // heartbeat
+    float fs = LED_HORIZON_DEG;
+    float pitch = SeatPitch, roll = SeatRoll;
+    if (pitch > fs) { pitch = fs; } else if (pitch < -fs) { pitch = -fs; }
+    if (roll > fs) { roll = fs; } else if (roll < -fs) { roll = -fs; }
+    float yc = 4.0f - (pitch / fs) * 4.0f;           // row of the edge at the centre
+    float slope = (roll / fs) * 0.6f;               // rows per column
+    for (int c = 0; c < 12; c++)
+    {
+        float edge = yc + slope * ((float)c - 5.5f);
+        for (int r = 0; r < 8; r++) { if ((float)r + 0.5f > edge) { FramePixel(r, c, 1); } }
+    }
 }
 
+// Oscilloscope trace while idle
+void DrawIdleTrace(unsigned long now)
+{
+    float ph = (float)(now % 100000UL) * 0.0025f;
+    int prev = -1;
+    for (int c = 0; c < 12; c++)
+    {
+        float y = 3.5f + 2.6f * sinf(ph + (float)c * 0.55f);
+        int r = (int)(y + 0.5f);
+        if (prev < 0) { prev = r; }
+        if (r > prev + 1)      { for (int rr = prev + 1; rr <= r; rr++) { FramePixel(rr, c, 1); } }   // join steep parts
+        else if (r < prev - 1) { for (int rr = r; rr < prev; rr++) { FramePixel(rr, c, 1); } }
+        else                   { FramePixel(r, c, 1); }
+        prev = r;
+    }
+}
 
 void UpdateMatrix()
 {
@@ -1553,42 +1950,61 @@ void UpdateMatrix()
     bool blink = (now / 250) & 1;
 
     FrameClear();
+    CollectErrors(now);
 
-#if ENABLE_WIFI
-    // Re-scroll the address (or the E-code) periodically while nothing is connected to the scope
-    if (IP_SCROLL_REPEAT_MS > 0 && !ClientUp && !MarqueeActive && (now - LastIpScroll) >= IP_SCROLL_REPEAT_MS)
+    if (!MarqueeActive)
     {
-        LastIpScroll = now;
-        MarqueeStart(WifiText);
-    }
+#if ENABLE_WIFI
+        if (PendingIpScroll)
+        {
+            PendingIpScroll = false;
+            MarqueeStart(WifiText, 0);
+            LastIpScroll = now;
+        }
+        else
 #endif
+        if (ErrN > 0 && (long)(now - ErrNextAt) >= 0)
+        {
+            if (ErrNext >= ErrN) { ErrNext = 0; }
+            uint8_t code = ErrCodes[ErrNext++];
+            char text[32];
+            ErrorText(code, text, sizeof(text));
+            MarqueeStart(text, (code >= 1 && code <= 4) ? 1 : 2);
+        }
+#if ENABLE_WIFI
+        // Re-scroll the address every minute while the page isn't connected (and nothing is wrong)
+        else if (ErrN == 0 && (LedFlags & 2) && WifiUp && !ClientUp && WifiText[0] != 'E'
+                 && (now - LastIpScroll) >= IP_SCROLL_REPEAT_MS)
+        {
+            LastIpScroll = now;
+            MarqueeStart(WifiText, 0);
+        }
+#endif
+    }
 
-    bool anyDisabled = Disable[0] || Disable[1] || Disable[2];
     if (MarqueeActive)
     {
         DrawMarquee(now);
-    }
-    else if (anyDisabled && ((now / 1000) & 1))
-    {
-        // alternate: one second of fault code ("E" + motor numbers), one second of the normal view
-        uint8_t g[3] = {GL_E, GL_BLANK, GL_BLANK};
-        uint8_t n = 1;
-        for (uint8_t m = 0; m < NUM_MOTORS && n < 3; m++) { if (Disable[m]) { g[n++] = m + 1; } }
-        FrameText3(g[0], g[1], g[2]);
+        if (!MarqueeActive && MarqueeKind != 0)
+        {
+            ErrNextAt = now + (MarqueeKind == 1 ? 1500UL : 8000UL);   // a moment of the view between scrolls
+        }
     }
     else
     {
-#if LED_VIEW == 1
-        DrawBubbleView(blink);
-#else
-        DrawTrackingView(blink);
-#endif
+        bool idle = (now - LastPosMillis) > LED_IDLE_AFTER_MS;
+        if (LedView == 1 && SensorFresh())       { DrawHorizon(); }
+        else if (LedView == 2)                   { FramePixel(7, 11, (now % 3000UL) < 150); }   // quiet: heartbeat
+        else if (idle && (LedFlags & 1) && ErrN == 0) { DrawIdleTrace(now); }
+        else                                     { DrawBars(blink); }
     }
-    DrawStatusRow(blink, now);
     Matrix.renderBitmap(Frame, 8, 12);
 }
 
+#else
+uint8_t MatrixError() { return 255; }          // no matrix: nothing shown
 #endif // LED_MATRIX
+// ==== LED MATRIX END ====
 
 //****************************************************************************************************************
 //    setup / loop
@@ -1610,9 +2026,6 @@ void setup()
 #endif
 
     Serial.begin(500000);
-#if IMU_SERIAL1
-    Serial1.begin(IMU_BAUD);
-#endif
 
 #ifdef DWT
     // cycle counter for ISR load measurement
@@ -1635,6 +2048,11 @@ void setup()
 
     // 1. PWM first - it must get the GPT channels that belong to D9/D10/D11
     ReadEEProm();
+    ReadBoardSettings();
+#if IMU_PORT
+    Serial1.begin(ImuBauds[ImuBaudIdx]);        // the baud rate that worked last time (9600 if never)
+    ImuBaudSince = millis();
+#endif
     ApplyPwmFrequencies();
     for (uint8_t m = 0; m < NUM_MOTORS; m++) { SetPwmQ(m, 0); }
     UpdatePIDLimits();
@@ -1655,7 +2073,7 @@ void setup()
 #if LED_MATRIX
     Matrix.begin();
     FrameClear();
-    FrameText3(GL_R, 4, GL_BLANK);              // "R4" - stays up while WiFi connects
+    DrawText(2, 1, "R4");                       // stays up while WiFi connects
     Matrix.renderBitmap(Frame, 8, 12);
     delay(600);
 #endif
@@ -1670,8 +2088,8 @@ void setup()
         Serial.print("\r\n");
     }
 #if LED_MATRIX
-    MarqueeStart(WifiText);                     // scrolls the full address (or E-code) once the loop is running
-    LastIpScroll = millis();
+    if (wifiOk && WifiText[0] != 'E') { PendingIpScroll = true; }   // the address scrolls once the loop runs
+    LastIpScroll = millis();                    // (a WiFi problem scrolls as an ERROR instead)
 #endif
 #endif
 
@@ -1686,6 +2104,7 @@ void setup()
     // 5. Enable the motors (same as the original, which enables at startup)
     for (uint8_t m = 0; m < NUM_MOTORS; m++) { EnableMotor(m); }
     LastPacketMillis = millis();
+    LastPosMillis = millis();
 }
 
 void loop()
@@ -1695,8 +2114,9 @@ void loop()
 
     CheckSerial();
 
-#if IMU_SERIAL1
+#if IMU_PORT
     PollImu();
+    ServiceImu(now);
 #endif
 
     if (now - LastMonitorMillis >= 20)          // every 20 ms, like the original

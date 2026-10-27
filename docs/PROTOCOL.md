@@ -32,7 +32,12 @@ are two separate bytes. The same commands work over USB (SimHub, SMC3Utils) and 
 | `[rd!]` | 1.4 | Build flags (bit0 REVERSE_MOTOR1; since 1.7 also bit1 MODE2, bit2 IMU, bit3 LED matrix, bit4 static IP) and firmware number (17 = 1.7) |
 | `[dis]` `[di1]`–`[di3]` | 1.5 | Disable all motors or one (brake, stay off until enabled) |
 | `[fab]` / `[rdf]` | 1.6 | Smoothing shift a (0–8, time constant 2^a / 4 ms at Fpid/1) and max speed b × 100 counts/s (0 = off) / read them |
-| `[rdd]` | 1.7 | Diagnostics frame (below). WiFi only. |
+| `[rdd]` | 1.7 | Diagnostics frame (below). WiFi only. Version 2 since 1.8. |
+| `[lvf]` / `[rdl]` | 1.8 | LED matrix view v (0 motor bars, 1 seat horizon, 2 quiet) and flags f (bit0 idle trace, bit1 address every minute) / read them. Saved at once. |
+| `[ift]` / `[rdi]` | 1.8 | Motion sensor flags f (bit0 on, bit1 swap roll/pitch, bit2 invert roll, bit3 invert pitch) and tilt limit t degrees (0 = off), saved at once / read: state (bits 0-3 as set, bit4 angles arriving, bit5 sensor found, bit6 setting up) and tilt limit. |
+| `[iL?]` `[iC?]` | 1.8 | Level now (the current angles count as 0°/0°) / clear the level. |
+| `[iSr]` | 1.8 | Set the sensor up through D1: angles only, rate code r (0 = 100 Hz), 115200 baud, saved in the sensor. |
+| `[iR?]` | 1.8 | Look for the sensor again (try the baud rates for 30 s). |
 
 Over WiFi, position commands count as "host alive" (since 1.4), so tests from the page run at full power. Reading
 telemetry alone doesn't.
@@ -46,8 +51,11 @@ The board pushes frames to the connected client. Everything is little-endian.
   uint32 millis
   3 × { int16 target (0-1023), int16 goal (Q4 = 1/16 count), int16 feedback (Q4), int16 pid (Q4, signed, before PWMmin) }
   uint8 status (Fpid divider × 16 + bit per disabled motor)   uint8 powerScale (7 normal, 9 low power)
-  int16 roll×100  int16 pitch×100  int16 yaw×100  (IMU, 0 without one)   uint16 worst ISR µs
+  int16 roll×100  int16 pitch×100  int16 yaw×100   uint16 worst ISR µs
 ```
+
+Roll and pitch are the seat's angles from the motion sensor, levelled and turned the way the sensor is mounted
+(firmware 1.8). -32768 means no sensor data; firmware 1.7 and older send 0.
 
 Samples are taken every 10 ms and sent in bursts of five every 50 ms. Replies to `[rd?]` come back on the same
 connection as ordinary 5-byte SMC3 replies.
@@ -69,8 +77,26 @@ connection as ordinary 5-byte SMC3 replies.
         uint16 pot glitches (> 16 counts in one 1/4 ms cycle),
         uint16 biggest one-cycle pot change (Q4) since the last [rdd],
         uint16 lowest and highest pot reading (Q4) since the last [rdd] }
-  uint8 n, then EEPROM bytes 0..n-1 (SMC3 layout, + 53-55 smoothing)
+  uint8 n, then EEPROM bytes 0..n-1 (SMC3 layout, + 53-55 smoothing, + 56-65 sensor/matrix in 1.8; n = 72)
+  version 2 (1.8) continues:
+  uint8 sensor state ([rdi] byte 1)   uint8 tilt limit °   uint8 baud index   uint32 baud
+  uint16 angle packets in the last second   uint32 good packets   uint16 bad checksums
+  uint16 ms since the last angle packet (65535 = never/long)
+  int16 raw roll, raw pitch, yaw (×100)   int16 level roll, level pitch (×100)   uint16 tilt-limit trips
+  uint8 matrix view   uint8 matrix flags   uint8 error on the matrix (0-9, 255 = none)
 ```
+
+### EEPROM 56-65 (firmware 1.8)
+
+| Address | Content |
+|---|---|
+| 56 | 0xA6 = this block is valid |
+| 57, 58 | Matrix view, matrix flags |
+| 59, 60 | Sensor flags, tilt limit (degrees) |
+| 61-62, 63-64 | Level offsets for roll and pitch, int16 ×100, big-endian |
+| 65 | Baud-rate index that last worked (9600, 115200, 230400, 57600, 38400, 19200, 4800) |
+
+They are written when the setting changes, not by `[sav]`, so the SMC3 tuning stays untouched.
 
 RSTSR2 bit0 (CWSF) reads 0 after a real power-on, or after a supply dip deep enough to restart the chip. The
 firmware sets it to 1 at boot, so a later reset by the button, an upload or the WiFi/USB chip reads 1. The first

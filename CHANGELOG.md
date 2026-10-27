@@ -3,6 +3,35 @@
 `smc3_scope` (the page) and `SMC3_R4` (the firmware) are versioned separately. The page works with older
 firmware too; the notes say which firmware a feature needs.
 
+## Page 1.9.1 + firmware 1.8.1
+
+The first published 1.9 / 1.8. (Firmware 1.8 stopped in the Arduino IDE with "'GlyphDef' does not name a
+type"; 1.8.1 fixes that, and the automatic test now compiles the firmware with Arduino's own tools on every push.)
+
+
+- **LED matrix redone** (firmware 1.8). The status dots are gone. After the IP address the matrix shows live
+  **motor bars**, with a dot blinking where a lagging motor should be. With the motion sensor it can show a
+  **seat horizon** instead, or stay **quiet**. While SimHub is idle it runs a slow **oscilloscope trace**.
+- **Problems scroll in words**: `ERROR E3 MOTOR 3 CUTOFF`, `ERROR E9 NO WIFI` and so on, again and again while they
+  last. A motor switched off on purpose is no longer shown as an error. Help lists every code with what to do.
+- **WT901C motion sensor**, set up in Settings, Motion sensor, with no recompiling:
+  - switch it on, set the mounting (swap, invert), **Level now**;
+  - a **tilt limit** that stops every motor if the seat tilts past it (`ERROR E4 TILT LIMIT`);
+  - **Set sensor to 100 Hz** (the factory setting is 10 Hz). The board finds the sensor's baud rate by itself.
+- **Seat angle chart** in Live Graphs: roll and pitch in degrees, the range reached, the fastest movement, and a
+  small horizon.
+- **Diagnostics with the sensor:**
+  - the full check measures the seat's own response to each step: degrees per count, **bounce** (flex) and
+    **play** in the linkage;
+  - findings for a silent, slow, garbled or unlevelled sensor;
+  - tilt-limit trips and a lost sensor are recorded as problems.
+- **Load map**: while SimHub drives, the page records where each motor falls behind or runs at full power, each
+  way. It tells you, for example, that motor 1 struggles lifting above pot 600, which is what a heavy driver does.
+  It works from the pots alone, and adds the seat's angle with the sensor.
+- **Auto-tune watches the seat** when the sensor sends: the seat's own overshoot and ringing count, so it won't pick
+  a Kp that keeps the motor calm but makes the frame bounce.
+- **Simulator:** a seat with a sensor (`--imu`), plus `--flex`, `--slop`, `--heavy` and `--imu-lost-at`.
+
 ## Page 1.8.1 (firmware unchanged at 1.7)
 
 - A single glitchy pot reading no longer distorts step measurements, so the full check doesn't report a false

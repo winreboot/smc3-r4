@@ -1,5 +1,5 @@
 """
-Simulated SMC3_R4 board (firmware 1.7, or 1.3-1.6 behaviour with --fw) - try smc3_scope without a rig, and
+Simulated SMC3_R4 board (firmware 1.8, or 1.3-1.7 behaviour with --fw) - try smc3_scope without a rig, and
 test its tuning and diagnostics against known faults.
 
   python3 tools/simboard.py 4210 --tuned            then:  python3 scope/smc3_scope.py --host 127.0.0.1
@@ -20,7 +20,17 @@ Same TCP protocol, telemetry and control law as the firmware; worm-geared motor 
   --reboot-at SEC      board restarts SEC seconds after start (cold start, connection dropped)
   --pwmmax0 M          motor M starts with PWMmax 0 (as after an auto-tune safety stop)
   --hunt M             motor M starts with Kp 1600 (hunts at rest)
-  --fw N               13, 14, 15, 16 or 17 (default 17)
+  --fw N               13, 14, 15, 16, 17 or 18 (default 18)
+
+Motion sensor (firmware 1.8): a seat on three actuators - roll from motors 1 and 2, pitch from their average
+against motor 3, 0.03 degrees per count - and a WT901C on it (mounted 1.3/-0.8 degrees off level):
+  --imu HZ             sensor fitted, sending at HZ (10 = factory setting, 100 after "set to 100 Hz")
+  --imu-no-tx          the board's TX isn't wired to the sensor, so "set to 100 Hz" does nothing
+  --imu-lost-at SEC    the sensor goes quiet SEC seconds after start
+  --flex               bouncy seat: the frame flexes (4 Hz, little damping) instead of following stiffly
+  --slop M:COUNTS      play in motor M's linkage: the seat doesn't follow until the motor moves COUNTS
+  --heavy M            heavy load on motor M: lifting needs much more drive, the more the higher it is
+  --sensor-on          start with the sensor switched on in the board's settings
 """
 import argparse, math, random, socket, struct, threading, time
 
@@ -40,7 +50,14 @@ ap.add_argument("--simhub-after", type=float, default=0)
 ap.add_argument("--reboot-at", type=float, default=0)
 ap.add_argument("--pwmmax0", type=int, default=0)
 ap.add_argument("--hunt", type=int, default=0)
-ap.add_argument("--fw", type=int, default=17)
+ap.add_argument("--fw", type=int, default=18)
+ap.add_argument("--imu", type=float, default=0)
+ap.add_argument("--imu-no-tx", action="store_true")
+ap.add_argument("--imu-lost-at", type=float, default=0)
+ap.add_argument("--flex", action="store_true")
+ap.add_argument("--slop", default="")
+ap.add_argument("--heavy", type=int, default=0)
+ap.add_argument("--sensor-on", action="store_true")
 ap.add_argument("--tuned", action="store_true", help="start with sane settings (Kp 250, Ki 0, Kd 0, PWMmin 30, dead zone 2)")
 args = ap.parse_args()
 
@@ -56,6 +73,13 @@ if args.swap_motors:
 if args.swap_pots:
     a, b = [int(x) - 1 for x in args.swap_pots.split(",")]
     potmap[a], potmap[b] = b, a
+SLOP = [0.0, 0.0, 0.0]
+if args.slop:
+    m_, c_ = args.slop.split(":")
+    SLOP[int(m_) - 1] = float(c_)
+DEG_PER_COUNT = 0.03
+SENSOR_OFFSET = (1.3, -0.8)                   # the sensor isn't mounted perfectly level
+BAUDS = [9600, 115200, 230400, 57600, 38400, 19200, 4800]
 
 
 class Phys:                                   # the motor + linkage + pot
@@ -63,6 +87,18 @@ class Phys:                                   # the motor + linkage + pot
         self.i = i
         self.x = 512.0 + random.uniform(-30, 30); self.v = 0.0; self.dl = 0.0; self.drive = 0.0; self.brake = True
         self.pot_x = self.x                       # where the pot thinks it is (differs only with --slip)
+        self.link = self.x                        # where the seat's end of the linkage is (differs with --slop)
+
+
+class Seat:                                   # the seat on the three linkages, and the sensor on it
+    def __init__(self):
+        self.roll = self.pitch = 0.0; self.vr = self.vp = 0.0
+        self.rate = args.imu; self.baud = 9600 if args.imu <= 20 else 115200
+        self.last_out = 0.0; self.out = None      # last sensor reading (raw roll, raw pitch, yaw)
+        self.packets = 0; self.bad = 0; self.found_at = None
+
+
+SEAT = Seat()
 
 
 class Chan:                                   # the firmware's per-motor state
@@ -93,9 +129,13 @@ P = [Phys(i) for i in range(3)]
 
 def boot(cold=True):
     """Power-up: params from 'EEPROM', motors enabled, counters reset."""
-    global C, power_scale, last_target_t, t0, fshift, frate, usb, eeprom, reset_flags
+    global C, power_scale, last_target_t, t0, fshift, frate, usb, eeprom, reset_flags, board
     C = [Chan(i) for i in range(3)]
     fshift, frate = 6, 0
+    # 1.8 board settings (EEPROM 56-65), sensor and matrix state
+    board = {"view": 0, "lflags": 3, "sflags": 1 if args.sensor_on else 0, "tilt": 0, "lv_r": 0, "lv_p": 0,
+             "baud_idx": 0, "tilt_hits": 0, "tilt_trips": 0, "grace": time.time() + 1.5, "last_pos": time.time(),
+             "setup_until": 0.0, "scan_until": 0.0}
     first = eeprom is None
     if first:                                 # very first power-up: defaults (+ --hunt) become the saved values
         if args.tuned:
@@ -105,12 +145,17 @@ def boot(cold=True):
         if args.hunt:
             h = C[args.hunt - 1]
             h.kp, h.ki, h.kd, h.dz, h.pwmmin = 2600, 0, 0, 0, 90
-        eeprom = bytearray(64)
+        eeprom = bytearray(72)
         save_eeprom()
         if args.pwmmax0:                      # running-only, like auto-tune's safety stop
             C[args.pwmmax0 - 1].pwmmax = 0
     else:
         load_eeprom()
+    if eeprom[56] == 0xA6:
+        board.update(view=eeprom[57], lflags=eeprom[58], sflags=eeprom[59] & 15, tilt=eeprom[60],
+                     lv_r=struct.unpack(">h", bytes(eeprom[61:63]))[0], lv_p=struct.unpack(">h", bytes(eeprom[63:65]))[0],
+                     baud_idx=eeprom[65] % 7)
+    SEAT.found_at = None; SEAT.packets = 0
     for c in C:
         p = P[potmap[c.i]]
         c.fb_q = int(p.pot_x * 16); c.lastpos = c.fb_q
@@ -140,6 +185,68 @@ def save_eeprom():
     e[50], e[51], e[52] = 1, 25, 25
     if args.fw >= 16:
         e[53], e[54], e[55] = fshift, frate // 100, 0x5A
+
+
+def save_board():
+    e = eeprom
+    e[57], e[58], e[59], e[60] = board["view"], board["lflags"], board["sflags"], board["tilt"]
+    e[61:63] = struct.pack(">h", board["lv_r"]); e[63:65] = struct.pack(">h", board["lv_p"])
+    e[65] = board["baud_idx"]; e[56] = 0xA6
+
+
+def sensor_fresh(now):
+    return SEAT.out is not None and now - SEAT.last_out < 0.5
+
+
+def seat_angles():
+    """Telemetry angles: levelled, then turned the way the sensor is mounted (board settings)."""
+    r = SEAT.out[0] - board["lv_r"] / 100.0
+    p = SEAT.out[1] - board["lv_p"] / 100.0
+    f = board["sflags"]
+    if f & 2: r, p = p, r
+    if f & 4: r = -r
+    if f & 8: p = -p
+    return r, p
+
+
+def matrix_error(now):
+    for i, c in enumerate(C):
+        if c.disabled and c.reason == 1: return i + 1
+    if any(c.disabled and c.reason == 4 for c in C): return 4
+    if (board["sflags"] & 1) and not sensor_fresh(now) and now - t0 > 8: return 5
+    return 255
+
+
+def sensor_tick(now):
+    """Called every 10 ms: the sensor sends at its rate; the board levels, turns and checks the tilt limit."""
+    if not args.imu or (args.imu_lost_at and now - started > args.imu_lost_at):
+        return
+    if SEAT.found_at is None:                 # the board tries baud rates until it finds the sensor
+        SEAT.found_at = now + (0.4 if BAUDS[board["baud_idx"]] == SEAT.baud else 1.6)
+        board["baud_idx"] = BAUDS.index(SEAT.baud)
+    if now < SEAT.found_at or now < board["setup_until"]:
+        return
+    if now - SEAT.last_out < 1.0 / SEAT.rate - 0.002:
+        return
+    q = lambda d: round(d * 32768 / 180) * 180 / 32768
+    SEAT.out = (q(SEAT.roll + SENSOR_OFFSET[0] + random.gauss(0, 0.015)),
+                q(SEAT.pitch + SENSOR_OFFSET[1] + random.gauss(0, 0.015)), q(37.5 + random.gauss(0, 0.05)))
+    SEAT.last_out = now; SEAT.packets += 3
+    lim = board["tilt"]
+    if (board["sflags"] & 1) and lim and now >= board["grace"]:
+        r, p = seat_angles()
+        if abs(r) > lim or abs(p) > lim:
+            board["tilt_hits"] += 1
+            if board["tilt_hits"] >= 3:
+                board["tilt_hits"] = 0
+                hit = False
+                for c in C:
+                    if not c.disabled: c.disabled, c.reason, hit = True, 4, True
+                if hit: board["tilt_trips"] += 1
+        else:
+            board["tilt_hits"] = 0
+    else:
+        board["tilt_hits"] = 0
 
 
 def load_eeprom():
@@ -213,6 +320,8 @@ def phys_tick(p, d, brake):
     if args.oneway == p.i + 1 and d < 0: d = 0.0
     p.dl += (d - p.dl) * DT / (0.035 if args.hunt == p.i + 1 else TLAG)   # --hunt: sluggish drive -> limit cycle
     fr = FRIC_UP if p.dl > 0 else FRIC_DN
+    if args.heavy == p.i + 1 and p.dl > 0:   # --heavy: lifting this corner needs a lot more, worse near the top
+        fr = 0.22 + 0.30 * max(0.0, (p.x - 560) / 300.0)
     deff = math.copysign(max(0.0, abs(p.dl) - fr), p.dl) if p.dl != 0 else 0.0
     if brake or deff == 0.0:
         p.v += -p.v * DT / 0.012
@@ -223,6 +332,21 @@ def phys_tick(p, d, brake):
     if p.x > 993: p.x, p.v = 993.0, 0.0
     if args.slip != p.i + 1:
         p.pot_x = p.x
+    h = SLOP[p.i] / 2.0                       # --slop: the linkage only follows once the play is taken up
+    p.link = min(max(p.link, p.x - h), p.x + h)
+
+
+def seat_tick():
+    """Seat angle from the linkages: stiff (follows within a few ms) or, with --flex, a bouncy spring."""
+    x1, x2, x3 = (P[i].link for i in range(3))
+    roll_t = DEG_PER_COUNT * (x1 - x2) / 2.0
+    pitch_t = DEG_PER_COUNT * ((x1 + x2) / 2.0 - x3)
+    wn, z = (2 * math.pi * 4.0, 0.12) if args.flex else (2 * math.pi * 22.0, 0.8)
+    for ang, vel, tgt in (("roll", "vr", roll_t), ("pitch", "vp", pitch_t)):
+        a, v = getattr(SEAT, ang), getattr(SEAT, vel)
+        acc = wn * wn * (tgt - a) - 2 * z * wn * v
+        v += acc * DT; a += v * DT
+        setattr(SEAT, ang, a); setattr(SEAT, vel, v)
 
 
 samples = []
@@ -252,12 +376,22 @@ def sim_loop():
                 for i in range(3):
                     d, br = out[i]
                     phys_tick(P[drvmap[i]], d, br)
-            ms = int((time.time() - t0) * 1000)
+                seat_tick()
+            now = time.time()
+            sensor_tick(now)
+            ms = int((now - t0) * 1000)
             status = 16 + sum((1 << i) for i, c in enumerate(C) if c.disabled)
             body = struct.pack("<I", ms & 0xFFFFFFFF)
             for c in C:
                 body += struct.pack("<hhhh", c.target, c.goal_q, c.fb_q, c.pid_q)
-            body += struct.pack("<BBhhhH", status, power_scale, 0, 0, 0, 70)
+            if args.fw >= 18 and sensor_fresh(now):
+                r, p = seat_angles()
+                cl = lambda v: max(-32767, min(32767, int(v * 100)))
+                body += struct.pack("<BBhhhH", status, power_scale, cl(r), cl(p), cl(SEAT.out[2]), 70)
+            elif args.fw >= 18:
+                body += struct.pack("<BBhhhH", status, power_scale, -32768, -32768, -32768, 70)
+            else:
+                body += struct.pack("<BBhhhH", status, power_scale, 0, 0, 0, 70)
             samples.append(body)
             if len(samples) > 50: del samples[:-50]
         sl = nxt - time.time()
@@ -278,10 +412,13 @@ def fake_simhub():
         with lock:
             for i, c in enumerate(C):
                 v = 512 + 120 * math.sin(t * (0.7 + 0.3 * i)) + 25 * math.sin(t * 7.3 + i)
+                if args.heavy:                    # a bit more travel, so the heavy corner reaches its hard part
+                    v = 512 + 200 * math.sin(t * (0.7 + 0.3 * i)) + 25 * math.sin(t * 7.3 + i)
                 c.target = int(max(c.clip, min(1023 - c.clip, v)))
                 usb["tgt"] += 1; usb["ok"] += 1
             usb["last"] = usb["last_tgt"] = t
             last_target_t = t
+            board["last_pos"] = t
 
 
 def reply2(code, a, b): return b"[" + code.encode() + bytes([a & 255, b & 255]) + b"]"
@@ -293,12 +430,32 @@ def diag_frame():
     ms = int((now - t0) * 1000)
     since = lambda x: 65535 if not x else min(65535, int((now - x) * 1000))
     pl = struct.pack("<I3BB4I2HIbBB", ms, *reset_flags, 1, usb["ok"], usb["tgt"], usb["bad"], usb["tcp"],
-                     since(usb["last"]), since(usb["last_tgt"]), random.randint(800, 4000), -58, 2 | 8, 17)
+                     since(usb["last"]), since(usb["last_tgt"]), random.randint(800, 4000), -58,
+                     (2 | 4 | 8) if args.fw >= 18 else (2 | 8), min(args.fw, 18))
     for c in C:
         pl += struct.pack("<BHhHHHH", c.reason, c.trips, c.trip_at, c.jumps, min(65535, c.jmax), c.fmin, c.fmax)
         c.jmax, c.fmin, c.fmax = 0, c.fb_q, c.fb_q
-    pl += bytes([64]) + bytes(eeprom)
-    return b"SM3D" + bytes([1, len(pl)]) + pl
+    if args.fw < 18:
+        pl += bytes([64]) + bytes(eeprom[:64])
+        return b"SM3D" + bytes([1, len(pl)]) + pl
+    pl += bytes([72]) + bytes(eeprom[:72])
+    fresh = sensor_fresh(now)
+    raw = SEAT.out or (0.0, 0.0, 0.0)
+    cl = lambda v: max(-32767, min(32767, int(v * 100)))
+    age = 65535 if SEAT.out is None else min(65535, int((now - SEAT.last_out) * 1000))
+    rate = int(SEAT.rate) if fresh else 0
+    pl += struct.pack("<BBBIHIHHhhhhhHBBB", sensor_state(now), board["tilt"], board["baud_idx"], BAUDS[board["baud_idx"]],
+                      rate, SEAT.packets, SEAT.bad, age, cl(raw[0]), cl(raw[1]), cl(raw[2]), board["lv_r"], board["lv_p"],
+                      board["tilt_trips"], board["view"], board["lflags"], matrix_error(now))
+    return b"SM3D" + bytes([2, len(pl)]) + pl
+
+
+def sensor_state(now):
+    v = board["sflags"] & 15
+    if sensor_fresh(now): v |= 0x10
+    if SEAT.out is not None and now - SEAT.last_out < 3: v |= 0x20
+    if now < board["setup_until"]: v |= 0x40
+    return v
 
 
 def handle_cmd(c, a, b, out):
@@ -310,6 +467,22 @@ def handle_cmd(c, a, b, out):
             ch = C["ABC".index(c)]
             ch.target = max(ch.clip, min(1023 - ch.clip, w))
             if args.fw >= 14: last_target_t = time.time()
+            board["last_pos"] = time.time()
+        elif c == "l" and args.fw >= 18:
+            if a <= 2: board["view"], board["lflags"] = a, b; save_board()
+        elif c == "i" and args.fw >= 18:
+            now = time.time()
+            if a < 16:
+                board["sflags"], board["tilt"] = a, min(b, 60); save_board()
+            elif a == ord("L") and sensor_fresh(now):
+                board["lv_r"], board["lv_p"] = int(SEAT.out[0] * 100), int(SEAT.out[1] * 100); save_board()
+            elif a == ord("C"):
+                board["lv_r"] = board["lv_p"] = 0; save_board()
+            elif a == ord("S") and args.imu:
+                board["setup_until"] = now + 1.2       # nine commands, 120 ms apart
+                if not args.imu_no_tx:
+                    SEAT.rate, SEAT.baud = {6: 10, 7: 20, 8: 50, 9: 100, 11: 200}.get(b or 9, 100), 115200
+                    board["baud_idx"] = 1; save_board()
         elif c in "DEF": C["DEF".index(c)].kp = w
         elif c in "GHI": ch = C["GHI".index(c)]; ch.ki = w; ch.update_ilim()
         elif c in "JKL": C["JKL".index(c)].kd = w
@@ -331,6 +504,7 @@ def handle_cmd(c, a, b, out):
             if b == ord("a"):
                 for ch in C: ch.disabled, ch.reason = False, 0
             elif ord("1") <= b <= ord("3"): C[b - ord("1")].disabled, C[b - ord("1")].reason = False, 0
+            board["grace"] = time.time() + 1.5
         elif c == "r" and a == ord("d"):
             k = chr(b)
             if k in "DEF": out.append(replyw(k, C["DEF".index(k)].kp))
@@ -343,7 +517,10 @@ def handle_cmd(c, a, b, out):
             elif k == "Y": out.append(reply2("Y", 16 + sum((1 << i) for i, ch in enumerate(C) if ch.disabled), 0))
             elif k == "~": out.append(reply2("~", 25, 25))
             elif k == "$": out.append(replyw("$", 70))
-            elif k == "!" and args.fw >= 14: out.append(reply2("!", 2 | 8 if args.fw >= 17 else 0, args.fw))
+            elif k == "!" and args.fw >= 14:
+                out.append(reply2("!", (2 | 4 | 8) if args.fw >= 18 else (2 | 8) if args.fw >= 17 else 0, args.fw))
+            elif k == "l" and args.fw >= 18: out.append(reply2("l", board["view"], board["lflags"]))
+            elif k == "i" and args.fw >= 18: out.append(reply2("i", sensor_state(time.time()), board["tilt"]))
             elif k == "f" and args.fw >= 16: out.append(reply2("f", fshift, frate // 100))
             elif k == "d" and args.fw >= 17: out.append(diag_frame())
 

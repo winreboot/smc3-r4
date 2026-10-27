@@ -5,6 +5,8 @@ Smoke test: start simulated rigs and the page, run diagnostics, check the result
 
 1. A healthy rig: quick and full check must find no problems.
 2. A rig with motor 2 wired backwards: the full check must say so and leave motor 2 switched off.
+3. A rig with a WT901C at its factory 10 Hz (firmware 1.8): the page finds it, switches it on, sets it to 100 Hz,
+   and the quick check is clean.
 """
 import json, os, subprocess, sys, tempfile, time, urllib.request as u
 
@@ -85,6 +87,18 @@ try:
     check(any("WRONG way" in t for t in problems(s)), f"reversed motor 2 found: {problems(s)}")
     time.sleep(1)
     check(get(base2, "/data?since=0")["samples"][-1]["dis"] == [False, True, False], "motor 2 left off, 1 and 3 back on")
+    sim3, scope3, base3 = start(4712, 8712, "--imu", "10")
+    procs += [sim3, scope3]
+    bs = get(base3, "/board/settings")
+    check(bs["ok"] and bs["sensor"]["receiving"] and bs["sensor"]["angles_per_s"] == 10, "sensor found at 10 Hz")
+    r = post(base3, "/board/sensor", {"on": True, "tilt": 12})
+    check(r["sensor"]["switched_on"] and r["sensor"]["tilt_limit_deg"] == 12, "sensor switched on, tilt limit 12")
+    r = post(base3, "/board/sensor/action", {"action": "setup"})
+    time.sleep(2)
+    check(get(base3, "/board/settings")["sensor"]["angles_per_s"] == 100, "sensor set to 100 Hz")
+    check(get(base3, "/data?since=0")["samples"][-1]["roll"] is not None, "seat angles in the telemetry")
+    s = run_check(base3, "quick")
+    check(s["state"] == "done" and not problems(s), f"rig with sensor, quick check: no problems {problems(s)}")
 finally:
     for p in procs:
         p.terminate()

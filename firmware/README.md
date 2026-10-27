@@ -16,7 +16,11 @@ What the R4 hardware adds:
 - **Target smoothing and max speed**: a low-pass filter and an optional speed limit on SimHub's steps. Both are
   settings since 1.6.
 - **A fixed PID**: a real integrator with anti-windup, and a filtered derivative taken on the measured position.
-- **LED matrix**: a tracking view, drive bars, fault codes, the IP address, and an optional IMU bubble level.
+- **LED matrix**: the IP address at power-up, then live motor bars (or a seat horizon with the motion sensor), an
+  oscilloscope trace while idle, and problems scrolled in words: `ERROR E3 MOTOR 3 CUTOFF`.
+- **Motion sensor (optional)**: a WitMotion WT901C on Serial1 gives the seat's real angles, a tilt-limit safety
+  cut-off and the seat's own movement for auto-tune and diagnostics. It is switched on and set up from the page,
+  with no recompiling.
 - **WiFi telemetry** at 100 samples a second to `smc3_scope`, plus live tuning and diagnostics. See
   [docs/PROTOCOL.md](../docs/PROTOCOL.md).
 
@@ -36,8 +40,10 @@ What the R4 hardware adds:
 | `TARGET_SMOOTH_SHIFT` | 6 (16 ms) | Default target smoothing: 4 = 4 ms … 8 = 64 ms, 0 = off. It's a setting since 1.6. |
 | `TARGET_MAX_RATE` | 0 (off) | Default max speed in counts per second. It's a setting since 1.6. |
 | `D_FILTER_SHIFT` | 3 | Low-pass filter on the derivative term. |
-| `LED_MATRIX`, `LED_VIEW`, `LED_FPS` | 1, 0, 20 | Use the matrix, choose the tracking view (0) or IMU bubble (1), set the refresh rate. |
-| `IMU_SERIAL1`, `IMU_BAUD` | 0, 115200 | Read a WitMotion WT901C on Serial1 (D0), through a MAX3232 for the RS-232 version. |
+| `LED_MATRIX`, `LED_FPS` | 1, 20 | Use the matrix; refresh rate. |
+| `LED_DEFAULT_VIEW`, `LED_DEFAULT_FLAGS` | 0, 3 | What a board that was never set shows: motor bars, idle trace on, address every minute. The page's Settings change it. |
+| `LED_IDLE_AFTER_MS`, `LED_HORIZON_DEG` | 20000, 10 | When the idle trace starts; how many degrees move the seat horizon to the edge. |
+| `IMU_PORT` | 1 | Listen for a WT901C on Serial1 (D0 RX, D1 TX). 0 leaves D0/D1 free. |
 | `ENABLE_WIFI` | 1 | 0 = no networking: a plain, faster SMC3. |
 | `WIFI_SSID`, `WIFI_PASS`, `WIFI_HOSTNAME` | placeholders, `smc3-r4` | Your network. |
 | `TELEMETRY_PORT` | 4210 | TCP port the page connects to. |
@@ -45,28 +51,54 @@ What the R4 hardware adds:
 
 ### LED matrix
 
-- **Boot:** "R4", then the IP address scrolls. It repeats every minute while no page is connected.
-- **WiFi errors:**
-  - **E0**: the WiFi module isn't answering.
-  - **E9**: the board can't join the network (wrong name or password, or a 5 GHz-only or WPA3-only network).
-  - **E8**: the board joined, but the router hasn't given it an address yet.
-- **E1 / E2 / E3**: that motor is off, either because its safety cutoff tripped or because Disable Motors was
-  pressed. **Enable Motors** re-arms it.
-- **Tracking view:** for each motor, a row showing where it's being sent above a row showing where it is, then
-  the drive bars.
-- **Bottom row**, left to right:
-  1. commands arriving;
-  2. comms timeout (low power);
-  3. motors on (three dots);
-  4. loop overrun;
-  5. IMU;
-  6. WiFi (solid = page connected, blinking = WiFi up);
-  7. heartbeat.
+One thing at a time, readable from across the room. The previews are rendered from the firmware's own drawing
+code.
+
+| | |
+|---|---|
+| <img src="../docs/img/matrix-boot.gif" width="250" alt="Boot"> | **Power-up:** "R4" while WiFi connects, then the IP address scrolls. It repeats every minute while the page isn't connected (Settings can turn that off). |
+| <img src="../docs/img/matrix-bars.gif" width="250" alt="Motor bars"> | **Motor bars** (default): each motor's position, live. The two columns of a bar differ by half a pixel between steps. A dot **blinks where a motor should be** when it falls well behind - here motor 2 gets stuck for a moment. |
+| <img src="../docs/img/matrix-horizon.gif" width="250" alt="Seat horizon"> | **Seat horizon** (motion sensor): the edge moves up with the seat's front and tilts with its roll. Without sensor data it shows the motor bars. |
+| <img src="../docs/img/matrix-idle.gif" width="250" alt="Idle trace"> | **Idle:** after 20 s without position commands, the motor-bars view becomes a slow oscilloscope trace. |
+| <img src="../docs/img/matrix-motor-off.gif" width="250" alt="Motor off"> | **A motor switched off on purpose** (Disable Motors, or not in use) is a dash at the bottom - not an error. |
+| <img src="../docs/img/matrix-error-cutoff.gif" width="250" alt="Cutoff error"> | **Problems scroll in words**, again and again while they last, with a moment of the view in between. A motor stopped by its cutoff blinks full height. |
+| <img src="../docs/img/matrix-error-tilt.gif" width="250" alt="Tilt limit"> | **Tilt limit** (motion sensor): the seat pitched past the limit, every motor stopped, `ERROR E4 TILT LIMIT`. |
+| <img src="../docs/img/matrix-error-wifi.gif" width="250" alt="No WiFi"> | **No WiFi**: `ERROR E9 NO WIFI` every few seconds; the motor bars carry on in between, because SimHub over USB still works. |
+
+| Code | Scrolls | Meaning |
+|---|---|---|
+| E1, E2, E3 | `ERROR E1 MOTOR 1 CUTOFF` | That motor's pot went past its safety cutoff; the motor is off until Enable Motors. |
+| E4 | `ERROR E4 TILT LIMIT` | The motion sensor saw the seat tilt past the tilt limit; every motor stopped. |
+| E5 | `ERROR E5 NO SENSOR` | The sensor is switched on, but nothing arrives from it. |
+| E9 | `ERROR E9 NO WIFI` | Can't join the network, or WiFi dropped (retries every 30 s while SimHub is idle). |
+| E8 | `ERROR E8 NO IP ADDRESS` | Joined, but the router hasn't given an address yet. |
+| E0 | `ERROR E0 WIFI MODULE` | The WiFi chip doesn't answer. |
+
+The page's Help section says what to do for each. E0, E8 and E9 only affect the page: SimHub over USB keeps working.
+
+### Motion sensor (WT901C)
+
+<img src="../docs/img/sensor-wiring.svg" width="720" alt="Sensor wiring">
+
+The **-232** version of the WT901C talks at RS-232 levels: it goes through a MAX3232 module, never straight to
+D0/D1. The board tries the usual baud rates until the sensor answers, levels and turns the angles the way the
+page's settings say, and sends them with every telemetry sample. With **Use the sensor** ticked in the page, a
+silent sensor scrolls `ERROR E5 NO SENSOR`, and the **tilt limit** works: three readings in a row past it stop
+every motor. The check pauses for 1.5 s after Enable Motors, so the seat can come back first.
+
+**Set sensor to 100 Hz** in the page sends the WitMotion set-up (unlock, output angles only, 100 Hz, 115200
+baud, save) through D1. It leaves the factory at 10 Hz, 9600 baud. If SimHub also
+reads the sensor, wire only TX and GND to the MAX3232 and set it up in WitMotion's PC software instead.
+
+The sensor and matrix settings live on the board (EEPROM 56-65) and are saved as soon as they change, separately
+from the SMC3 tuning.
 
 ### Versions
 
 | Version | Change |
 |---|---|
+| 1.8.1 | Compiles in the Arduino IDE (1.8 didn't). Same features. |
+| 1.8 | LED matrix redone (motor bars, seat horizon, idle trace, problems in words). WT901C sensor at run time: `[i..]` on/off, mounting, level, tilt limit, set to 100 Hz; `[l..]` matrix view. `[rdd]` frame version 2 adds the sensor and matrix state. |
 | 1.7 | `[rdd]` diagnostics frame (reset cause, USB counters, glitch counts, why motors are off, EEPROM copy). `[rd!]` reports the build options. |
 | 1.6 | Smoothing and max speed are settings (`[f a b]`, `[rdf]`) saved to EEPROM. |
 | 1.5 | `[dis]` and `[di1]`–`[di3]` software stop. |

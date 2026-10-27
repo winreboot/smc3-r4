@@ -20,6 +20,33 @@ jobs:
       - name: Quick and full diagnostics against simulated rigs
         run: uv run --no-project --python ${{ matrix.python }} python tools/smoke_test.py
 
+  firmware:
+    name: Firmware compiles (${{ matrix.board }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - board: UNO R4 WiFi
+            fqbn: arduino:renesas_uno:unor4wifi
+            platform: arduino:renesas_uno
+            sketch: firmware/SMC3_R4
+          - board: UNO R3
+            fqbn: arduino:avr:uno
+            platform: arduino:avr
+            sketch: firmware/SMC3_smooth
+    steps:
+      - uses: actions/checkout@v4
+      - uses: arduino/compile-sketches@v1   # Arduino's own build, prototypes and all - as in the IDE
+        with:
+          fqbn: ${{ matrix.fqbn }}
+          platforms: |
+            - name: ${{ matrix.platform }}
+          sketch-paths: |
+            - ${{ matrix.sketch }}
+          libraries: '[]'
+          enable-warnings-report: true
+
   docker:
     name: Docker image builds
     runs-on: ubuntu-latest
