@@ -1,5 +1,5 @@
 """
-Simulated SMC3_R4 board (firmware 1.8, or 1.3-1.7 behaviour with --fw) - try smc3_scope without a rig, and
+Simulated SMC3_R4 board (firmware 1.9, or 1.3-1.8 behaviour with --fw) - try smc3_scope without a rig, and
 test its tuning and diagnostics against known faults.
 
   python3 tools/simboard.py 4210 --tuned            then:  python3 scope/smc3_scope.py --host 127.0.0.1
@@ -20,7 +20,7 @@ Same TCP protocol, telemetry and control law as the firmware; worm-geared motor 
   --reboot-at SEC      board restarts SEC seconds after start (cold start, connection dropped)
   --pwmmax0 M          motor M starts with PWMmax 0 (as after an auto-tune safety stop)
   --hunt M             motor M starts with Kp 1600 (hunts at rest)
-  --fw N               13, 14, 15, 16, 17 or 18 (default 18)
+  --fw N               13, 14, 15, 16, 17, 18 or 19 (default 19)
 
 Motion sensor (firmware 1.8): a seat on three actuators - roll from motors 1 and 2, pitch from their average
 against motor 3, 0.03 degrees per count - and a WT901C on it (mounted 1.3/-0.8 degrees off level):
@@ -31,6 +31,11 @@ against motor 3, 0.03 degrees per count - and a WT901C on it (mounted 1.3/-0.8 d
   --slop M:COUNTS      play in motor M's linkage: the seat doesn't follow until the motor moves COUNTS
   --heavy M            heavy load on motor M: lifting needs much more drive, the more the higher it is
   --sensor-on          start with the sensor switched on in the board's settings
+
+Seat set-up (firmware 1.9):
+  --seat-tilt R:P      the seat isn't level with every motor at 512: R degrees roll, P degrees pitch
+  --stops M:LO:HI      motor M hits a mechanical stop at pot LO and HI (default 30 and 993 for every motor)
+  --seat-setup         start with a saved seat set-up (level trims, travel limits, end stops, tilt limits)
 """
 import argparse, math, random, socket, struct, threading, time
 
@@ -50,7 +55,7 @@ ap.add_argument("--simhub-after", type=float, default=0)
 ap.add_argument("--reboot-at", type=float, default=0)
 ap.add_argument("--pwmmax0", type=int, default=0)
 ap.add_argument("--hunt", type=int, default=0)
-ap.add_argument("--fw", type=int, default=18)
+ap.add_argument("--fw", type=int, default=19)
 ap.add_argument("--imu", type=float, default=0)
 ap.add_argument("--imu-no-tx", action="store_true")
 ap.add_argument("--imu-lost-at", type=float, default=0)
@@ -58,6 +63,9 @@ ap.add_argument("--flex", action="store_true")
 ap.add_argument("--slop", default="")
 ap.add_argument("--heavy", type=int, default=0)
 ap.add_argument("--sensor-on", action="store_true")
+ap.add_argument("--seat-tilt", default="")
+ap.add_argument("--stops", action="append", default=[])
+ap.add_argument("--seat-setup", action="store_true")
 ap.add_argument("--tuned", action="store_true", help="start with sane settings (Kp 250, Ki 0, Kd 0, PWMmin 30, dead zone 2)")
 args = ap.parse_args()
 
@@ -79,6 +87,11 @@ if args.slop:
     SLOP[int(m_) - 1] = float(c_)
 DEG_PER_COUNT = 0.03
 SENSOR_OFFSET = (1.3, -0.8)                   # the sensor isn't mounted perfectly level
+SEAT_TILT = tuple(float(x) for x in args.seat_tilt.split(":")) if args.seat_tilt else (0.0, 0.0)
+STOPS = [[30.0, 993.0] for _ in range(3)]     # mechanical ends of each motor's travel (pot counts)
+for st_ in args.stops:
+    m_, lo_, hi_ = st_.split(":")
+    STOPS[int(m_) - 1] = [float(lo_), float(hi_)]
 BAUDS = [9600, 115200, 230400, 57600, 38400, 19200, 4800]
 
 
@@ -96,6 +109,9 @@ class Seat:                                   # the seat on the three linkages, 
         self.rate = args.imu; self.baud = 9600 if args.imu <= 20 else 115200
         self.last_out = 0.0; self.out = None      # last sensor reading (raw roll, raw pitch, yaw)
         self.packets = 0; self.bad = 0; self.found_at = None
+        self.all = True                           # factory: acceleration, gyro and angles; [iS 0] = angles only
+        self.acc = (0, 0, 2048); self.gyro = (0, 0, 0); self.acc_t = 0.0; self.acc_n = 0; self.peak = 0
+        self.vr_prev = 0.0; self.vp_prev = 0.0
 
 
 SEAT = Seat()
@@ -111,7 +127,22 @@ class Chan:                                   # the firmware's per-motor state
         self.cum = 0; self.ilim = 0; self.lastpos = 512 << 4; self.dterm = 0; self.kdcnt = 0
         self.disabled = True; self.reason = 3; self.fb_q = 512 << 4; self.pid_q = 0
         self.trips = 0; self.trip_at = -1; self.jumps = 0; self.jmax = 0; self.fmin = 16383; self.fmax = 0
+        self.trim, self.tlo, self.thi, self.elo, self.ehi = 0, 0, 1023, 0, 1023     # 1.9 seat set-up
         self.update_ilim()
+
+    def window(self):                         # target limits in force: SMC3 clip and the travel limits (1.9)
+        lo, hi = max(self.clip, self.tlo), min(1023 - self.clip, self.thi)
+        return (self.clip, 1023 - self.clip) if hi < lo + 8 else (lo, hi)
+
+    def cut_window(self):                     # cutoff in force: SMC3 Max limit and the end stops (1.9)
+        lo, hi = max(self.cut, self.elo), min(1023 - self.cut, self.ehi)
+        return (self.cut, 1023 - self.cut) if hi < lo + 8 else (lo, hi)
+
+    def set_target(self, v):                  # SetTarget(): level trim, then the window (1.9)
+        if args.fw >= 19:
+            v += self.trim
+        lo, hi = self.window()
+        self.target = int(max(lo, min(hi, v)))
 
     def update_ilim(self):
         self.ilim = ((FULL << 13) // self.ki) if self.ki > 0 else 0
@@ -120,6 +151,10 @@ class Chan:                                   # the firmware's per-motor state
 lock = threading.Lock()
 TICKS = [0]
 SIMHUB = [False]                          # switched with [zs1] / [zs0] from any client (simulator only)
+HOLD = [0.0]                              # 1.9 [kH n]: SimHub's positions are ignored until then
+EXTRAS_ANY = [False]
+VREG = [0]                                # 1.9 [w hi lo]
+TILT4 = [0, 0, 0, 0]                      # 1.9 tilt limits x10: roll +, roll -, pitch +, pitch -
 state = {}
 
 
@@ -145,8 +180,13 @@ def boot(cold=True):
         if args.hunt:
             h = C[args.hunt - 1]
             h.kp, h.ki, h.kd, h.dz, h.pwmmin = 2600, 0, 0, 0, 90
-        eeprom = bytearray(72)
+        eeprom = bytearray(128)
         save_eeprom()
+        if args.seat_setup and args.fw >= 19:   # a seat set-up made earlier (Seat setup in the page)
+            for c, (tr, lo, hi) in zip(C, ((18, 140, 880), (-24, 150, 870), (6, 160, 860))):
+                c.trim, c.tlo, c.thi, c.elo, c.ehi = tr, lo, hi, lo - 15, hi + 15
+            TILT4[:] = [130, 130, 110, 110]
+            save_seat()
         if args.pwmmax0:                      # running-only, like auto-tune's safety stop
             C[args.pwmmax0 - 1].pwmmax = 0
     else:
@@ -155,12 +195,18 @@ def boot(cold=True):
         board.update(view=eeprom[57], lflags=eeprom[58], sflags=eeprom[59] & 15, tilt=eeprom[60],
                      lv_r=struct.unpack(">h", bytes(eeprom[61:63]))[0], lv_p=struct.unpack(">h", bytes(eeprom[63:65]))[0],
                      baud_idx=eeprom[65] % 7)
+    if args.fw >= 19:
+        load_seat()
     SEAT.found_at = None; SEAT.packets = 0
     for c in C:
         p = P[potmap[c.i]]
         c.fb_q = int(p.pot_x * 16); c.lastpos = c.fb_q
-        c.goal_acc = (max(c.clip, min(1023 - c.clip, int(p.pot_x))) << 12); c.goal_q = c.goal_acc >> 8
-        c.target = max(c.clip, min(1023 - c.clip, int(p.pot_x)))
+        lo, hi = c.window()
+        c.goal_acc = (max(lo, min(hi, int(p.pot_x))) << 12); c.goal_q = c.goal_acc >> 8
+        if args.fw >= 19 and any(ch.trim for ch in C):
+            c.set_target(512)                 # 1.9 with a seat set-up: the centre - the level seat
+        else:                                 # (simplified: the real board also heads for 512 without one)
+            c.target = max(lo, min(hi, int(p.pot_x)))
         c.disabled, c.reason = False, 0
     power_scale = 7
     last_target_t = 0.0
@@ -189,9 +235,49 @@ def save_eeprom():
 
 def save_board():
     e = eeprom
-    e[57], e[58], e[59], e[60] = board["view"], board["lflags"], board["sflags"], board["tilt"]
+    e[57], e[58], e[59], e[60] = board["view"], board["lflags"], board["sflags"], tilt_deg()
     e[61:63] = struct.pack(">h", board["lv_r"]); e[63:65] = struct.pack(">h", board["lv_p"])
     e[65] = board["baud_idx"]; e[56] = 0xA6
+
+
+def tilt_deg():                               # 1.8's single tilt limit: the tightest of the four (1.9)
+    if args.fw < 19:
+        return board["tilt"]
+    nz = [t for t in TILT4 if t > 0]
+    return min(90, max(1, (min(nz) + 5) // 10)) if nz else 0
+
+
+def seat_bytes():
+    b = b""
+    for c in C:
+        b += struct.pack(">5h", c.trim, c.tlo, c.thi, c.elo, c.ehi)
+    return b + struct.pack(">4h", *TILT4)
+
+
+def save_seat():                              # [kSV] / [sav]: EEPROM 66-104
+    eeprom[67:105] = seat_bytes(); eeprom[66] = 0xB9
+
+
+def clear_seat():
+    for c in C:
+        c.trim, c.tlo, c.thi, c.elo, c.ehi = 0, 0, 1023, 0, 1023
+
+
+def load_seat():                              # [kRL] and power-up; 1.8's single tilt limit as the fallback
+    clear_seat()
+    TILT4[:] = [board["tilt"] * 10] * 4
+    if eeprom[66] == 0xB9:
+        for i, c in enumerate(C):
+            c.trim, c.tlo, c.thi, c.elo, c.ehi = struct.unpack(">5h", bytes(eeprom[67 + 10 * i: 77 + 10 * i]))
+        TILT4[:] = struct.unpack(">4h", bytes(eeprom[97:105]))
+    for c in C:
+        lo, hi = c.window(); c.target = max(lo, min(hi, c.target))
+
+
+def seat_saved():
+    if eeprom[66] != 0xB9:
+        return all((c.trim, c.tlo, c.thi, c.elo, c.ehi) == (0, 0, 1023, 0, 1023) for c in C)
+    return bytes(eeprom[67:105]) == seat_bytes()
 
 
 def sensor_fresh(now):
@@ -231,11 +317,31 @@ def sensor_tick(now):
     q = lambda d: round(d * 32768 / 180) * 180 / 32768
     SEAT.out = (q(SEAT.roll + SENSOR_OFFSET[0] + random.gauss(0, 0.015)),
                 q(SEAT.pitch + SENSOR_OFFSET[1] + random.gauss(0, 0.015)), q(37.5 + random.gauss(0, 0.05)))
+    dt = max(1e-3, now - SEAT.last_out)
     SEAT.last_out = now; SEAT.packets += 3
+    if SEAT.all:                              # acceleration (g) and gyro (deg/s) as the sensor sends them, raw
+        rr, pp = math.radians(SEAT.out[0]), math.radians(SEAT.out[1])
+        ar = (SEAT.vr - SEAT.vr_prev) / dt; ap_ = (SEAT.vp - SEAT.vp_prev) / dt      # deg/s^2
+        SEAT.vr_prev, SEAT.vp_prev = SEAT.vr, SEAT.vp
+        lever = 0.35 / 9.81 * math.pi / 180.0                                          # 35 cm above the pivot
+        gx = math.sin(pp) + ap_ * lever + random.gauss(0, 0.004)
+        gy = -math.sin(rr) * math.cos(pp) - ar * lever + random.gauss(0, 0.004)
+        gz = math.cos(rr) * math.cos(pp) + random.gauss(0, 0.006)
+        cl = lambda v: max(-32767, min(32767, int(round(v))))
+        SEAT.acc = (cl(gx * 2048), cl(gy * 2048), cl(gz * 2048))
+        SEAT.gyro = (cl((SEAT.vr + random.gauss(0, 0.08)) * 16.384), cl((SEAT.vp + random.gauss(0, 0.08)) * 16.384),
+                     cl(random.gauss(0, 0.05) * 16.384))
+        SEAT.acc_t = now; SEAT.acc_n += 1; SEAT.packets += 0
+        SEAT.peak = max(SEAT.peak, int(abs(math.sqrt(gx * gx + gy * gy + gz * gz) - 1.0) * 1000))
     lim = board["tilt"]
+    if args.fw >= 19:
+        r, p = seat_angles()
+        past = ((TILT4[0] and r > TILT4[0] / 10.0) or (TILT4[1] and r < -TILT4[1] / 10.0)
+                or (TILT4[2] and p > TILT4[2] / 10.0) or (TILT4[3] and p < -TILT4[3] / 10.0))
+        lim = 1 if any(TILT4) else 0
     if (board["sflags"] & 1) and lim and now >= board["grace"]:
         r, p = seat_angles()
-        if abs(r) > lim or abs(p) > lim:
+        if (past if args.fw >= 19 else (abs(r) > lim or abs(p) > lim)):
             board["tilt_hits"] += 1
             if board["tilt_hits"] >= 3:
                 board["tilt_hits"] = 0
@@ -285,7 +391,8 @@ def chan_tick(c):
     if j > 16 * 16 and c.jumps < 65535: c.jumps += 1
     c.jmax = max(c.jmax, j); c.fmin = min(c.fmin, fb); c.fmax = max(c.fmax, fb)
     c.fb_q = fb
-    if fb > ((1023 - c.cut) << 4) or fb < (c.cut << 4):
+    clo, chi = c.cut_window() if args.fw >= 19 else (c.cut, 1023 - c.cut)
+    if fb > (chi << 4) or fb < (clo << 4):
         if not c.disabled:
             c.trips += 1; c.trip_at = fb >> 4; c.reason = 1
         c.disabled = True
@@ -328,8 +435,9 @@ def phys_tick(p, d, brake):
     else:
         p.v += (deff * VMAX - p.v) * DT / TAU
     p.x += p.v * DT
-    if p.x < 30: p.x, p.v = 30.0, 0.0
-    if p.x > 993: p.x, p.v = 993.0, 0.0
+    lo_, hi_ = STOPS[p.i]                     # mechanical ends (--stops)
+    if p.x < lo_: p.x, p.v = lo_, 0.0
+    if p.x > hi_: p.x, p.v = hi_, 0.0
     if args.slip != p.i + 1:
         p.pot_x = p.x
     h = SLOP[p.i] / 2.0                       # --slop: the linkage only follows once the play is taken up
@@ -339,8 +447,8 @@ def phys_tick(p, d, brake):
 def seat_tick():
     """Seat angle from the linkages: stiff (follows within a few ms) or, with --flex, a bouncy spring."""
     x1, x2, x3 = (P[i].link for i in range(3))
-    roll_t = DEG_PER_COUNT * (x1 - x2) / 2.0
-    pitch_t = DEG_PER_COUNT * ((x1 + x2) / 2.0 - x3)
+    roll_t = DEG_PER_COUNT * (x1 - x2) / 2.0 + SEAT_TILT[0]
+    pitch_t = DEG_PER_COUNT * ((x1 + x2) / 2.0 - x3) + SEAT_TILT[1]
     wn, z = (2 * math.pi * 4.0, 0.12) if args.flex else (2 * math.pi * 22.0, 0.8)
     for ang, vel, tgt in (("roll", "vr", roll_t), ("pitch", "vp", pitch_t)):
         a, v = getattr(SEAT, ang), getattr(SEAT, vel)
@@ -410,14 +518,18 @@ def fake_simhub():
             continue
         t = time.time()
         with lock:
+            held = args.fw >= 19 and t < HOLD[0]  # 1.9: the page holds the seat - SimHub's positions wait
             for i, c in enumerate(C):
                 v = 512 + 120 * math.sin(t * (0.7 + 0.3 * i)) + 25 * math.sin(t * 7.3 + i)
                 if args.heavy:                    # a bit more travel, so the heavy corner reaches its hard part
                     v = 512 + 200 * math.sin(t * (0.7 + 0.3 * i)) + 25 * math.sin(t * 7.3 + i)
-                c.target = int(max(c.clip, min(1023 - c.clip, v)))
+                if held:
+                    usb["held"] = usb.get("held", 0) + 1
+                else:
+                    c.set_target(int(v))
                 usb["tgt"] += 1; usb["ok"] += 1
             usb["last"] = usb["last_tgt"] = t
-            last_target_t = t
+            last_target_t = t                     # (held or not, like the firmware: SimHub is alive)
             board["last_pos"] = t
 
 
@@ -431,7 +543,7 @@ def diag_frame():
     since = lambda x: 65535 if not x else min(65535, int((now - x) * 1000))
     pl = struct.pack("<I3BB4I2HIbBB", ms, *reset_flags, 1, usb["ok"], usb["tgt"], usb["bad"], usb["tcp"],
                      since(usb["last"]), since(usb["last_tgt"]), random.randint(800, 4000), -58,
-                     (2 | 4 | 8) if args.fw >= 18 else (2 | 8), min(args.fw, 18))
+                     (2 | 4 | 8) if args.fw >= 18 else (2 | 8), min(args.fw, 19))
     for c in C:
         pl += struct.pack("<BHhHHHH", c.reason, c.trips, c.trip_at, c.jumps, min(65535, c.jmax), c.fmin, c.fmax)
         c.jmax, c.fmin, c.fmax = 0, c.fb_q, c.fb_q
@@ -444,10 +556,28 @@ def diag_frame():
     cl = lambda v: max(-32767, min(32767, int(v * 100)))
     age = 65535 if SEAT.out is None else min(65535, int((now - SEAT.last_out) * 1000))
     rate = int(SEAT.rate) if fresh else 0
-    pl += struct.pack("<BBBIHIHHhhhhhHBBB", sensor_state(now), board["tilt"], board["baud_idx"], BAUDS[board["baud_idx"]],
+    pl += struct.pack("<BBBIHIHHhhhhhHBBB", sensor_state(now), tilt_deg(), board["baud_idx"], BAUDS[board["baud_idx"]],
                       rate, SEAT.packets, SEAT.bad, age, cl(raw[0]), cl(raw[1]), cl(raw[2]), board["lv_r"], board["lv_p"],
                       board["tilt_trips"], board["view"], board["lflags"], matrix_error(now))
-    return b"SM3D" + bytes([2, len(pl)]) + pl
+    if args.fw < 19:
+        return b"SM3D" + bytes([2, len(pl)]) + pl
+    for c in C:                               # version 3 (1.9): seat set-up and the rest of the sensor
+        pl += struct.pack("<5h", c.trim, c.tlo, c.thi, c.elo, c.ehi)
+    pl += struct.pack("<4h", *TILT4)
+    fl = (1 if seat_saved() else 0) | (2 if eeprom[66] == 0xB9 else 0) | (4 if EXTRAS_ANY[0] else 0) | \
+        (8 if time.time() < HOLD[0] else 0)
+    hz = int(SEAT.rate) if (fresh and SEAT.all) else 0
+    pl += struct.pack("<BIHH3h3hh", fl, usb.get("held", 0), hz, hz, *SEAT.acc, *SEAT.gyro, 2950)
+    return b"SM3D" + bytes([3, len(pl)]) + pl
+
+
+def extras_frame():
+    """1.9 "SM3X": the sensor's acceleration and gyro, after every telemetry burst once the page asked ([xe1])."""
+    now = time.time()
+    fresh = 3 if (SEAT.all and SEAT.out is not None and now - SEAT.acc_t < 0.5) else 0
+    pl = struct.pack("<3h3hhHBB", *SEAT.acc, *SEAT.gyro, 2950, min(65000, SEAT.peak), fresh, min(255, SEAT.acc_n))
+    SEAT.peak = 0; SEAT.acc_n = 0
+    return b"SM3X" + bytes([1, len(pl)]) + pl
 
 
 def sensor_state(now):
@@ -455,25 +585,57 @@ def sensor_state(now):
     if sensor_fresh(now): v |= 0x10
     if SEAT.out is not None and now - SEAT.last_out < 3: v |= 0x20
     if now < board["setup_until"]: v |= 0x40
+    if args.fw >= 19 and SEAT.all and sensor_fresh(now): v |= 0x80
     return v
 
 
-def handle_cmd(c, a, b, out):
+def handle_cmd(c, a, b, out, cl=None):
     global last_target_t, fshift, frate
     w = a * 256 + b
     with lock:
         usb["tcp"] += 1
         if c in "ABC":
             ch = C["ABC".index(c)]
-            ch.target = max(ch.clip, min(1023 - ch.clip, w))
+            ch.set_target(w)
             if args.fw >= 14: last_target_t = time.time()
             board["last_pos"] = time.time()
+        elif c == "w" and args.fw >= 19:
+            VREG[0] = w - 65536 if w >= 32768 else w
+        elif c == "k" and args.fw >= 19:
+            v = VREG[0]
+            if b == ord("="):
+                if 64 <= a < 68:
+                    if 0 <= v <= 900: TILT4[a - 64] = v
+                elif a in (80, 81):
+                    if -9000 <= v <= 9000:
+                        board["lv_r" if a == 80 else "lv_p"] = v; save_board()
+                elif (a >> 4) < 3:
+                    ch, k = C[a >> 4], a & 15
+                    if k == 0 and -300 <= v <= 300: ch.trim = v
+                    elif k == 1 and 0 <= v <= 1023: ch.tlo = v
+                    elif k == 2 and 0 <= v <= 1023: ch.thi = v
+                    elif k == 3 and 0 <= v <= 1023: ch.elo = v
+                    elif k == 4 and 0 <= v <= 1023: ch.ehi = v
+                    lo, hi = ch.window(); ch.target = max(lo, min(hi, ch.target))
+            elif (a, b) == (ord("S"), ord("V")): save_seat()
+            elif (a, b) == (ord("R"), ord("L")): load_seat()
+            elif (a, b) == (ord("C"), ord("L")): clear_seat()
+            elif a == ord("H"): HOLD[0] = time.time() + b * 0.1
+        elif c == "x" and a == ord("e") and args.fw >= 19 and cl is not None:
+            cl["extras"] = b in (1, ord("1"))
+            EXTRAS_ANY[0] = cl["extras"]
         elif c == "l" and args.fw >= 18:
             if a <= 2: board["view"], board["lflags"] = a, b; save_board()
         elif c == "i" and args.fw >= 18:
             now = time.time()
             if a < 16:
-                board["sflags"], board["tilt"] = a, min(b, 60); save_board()
+                board["sflags"] = a
+                if b != 255 or args.fw < 19:
+                    board["tilt"] = min(b, 60)
+                    if args.fw >= 19:
+                        TILT4[:] = [board["tilt"] * 10] * 4
+                        if eeprom[66] == 0xB9: save_seat()
+                save_board()
             elif a == ord("L") and sensor_fresh(now):
                 board["lv_r"], board["lv_p"] = int(SEAT.out[0] * 100), int(SEAT.out[1] * 100); save_board()
             elif a == ord("C"):
@@ -481,14 +643,18 @@ def handle_cmd(c, a, b, out):
             elif a == ord("S") and args.imu:
                 board["setup_until"] = now + 1.2       # nine commands, 120 ms apart
                 if not args.imu_no_tx:
-                    SEAT.rate, SEAT.baud = {6: 10, 7: 20, 8: 50, 9: 100, 11: 200}.get(b or 9, 100), 115200
+                    code = (b & 0x0F) or 9
+                    SEAT.rate, SEAT.baud = {6: 10, 7: 20, 8: 50, 9: 100, 11: 200}.get(code, 100), 115200
+                    SEAT.all = bool(b & 0x40) and args.fw >= 19          # [iS 0] (1.8): angles only
                     board["baud_idx"] = 1; save_board()
         elif c in "DEF": C["DEF".index(c)].kp = w
         elif c in "GHI": ch = C["GHI".index(c)]; ch.ki = w; ch.update_ilim()
         elif c in "JKL": C["JKL".index(c)].kd = w
         elif c in "MNO": C["MNO".index(c)].ks = max(1, w)
         elif c in "PQR": ch = C["PQR".index(c)]; ch.pwmmin, ch.pwmmax = a, b
-        elif c in "STU": ch = C["STU".index(c)]; ch.cut, ch.clip = a, b
+        elif c in "STU":
+            ch = C["STU".index(c)]; ch.cut, ch.clip = a, b
+            lo, hi = ch.window(); ch.target = max(lo, min(hi, ch.target))
         elif c in "VWX": ch = C["VWX".index(c)]; ch.dz, ch.pwmrev = a, b
         elif c == "d" and a == ord("i") and args.fw >= 15:
             if b == ord("s"):
@@ -500,6 +666,7 @@ def handle_cmd(c, a, b, out):
             SIMHUB[0] = (b == ord("1"))
         elif c == "s" and a == ord("a") and b == ord("v"):
             save_eeprom()
+            if args.fw >= 19: save_seat()
         elif c == "e" and a == ord("n"):
             if b == ord("a"):
                 for ch in C: ch.disabled, ch.reason = False, 0
@@ -520,7 +687,7 @@ def handle_cmd(c, a, b, out):
             elif k == "!" and args.fw >= 14:
                 out.append(reply2("!", (2 | 4 | 8) if args.fw >= 18 else (2 | 8) if args.fw >= 17 else 0, args.fw))
             elif k == "l" and args.fw >= 18: out.append(reply2("l", board["view"], board["lflags"]))
-            elif k == "i" and args.fw >= 18: out.append(reply2("i", sensor_state(time.time()), board["tilt"]))
+            elif k == "i" and args.fw >= 18: out.append(reply2("i", sensor_state(time.time()), tilt_deg()))
             elif k == "f" and args.fw >= 16: out.append(reply2("f", fshift, frate // 100))
             elif k == "d" and args.fw >= 17: out.append(diag_frame())
 
@@ -532,6 +699,7 @@ def client(conn):
     with lock:
         clients.append(conn)
     buf = b""; last_send = time.time()
+    cl = {"extras": False}
     while True:
         time.sleep(0.02)
         if conn not in clients:
@@ -547,7 +715,7 @@ def client(conn):
         out = []
         while len(buf) >= 5:
             if buf[0:1] == b"[" and buf[4:5] == b"]":
-                handle_cmd(chr(buf[1]), buf[2], buf[3], out); buf = buf[5:]
+                handle_cmd(chr(buf[1]), buf[2], buf[3], out, cl); buf = buf[5:]
             else:
                 buf = buf[1:]
         if time.time() - last_send >= 0.05:
@@ -556,6 +724,9 @@ def client(conn):
                 batch = samples[-5:]; samples.clear()
             if batch:
                 out.append(b"SM3T" + bytes([1, len(batch)]) + b"".join(batch))
+                if cl["extras"]:
+                    with lock:
+                        out.append(extras_frame())
         try:
             for o in out: conn.sendall(o)
         except OSError:

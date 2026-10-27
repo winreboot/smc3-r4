@@ -2,7 +2,10 @@
 
 `smc3_scope.py` is a single file that uses only the Python standard library (3.8 or newer). It connects to the
 board's telemetry port over WiFi, keeps the last two minutes of data, and serves the page. It also runs the test
-signals, auto-tune, the watcher and the diagnostics. SimHub keeps the USB port; the page never needs it.
+signals, auto-tune, Seat setup, the watcher and the diagnostics. SimHub keeps the USB port; the page never needs it.
+
+The 3D view's engine, three.js r160 (MIT licence, served at `/vendor/three/LICENSE.txt`), is built into the file,
+so the page works on a network without internet access.
 
 ## Running it
 
@@ -32,6 +35,7 @@ python3 smc3_scope.py --host 192.168.1.50 --bind 0.0.0.0 --web 8198
 | File | What it holds |
 |---|---|
 | `config.json` | Settings made in the page: board address, theme, motors in use, motor names. |
+| `seat.json` | The last Seat setup: where the seat is level, how each motor tilts it, the ends found and the limits saved. The 3D view uses it; the limits themselves live on the board. |
 | `profiles.json` | Named profiles. |
 | `backups.json` | Backups of the board settings: every Save to EEPROM, every bigger change, and manual ones. |
 | `diagnostics/events.jsonl` | The event log. |
@@ -40,8 +44,8 @@ python3 smc3_scope.py --host 192.168.1.50 --bind 0.0.0.0 --web 8198
 
 To upgrade, rebuild with the new `smc3_scope.py`. Keep the data folder, and everything carries over.
 
-The LED matrix and motion sensor settings (firmware 1.8) are not in the data folder: they live on the board itself,
-so they stay with the rig.
+The LED matrix and motion sensor settings (firmware 1.8) and the seat set-up (firmware 1.9: level trim, travel
+limits, end stops, tilt limits) are not in the data folder: they live on the board itself, so they stay with the rig.
 
 ## Security
 

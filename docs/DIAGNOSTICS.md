@@ -1,7 +1,7 @@
 # Diagnostics
 
 Diagnostics is in Settings. It's for when something isn't right and you don't know why. It works with any firmware
-from 1.3 on; firmware 1.7 adds the board's own counters, and 1.8 the motion sensor.
+from 1.3 on; firmware 1.7 adds the board's own counters, 1.8 the motion sensor and 1.9 the seat set-up.
 
 ## Quick check
 
@@ -86,7 +86,10 @@ cover:
 - full-check results: reversed, swapped, not moving, moving one way only, unstable, PWMmin too low;
 - where a motor struggles under load (load map);
 - the motion sensor: silent, not switched on, too slow (factory 10 Hz), garbled data, tilt limit off or tripping,
-  not levelled, wobbling; the seat bouncing, play in a linkage, how many degrees each motor tilts the seat;
+  not levelled, wobbling, sending angles only (1.9 can add gyro and acceleration); the seat bouncing, play in a
+  linkage, how many degrees each motor tilts the seat;
+- the seat set-up (firmware 1.9): none yet, running but not saved (Seat setup left open), a motor switched off by
+  its end stop, the page holding SimHub's positions back;
 - motors that don't agree on which way is up;
 - a motor whose name doesn't match where you saw it move.
 
@@ -101,7 +104,7 @@ The newest 20 are kept in `diagnostics/reports/` and can be downloaded from the 
 | `made`, `kind`, `problem` | When, quick or full, and what the owner typed |
 | `summary` | The findings as plain text |
 | `findings` | The findings, structured |
-| `board` | Connection, firmware, build options, uptime, last start cause, WiFi, USB counters, per-motor counters, motion sensor and LED matrix (1.8) |
+| `board` | Connection, firmware, build options, uptime, last start cause, WiFi, USB counters, per-motor counters, motion sensor and LED matrix (1.8), seat set-up: level trim, travel limits, end stops, tilt limits (1.9) |
 | `rig` | Motors in use, motor names |
 | `settings` | Running settings, saved settings (EEPROM), the differences, the last save made from the page |
 | `live` | The 3-second listen |

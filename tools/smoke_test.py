@@ -5,8 +5,10 @@ Smoke test: start simulated rigs and the page, run diagnostics, check the result
 
 1. A healthy rig: quick and full check must find no problems.
 2. A rig with motor 2 wired backwards: the full check must say so and leave motor 2 switched off.
-3. A rig with a WT901C at its factory 10 Hz (firmware 1.8): the page finds it, switches it on, sets it to 100 Hz,
-   and the quick check is clean.
+3. A rig with a WT901C at its factory 10 Hz: the page finds it, switches it on, sets it to 100 Hz with gyro and
+   acceleration, and the quick check is clean.
+4. Seat setup (firmware 1.9) on a seat that isn't level: it levels itself, finds one end, saves; the board then has
+   the level trim, travel limits and end stops, and the seat reads level.
 """
 import json, os, subprocess, sys, tempfile, time, urllib.request as u
 
@@ -97,8 +99,44 @@ try:
     time.sleep(2)
     check(get(base3, "/board/settings")["sensor"]["angles_per_s"] == 100, "sensor set to 100 Hz")
     check(get(base3, "/data?since=0")["samples"][-1]["roll"] is not None, "seat angles in the telemetry")
+    check(get(base3, "/board/settings")["sensor"]["accel_gyro"], "gyro and acceleration arriving")
+    time.sleep(1)
+    check(get(base3, "/data?since=0")["imu"] is not None, "acceleration and gyro reach the page")
     s = run_check(base3, "quick")
     check(s["state"] == "done" and not problems(s), f"rig with sensor, quick check: no problems {problems(s)}")
+    sim4, scope4, base4 = start(4713, 8713, "--imu", "100", "--sensor-on", "--seat-tilt", "1.5:-2.0")
+    procs += [sim4, scope4]
+
+    def seat_wait():
+        t0 = time.time()
+        while time.time() - t0 < 120:
+            st = get(base4, "/seat/status")
+            if st["action"] is None:
+                return st
+            time.sleep(0.5)
+        raise AssertionError("seat setup did not finish")
+    check(post(base4, "/seat/start")["ok"], "seat setup opens")
+    post(base4, "/seat/level")
+    st = seat_wait()
+    check(st["error"] is None and abs(st["live"]["roll_abs"]) < 0.2 and abs(st["live"]["pitch_abs"]) < 0.2,
+          f"seat levels itself (roll {st['live']['roll_abs']:+.2f}, pitch {st['live']['pitch_abs']:+.2f})")
+    r = post(base4, "/seat/accept")
+    check(r["ok"], "level accepted")
+    lv = r["status"]["level_pos"]
+    post(base4, "/seat/options", {"want": {"roll_right": 6, "roll_left": 6, "front_up": 5, "front_down": 5},
+                                   "keep_inside": False})   # only one end is explored here
+    post(base4, "/seat/explore", {"motor": 2, "way": 1})
+    st = seat_wait()
+    e = st["ends"][2][1]
+    check(e and e["why"] == "angle" and abs(e["pitch"]) >= 4.8, f"motor 3 stops at the tilt allowed ({e})")
+    check(post(base4, "/seat/save")["ok"], "save starts")
+    st = seat_wait()
+    b = get(base4, "/board/settings")["seat"]
+    check(st["step"] == "done" and b["saved"] and b["trim"] == [p - 512 for p in lv] and
+          b["travel"][2][1] == e["pot"] - 20, f"board has the set-up (trim {b['trim']}, travel {b['travel']})")
+    time.sleep(1)
+    s = get(base4, "/data?since=0")["samples"][-1]
+    check(abs(s["roll"]) < 0.2 and abs(s["pitch"]) < 0.2, "the level seat reads 0° / 0°")
 finally:
     for p in procs:
         p.terminate()

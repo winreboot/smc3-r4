@@ -16,7 +16,10 @@
 //   * 12x8 LED matrix: scrolls the IP address, then live motor bars (or a seat horizon with the motion sensor)
 //     and an oscilloscope trace while idle; problems scroll as words ("ERROR E3 MOTOR 3 CUTOFF").
 //   * Optional WitMotion WT901C motion sensor on Serial1 (D0/D1, through a MAX3232 for the -232 model): seat
-//     angles in the telemetry, tilt-limit safety cut-off.  Switched on and set up from smc3_scope.
+//     angles in the telemetry, tilt limits for each direction, acceleration and gyro for the page's 3D view.
+//     Switched on and set up from smc3_scope.
+//   * Seat set-up (from smc3_scope's Seat setup): a level trim so SimHub's centre is the level seat, travel limits
+//     and end stops for each motor and each direction.
 //   * WiFi telemetry + live tuning: the board runs a small TCP server.  A PC tool (smc3_scope.py) connects,
 //     receives 100 Hz telemetry (target / goal / feedback / PID output per motor, status, IMU angles,
 //     loop timing) and sends ordinary SMC3 commands back - so you can tune Kp/Ki/Kd/PWMmin... live while
@@ -38,8 +41,22 @@
 // Pots: wiper must stay within 0-5 V (the R4 is a 5 V board, so existing wiring is fine).
 //****************************************************************************************************************
 
-#define FW_VERSION     "1.8.1"         // shown in the USB boot banner; [ver] still answers 70 for SMC3Utils
-#define FW_VERSION_NUM 18              // reported by [rd!] so smc3_scope can check what it is talking to (1.8.x = 18)
+#define FW_VERSION     "1.9"           // shown in the USB boot banner; [ver] still answers 70 for SMC3Utils
+#define FW_VERSION_NUM 19              // reported by [rd!] so smc3_scope can check what it is talking to (1.9.x = 19)
+
+// v1.9 changes:  seat set-up, made by smc3_scope's Seat setup:
+//                * level trim per motor: added to every position command, so SimHub's centre (512) is the level seat
+//                  (and the seat goes level at power-up);
+//                * travel limits per motor, low and high separately: position commands never go past them;
+//                * end stops per motor: the motor switches off (E1-E3) if its pot gets past one anyway;
+//                * tilt limits for each direction - roll right/left, front up/down - instead of one for all.
+//                [w hi lo] loads a value, [k f '='] stores it in field f, [kSV] saves the set-up (so does [sav]),
+//                [kRL] reloads the saved one, [kCL] clears it (until saved or restarted), [kH n] lets the page hold
+//                the seat for n x 100 ms: SimHub's position commands are ignored meanwhile (the page refreshes it).
+//                Motion sensor: acceleration and gyro packets are read too; [iS b] with bit6 set asks the sensor for
+//                angles + gyro + acceleration.  [xe1] sends them to the page after every telemetry burst ("SM3X").
+//                [rdd] frame version 3 adds the seat set-up and the sensor's acceleration, gyro and temperature.
+//                SimHub and SMC3Utils see no difference, apart from the level trim and the limits doing their job.
 
 // v1.8.1 changes: compiles in the Arduino IDE.  1.8 stopped with "'GlyphDef' does not name a type": the IDE copies
 //                every function's declaration to the top of the sketch, and FindGlyph() returned a GlyphDef pointer.
@@ -199,7 +216,15 @@
 //    [ift]                     Sensor flags f (bit0 on, bit1 swap roll/pitch, bit2 invert roll, bit3 invert
 //                              pitch) and tilt limit t degrees (0 = off) - new in 1.8 ([rdi] reads)
 //    [iL?] [iC?] [iS?] [iR?]   Sensor: level now, clear level, set to 100 Hz/115200, search baud again - 1.8
-//    [sav]                     Save parameters to EEPROM
+//                              [iSb]: b = WitMotion rate code, bit6 set = angles + gyro + acceleration (1.9)
+//    [whl]                     Value register = h*256+l (signed) - 1.9
+//    [kf=]                     Seat set-up field f = value register: f = 16*motor(0-2) + 0 trim, 1 travel low,
+//                              2 travel high, 3 end stop low, 4 end stop high (pot counts); f = 64 + d: tilt
+//                              limit in 0.1 degree for d = 0 roll +, 1 roll -, 2 pitch +, 3 pitch - (0 = none);
+//                              f = 80 / 81: the sensor's level roll / pitch x100 (saved at once) - 1.9
+//    [kSV] [kRL] [kCL] [kHn]   Seat set-up: save, reload saved, clear, page holds the seat n x 100 ms - 1.9
+//    [xe1] / [xe0]             Sensor acceleration + gyro after every telemetry burst on / off - 1.9
+//    [sav]                     Save parameters to EEPROM (and the seat set-up, 1.9)
 //    [ver]                     Software version (replies 70 so SMC3Utils is happy)
 
 #include <EEPROM.h>
@@ -344,8 +369,10 @@ unsigned int  TcpRxBuffer[5] = {0};
 
 #define TEL_SAMPLE_BYTES   38
 #define TEL_MAX_SAMPLES    (TELEMETRY_SEND_MS / TELEMETRY_SAMPLE_MS + 1)
-uint8_t       TelBuf[6 + TEL_MAX_SAMPLES * TEL_SAMPLE_BYTES];
+#define TEL_EXTRA_BYTES    18                  // 1.9: "SM3X" payload (sensor acceleration + gyro)
+uint8_t       TelBuf[6 + TEL_MAX_SAMPLES * TEL_SAMPLE_BYTES + 6 + TEL_EXTRA_BYTES];
 uint8_t       TelCount = 0;
+bool          TelExtras = false;               // [xe1]: the page wants "SM3X" frames (off for every new client)
 #endif
 
 //----------------------------------------------------------------------------------------------------------------
@@ -353,7 +380,7 @@ uint8_t       TelCount = 0;
 //----------------------------------------------------------------------------------------------------------------
 
 uint8_t       SensorFlags  = 0;               // bit0 sensor fitted (on), bit1 swap roll/pitch, bit2 invert roll, bit3 invert pitch
-uint8_t       TiltLimitDeg = 0;               // 0 = off; otherwise all motors stop if the seat tilts further than this
+uint8_t       TiltLimitDeg = 0;               // 1.8's single tilt limit, still answered by [rdi]: the tightest of the four below
 int16_t       LevelRoll_x100 = 0, LevelPitch_x100 = 0;   // "Level now": raw sensor angles that count as level
 uint8_t       LedView  = LED_DEFAULT_VIEW;
 uint8_t       LedFlags = LED_DEFAULT_FLAGS;
@@ -373,6 +400,35 @@ uint8_t       TiltHits = 0;
 uint16_t      TiltTrips = 0;
 unsigned long TiltGraceUntil = 0;             // no tilt check for a moment after the motors are enabled
 unsigned long LastPosMillis = 0;              // last position command from SimHub or the page (idle trace)
+
+// 1.9: acceleration and gyro from the sensor (raw: acceleration / 32768 * 16 g, gyro / 32768 * 2000 deg/s)
+int16_t       ImuAcc[3]  = {0, 0, 0};
+int16_t       ImuGyro[3] = {0, 0, 0};
+int16_t       ImuTemp_x100 = 0;
+unsigned long ImuAccMillis = 0, ImuGyroMillis = 0;
+uint16_t      ImuAccCount = 0, ImuGyroCount = 0, ImuAccHz = 0, ImuGyroHz = 0;
+uint16_t      AccPeak_mg = 0;                 // biggest |acceleration| - 1 g since the last telemetry burst
+uint8_t       AccBurstN = 0;                  // acceleration packets since the last telemetry burst
+
+//----------------------------------------------------------------------------------------------------------------
+//  Seat set-up - 1.9.  Made by smc3_scope's Seat setup; saved with [kSV] or [sav] in EEPROM 66-104 (66 = 0xB9).
+//----------------------------------------------------------------------------------------------------------------
+
+int16_t       Trim[NUM_MOTORS]     = {0, 0, 0};          // level trim, added to every position command (counts)
+int16_t       TravelLo[NUM_MOTORS] = {0, 0, 0};          // position commands never go below / above (pot counts)
+int16_t       TravelHi[NUM_MOTORS] = {1023, 1023, 1023};
+int16_t       EndLo[NUM_MOTORS]    = {0, 0, 0};          // the motor switches off if its pot gets past these
+int16_t       EndHi[NUM_MOTORS]    = {1023, 1023, 1023};
+int16_t       TiltLim_x10[4]       = {0, 0, 0, 0};       // 0.1 deg: roll + (right side down), roll - (left side down),
+                                                         // pitch + (front up), pitch - (front down); 0 = no limit
+volatile int  TargetLo[NUM_MOTORS] = {100, 100, 100};    // in force: the SMC3 clip and the travel limits together
+volatile int  TargetHi[NUM_MOTORS] = {923, 923, 923};
+volatile int  CutLo[NUM_MOTORS]    = {23, 23, 23};       // in force: the SMC3 cutoff and the end stops together (ISR)
+volatile int  CutHi[NUM_MOTORS]    = {1000, 1000, 1000};
+int16_t       ValueReg = 0;                              // [w hi lo]
+bool          PageHold = false;                          // [kH n]: SimHub's position commands wait ...
+unsigned long PageHoldUntil = 0;                         // ... until then
+uint32_t      UsbHeldFrames = 0;                         // ... and how many were ignored
 
 #if IMU_PORT
 const uint32_t ImuBauds[] = {9600, 115200, 230400, 57600, 38400, 19200, 4800};
@@ -694,7 +750,7 @@ void PidIsr(timer_callback_args_t *p_args)
         if (fb > FbMax_q[m]) { FbMax_q[m] = fb; }
         Feedback_q[m] = fb;
 
-        if ((fb > (CutoffLimitMax[m] << POS_SHIFT)) || (fb < (CutoffLimitMin[m] << POS_SHIFT)))
+        if ((fb > (CutHi[m] << POS_SHIFT)) || (fb < (CutLo[m] << POS_SHIFT)))     // SMC3 cutoff + 1.9 end stops
         {
             if (Disable[m] == 0)                    // a new trip (not a motor that is already off)
             {
@@ -838,6 +894,34 @@ void ReadEEProm()
     }
 }
 
+// 1.9: the limits in force are the tighter of SMC3's (clip, cutoff - the same both ways) and the seat set-up's
+// (travel limits, end stops - set separately each way).  Called whenever either changes.
+void UpdateLimits()
+{
+    for (uint8_t m = 0; m < NUM_MOTORS; m++)
+    {
+        int lo = (TravelLo[m] > InputClipMin[m]) ? TravelLo[m] : InputClipMin[m];
+        int hi = (TravelHi[m] < InputClipMax[m]) ? TravelHi[m] : InputClipMax[m];
+        if (hi < lo + 8) { lo = InputClipMin[m]; hi = InputClipMax[m]; }      // makes no sense: SMC3's alone
+        int clo = (EndLo[m] > CutoffLimitMin[m]) ? EndLo[m] : CutoffLimitMin[m];
+        int chi = (EndHi[m] < CutoffLimitMax[m]) ? EndHi[m] : CutoffLimitMax[m];
+        if (chi < clo + 8) { clo = CutoffLimitMin[m]; chi = CutoffLimitMax[m]; }
+        TargetLo[m] = lo;
+        TargetHi[m] = hi;
+        CutLo[m] = clo;
+        CutHi[m] = chi;
+        int t = Target[m];
+        if (t < lo) { Target[m] = lo; } else if (t > hi) { Target[m] = hi; }
+    }
+    int16_t tight = 0;                           // 1.8's single value for [rdi]: the tightest limit, whole degrees
+    for (uint8_t d = 0; d < 4; d++)
+    {
+        if (TiltLim_x10[d] > 0 && (tight == 0 || TiltLim_x10[d] < tight)) { tight = TiltLim_x10[d]; }
+    }
+    TiltLimitDeg = (tight == 0) ? 0 : (uint8_t)((tight + 5) / 10 < 1 ? 1 : ((tight + 5) / 10 > 90 ? 90 : (tight + 5) / 10));
+}
+
+
 // 1.8: sensor and matrix settings.  Written as soon as they change (not by [sav]), so they survive a restart
 // without touching the SMC3 tuning; boards that never had them keep the defaults.
 static inline void EEPromPut16(int a, int16_t v) { EEPROM.update(a, (uint8_t)((uint16_t)v >> 8)); EEPROM.update(a + 1, (uint8_t)((uint16_t)v & 0xFF)); }
@@ -872,6 +956,126 @@ void ReadBoardSettings()
     v = EEPROM.read(65);
     ImuBaudIdx = (v < IMU_NBAUDS) ? v : 0;
 #endif
+}
+
+// Seat set-up in EEPROM 66-104: 66 = 0xB9 "valid", then per motor trim, travel low/high, end stop low/high (int16,
+// 67 + 10 * motor), then the four tilt limits (int16, 97-104).
+#define SEAT_EE 66
+
+void WriteSeatSetup()
+{
+    for (uint8_t m = 0; m < NUM_MOTORS; m++)
+    {
+        int a = SEAT_EE + 1 + 10 * m;
+        EEPromPut16(a, Trim[m]);
+        EEPromPut16(a + 2, TravelLo[m]);
+        EEPromPut16(a + 4, TravelHi[m]);
+        EEPromPut16(a + 6, EndLo[m]);
+        EEPromPut16(a + 8, EndHi[m]);
+    }
+    for (uint8_t d = 0; d < 4; d++) { EEPromPut16(SEAT_EE + 31 + 2 * d, TiltLim_x10[d]); }
+    EEPROM.update(SEAT_EE, 0xB9);
+}
+
+bool SeatSetupSaved()                            // what runs is what is saved
+{
+    if (EEPROM.read(SEAT_EE) != 0xB9)
+    {
+        for (uint8_t m = 0; m < NUM_MOTORS; m++)
+        {
+            if (Trim[m] != 0 || TravelLo[m] != 0 || TravelHi[m] != 1023 || EndLo[m] != 0 || EndHi[m] != 1023) { return false; }
+        }
+        return true;                             // nothing saved and nothing set: same thing (tilt lives in 1.8's byte)
+    }
+    for (uint8_t m = 0; m < NUM_MOTORS; m++)
+    {
+        int a = SEAT_EE + 1 + 10 * m;
+        if (EEPromGet16(a) != Trim[m] || EEPromGet16(a + 2) != TravelLo[m] || EEPromGet16(a + 4) != TravelHi[m]
+            || EEPromGet16(a + 6) != EndLo[m] || EEPromGet16(a + 8) != EndHi[m]) { return false; }
+    }
+    for (uint8_t d = 0; d < 4; d++) { if (EEPromGet16(SEAT_EE + 31 + 2 * d) != TiltLim_x10[d]) { return false; } }
+    return true;
+}
+
+void ClearSeatSetup()
+{
+    for (uint8_t m = 0; m < NUM_MOTORS; m++)
+    {
+        Trim[m] = 0; TravelLo[m] = 0; TravelHi[m] = 1023; EndLo[m] = 0; EndHi[m] = 1023;
+    }
+}
+
+void ReadSeatSetup()                             // after ReadBoardSettings(): 1.8's tilt limit is the fallback
+{
+    ClearSeatSetup();
+    for (uint8_t d = 0; d < 4; d++) { TiltLim_x10[d] = (int16_t)TiltLimitDeg * 10; }
+    if (EEPROM.read(SEAT_EE) == 0xB9)
+    {
+        for (uint8_t m = 0; m < NUM_MOTORS; m++)
+        {
+            int a = SEAT_EE + 1 + 10 * m;
+            int16_t t = EEPromGet16(a);
+            Trim[m] = (t >= -300 && t <= 300) ? t : 0;
+            int16_t v;
+            v = EEPromGet16(a + 2); TravelLo[m] = (v >= 0 && v <= 1023) ? v : 0;
+            v = EEPromGet16(a + 4); TravelHi[m] = (v >= 0 && v <= 1023) ? v : 1023;
+            v = EEPromGet16(a + 6); EndLo[m]    = (v >= 0 && v <= 1023) ? v : 0;
+            v = EEPromGet16(a + 8); EndHi[m]    = (v >= 0 && v <= 1023) ? v : 1023;
+        }
+        for (uint8_t d = 0; d < 4; d++)
+        {
+            int16_t v = EEPromGet16(SEAT_EE + 31 + 2 * d);
+            TiltLim_x10[d] = (v >= 0 && v <= 900) ? v : 0;
+        }
+    }
+    UpdateLimits();
+}
+
+void UpdateSeatAngles();
+
+// [k f c]
+void SeatCommand(uint8_t f, uint8_t c)
+{
+    if (c == '=')
+    {
+        int16_t v = ValueReg;
+        if (f >= 64 && f < 68)
+        {
+            if (v >= 0 && v <= 900) { TiltLim_x10[f - 64] = v; }
+        }
+        else if (f == 80 || f == 81)             // the sensor's level (raw angles x100 that count as level), saved at once
+        {
+            if (v >= -9000 && v <= 9000)
+            {
+                if (f == 80) { LevelRoll_x100 = v; } else { LevelPitch_x100 = v; }
+                UpdateSeatAngles();
+                WriteBoardSettings();
+            }
+            return;
+        }
+        else if ((f >> 4) < NUM_MOTORS)
+        {
+            uint8_t m = f >> 4;
+            switch (f & 15)
+            {
+                case 0: if (v >= -300 && v <= 300) { Trim[m] = v; } break;
+                case 1: if (v >= 0 && v <= 1023) { TravelLo[m] = v; } break;
+                case 2: if (v >= 0 && v <= 1023) { TravelHi[m] = v; } break;
+                case 3: if (v >= 0 && v <= 1023) { EndLo[m] = v; } break;
+                case 4: if (v >= 0 && v <= 1023) { EndHi[m] = v; } break;
+                default: break;
+            }
+        }
+        UpdateLimits();
+    }
+    else if (f == 'S' && c == 'V') { WriteSeatSetup(); }
+    else if (f == 'R' && c == 'L') { ReadSeatSetup(); }
+    else if (f == 'C' && c == 'L') { ClearSeatSetup(); UpdateLimits(); }
+    else if (f == 'H')                           // hold: c x 100 ms (0 = give the seat back to SimHub now)
+    {
+        PageHold = (c != 0);
+        PageHoldUntil = millis() + (unsigned long)c * 100UL;
+    }
 }
 
 //****************************************************************************************************************
@@ -953,9 +1157,16 @@ void SetTarget(uint8_t m, int value)
 #ifdef REVERSE_MOTOR1
     if (m == 0) { value = 1023 - value; }
 #endif
-    if (value > InputClipMax[m]) { value = InputClipMax[m]; }
-    else if (value < InputClipMin[m]) { value = InputClipMin[m]; }
+    value += Trim[m];                            // 1.9: level trim, then SMC3's clip and the travel limits
+    if (value > TargetHi[m]) { value = TargetHi[m]; }
+    else if (value < TargetLo[m]) { value = TargetLo[m]; }
     Target[m] = value;
+}
+
+static inline bool PageHolds()                   // 1.9: the page has the seat ([kH n]); SimHub's positions wait
+{
+    if (PageHold && (long)(PageHoldUntil - millis()) <= 0) { PageHold = false; }
+    return PageHold;
 }
 
 #if ENABLE_WIFI
@@ -989,6 +1200,13 @@ void ParseCommand(const unsigned int *buf, uint8_t source)
     unsigned int b1 = buf[1];
     unsigned int b2 = buf[2];
     int word = (int)((b1 * 256) + b2);
+
+    if (isTarget && source == 0 && PageHolds())  // Seat setup is moving the seat: SimHub waits (1.9)
+    {
+        UsbHeldFrames++;
+        ReplyTarget = 0;
+        return;
+    }
 
     switch (buf[0])
     {
@@ -1065,9 +1283,9 @@ void ParseCommand(const unsigned int *buf, uint8_t source)
         case 'P': PWMoffset[0] = b1; PWMmax[0] = b2; break;
         case 'Q': PWMoffset[1] = b1; PWMmax[1] = b2; break;
         case 'R': PWMoffset[2] = b1; PWMmax[2] = b2; break;
-        case 'S': CutoffLimitMin[0] = b1; CutoffLimitMax[0] = 1023 - b1; InputClipMin[0] = b2; InputClipMax[0] = 1023 - b2; break;
-        case 'T': CutoffLimitMin[1] = b1; CutoffLimitMax[1] = 1023 - b1; InputClipMin[1] = b2; InputClipMax[1] = 1023 - b2; break;
-        case 'U': CutoffLimitMin[2] = b1; CutoffLimitMax[2] = 1023 - b1; InputClipMin[2] = b2; InputClipMax[2] = 1023 - b2; break;
+        case 'S': CutoffLimitMin[0] = b1; CutoffLimitMax[0] = 1023 - b1; InputClipMin[0] = b2; InputClipMax[0] = 1023 - b2; UpdateLimits(); break;
+        case 'T': CutoffLimitMin[1] = b1; CutoffLimitMax[1] = 1023 - b1; InputClipMin[1] = b2; InputClipMax[1] = 1023 - b2; UpdateLimits(); break;
+        case 'U': CutoffLimitMin[2] = b1; CutoffLimitMax[2] = 1023 - b1; InputClipMin[2] = b2; InputClipMax[2] = 1023 - b2; UpdateLimits(); break;
         case 'V': DeadZone[0] = b1; PWMrev[0] = b2; break;
         case 'W': DeadZone[1] = b1; PWMrev[1] = b2; break;
         case 'X': DeadZone[2] = b1; PWMrev[2] = b2; break;
@@ -1090,6 +1308,13 @@ void ParseCommand(const unsigned int *buf, uint8_t source)
         case 'i':                                                // 1.8: motion sensor
             ImuCommand(b1, b2);
             break;
+        case 'w': ValueReg = (int16_t)(uint16_t)word; break;     // 1.9: value register for [k]
+        case 'k': SeatCommand((uint8_t)b1, (uint8_t)b2); break;  // 1.9: seat set-up
+#if ENABLE_WIFI
+        case 'x':                                                // 1.9: sensor acceleration + gyro frames
+            if (b1 == 'e' && source == 1) { TelExtras = (b2 == '1' || b2 == 1); }
+            break;
+#endif
         case 'm':
             if (b1 == 'o')
             {
@@ -1097,7 +1322,7 @@ void ParseCommand(const unsigned int *buf, uint8_t source)
             }
             break;
         case 's':
-            if (b1 == 'a' && b2 == 'v') { WriteEEProm(); }
+            if (b1 == 'a' && b2 == 'v') { WriteEEProm(); WriteSeatSetup(); }   // 1.9: the seat set-up too
             break;
         case 'v':
             if (b1 == 'e' && b2 == 'r') { SendValue('v', 70); }   // reports as v0.70 so SMC3Utils accepts it
@@ -1163,7 +1388,8 @@ void SendMonitorData()
 
 //****************************************************************************************************************
 //    WitMotion WT901C motion sensor (Serial1, 1.8).  11-byte packets: 0x55, type, 8 data bytes, checksum (sum of
-//    the first 10).  Type 0x53 = angles: roll, pitch, yaw as int16 / 32768 * 180 degrees.  The board tries the
+//    the first 10).  Type 0x53 = angles: roll, pitch, yaw as int16 / 32768 * 180 degrees.  1.9 also reads 0x51 =
+//    acceleration (/ 32768 * 16 g) + temperature (/ 100 C) and 0x52 = angular rate (/ 32768 * 2000 deg/s).  The board tries the
 //    usual baud rates until packets with good checksums arrive.  Set-up commands are FF AA reg lo hi, after an
 //    unlock (FF AA 69 88 B5), at least 100 ms apart.
 //****************************************************************************************************************
@@ -1176,6 +1402,8 @@ static inline uint8_t SensorState()       // [rdi] byte 1
 #if IMU_PORT
     if (ImuCmdN > 0) { v |= 0x40; }
 #endif
+    unsigned long now = millis();                // 1.9: acceleration and gyro arriving too
+    if (ImuAccMillis != 0 && ImuGyroMillis != 0 && (now - ImuAccMillis) < 500 && (now - ImuGyroMillis) < 500) { v |= 0x80; }
     return v;
 }
 
@@ -1197,22 +1425,24 @@ void UpdateSeatAngles()
     SeatPitch = p;
 }
 
-// Tilt limit: three angle packets in a row past the limit stop every motor (E4).  Enable motors again from the
+// Tilt limits: three angle packets in a row past a limit stop every motor (E4).  Enable motors again from the
 // page (or [ena]) once the cause is fixed; the check pauses 1.5 s after enabling so the seat can come back.
+// 1.9: a limit for each direction (0 = none) - roll right/left, front up/down.
 void CheckTilt(unsigned long now)
 {
-    if (!(SensorFlags & 1) || TiltLimitDeg == 0 || (long)(now - TiltGraceUntil) < 0) { TiltHits = 0; return; }
-    float lim = (float)TiltLimitDeg;
-    bool past = (SeatRoll > lim || SeatRoll < -lim || SeatPitch > lim || SeatPitch < -lim);
+    bool any = TiltLim_x10[0] || TiltLim_x10[1] || TiltLim_x10[2] || TiltLim_x10[3];
+    if (!(SensorFlags & 1) || !any || (long)(now - TiltGraceUntil) < 0) { TiltHits = 0; return; }
+    bool past = (TiltLim_x10[0] && SeatRoll  >  TiltLim_x10[0] * 0.1f) || (TiltLim_x10[1] && SeatRoll  < -TiltLim_x10[1] * 0.1f)
+             || (TiltLim_x10[2] && SeatPitch >  TiltLim_x10[2] * 0.1f) || (TiltLim_x10[3] && SeatPitch < -TiltLim_x10[3] * 0.1f);
     if (!past) { TiltHits = 0; return; }
     if (++TiltHits < 3) { return; }
     TiltHits = 0;
-    bool any = false;
+    bool hit = false;
     for (uint8_t m = 0; m < NUM_MOTORS; m++)
     {
-        if (Disable[m] == 0) { any = true; DisableReason[m] = DIS_TILT; DisableMotor(m); }
+        if (Disable[m] == 0) { hit = true; DisableReason[m] = DIS_TILT; DisableMotor(m); }
     }
-    if (any && TiltTrips < 65535) { TiltTrips++; }
+    if (hit && TiltTrips < 65535) { TiltTrips++; }
 }
 
 #if IMU_PORT
@@ -1266,6 +1496,25 @@ void PollImu()
             UpdateSeatAngles();
             CheckTilt(now);
         }
+        else if (buf[1] == 0x51)                // 1.9: acceleration (x, y, z / 32768 * 16 g) and temperature
+        {
+            for (uint8_t i = 0; i < 3; i++) { ImuAcc[i] = (int16_t)((buf[3 + 2 * i] << 8) | buf[2 + 2 * i]); }
+            ImuTemp_x100 = (int16_t)((buf[9] << 8) | buf[8]);
+            ImuAccMillis = now;
+            ImuAccCount++;
+            float ax = ImuAcc[0], ay = ImuAcc[1], az = ImuAcc[2];
+            float dev = sqrtf(ax * ax + ay * ay + az * az) * (1000.0f / 2048.0f) - 1000.0f;   // 2048 = 1 g
+            if (dev < 0) { dev = -dev; }
+            uint16_t mg = (dev > 65000.0f) ? 65000 : (uint16_t)dev;
+            if (mg > AccPeak_mg) { AccPeak_mg = mg; }
+            if (AccBurstN < 255) { AccBurstN++; }
+        }
+        else if (buf[1] == 0x52)                // 1.9: angular rate (x, y, z / 32768 * 2000 deg/s)
+        {
+            for (uint8_t i = 0; i < 3; i++) { ImuGyro[i] = (int16_t)((buf[3 + 2 * i] << 8) | buf[2 + 2 * i]); }
+            ImuGyroMillis = now;
+            ImuGyroCount++;
+        }
     }
 }
 
@@ -1276,17 +1525,18 @@ void ImuQueue(uint8_t reg, uint16_t val)
     c[0] = 0xFF; c[1] = 0xAA; c[2] = reg; c[3] = (uint8_t)(val & 0xFF); c[4] = (uint8_t)(val >> 8);
 }
 
-// Output angles only (the board uses nothing else, and at 100 Hz that is 1100 bytes/s - well inside the 512-byte
-// receive buffer even when a WiFi call holds up loop() for 150 ms), rateCode (WitMotion: 0x06 10 Hz, 0x08 50 Hz,
-// 0x09 100 Hz, 0x0B 200 Hz), 115200 baud, saved in the sensor.  Needs D1 -> MAX3232 -> sensor RX.  Saved at the old baud and
-// again at the new one, because sensors differ in when the new baud rate takes effect.
-void ImuStartSetup(uint8_t rateCode)
+// Output angles only (1100 bytes/s at 100 Hz), or - 1.9, for smc3_scope's 3D view - angles, gyro and acceleration
+// (3300 bytes/s: a 150 ms hold-up of loop() by a WiFi call still fits the 512-byte receive buffer; a longer one
+// costs a few packets, nothing else).  rateCode (WitMotion: 0x06 10 Hz, 0x08 50 Hz, 0x09 100 Hz, 0x0B 200 Hz),
+// 115200 baud, saved in the sensor.  Needs D1 -> MAX3232 -> sensor RX.  Saved at the old baud and again at the
+// new one, because sensors differ in when the new baud rate takes effect.
+void ImuStartSetup(uint8_t rateCode, bool all)
 {
     if (ImuCmdN > 0) { return; }
     if (rateCode < 0x01 || rateCode > 0x0B) { rateCode = 0x09; }
     ImuCmdPos = 0;
     ImuQueue(0x69, 0xB588);                     // unlock
-    ImuQueue(0x02, 0x0008);                     // output: angles only
+    ImuQueue(0x02, all ? 0x000E : 0x0008);      // output: angles (0x53), + acceleration (0x51) and gyro (0x52)
     ImuQueue(0x03, rateCode);                   // output rate
     ImuQueue(0x00, 0x0000);                     // save
     ImuQueue(0x69, 0xB588);
@@ -1305,6 +1555,8 @@ void ServiceImu(unsigned long now)
         ImuRateSince = now;
         ImuRateHz = ImuAngleCount;
         ImuAngleCount = 0;
+        ImuAccHz = ImuAccCount;   ImuAccCount = 0;
+        ImuGyroHz = ImuGyroCount; ImuGyroCount = 0;
     }
 
     if (ImuCmdN > 0)                            // set-up in progress
@@ -1352,7 +1604,13 @@ void ImuCommand(uint8_t a, uint8_t b)
     if (a < 16)
     {
         SensorFlags = a;
-        TiltLimitDeg = (b <= 60) ? b : 60;
+        if (b != 255)                            // 1.8's single limit: all four directions (255 = leave them, 1.9)
+        {
+            uint8_t t = (b <= 60) ? b : 60;
+            for (uint8_t d = 0; d < 4; d++) { TiltLim_x10[d] = (int16_t)t * 10; }
+            UpdateLimits();
+            if (EEPROM.read(SEAT_EE) == 0xB9) { WriteSeatSetup(); }
+        }
         UpdateSeatAngles();
         WriteBoardSettings();
     }
@@ -1374,7 +1632,9 @@ void ImuCommand(uint8_t a, uint8_t b)
 #if IMU_PORT
     else if (a == 'S')
     {
-        ImuStartSetup(b == 0 ? 0x09 : b);
+        // b = 0: 100 Hz, angles only (1.8).  1.9: low nibble = WitMotion rate code, bit6 = angles + gyro + acceleration
+        if (b == 0) { ImuStartSetup(0x09, false); }
+        else        { ImuStartSetup((b & 0x0F) ? (b & 0x0F) : 0x09, (b & 0x40) != 0); }
     }
     else if (a == 'R')
     {
@@ -1393,6 +1653,10 @@ void ImuCommand(uint8_t a, uint8_t b)
 //      motion sensor, levelled and turned to its mounting; -32768 = no data), uint16 isrMaxMicros
 //    = 38 bytes per sample.  Commands from the client use the exact SMC3 "[xyz]" format; replies to [rd?]
 //    go back over the same connection.
+//    1.9, after [xe1] only: every burst is followed by 'S' 'M' '3' 'X', uint8 version (1), uint8 length (18), then
+//      int16 acceleration x, y, z (raw, / 32768 * 16 g), int16 gyro x, y, z (raw, / 32768 * 2000 deg/s),
+//      int16 temperature x100, uint16 biggest |acceleration| - 1 g since the last burst (milli-g),
+//      uint8 flags (bit0 acceleration fresh, bit1 gyro fresh), uint8 acceleration packets since the last burst.
 //****************************************************************************************************************
 
 #if ENABLE_WIFI
@@ -1487,6 +1751,25 @@ void TelemetrySend()
     TelBuf[4] = 1;
     TelBuf[5] = TelCount;
     size_t n = 6 + (size_t)TelCount * TEL_SAMPLE_BYTES;
+    if (TelExtras)                               // 1.9: the sensor's acceleration and gyro, in the same write
+    {
+        uint8_t *x = TelBuf + n;
+        unsigned long now = millis();
+        x[0] = 'S'; x[1] = 'M'; x[2] = '3'; x[3] = 'X'; x[4] = 1; x[5] = TEL_EXTRA_BYTES;
+        uint8_t *p = x + 6;
+        for (uint8_t i = 0; i < 3; i++) { Put16(p, ImuAcc[i]);  p += 2; }
+        for (uint8_t i = 0; i < 3; i++) { Put16(p, ImuGyro[i]); p += 2; }
+        Put16(p, ImuTemp_x100); p += 2;
+        Put16(p, AccPeak_mg);   p += 2;
+        uint8_t fl = 0;
+        if (ImuAccMillis != 0 && (now - ImuAccMillis) < 500)   { fl |= 1; }
+        if (ImuGyroMillis != 0 && (now - ImuGyroMillis) < 500) { fl |= 2; }
+        *p++ = fl;
+        *p++ = AccBurstN;
+        n += 6 + TEL_EXTRA_BYTES;
+    }
+    AccPeak_mg = 0;                              // per burst, sent or not
+    AccBurstN = 0;
     if (TcpClient.write(TelBuf, n) == 0) { ClientUp = false; }
     TelCount = 0;
 }
@@ -1505,12 +1788,17 @@ void TelemetrySend()
 //   uint16 ms since the last angle packet (65535 = longer/never), int16 raw roll, raw pitch, yaw (x100),
 //   int16 level roll, level pitch (x100), uint16 tilt trips, uint8 matrix view, uint8 matrix flags,
 //   uint8 error code on the matrix (255 = none).
+//   Version 3 (1.9) adds:  per motor int16 level trim, travel low, travel high, end stop low, end stop high |
+//   int16 tilt limits x10 (roll +, roll -, pitch +, pitch -) | uint8 flags: bit0 seat set-up saved (what runs is in
+//   EEPROM), bit1 a seat set-up is in EEPROM, bit2 "SM3X" frames on, bit3 the page holds the seat | uint32 SimHub
+//   position commands ignored while the page held the seat | uint16 acceleration and gyro packets in the last
+//   second | int16 raw acceleration x, y, z, raw gyro x, y, z, temperature x100.
 // Only ever sent to the WiFi client, so SimHub and SMC3Utils on USB never see it.
 uint8_t MatrixError();
 
 void SendDiag()
 {
-    uint8_t buf[6 + 220];
+    uint8_t buf[6 + 255];
     uint8_t *p = buf + 6;
     unsigned long now = millis();
     Put32(p, (uint32_t)now); p += 4;
@@ -1570,9 +1858,30 @@ void SendDiag()
     *p++ = LedView;
     *p++ = LedFlags;
     *p++ = MatrixError();
+    for (uint8_t m = 0; m < NUM_MOTORS; m++)       // version 3 (1.9): seat set-up and the rest of the sensor
+    {
+        Put16(p, Trim[m]);     p += 2;
+        Put16(p, TravelLo[m]); p += 2;
+        Put16(p, TravelHi[m]); p += 2;
+        Put16(p, EndLo[m]);    p += 2;
+        Put16(p, EndHi[m]);    p += 2;
+    }
+    for (uint8_t d = 0; d < 4; d++) { Put16(p, TiltLim_x10[d]); p += 2; }
+    uint8_t fl = 0;
+    if (SeatSetupSaved()) { fl |= 1; }
+    if (EEPROM.read(SEAT_EE) == 0xB9) { fl |= 2; }
+    if (TelExtras) { fl |= 4; }
+    if (PageHolds()) { fl |= 8; }
+    *p++ = fl;
+    Put32(p, UsbHeldFrames); p += 4;
+    Put16(p, ImuAccHz);  p += 2;
+    Put16(p, ImuGyroHz); p += 2;
+    for (uint8_t i = 0; i < 3; i++) { Put16(p, ImuAcc[i]);  p += 2; }
+    for (uint8_t i = 0; i < 3; i++) { Put16(p, ImuGyro[i]); p += 2; }
+    Put16(p, ImuTemp_x100); p += 2;
     size_t len = (size_t)(p - (buf + 6));
     buf[0] = 'S'; buf[1] = 'M'; buf[2] = '3'; buf[3] = 'D';
-    buf[4] = 2;
+    buf[4] = 3;
     buf[5] = (uint8_t)len;
     if (TcpClient.write(buf, 6 + len) == 0) { ClientUp = false; }
 }
@@ -1618,6 +1927,7 @@ void ServiceNetwork(unsigned long now)
                 TcpClient = c;
                 ClientUp = true;
                 TelCount = 0;
+                TelExtras = false;                      // a new page asks for them if it wants them
                 TcpBufferEnd = -1;
                 NetLastSample = NetLastSend = NetLastPoll = NetLastCheck = now;
             }
@@ -1679,7 +1989,7 @@ void ServiceNetwork(unsigned long now)
 //      * otherwise the chosen view: motor bars, the seat horizon (motion sensor), or quiet;
 //      * motor bars view while SimHub is idle: a slow oscilloscope trace.
 //    The code between the BEGIN/END markers only uses the globals listed here, so the preview tool can build it on
-//    a PC: Frame, Disable, DisableReason, Feedback_q, Goal_q, InputClipMin/Max, SeatRoll/SeatPitch, SensorFresh(),
+//    a PC: Frame, Disable, DisableReason, Feedback_q, Goal_q, TargetLo/Hi, SeatRoll/SeatPitch, SensorFresh(),
 //    SensorFlags, LedView, LedFlags, LastPosMillis, WifiText, WifiUp, ClientUp, PendingIpScroll, LastIpScroll.
 //****************************************************************************************************************
 
@@ -1865,7 +2175,7 @@ void ErrorText(uint8_t code, char *out, size_t n)
 
 static inline int HalfSteps(uint8_t m, int q)   // position (Q4) -> bar height in half pixels, 2..16
 {
-    int lo = InputClipMin[m], hi = InputClipMax[m];
+    int lo = TargetLo[m], hi = TargetHi[m];       // the range in force (SMC3 clip + travel limits, 1.9)
     if (hi - lo < 16) { lo = 0; hi = 1023; }
     long v = ((long)q * 16) >> POS_SHIFT;        // 1/16 count
     long h = 2 + ((v - (long)lo * 16) * 14 + (long)(hi - lo) * 8) / ((long)(hi - lo) * 16);
@@ -2049,6 +2359,7 @@ void setup()
     // 1. PWM first - it must get the GPT channels that belong to D9/D10/D11
     ReadEEProm();
     ReadBoardSettings();
+    ReadSeatSetup();                            // 1.9: level trim and limits (needs the two above)
 #if IMU_PORT
     Serial1.begin(ImuBauds[ImuBaudIdx]);        // the baud rate that worked last time (9600 if never)
     ImuBaudSince = millis();
@@ -2058,11 +2369,13 @@ void setup()
     UpdatePIDLimits();
     UpdateSmoothingRate();
 
-    // 2. Start the smoothed goals from wherever the motors actually are
+    // 2. Start the smoothed goals from wherever the motors actually are; the target is the centre - with a level
+    //    trim (1.9) that is the level seat
     for (uint8_t m = 0; m < NUM_MOTORS; m++)
     {
+        SetTarget(m, 512);
         int fb = analogRead(FeedbackPin[m]);
-        int fb10 = constrain(fb >> POS_SHIFT, InputClipMin[m], InputClipMax[m]);
+        int fb10 = constrain(fb >> POS_SHIFT, TargetLo[m], TargetHi[m]);
         GoalAcc[m] = (long)fb10 << 12;
         Goal_q[m] = fb10 << POS_SHIFT;
         Feedback_q[m] = fb;

@@ -1,58 +1,360 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 520" width="960" height="520" font-family="Inter, 'Segoe UI', Helvetica, Arial, sans-serif">
-  <defs>
-    <style>
-      .box{fill:#f7f9fc;stroke:#2b3a4e;stroke-width:2;rx:10}
-      .t{font-size:17px;font-weight:700;fill:#0f1b2d}
-      .s{font-size:12.5px;fill:#4a5a70}
-      .pin{font-size:13.5px;font-weight:600;fill:#0f1b2d}
-      .pn{font-size:12px;fill:#4a5a70}
-      .w{fill:none;stroke-width:3.2;stroke-linecap:round;stroke-linejoin:round}
-      .opt{stroke-dasharray:9 6}
-      .note{font-size:13px;fill:#2b3a4e}
-      .warn{font-size:13px;fill:#b3261e;font-weight:600}
-    </style>
-  </defs>
-  <rect x="0" y="0" width="960" height="520" fill="#ffffff"/>
-  <text x="24" y="34" class="t" style="font-size:20px">WT901C-232 motion sensor on the UNO R4 WiFi</text>
-  <text x="24" y="56" class="s">Solid wires are needed. Dashed: only so the page can set the sensor to 100 Hz (Settings, Motion sensor).</text>
-
-  <!-- sensor -->
-  <rect class="box" x="24" y="96" width="210" height="250"/>
-  <text x="40" y="124" class="t">WT901C-232</text>
-  <text x="40" y="143" class="s">on the seat frame</text>
-  <g class="pin"><text x="40" y="184">VCC</text><text x="40" y="226">GND</text><text x="40" y="268">TX</text><text x="40" y="310">RX</text></g>
-  <g class="pn"><text x="90" y="184">red, 5-36 V</text><text x="90" y="226">black</text><text x="90" y="268">yellow</text><text x="90" y="310">green</text></g>
-
-  <!-- MAX3232 -->
-  <rect class="box" x="374" y="150" width="212" height="196"/>
-  <text x="390" y="176" class="t">MAX3232 module</text>
-  <text x="390" y="194" class="s">RS-232 ⇄ TTL, at 5 V</text>
-  <g class="pin"><text x="390" y="268">RX</text><text x="390" y="310">TX</text><text x="548" y="268" text-anchor="end">TX</text><text x="548" y="310" text-anchor="end">RX</text></g>
-  <text x="390" y="336" class="pn">RS-232 side</text><text x="572" y="336" class="pn" text-anchor="end">TTL side</text>
-  <text x="572" y="223" class="pin" text-anchor="end">VCC</text><text x="572" y="243" class="pin" text-anchor="end">GND</text>
-
-  <!-- board -->
-  <rect class="box" x="722" y="96" width="214" height="250"/>
-  <text x="738" y="124" class="t">UNO R4 WiFi</text>
-  <text x="738" y="143" class="s">SMC3_R4 firmware 1.8</text>
-  <g class="pin"><text x="920" y="184" text-anchor="end">5V</text><text x="920" y="226" text-anchor="end">GND</text><text x="920" y="268" text-anchor="end">D0  (RX)</text><text x="920" y="310" text-anchor="end">D1  (TX)</text></g>
-
-  <!-- wires -->
-  <path class="w" stroke="#d32f2f" d="M234 178 H300 V120 H660 V178 H722"/>
-  <path class="w" stroke="#d32f2f" d="M660 120 V218 H586"/>
-  <path class="w" stroke="#222" d="M234 220 H316 V106 H676 V220 H722"/>
-  <path class="w" stroke="#222" d="M676 220 V238 H586"/>
-  <path class="w" stroke="#e0b000" d="M234 262 H374"/>
-  <path class="w" stroke="#e0b000" d="M586 262 H722"/>
-  <path class="w opt" stroke="#2e9e44" d="M234 304 H374"/>
-  <path class="w opt" stroke="#2e9e44" d="M586 304 H722"/>
-  <g fill="#2b3a4e"><circle cx="660" cy="178" r="4.5"/><circle cx="676" cy="220" r="4.5"/></g>
-
-  <!-- notes -->
-  <text x="24" y="392" class="warn">A -232 sensor must never go to D0 / D1 directly - RS-232 levels (up to ±12 V) damage the board.</text>
-  <text x="24" y="418" class="note">Module labels differ: on most, the TTL side's TX is the module's output (to D0) and RX its input (from D1).</text>
-  <text x="24" y="438" class="note">If the page finds nothing, try the two TTL wires the other way round. The board tries the baud rates by itself.</text>
-  <text x="24" y="470" class="note" font-weight="600">Sharing the sensor with SimHub (VR motion compensation)?</text>
-  <text x="24" y="490" class="note">Keep the sensor on the PC's USB adapter as it is, and add only its TX (yellow) and GND to the MAX3232 - no VCC, no D1.</text>
-  <text x="24" y="510" class="note">The board just listens. Set 100 Hz / 115200 baud in WitMotion's PC software.</text>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 960" width="1280" height="960" font-family="Inter, 'Segoe UI', Helvetica, Arial, sans-serif">
+<defs><linearGradient id="pcbT" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#079aa2"/><stop offset="1" stop-color="#047a82"/></linearGradient><linearGradient id="pcbB" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#2468c4"/><stop offset="1" stop-color="#1a4f9a"/></linearGradient><linearGradient id="metal" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#9aa3ad"/><stop offset=".5" stop-color="#e4e8ec"/><stop offset="1" stop-color="#9aa3ad"/></linearGradient><linearGradient id="sens" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#3a3f47"/><stop offset="1" stop-color="#16191d"/></linearGradient><filter id="sh" x="-10%" y="-10%" width="130%" height="130%"><feDropShadow dx="0" dy="3" stdDeviation="4" flood-color="#000" flood-opacity=".22"/></filter></defs>
+<rect width="1280" height="960" fill="#ffffff"/>
+<text x="40.0" y="46.0" font-size="25" font-weight="700" fill="#0f1b2d" text-anchor="start" >Motion sensor wiring: WT901C-232 → MAX3232 → UNO R4 WiFi</text>
+<text x="40.0" y="72.0" font-size="14" font-weight="400" fill="#4a5a70" text-anchor="start" >All four sensor wires, so the page can also set the sensor up. Motor wiring stays as it is. Switch the motor power off while you wire.</text>
+<g filter="url(#sh)"><rect x="40" y="180" width="200" height="150" rx="16" fill="url(#sens)" stroke="#0b0d10" stroke-width="2"/></g>
+<circle cx="56" cy="196" r="6" fill="#0b0d10" stroke="#5a616b" stroke-width="1.5"/>
+<circle cx="224" cy="196" r="6" fill="#0b0d10" stroke="#5a616b" stroke-width="1.5"/>
+<circle cx="56" cy="314" r="6" fill="#0b0d10" stroke="#5a616b" stroke-width="1.5"/>
+<circle cx="224" cy="314" r="6" fill="#0b0d10" stroke="#5a616b" stroke-width="1.5"/>
+<text x="140.0" y="242.0" font-size="19" font-weight="700" fill="#ffffff" text-anchor="middle" >WT901C-232</text>
+<text x="140.0" y="264.0" font-size="12" font-weight="400" fill="#b8c0ca" text-anchor="middle" >9-axis motion sensor</text>
+<text x="140.0" y="284.0" font-size="12" font-weight="600" fill="#ffb4a8" text-anchor="middle" >RS-232 output</text>
+<rect x="236" y="242" width="18" height="26" rx="4" fill="#2a2e34" stroke="#0b0d10"/>
+<path d="M254,255 L302,255" stroke="#4b5058" stroke-width="16" stroke-linecap="round"/>
+<text x="40.0" y="362.0" font-size="12.5" font-weight="400" fill="#4a5a70" text-anchor="start" >Mount it flat on the seat frame.</text>
+<text x="40.0" y="380.0" font-size="12.5" font-weight="400" fill="#4a5a70" text-anchor="start" >Any direction - you set the mounting</text>
+<text x="40.0" y="398.0" font-size="12.5" font-weight="400" fill="#4a5a70" text-anchor="start" >in the page afterwards.</text>
+<text x="40.0" y="432.0" font-size="13" font-weight="700" fill="#0f1b2d" text-anchor="start" >Sensor wires</text>
+<line x1="40" y1="450" x2="70" y2="450" stroke="#d6332b" stroke-width="5" stroke-linecap="round"/>
+<text x="80.0" y="454.0" font-size="12.5" font-weight="600" fill="#0f1b2d" text-anchor="start" >red</text>
+<text x="132.0" y="454.0" font-size="12.5" font-weight="400" fill="#4a5a70" text-anchor="start" >VCC, 5-36 V</text>
+<line x1="40" y1="471" x2="70" y2="471" stroke="#1b1b1b" stroke-width="5" stroke-linecap="round"/>
+<text x="80.0" y="475.0" font-size="12.5" font-weight="600" fill="#0f1b2d" text-anchor="start" >black</text>
+<text x="132.0" y="475.0" font-size="12.5" font-weight="400" fill="#4a5a70" text-anchor="start" >GND</text>
+<line x1="40" y1="492" x2="70" y2="492" stroke="#e9a800" stroke-width="5" stroke-linecap="round"/>
+<text x="80.0" y="496.0" font-size="12.5" font-weight="600" fill="#0f1b2d" text-anchor="start" >yellow</text>
+<text x="132.0" y="496.0" font-size="12.5" font-weight="400" fill="#4a5a70" text-anchor="start" >TX (data out)</text>
+<line x1="40" y1="513" x2="70" y2="513" stroke="#239a3b" stroke-width="5" stroke-linecap="round"/>
+<text x="80.0" y="517.0" font-size="12.5" font-weight="600" fill="#0f1b2d" text-anchor="start" >green</text>
+<text x="132.0" y="517.0" font-size="12.5" font-weight="400" fill="#4a5a70" text-anchor="start" >RX (data in)</text>
+<g filter="url(#sh)"><rect x="400" y="190" width="74" height="196" rx="6" fill="#2e7d4f" stroke="#1d5435" stroke-width="2"/></g>
+<rect x="404" y="200" width="30" height="16" rx="2" fill="#3fae6a" stroke="#1d5435"/>
+<circle cx="419" cy="208" r="5.2" fill="#d9dde2" stroke="#6d7680" stroke-width="1.2"/><line x1="415.5" y1="208" x2="422.5" y2="208" stroke="#6d7680" stroke-width="1.4"/>
+<text x="446.0" y="212.5" font-size="11" font-weight="400" fill="#bfe3cd" text-anchor="middle" >1</text>
+<rect x="404" y="220" width="30" height="16" rx="2" fill="#3fae6a" stroke="#1d5435"/>
+<circle cx="419" cy="228" r="5.2" fill="#d9dde2" stroke="#6d7680" stroke-width="1.2"/><line x1="415.5" y1="228" x2="422.5" y2="228" stroke="#6d7680" stroke-width="1.4"/>
+<text x="446.0" y="232.5" font-size="12.5" font-weight="700" fill="#ffffff" text-anchor="middle" >2</text>
+<rect x="404" y="240" width="30" height="16" rx="2" fill="#3fae6a" stroke="#1d5435"/>
+<circle cx="419" cy="248" r="5.2" fill="#d9dde2" stroke="#6d7680" stroke-width="1.2"/><line x1="415.5" y1="248" x2="422.5" y2="248" stroke="#6d7680" stroke-width="1.4"/>
+<text x="446.0" y="252.5" font-size="12.5" font-weight="700" fill="#ffffff" text-anchor="middle" >3</text>
+<rect x="404" y="260" width="30" height="16" rx="2" fill="#3fae6a" stroke="#1d5435"/>
+<circle cx="419" cy="268" r="5.2" fill="#d9dde2" stroke="#6d7680" stroke-width="1.2"/><line x1="415.5" y1="268" x2="422.5" y2="268" stroke="#6d7680" stroke-width="1.4"/>
+<text x="446.0" y="272.5" font-size="11" font-weight="400" fill="#bfe3cd" text-anchor="middle" >4</text>
+<rect x="404" y="280" width="30" height="16" rx="2" fill="#3fae6a" stroke="#1d5435"/>
+<circle cx="419" cy="288" r="5.2" fill="#d9dde2" stroke="#6d7680" stroke-width="1.2"/><line x1="415.5" y1="288" x2="422.5" y2="288" stroke="#6d7680" stroke-width="1.4"/>
+<text x="446.0" y="292.5" font-size="12.5" font-weight="700" fill="#ffffff" text-anchor="middle" >5</text>
+<rect x="404" y="300" width="30" height="16" rx="2" fill="#3fae6a" stroke="#1d5435"/>
+<circle cx="419" cy="308" r="5.2" fill="#d9dde2" stroke="#6d7680" stroke-width="1.2"/><line x1="415.5" y1="308" x2="422.5" y2="308" stroke="#6d7680" stroke-width="1.4"/>
+<text x="446.0" y="312.5" font-size="11" font-weight="400" fill="#bfe3cd" text-anchor="middle" >6</text>
+<rect x="404" y="320" width="30" height="16" rx="2" fill="#3fae6a" stroke="#1d5435"/>
+<circle cx="419" cy="328" r="5.2" fill="#d9dde2" stroke="#6d7680" stroke-width="1.2"/><line x1="415.5" y1="328" x2="422.5" y2="328" stroke="#6d7680" stroke-width="1.4"/>
+<text x="446.0" y="332.5" font-size="11" font-weight="400" fill="#bfe3cd" text-anchor="middle" >7</text>
+<rect x="404" y="340" width="30" height="16" rx="2" fill="#3fae6a" stroke="#1d5435"/>
+<circle cx="419" cy="348" r="5.2" fill="#d9dde2" stroke="#6d7680" stroke-width="1.2"/><line x1="415.5" y1="348" x2="422.5" y2="348" stroke="#6d7680" stroke-width="1.4"/>
+<text x="446.0" y="352.5" font-size="11" font-weight="400" fill="#bfe3cd" text-anchor="middle" >8</text>
+<rect x="404" y="360" width="30" height="16" rx="2" fill="#3fae6a" stroke="#1d5435"/>
+<circle cx="419" cy="368" r="5.2" fill="#d9dde2" stroke="#6d7680" stroke-width="1.2"/><line x1="415.5" y1="368" x2="422.5" y2="368" stroke="#6d7680" stroke-width="1.4"/>
+<text x="446.0" y="372.5" font-size="11" font-weight="400" fill="#bfe3cd" text-anchor="middle" >9</text>
+<text x="437.0" y="164.0" font-size="12" font-weight="600" fill="#0f1b2d" text-anchor="middle" >DB9 plug with</text>
+<text x="437.0" y="179.0" font-size="12" font-weight="600" fill="#0f1b2d" text-anchor="middle" >screw terminals</text>
+<text x="437.0" y="406.0" font-size="11.5" font-weight="600" fill="#2e7d4f" text-anchor="middle" >pins 2, 3, 5</text>
+<path d="M474,224 L500,236 L500,340 L474,352 Z" fill="url(#metal)" stroke="#6d7680" stroke-width="1.5"/>
+<text x="487.0" y="291.0" font-size="10" font-weight="700" fill="#3b4450" text-anchor="middle" transform="rotate(-90 487 291)">DB9</text>
+<g filter="url(#sh)"><rect x="500" y="202" width="196" height="172" rx="7" fill="url(#pcbB)" stroke="#123a73" stroke-width="2"/></g>
+<circle cx="512" cy="214" r="5" fill="#ffffff" stroke="#123a73"/>
+<circle cx="684" cy="214" r="5" fill="#ffffff" stroke="#123a73"/>
+<circle cx="512" cy="362" r="5" fill="#ffffff" stroke="#123a73"/>
+<circle cx="684" cy="362" r="5" fill="#ffffff" stroke="#123a73"/>
+<rect x="562" y="266" width="58" height="40" rx="3" fill="#15171a"/>
+<rect x="566.0" y="262" width="3" height="5" fill="#c9ccd1"/><rect x="566.0" y="305" width="3" height="5" fill="#c9ccd1"/>
+<rect x="572.6" y="262" width="3" height="5" fill="#c9ccd1"/><rect x="572.6" y="305" width="3" height="5" fill="#c9ccd1"/>
+<rect x="579.2" y="262" width="3" height="5" fill="#c9ccd1"/><rect x="579.2" y="305" width="3" height="5" fill="#c9ccd1"/>
+<rect x="585.8" y="262" width="3" height="5" fill="#c9ccd1"/><rect x="585.8" y="305" width="3" height="5" fill="#c9ccd1"/>
+<rect x="592.4" y="262" width="3" height="5" fill="#c9ccd1"/><rect x="592.4" y="305" width="3" height="5" fill="#c9ccd1"/>
+<rect x="599.0" y="262" width="3" height="5" fill="#c9ccd1"/><rect x="599.0" y="305" width="3" height="5" fill="#c9ccd1"/>
+<rect x="605.6" y="262" width="3" height="5" fill="#c9ccd1"/><rect x="605.6" y="305" width="3" height="5" fill="#c9ccd1"/>
+<rect x="612.2" y="262" width="3" height="5" fill="#c9ccd1"/><rect x="612.2" y="305" width="3" height="5" fill="#c9ccd1"/>
+<text x="591.0" y="290.0" font-size="10" font-weight="700" fill="#e8eaee" text-anchor="middle" >MAX3232</text>
+<rect x="533" y="238" width="14" height="8" rx="2" fill="#c8a46a" stroke="#8a6d3b" stroke-width=".8"/>
+<rect x="633" y="238" width="14" height="8" rx="2" fill="#c8a46a" stroke="#8a6d3b" stroke-width=".8"/>
+<rect x="533" y="328" width="14" height="8" rx="2" fill="#c8a46a" stroke="#8a6d3b" stroke-width=".8"/>
+<rect x="633" y="328" width="14" height="8" rx="2" fill="#c8a46a" stroke="#8a6d3b" stroke-width=".8"/>
+<circle cx="600" cy="342" r="4" fill="#ff4b3e"/>
+<text x="506.0" y="188.0" font-size="14" font-weight="700" fill="#0f1b2d" text-anchor="start" >MAX3232 module (RS-232 ⇄ TTL)</text>
+<text x="530.0" y="394.0" font-size="11.5" font-weight="600" fill="#4a5a70" text-anchor="middle" >RS-232 side</text>
+<text x="670.0" y="394.0" font-size="11.5" font-weight="600" fill="#4a5a70" text-anchor="middle" >TTL side</text>
+<rect x="690" y="242" width="16" height="12" rx="1.5" fill="#15171a"/><rect x="696" y="246" width="12" height="4" fill="#d4b04a"/>
+<text x="684.0" y="252.5" font-size="12.5" font-weight="700" fill="#ffffff" text-anchor="end" >TXD</text>
+<rect x="690" y="268" width="16" height="12" rx="1.5" fill="#15171a"/><rect x="696" y="272" width="12" height="4" fill="#d4b04a"/>
+<text x="684.0" y="278.5" font-size="12.5" font-weight="700" fill="#ffffff" text-anchor="end" >RXD</text>
+<rect x="690" y="294" width="16" height="12" rx="1.5" fill="#15171a"/><rect x="696" y="298" width="12" height="4" fill="#d4b04a"/>
+<text x="684.0" y="304.5" font-size="12.5" font-weight="700" fill="#ffffff" text-anchor="end" >GND</text>
+<rect x="690" y="320" width="16" height="12" rx="1.5" fill="#15171a"/><rect x="696" y="324" width="12" height="4" fill="#d4b04a"/>
+<text x="684.0" y="330.5" font-size="12.5" font-weight="700" fill="#ffffff" text-anchor="end" >VCC</text>
+<g filter="url(#sh)"><rect x="820" y="180" width="420" height="327" rx="11" fill="url(#pcbT)" stroke="#035e64" stroke-width="2"/></g>
+<circle cx="905.7" cy="195.3" r="7" fill="#ffffff" stroke="#035e64" stroke-width="1.5"/>
+<circle cx="913.7" cy="490.4" r="7" fill="#ffffff" stroke="#035e64" stroke-width="1.5"/>
+<circle cx="1224.7" cy="226.5" r="7" fill="#ffffff" stroke="#035e64" stroke-width="1.5"/>
+<circle cx="1224.7" cy="397.3" r="7" fill="#ffffff" stroke="#035e64" stroke-width="1.5"/>
+<rect x="806" y="220" width="34" height="44" rx="6" fill="url(#metal)" stroke="#6d7680"/>
+<text x="846.0" y="246.0" font-size="10" font-weight="700" fill="#e6fbfc" text-anchor="start" >USB-C</text>
+<rect x="802" y="403" width="56" height="64" rx="5" fill="#16191d"/>
+<circle cx="830" cy="435" r="12" fill="#2b3036"/>
+<rect x="960" y="302" width="150" height="106" rx="5" fill="#04666c"/>
+<rect x="970" y="312" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="981" y="312" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="992" y="312" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="1003" y="312" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="1014" y="312" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="1025" y="312" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="1036" y="312" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="1047" y="312" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="1058" y="312" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="1069" y="312" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="1080" y="312" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="1091" y="312" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="970" y="323" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="981" y="323" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="992" y="323" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="1003" y="323" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="1014" y="323" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="1025" y="323" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="1036" y="323" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="1047" y="323" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="1058" y="323" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="1069" y="323" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="1080" y="323" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="1091" y="323" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="970" y="334" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="981" y="334" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="992" y="334" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="1003" y="334" width="6" height="4" rx="1" fill="#ff5a4a" opacity="1"/>
+<rect x="1014" y="334" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="1025" y="334" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="1036" y="334" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="1047" y="334" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="1058" y="334" width="6" height="4" rx="1" fill="#ff5a4a" opacity="1"/>
+<rect x="1069" y="334" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="1080" y="334" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="1091" y="334" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="970" y="345" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="981" y="345" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="992" y="345" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="1003" y="345" width="6" height="4" rx="1" fill="#ff5a4a" opacity="1"/>
+<rect x="1014" y="345" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="1025" y="345" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="1036" y="345" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="1047" y="345" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="1058" y="345" width="6" height="4" rx="1" fill="#ff5a4a" opacity="1"/>
+<rect x="1069" y="345" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="1080" y="345" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="1091" y="345" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="970" y="356" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="981" y="356" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="992" y="356" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="1003" y="356" width="6" height="4" rx="1" fill="#ff5a4a" opacity="1"/>
+<rect x="1014" y="356" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="1025" y="356" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="1036" y="356" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="1047" y="356" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="1058" y="356" width="6" height="4" rx="1" fill="#ff5a4a" opacity="1"/>
+<rect x="1069" y="356" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="1080" y="356" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="1091" y="356" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="970" y="367" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="981" y="367" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="992" y="367" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="1003" y="367" width="6" height="4" rx="1" fill="#ff5a4a" opacity="1"/>
+<rect x="1014" y="367" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="1025" y="367" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="1036" y="367" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="1047" y="367" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="1058" y="367" width="6" height="4" rx="1" fill="#ff5a4a" opacity="1"/>
+<rect x="1069" y="367" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="1080" y="367" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="1091" y="367" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="970" y="378" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="981" y="378" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="992" y="378" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="1003" y="378" width="6" height="4" rx="1" fill="#ff5a4a" opacity="1"/>
+<rect x="1014" y="378" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="1025" y="378" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="1036" y="378" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="1047" y="378" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="1058" y="378" width="6" height="4" rx="1" fill="#ff5a4a" opacity="1"/>
+<rect x="1069" y="378" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="1080" y="378" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="1091" y="378" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="970" y="389" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="981" y="389" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="992" y="389" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="1003" y="389" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="1014" y="389" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="1025" y="389" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="1036" y="389" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="1047" y="389" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="1058" y="389" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="1069" y="389" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="1080" y="389" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="1091" y="389" width="6" height="4" rx="1" fill="#d9f3f4" opacity="0.55"/>
+<rect x="1132" y="300" width="84" height="62" rx="4" fill="url(#metal)" stroke="#6d7680"/>
+<text x="1174.0" y="336.0" font-size="10" font-weight="700" fill="#3b4450" text-anchor="middle" >ESP32-S3</text>
+<rect x="1150" y="372" width="46" height="46" rx="3" fill="#1b1e22"/>
+<text x="1173.0" y="399.0" font-size="8.5" font-weight="700" fill="#cfd5db" text-anchor="middle" >RA4M1</text>
+<text x="820.0" y="533.0" font-size="14" font-weight="700" fill="#0f1b2d" text-anchor="start" >Arduino UNO R4 WiFi, top view</text>
+<rect x="1090.9" y="185" width="126.9" height="18" rx="2" fill="#15171a"/>
+<rect x="926.1" y="185" width="158.0" height="18" rx="2" fill="#15171a"/>
+<rect x="982.1" y="484" width="126.9" height="18" rx="2" fill="#15171a"/>
+<rect x="1122.0" y="484" width="95.8" height="18" rx="2" fill="#15171a"/>
+<rect x="1205.3" y="190.5" width="7" height="7" fill="#d4b04a"/>
+<text x="1212.3" y="210.0" font-size="10" font-weight="700" fill="#ffe680" text-anchor="end" transform="rotate(-90 1212.3 210)">RX◀0</text>
+<rect x="1189.7" y="190.5" width="7" height="7" fill="#d4b04a"/>
+<text x="1196.7" y="210.0" font-size="10" font-weight="700" fill="#ffe680" text-anchor="end" transform="rotate(-90 1196.7 210)">TX▶1</text>
+<rect x="1174.2" y="190.5" width="7" height="7" fill="#d4b04a"/>
+<text x="1181.2" y="210.0" font-size="10" font-weight="400" fill="#9fd9dc" text-anchor="end" transform="rotate(-90 1181.2 210)">2</text>
+<rect x="1158.6" y="190.5" width="7" height="7" fill="#d4b04a"/>
+<text x="1165.6" y="210.0" font-size="10" font-weight="400" fill="#9fd9dc" text-anchor="end" transform="rotate(-90 1165.6 210)">3</text>
+<rect x="1143.1" y="190.5" width="7" height="7" fill="#d4b04a"/>
+<text x="1150.1" y="210.0" font-size="10" font-weight="400" fill="#9fd9dc" text-anchor="end" transform="rotate(-90 1150.1 210)">4</text>
+<rect x="1127.5" y="190.5" width="7" height="7" fill="#d4b04a"/>
+<text x="1134.5" y="210.0" font-size="10" font-weight="400" fill="#9fd9dc" text-anchor="end" transform="rotate(-90 1134.5 210)">5</text>
+<rect x="1112.0" y="190.5" width="7" height="7" fill="#d4b04a"/>
+<text x="1119.0" y="210.0" font-size="10" font-weight="400" fill="#9fd9dc" text-anchor="end" transform="rotate(-90 1119.0 210)">6</text>
+<rect x="1096.4" y="190.5" width="7" height="7" fill="#d4b04a"/>
+<text x="1103.4" y="210.0" font-size="10" font-weight="400" fill="#9fd9dc" text-anchor="end" transform="rotate(-90 1103.4 210)">7</text>
+<rect x="1071.5" y="190.5" width="7" height="7" fill="#d4b04a"/>
+<text x="1078.5" y="210.0" font-size="10" font-weight="400" fill="#ffffff" text-anchor="end" transform="rotate(-90 1078.5 210)">8</text>
+<rect x="1056.0" y="190.5" width="7" height="7" fill="#d4b04a"/>
+<text x="1063.0" y="210.0" font-size="10" font-weight="400" fill="#9fd9dc" text-anchor="end" transform="rotate(-90 1063.0 210)">9</text>
+<rect x="1040.4" y="190.5" width="7" height="7" fill="#d4b04a"/>
+<text x="1047.4" y="210.0" font-size="10" font-weight="400" fill="#9fd9dc" text-anchor="end" transform="rotate(-90 1047.4 210)">10</text>
+<rect x="1024.9" y="190.5" width="7" height="7" fill="#d4b04a"/>
+<text x="1031.9" y="210.0" font-size="10" font-weight="400" fill="#9fd9dc" text-anchor="end" transform="rotate(-90 1031.9 210)">11</text>
+<rect x="1009.3" y="190.5" width="7" height="7" fill="#d4b04a"/>
+<text x="1016.3" y="210.0" font-size="10" font-weight="400" fill="#ffffff" text-anchor="end" transform="rotate(-90 1016.3 210)">12</text>
+<rect x="993.8" y="190.5" width="7" height="7" fill="#d4b04a"/>
+<text x="1000.8" y="210.0" font-size="10" font-weight="400" fill="#ffffff" text-anchor="end" transform="rotate(-90 1000.8 210)">13</text>
+<rect x="978.2" y="190.5" width="7" height="7" fill="#d4b04a"/>
+<text x="985.2" y="210.0" font-size="10" font-weight="700" fill="#ffe680" text-anchor="end" transform="rotate(-90 985.2 210)">GND</text>
+<rect x="962.7" y="190.5" width="7" height="7" fill="#d4b04a"/>
+<text x="969.7" y="210.0" font-size="10" font-weight="400" fill="#ffffff" text-anchor="end" transform="rotate(-90 969.7 210)">AREF</text>
+<rect x="947.1" y="190.5" width="7" height="7" fill="#d4b04a"/>
+<text x="954.1" y="210.0" font-size="10" font-weight="400" fill="#ffffff" text-anchor="end" transform="rotate(-90 954.1 210)">SDA</text>
+<rect x="931.6" y="190.5" width="7" height="7" fill="#d4b04a"/>
+<text x="938.6" y="210.0" font-size="10" font-weight="400" fill="#ffffff" text-anchor="end" transform="rotate(-90 938.6 210)">SCL</text>
+<rect x="987.6" y="489.5" width="7" height="7" fill="#d4b04a"/>
+<text x="994.6" y="477.0" font-size="10" font-weight="400" fill="#ffffff" text-anchor="start" transform="rotate(-90 994.6 477)">BOOT</text>
+<rect x="1003.1" y="489.5" width="7" height="7" fill="#d4b04a"/>
+<text x="1010.1" y="477.0" font-size="10" font-weight="400" fill="#ffffff" text-anchor="start" transform="rotate(-90 1010.1 477)">IOREF</text>
+<rect x="1018.7" y="489.5" width="7" height="7" fill="#d4b04a"/>
+<text x="1025.7" y="477.0" font-size="10" font-weight="400" fill="#ffffff" text-anchor="start" transform="rotate(-90 1025.7 477)">RESET</text>
+<rect x="1034.2" y="489.5" width="7" height="7" fill="#d4b04a"/>
+<text x="1041.2" y="477.0" font-size="10" font-weight="400" fill="#ffffff" text-anchor="start" transform="rotate(-90 1041.2 477)">3V3</text>
+<rect x="1049.8" y="489.5" width="7" height="7" fill="#d4b04a"/>
+<text x="1056.8" y="477.0" font-size="10" font-weight="700" fill="#ffe680" text-anchor="start" transform="rotate(-90 1056.8 477)">5V</text>
+<rect x="1065.3" y="489.5" width="7" height="7" fill="#d4b04a"/>
+<text x="1072.3" y="477.0" font-size="10" font-weight="400" fill="#ffffff" text-anchor="start" transform="rotate(-90 1072.3 477)">GND</text>
+<rect x="1080.9" y="489.5" width="7" height="7" fill="#d4b04a"/>
+<text x="1087.9" y="477.0" font-size="10" font-weight="400" fill="#ffffff" text-anchor="start" transform="rotate(-90 1087.9 477)">GND</text>
+<rect x="1096.4" y="489.5" width="7" height="7" fill="#d4b04a"/>
+<text x="1103.4" y="477.0" font-size="10" font-weight="400" fill="#ffffff" text-anchor="start" transform="rotate(-90 1103.4 477)">VIN</text>
+<rect x="1127.5" y="489.5" width="7" height="7" fill="#d4b04a"/>
+<text x="1134.5" y="477.0" font-size="10" font-weight="400" fill="#9fd9dc" text-anchor="start" transform="rotate(-90 1134.5 477)">A0</text>
+<rect x="1143.1" y="489.5" width="7" height="7" fill="#d4b04a"/>
+<text x="1150.1" y="477.0" font-size="10" font-weight="400" fill="#9fd9dc" text-anchor="start" transform="rotate(-90 1150.1 477)">A1</text>
+<rect x="1158.6" y="489.5" width="7" height="7" fill="#d4b04a"/>
+<text x="1165.6" y="477.0" font-size="10" font-weight="400" fill="#9fd9dc" text-anchor="start" transform="rotate(-90 1165.6 477)">A2</text>
+<rect x="1174.2" y="489.5" width="7" height="7" fill="#d4b04a"/>
+<text x="1181.2" y="477.0" font-size="10" font-weight="400" fill="#ffffff" text-anchor="start" transform="rotate(-90 1181.2 477)">A3</text>
+<rect x="1189.7" y="489.5" width="7" height="7" fill="#d4b04a"/>
+<text x="1196.7" y="477.0" font-size="10" font-weight="400" fill="#ffffff" text-anchor="start" transform="rotate(-90 1196.7 477)">A4</text>
+<rect x="1205.3" y="489.5" width="7" height="7" fill="#d4b04a"/>
+<text x="1212.3" y="477.0" font-size="10" font-weight="400" fill="#ffffff" text-anchor="start" transform="rotate(-90 1212.3 477)">A5</text>
+<text x="1138.8" y="272.0" font-size="10" font-weight="400" fill="#9fd9dc" text-anchor="middle" >motor direction</text>
+<text x="1043.9" y="272.0" font-size="10" font-weight="400" fill="#9fd9dc" text-anchor="middle" >PWM</text>
+<text x="1146.6" y="437.0" font-size="10" font-weight="400" fill="#9fd9dc" text-anchor="middle" >pots</text>
+<circle cx="1208.8" cy="194" r="8.5" fill="none" stroke="#ffe680" stroke-width="2.2"/>
+<circle cx="1193.2" cy="194" r="8.5" fill="none" stroke="#ffe680" stroke-width="2.2"/>
+<circle cx="981.7" cy="194" r="8.5" fill="none" stroke="#ffe680" stroke-width="2.2"/>
+<circle cx="1053.3" cy="493" r="8.5" fill="none" stroke="#ffe680" stroke-width="2.2"/>
+<path d="M302,249 C372,249 336,228 406,228" fill="none" stroke="#00000055" stroke-width="6.4" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M302,249 C372,249 336,228 406,228" fill="none" stroke="#239a3b" stroke-width="4.2" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M302,253 C372,253 336,248 406,248" fill="none" stroke="#00000055" stroke-width="6.4" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M302,253 C372,253 336,248 406,248" fill="none" stroke="#e9a800" stroke-width="4.2" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M302,257 C372,257 336,288 406,288" fill="none" stroke="#00000055" stroke-width="6.4" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M302,257 C372,257 336,288 406,288" fill="none" stroke="#1b1b1b" stroke-width="4.2" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M302.0,261.0 L320.0,261.0 Q334.0,261.0 334.0,275.0 L334.0,579.0 Q334.0,593.0 348.0,593.0 L974.0,593.0" fill="none" stroke="#00000055" stroke-width="6.4" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M302.0,261.0 L320.0,261.0 Q334.0,261.0 334.0,275.0 L334.0,579.0 Q334.0,593.0 348.0,593.0 L974.0,593.0" fill="none" stroke="#d6332b" stroke-width="4.2" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M704.0,326.0 L718.0,326.0 Q728.0,326.0 728.0,336.0 L728.0,567.0 Q728.0,577.0 738.0,577.0 L974.0,577.0" fill="none" stroke="#00000055" stroke-width="6.4" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M704.0,326.0 L718.0,326.0 Q728.0,326.0 728.0,336.0 L728.0,567.0 Q728.0,577.0 738.0,577.0 L974.0,577.0" fill="none" stroke="#d6332b" stroke-width="4.2" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M1053.3,493.0 L1053.3,569.0" fill="none" stroke="#00000055" stroke-width="6.4" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M1053.3,493.0 L1053.3,569.0" fill="none" stroke="#d6332b" stroke-width="4.2" stroke-linecap="round" stroke-linejoin="round"/>
+<g filter="url(#sh)"><rect x="970" y="565" width="120" height="40" rx="6" fill="#e9ecef" stroke="#8b949e" stroke-width="1.5"/></g>
+<rect x="984" y="557" width="24" height="14" rx="3" fill="#f39c34" stroke="#b86d12"/>
+<rect x="1018" y="557" width="24" height="14" rx="3" fill="#f39c34" stroke="#b86d12"/>
+<rect x="1052" y="557" width="24" height="14" rx="3" fill="#f39c34" stroke="#b86d12"/>
+<text x="1030.0" y="593.0" font-size="12" font-weight="700" fill="#3b4450" text-anchor="middle" >5 V splice</text>
+<text x="1102.0" y="581.0" font-size="11.5" font-weight="400" fill="#4a5a70" text-anchor="start" >lever connector,</text>
+<text x="1102.0" y="596.0" font-size="11.5" font-weight="400" fill="#4a5a70" text-anchor="start" >or solder + heat-shrink</text>
+<path d="M704.0,300.0 L772.0,300.0 Q784.0,300.0 784.0,288.0 L784.0,160.0 Q784.0,148.0 796.0,148.0 L969.7,148.0 Q981.7,148.0 981.7,160.0 L981.7,194.0" fill="none" stroke="#00000055" stroke-width="6.4" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M704.0,300.0 L772.0,300.0 Q784.0,300.0 784.0,288.0 L784.0,160.0 Q784.0,148.0 796.0,148.0 L969.7,148.0 Q981.7,148.0 981.7,160.0 L981.7,194.0" fill="none" stroke="#1b1b1b" stroke-width="4.2" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M704.0,274.0 L754.0,274.0 Q766.0,274.0 766.0,262.0 L766.0,140.0 Q766.0,128.0 778.0,128.0 L1181.2,128.0 Q1193.2,128.0 1193.2,140.0 L1193.2,194.0" fill="none" stroke="#00000055" stroke-width="6.4" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M704.0,274.0 L754.0,274.0 Q766.0,274.0 766.0,262.0 L766.0,140.0 Q766.0,128.0 778.0,128.0 L1181.2,128.0 Q1193.2,128.0 1193.2,140.0 L1193.2,194.0" fill="none" stroke="#239a3b" stroke-width="4.2" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M704.0,248.0 L736.0,248.0 Q748.0,248.0 748.0,236.0 L748.0,120.0 Q748.0,108.0 760.0,108.0 L1196.8,108.0 Q1208.8,108.0 1208.8,120.0 L1208.8,194.0" fill="none" stroke="#00000055" stroke-width="6.4" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M704.0,248.0 L736.0,248.0 Q748.0,248.0 748.0,236.0 L748.0,120.0 Q748.0,108.0 760.0,108.0 L1196.8,108.0 Q1208.8,108.0 1208.8,120.0 L1208.8,194.0" fill="none" stroke="#e9a800" stroke-width="4.2" stroke-linecap="round" stroke-linejoin="round"/>
+<rect x="857.2" y="97" width="109.6" height="20" rx="10" fill="#ffffff" stroke="#e9a800" stroke-width="2"/>
+<text x="912.0" y="112.0" font-size="11.5" font-weight="700" fill="#0f1b2d" text-anchor="middle" >TXD → D0 (RX)</text>
+<rect x="993.2" y="117" width="109.6" height="20" rx="10" fill="#ffffff" stroke="#239a3b" stroke-width="2"/>
+<text x="1048.0" y="132.0" font-size="11.5" font-weight="700" fill="#0f1b2d" text-anchor="middle" >D1 (TX) → RXD</text>
+<rect x="864.6" y="137.5" width="80.8" height="20" rx="10" fill="#ffffff" stroke="#1b1b1b" stroke-width="2"/>
+<text x="905.0" y="152.5" font-size="11.5" font-weight="700" fill="#0f1b2d" text-anchor="middle" >GND → GND</text>
+<rect x="491.6" y="582" width="80.8" height="20" rx="10" fill="#ffffff" stroke="#d6332b" stroke-width="2"/>
+<text x="532.0" y="597.0" font-size="11.5" font-weight="700" fill="#0f1b2d" text-anchor="middle" >red → 5 V</text>
+<line x1="40" y1="660" x2="1240" y2="660" stroke="#dde3ea" stroke-width="1.5"/>
+<text x="40.0" y="690.0" font-size="15" font-weight="700" fill="#0f1b2d" text-anchor="start" >Connections</text>
+<circle cx="46" cy="712" r="5.5" fill="#d6332b"/>
+<text x="60.0" y="716.0" font-size="13" font-weight="600" fill="#0f1b2d" text-anchor="start" >Sensor red (VCC)</text>
+<text x="200.0" y="716.0" font-size="13" font-weight="400" fill="#4a5a70" text-anchor="start" >→</text>
+<text x="222.0" y="716.0" font-size="13" font-weight="400" fill="#2b3a4e" text-anchor="start" >5 V splice → board 5V</text>
+<circle cx="46" cy="735" r="5.5" fill="#1b1b1b"/>
+<text x="60.0" y="739.0" font-size="13" font-weight="600" fill="#0f1b2d" text-anchor="start" >Sensor black (GND)</text>
+<text x="200.0" y="739.0" font-size="13" font-weight="400" fill="#4a5a70" text-anchor="start" >→</text>
+<text x="222.0" y="739.0" font-size="13" font-weight="400" fill="#2b3a4e" text-anchor="start" >DB9 pin 5</text>
+<circle cx="46" cy="758" r="5.5" fill="#e9a800"/>
+<text x="60.0" y="762.0" font-size="13" font-weight="600" fill="#0f1b2d" text-anchor="start" >Sensor yellow (TX)</text>
+<text x="200.0" y="762.0" font-size="13" font-weight="400" fill="#4a5a70" text-anchor="start" >→</text>
+<text x="222.0" y="762.0" font-size="13" font-weight="400" fill="#2b3a4e" text-anchor="start" >DB9 pin 3</text>
+<circle cx="46" cy="781" r="5.5" fill="#239a3b"/>
+<text x="60.0" y="785.0" font-size="13" font-weight="600" fill="#0f1b2d" text-anchor="start" >Sensor green (RX)</text>
+<text x="200.0" y="785.0" font-size="13" font-weight="400" fill="#4a5a70" text-anchor="start" >→</text>
+<text x="222.0" y="785.0" font-size="13" font-weight="400" fill="#2b3a4e" text-anchor="start" >DB9 pin 2</text>
+<circle cx="46" cy="804" r="5.5" fill="#e9a800"/>
+<text x="60.0" y="808.0" font-size="13" font-weight="600" fill="#0f1b2d" text-anchor="start" >MAX3232 TXD</text>
+<text x="200.0" y="808.0" font-size="13" font-weight="400" fill="#4a5a70" text-anchor="start" >→</text>
+<text x="222.0" y="808.0" font-size="13" font-weight="400" fill="#2b3a4e" text-anchor="start" >board D0 (RX)</text>
+<circle cx="46" cy="827" r="5.5" fill="#239a3b"/>
+<text x="60.0" y="831.0" font-size="13" font-weight="600" fill="#0f1b2d" text-anchor="start" >MAX3232 RXD</text>
+<text x="200.0" y="831.0" font-size="13" font-weight="400" fill="#4a5a70" text-anchor="start" >→</text>
+<text x="222.0" y="831.0" font-size="13" font-weight="400" fill="#2b3a4e" text-anchor="start" >board D1 (TX)</text>
+<circle cx="46" cy="850" r="5.5" fill="#1b1b1b"/>
+<text x="60.0" y="854.0" font-size="13" font-weight="600" fill="#0f1b2d" text-anchor="start" >MAX3232 GND</text>
+<text x="200.0" y="854.0" font-size="13" font-weight="400" fill="#4a5a70" text-anchor="start" >→</text>
+<text x="222.0" y="854.0" font-size="13" font-weight="400" fill="#2b3a4e" text-anchor="start" >board GND</text>
+<circle cx="46" cy="873" r="5.5" fill="#d6332b"/>
+<text x="60.0" y="877.0" font-size="13" font-weight="600" fill="#0f1b2d" text-anchor="start" >MAX3232 VCC</text>
+<text x="200.0" y="877.0" font-size="13" font-weight="400" fill="#4a5a70" text-anchor="start" >→</text>
+<text x="222.0" y="877.0" font-size="13" font-weight="400" fill="#2b3a4e" text-anchor="start" >5 V splice</text>
+<text x="470.0" y="690.0" font-size="15" font-weight="700" fill="#0f1b2d" text-anchor="start" >Before you switch on</text>
+<text x="470.0" y="716.0" font-size="13" font-weight="400" fill="#2b3a4e" text-anchor="start" >Check it is the RS-232 kind: power the sensor alone and measure yellow to black.</text>
+<text x="470.0" y="739.0" font-size="13" font-weight="400" fill="#2b3a4e" text-anchor="start" >Negative (about −5 to −9 V) = RS-232: it needs the MAX3232, as drawn.</text>
+<text x="470.0" y="762.0" font-size="13" font-weight="700" fill="#b3261e" text-anchor="start" >Never put yellow or green straight on D0 / D1 - RS-232 levels damage the board.</text>
+<text x="470.0" y="785.0" font-size="13" font-weight="400" fill="#2b3a4e" text-anchor="start" >Modules print their pins differently: go by the names, not by this picture's order.</text>
+<text x="470.0" y="808.0" font-size="13" font-weight="400" fill="#2b3a4e" text-anchor="start" >The page finds nothing? Swap the yellow and green wires at the DB9 (pins 2 and 3).</text>
+<text x="470.0" y="831.0" font-size="13" font-weight="400" fill="#2b3a4e" text-anchor="start" >D0 / D1 aren't the USB port on the R4: SimHub and uploading carry on as before.</text>
+<text x="470.0" y="854.0" font-size="13" font-weight="400" fill="#2b3a4e" text-anchor="start" >Module with pins instead of a DB9 socket: yellow → its RS-232 RX (R1IN), green → its</text>
+<text x="470.0" y="877.0" font-size="13" font-weight="400" fill="#2b3a4e" text-anchor="start" >RS-232 TX (T1OUT), black → GND.</text>
+<text x="470.0" y="900.0" font-size="13" font-weight="400" fill="#2b3a4e" text-anchor="start" >5V already feeds your IBT-2 boards? Put the two new red wires on that same splice.</text>
+<text x="40.0" y="942.0" font-size="13" font-weight="600" fill="#035e64" text-anchor="start" >Then in the page: Settings, Motion sensor - tick Use the sensor, press Set up the sensor, then run Seat setup.</text>
 </svg>

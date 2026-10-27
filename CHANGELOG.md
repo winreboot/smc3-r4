@@ -3,6 +3,34 @@
 `smc3_scope` (the page) and `SMC3_R4` (the firmware) are versioned separately. The page works with older
 firmware too; the notes say which firmware a feature needs.
 
+## Page 2.0 + firmware 1.9
+
+- **Seat setup** (new section, firmware 1.9): level first, then the limits.
+  - **Level the platform**: by itself with the motion sensor (each motor moves a little to learn how it tilts the
+    seat, then the page levels it at the position nearest the middle of every motor), or by hand with a spirit
+    level. That becomes **SimHub's centre**: the board adds a level trim to every position command, and the seat
+    powers up level.
+  - **Find each motor's safe travel**, both ways: it moves slowly and stops at the tilt you allow, when it pushes
+    against something, at the end of its Clip window, or when you press Stop (space bar).
+  - **Save the limits** on the board: **travel limits** (no position command goes past them), **end stops** (the
+    motor switches off past one: E1-E3) and **tilt limits for each direction** (every motor stops: E4). A picture
+    shows where the seat can tilt inside them; combined moves can be kept within what you allow.
+  - The board ignores SimHub's positions while Seat setup moves the seat, so SimHub can stay running. Cancel puts
+    everything back.
+- **3D view** (new section): a sci-fi cockpit seat moving live with the motion sensor (or estimated from the motor
+  positions), actuators glowing with their drive, a glowing outline where the motors are being sent, the sensor's
+  angles, gyro and acceleration, and an attitude indicator with the tilt limits. Cameras, orbit and full screen.
+  three.js is built into the page server, so it works without internet access.
+- **Motion sensor**: tilt limits for each direction (firmware 1.9); **Set up the sensor** now asks for gyro and
+  acceleration too, at 100 Hz.
+- Auto-tune, the test signal and the full check stay inside the travel limits, centred on the level seat.
+- Diagnostics: the seat set-up is in the file, with findings for a missing or unsaved set-up, an end stop that
+  tripped, and a sensor sending angles only.
+- **Firmware 1.9**: `[w..]` / `[k..]` seat set-up (EEPROM 66-104, also saved by `[sav]`), `[kH n]` holds SimHub's
+  position commands back, `[xe1]` sends the sensor's acceleration and gyro ("SM3X"), `[rdd]` frame version 3. SimHub
+  and SMC3Utils see no difference, apart from the level trim and the limits doing their job.
+- **Simulator**: `--seat-tilt`, `--stops`, `--seat-setup`, acceleration and gyro from the seat's movement.
+
 ## Page 1.9.1 + firmware 1.8.1
 
 The first published 1.9 / 1.8. (Firmware 1.8 stopped in the Arduino IDE with "'GlyphDef' does not name a

@@ -11,7 +11,9 @@ The page lets you:
 - tune while you drive;
 - let each motor tune itself;
 - keep backups and per-game profiles;
-- see the seat's real angles with an optional motion sensor;
+- see the seat's real angles with an optional motion sensor, and the seat itself moving in a **3D view**;
+- **level the platform** and make that SimHub's centre, then let each motor find how far it may go and save
+  **travel limits, end stops and tilt limits** on the board;
 - find out why when something goes wrong, and where the rig struggles under load.
 
 SimHub keeps driving the rig over USB exactly as before. The page talks to the board over WiFi, so both run at
@@ -25,7 +27,7 @@ the same time. You can open it from any browser, including your phone.
 
 | Folder | What it is |
 |---|---|
-| [`firmware/SMC3_R4`](firmware/SMC3_R4) | Firmware for the **Arduino UNO R4 WiFi**. It speaks the SMC3 v0.70 protocol, so SimHub, SimTools, FlyPT Mover and SMC3Utils work unchanged. It adds a 4 kHz control loop, 14-bit pot readings, quiet 25 kHz PWM, target smoothing, a fixed PID, WiFi telemetry at 100 samples a second, an LED matrix that shows live motor bars and problems in words, and an optional WT901C motion sensor with a tilt-limit cut-off. |
+| [`firmware/SMC3_R4`](firmware/SMC3_R4) | Firmware for the **Arduino UNO R4 WiFi**. It speaks the SMC3 v0.70 protocol, so SimHub, SimTools, FlyPT Mover and SMC3Utils work unchanged. It adds a 4 kHz control loop, 14-bit pot readings, quiet 25 kHz PWM, target smoothing, a fixed PID, WiFi telemetry at 100 samples a second, an LED matrix that shows live motor bars and problems in words, a level trim with travel limits and end stops for each motor, and an optional WT901C motion sensor with tilt limits for each direction. |
 | [`scope/`](scope) | `smc3_scope.py`: the page server. It's one file using only the Python standard library, with a Dockerfile and compose file for a NAS or any PC. |
 | [`tools/simboard.py`](tools/simboard.py) | A simulated rig. You can try everything without hardware, and inject faults (reversed motor, swapped wiring, glitchy pot and more). |
 | [`firmware/SMC3_smooth`](firmware/SMC3_smooth) | The original SMC3 for the **UNO R3**, with target smoothing and the PID fixes, for anyone staying on an R3. |
@@ -77,6 +79,47 @@ horizon. A smooth slope while the seat moves is good; steps, wobbles, or a slope
 show load, play or flex.
 
 ![Seat angle chart](docs/img/seat-chart.png)
+
+### 3D view
+
+The seat in a sci-fi cockpit, moving live. With the motion sensor it shows the seat's real attitude; without one,
+an estimate from the motor positions. The actuators sit where Seat setup found each motor acts, and glow brighter
+the harder they drive; a glowing outline shows where the motors are being sent whenever the seat lags behind.
+Around it: the angles, the sensor's gyro and acceleration, the actuators' positions, the sensor's state and an
+attitude indicator with the tilt limits. Drag to turn it, scroll to zoom, or pick a camera; it also goes full
+screen. The 3D engine (three.js) is built into the page server, so it works without internet access.
+
+![3D view](docs/img/view3d.png)
+
+| Side | Front |
+|---|---|
+| ![](docs/img/view3d-side.png) | ![](docs/img/view3d-front.png) |
+
+### Seat setup
+
+**Level first, then the limits.** Seat setup (firmware 1.9) does in a couple of minutes what used to take an
+evening with SMC3Utils:
+
+1. **Level the platform.** With the motion sensor, press **Level automatically**: each motor moves a little to learn
+   how it tilts the seat, then the page moves them until the sensor reads level, choosing the level position nearest
+   the middle of every motor. Without the sensor, nudge the motors with a spirit level on the seat. Whatever you
+   accept becomes **SimHub's centre**: the board adds a level trim to every position SimHub sends, and the seat
+   powers up level.
+2. **Find how far each motor may go.** Say how far the seat may tilt each way. Each motor moves slowly away from
+   level, both ways, and stops by itself at that tilt, when it **pushes against something**, at the end of its Clip
+   window - or when you press **Stop** (or the space bar).
+3. **Check and save the limits.** From what was found the page suggests **travel limits** (the board never sends a
+   motor past them, whatever SimHub asks), **end stops** (a motor that gets past one anyway is switched off) and
+   **tilt limits** for each direction (every motor stops). A picture shows where the seat can tilt inside them;
+   front up and down usually need several motors at once, so the travel can be narrowed until no combination goes
+   further than you allow.
+
+While Seat setup is open the board ignores SimHub's positions, so SimHub can stay running; **Cancel** puts
+everything back. Auto-tune, the test signal and the full check stay inside the travel limits afterwards.
+
+| Level | Limits | Saved |
+|---|---|---|
+| ![](docs/img/seat-setup-level.png) | ![](docs/img/seat-setup-limits.png) | ![](docs/img/seat-setup-done.png) |
 
 ### Tuning
 
@@ -167,10 +210,12 @@ SimHub's outputs and the LED matrix codes go by number.
 - switching the sensor on;
 - how it is mounted;
 - **Level now**;
-- the **tilt limit**, which stops every motor if the seat tilts further than it should;
-- **Set sensor to 100 Hz** (it leaves the factory at 10 Hz).
+- the **tilt limits** for each direction (firmware 1.9; one for all with 1.8), which stop every motor if the seat
+  tilts further than it should;
+- **Set up the sensor**: 100 readings a second with gyro and acceleration (it leaves the factory at 10).
 
-The status line says whether the sensor is found, at what baud rate and how fast it sends.
+The status line says whether the sensor is found, at what baud rate, how fast it sends and whether gyro and
+acceleration arrive.
 
 ![LED matrix and motion sensor settings](docs/img/settings-board.png)
 
@@ -268,10 +313,11 @@ The Help section in the page sums everything up, including every LED matrix code
 - Up to three DC motors with feedback pots, such as worm-gear wiper motors on crank arms or linear actuators, and
   a motor supply that suits them.
 - Optional: a WitMotion **WT901C** motion sensor on the seat. The -232 model connects through a MAX3232 module
-  (RS-232 to TTL) to D0, and optionally D1. It gives seat angles, a tilt-limit safety cut-off, and seat
-  measurements in auto-tune and diagnostics. It is set up from the page.
+  (RS-232 to TTL) to D0 and D1 - **never straight to the pins**: RS-232 levels damage the board. It gives seat
+  angles, automatic levelling, tilt limits, the 3D view, and seat measurements in auto-tune and diagnostics. It is
+  set up from the page.
 
-<img src="docs/img/sensor-wiring.svg" width="760" alt="WT901C wiring through a MAX3232">
+![WT901C-232 wiring: DB9 plug with screw terminals, MAX3232 module, UNO R4 WiFi](docs/img/sensor-wiring.png)
 
 Wiring is the same as the original SMC3 on an UNO, so existing rigs need no changes:
 
@@ -329,7 +375,12 @@ In SimHub, set the motion output to an **SMC3** device on the board's COM port, 
 one program can use the COM port, so close SMC3Utils and the Arduino serial monitor. The page never needs the COM
 port.
 
-### 4. Tune
+### 4. Seat setup
+
+Open **Seat Setup**: level the platform (by itself with the motion sensor), let each motor find its safe travel,
+and save. SimHub's centre is then the level seat, and the limits protect the rig whatever drives it.
+
+### 5. Tune
 
 Run **auto-tune** on each motor (seat empty first, then seated), try it in a game, and **Save to EEPROM**. Then
 try the **recommendations** for the sims you play and save them as profiles.
@@ -359,6 +410,9 @@ noise. To see what the diagnostics find, add a fault:
 | `--flex` / `--slop 2:24` | a bouncy seat frame / 24 counts of play in motor 2's linkage |
 | `--heavy 1` | a heavy load on motor 1: lifting needs much more drive, worse near the top |
 | `--imu-lost-at 30` | the sensor goes quiet after 30 s |
+| `--seat-tilt 1.6:-2.2` | the seat isn't level with every motor at 512 (for Seat setup) |
+| `--stops 3:180:860` | motor 3 hits a mechanical stop at pot 180 and 860 |
+| `--seat-setup` | start with a saved seat set-up (level trim, travel limits, end stops, tilt limits) |
 
 ## Compatibility
 
@@ -369,7 +423,9 @@ noise. To see what the diagnostics find, add a fault:
   - 1.5: Disable Motors;
   - 1.6: smoothing settings;
   - 1.7: full diagnostics;
-  - 1.8: the LED matrix in words, and the motion sensor.
+  - 1.8: the LED matrix in words, and the motion sensor;
+  - 1.9: Seat setup (level trim, travel limits, end stops, tilt limits for each direction), gyro and acceleration
+    for the 3D view.
 
   See the [CHANGELOG](CHANGELOG.md).
 - New commands are documented in [docs/PROTOCOL.md](docs/PROTOCOL.md). They go over WiFi; USB stays plain SMC3.
@@ -380,6 +436,8 @@ noise. To see what the diagnostics find, add a fault:
   port and extension of SMC3 v0.70. Thank you.
 - The **Michroma** font, SIL Open Font License 1.1 ([licence](docs/licenses/Michroma-OFL-1.1.txt)), is embedded
   in the page for the SMC3 R4 wordmark.
+- **three.js** r160 (MIT, [licence](docs/licenses/three.js-LICENSE.txt)) is embedded in the page server for the 3D
+  view.
 - The seat logo, rig picture and motor icon come from the dashboard mock-up this project started from.
 - Built with help from Claude (Anthropic).
 
