@@ -34,9 +34,12 @@ Stop SimHub's motion output and keep the seat empty. Each motor in turn, with th
    left over and top speed. If the motor swings out of control, the check calms it with gentle settings.
    With the motion sensor, the same steps also show what the **seat** did: how many degrees it moved (degrees per
    count, and the whole range that gives), whether it **bounces** after the motor has stopped (frame, mounts or
-   linkage flexing), and whether there is **play** - the motor turning before the seat follows.
+   linkage flexing), and whether there is **play** - the motor turning before the seat follows. On a traction-loss
+   rig, motor 3's response is how far the seat **turns** (the sensor's yaw); a lift that turns the seat, or a
+   traction-loss motor that tilts it, means the wiring or the rig setting doesn't match.
 3. **What you saw.** The motor nudges towards higher numbers and you answer: up, down, didn't move, or not sure,
-   and where on the seat it is. If a motor doesn't move at all, you're asked whether it moved, hummed, or did
+   and where on the seat it is. For the traction-loss motor: whether the rear went left or right (or up or down -
+   then it isn't the rear slide); the answer is kept for the 3D view. If a motor doesn't move at all, you're asked whether it moved, hummed, or did
    nothing. That tells a slipped pot from a jammed motor from no power.
 4. Everything is put back afterwards: settings, positions and which motors were on.
 
@@ -87,7 +90,8 @@ cover:
 - where a motor struggles under load (load map);
 - the motion sensor: silent, not switched on, too slow (factory 10 Hz), garbled data, tilt limit off or tripping,
   not levelled, wobbling, sending angles only (1.9 can add gyro and acceleration); the seat bouncing, play in a
-  linkage, how many degrees each motor tilts the seat;
+  linkage, how many degrees each motor tilts the seat (or, for the rear slide, turns it);
+- the rig layout: a lift that turns the seat, a traction-loss motor that tilts it or that you saw lift the seat;
 - the seat set-up (firmware 1.9): none yet, running but not saved (Seat setup left open), a motor switched off by
   its end stop, the page holding SimHub's positions back;
 - motors that don't agree on which way is up;
@@ -105,7 +109,7 @@ The newest 20 are kept in `diagnostics/reports/` and can be downloaded from the 
 | `summary` | The findings as plain text |
 | `findings` | The findings, structured |
 | `board` | Connection, firmware, build options, uptime, last start cause, WiFi, USB counters, per-motor counters, motion sensor and LED matrix (1.8), seat set-up: level trim, travel limits, end stops, tilt limits (1.9) |
-| `rig` | Motors in use, motor names |
+| `rig` | Motors in use, motor names, layout (front lifts + rear traction loss, or lifts), which motor is the rear slide and which way it goes for higher numbers |
 | `settings` | Running settings, saved settings (EEPROM), the differences, the last save made from the page |
 | `live` | The 3-second listen |
 | `check` | Full check: per motor the result, the drive needed, step metrics, what you saw, and a 50 Hz trace |

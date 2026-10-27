@@ -16,6 +16,10 @@ The page lets you:
   **travel limits, end stops and tilt limits** on the board;
 - find out why when something goes wrong, and where the rig struggles under load.
 
+It knows two kinds of rig: **two front lifts plus a traction-loss motor** (motors 1 and 2 lift the front corners,
+motor 3 is mounted horizontally and swings the rear left and right about a pivot at the front - the default), and
+**three lifts**. Pick yours under Settings, Motor names.
+
 SimHub keeps driving the rig over USB exactly as before. The page talks to the board over WiFi, so both run at
 the same time. You can open it from any browser, including your phone.
 
@@ -83,17 +87,20 @@ show load, play or flex.
 ### 3D view
 
 The seat in a sci-fi cockpit, moving live. With the motion sensor it shows the seat's real attitude; without one,
-an estimate from the motor positions. The actuators sit where Seat setup found each motor acts, and glow brighter
-the harder they drive; a glowing outline shows where the motors are being sent whenever the seat lags behind.
-Around it: the angles, the sensor's gyro and acceleration, the actuators' positions, the sensor's state and an
-attitude indicator with the tilt limits. Drag to turn it, scroll to zoom, or pick a camera; it also goes full
-screen. The 3D engine (three.js) is built into the page server, so it works without internet access.
+an estimate from the motor positions. On a traction-loss rig the two front actuators lift the front corners through a
+yoke, and the horizontal rear actuator slides the rear left and right, so the seat swings about the pivot at the
+front; how far it turns comes straight from motor 3's pot, so it moves exactly with the rig, and an arc on the floor
+shows the rear's travel limits. (On a three-lift rig the actuators sit where Seat setup found each motor acts.) The
+actuators glow brighter the harder they drive; a glowing outline shows where the motors are being sent whenever the seat lags behind.
+Around it: the angles and the rear's turn, the sensor's gyro and acceleration, the actuators' positions, the sensor's
+state and an attitude indicator with the tilt limits. Drag to turn it, scroll to zoom, or pick a camera (**Rig**
+looks at the mechanics from low down at the back); it also goes full screen. The 3D engine (three.js) is built into the page server, so it works without internet access.
 
 ![3D view](docs/img/view3d.png)
 
-| Side | Front |
+| Rig | Side |
 |---|---|
-| ![](docs/img/view3d-side.png) | ![](docs/img/view3d-front.png) |
+| ![](docs/img/view3d-rig.png) | ![](docs/img/view3d-side.png) |
 
 ### Seat setup
 
@@ -104,15 +111,17 @@ evening with SMC3Utils:
    how it tilts the seat, then the page moves them until the sensor reads level, choosing the level position nearest
    the middle of every motor. Without the sensor, nudge the motors with a spirit level on the seat. Whatever you
    accept becomes **SimHub's centre**: the board adds a level trim to every position SimHub sends, and the seat
-   powers up level.
-2. **Find how far each motor may go.** Say how far the seat may tilt each way. Each motor moves slowly away from
-   level, both ways, and stops by itself at that tilt, when it **pushes against something**, at the end of its Clip
-   window - or when you press **Stop** (or the space bar).
+   powers up level. On a traction-loss rig only motors 1 and 2 level the seat: you **centre** motor 3, the rear
+   slide, so the seat points straight ahead, and tell the page which way the rear went for +10.
+2. **Find how far each motor may go.** Say how far the seat may tilt each way (and, with traction loss, how far it
+   may turn). Each motor moves slowly away from level, both ways, and stops by itself at that tilt - the rear slide
+   at that turn, measured by the sensor - when it **pushes against something**, at the end of its Clip window, or
+   when you press **Stop** (or the space bar).
 3. **Check and save the limits.** From what was found the page suggests **travel limits** (the board never sends a
    motor past them, whatever SimHub asks), **end stops** (a motor that gets past one anyway is switched off) and
    **tilt limits** for each direction (every motor stops). A picture shows where the seat can tilt inside them;
    front up and down usually need several motors at once, so the travel can be narrowed until no combination goes
-   further than you allow.
+   further than you allow. For the rear slide it shows how far the seat turns each way inside its travel limits.
 
 While Seat setup is open the board ignores SimHub's positions, so SimHub can stay running; **Cancel** puts
 everything back. Auto-tune, the test signal and the full check stay inside the travel limits afterwards.
@@ -198,9 +207,18 @@ In Settings you set:
 - the theme;
 - **how many motors you use** (1 to 3). Unused motors can also be switched off on the board.
 
-Under **Motor names** you can call each motor by where it sits: Left, Right, Rear, Front left, or anything you
-like. The names show everywhere in the page and in diagnostics, always next to the number, because the wiring,
+Under **Motor names** you can call each motor by where it sits: Front left, Front right, Traction loss, or anything
+you like. The names show everywhere in the page and in diagnostics, always next to the number, because the wiring,
 SimHub's outputs and the LED matrix codes go by number.
+
+The same card says what **motor 3** does:
+
+- **Slides the rear left / right (traction loss)**, the default: motors 1 and 2 lift the front corners, and motor 3,
+  mounted horizontally, swings the rear about a pivot at the front. Also which way the rear goes for higher numbers
+  (Seat setup and the full check ask you).
+- **Lifts the seat, like motors 1 and 2**: three lifts.
+
+Seat setup, the full check, auto-tune, the recommendations and the 3D view follow it.
 
 ![Settings with motor names](docs/img/settings.png)
 
@@ -253,8 +271,9 @@ it finds:
 - whether another motor moves instead, which means swapped motor or pot wiring;
 - how it handles a small step with its own settings.
 
-It also **asks you what you saw**: which way each corner went, and where it is on the seat. That's the one thing
-sensors can't tell, for example whether the motion will be upside down in games. A motor that moves the wrong
+It also **asks you what you saw**: which way each corner went, and where it is on the seat - for the traction-loss
+motor, whether the rear went left or right. That's the one thing sensors can't tell, for example whether the motion
+will be upside down in games. A motor that moves the wrong
 way is stopped at once and left off.
 
 | Before it starts | "Watch now", then the question |
@@ -284,7 +303,9 @@ the band and, with the sensor, the seat angles there:
 ![Quick check: motor 1 struggles lifting](docs/img/diag-load.png)
 
 With the motion sensor, the full check also measures what the **seat** does on each step: how many degrees each
-motor tilts it, whether it **bounces** after the motor stops (flex), and whether there is **play** in a linkage.
+motor tilts it (the traction-loss motor: how far it turns it), whether it **bounces** after the motor stops (flex),
+and whether there is **play** in a linkage. A lift that turns the seat, or a traction-loss motor that tilts it, is
+flagged: the wiring or the setting doesn't match the rig.
 
 Each one keeps a few seconds of data from before and after. A badge and a System Status line tell you about it,
 and the **event log** shows what led up to it.
@@ -311,7 +332,8 @@ The Help section in the page sums everything up, including every LED matrix code
 - Motor bridges: **IBT-2 / BTS7960** (`MODE2`, the default), or a bridge with PWM plus two direction pins
   (`MODE1`).
 - Up to three DC motors with feedback pots, such as worm-gear wiper motors on crank arms or linear actuators, and
-  a motor supply that suits them.
+  a motor supply that suits them. Typical layouts: two lifts at the front plus a horizontal **traction-loss** motor
+  sliding the rear (SimHub's 2DOF + traction loss), or three lifts.
 - Optional: a WitMotion **WT901C** motion sensor on the seat. The -232 model connects through a MAX3232 module
   (RS-232 to TTL) to D0 and D1 - **never straight to the pins**: RS-232 levels damage the board. It gives seat
   angles, automatic levelling, tilt limits, the 3D view, and seat measurements in auto-tune and diagnostics. It is
@@ -373,12 +395,13 @@ python3 scope/smc3_scope.py --host 192.168.1.50 --bind 0.0.0.0 --web 8198
 
 In SimHub, set the motion output to an **SMC3** device on the board's COM port, exactly as with an UNO R3. Only
 one program can use the COM port, so close SMC3Utils and the Arduino serial monitor. The page never needs the COM
-port.
+port. With a traction-loss rig, SimHub's traction-loss (yaw / slip) output goes to motor 3; if the rear swings the
+wrong way in a slide (in a right-hand slide it should swing out to the left), tick Invert on that output.
 
 ### 4. Seat setup
 
-Open **Seat Setup**: level the platform (by itself with the motion sensor), let each motor find its safe travel,
-and save. SimHub's centre is then the level seat, and the limits protect the rig whatever drives it.
+Open **Seat Setup**: level the platform (by itself with the motion sensor), centre the rear slide if you have
+traction loss, let each motor find its safe travel, and save. SimHub's centre is then the level seat, and the limits protect the rig whatever drives it.
 
 ### 5. Tune
 
@@ -404,6 +427,7 @@ noise. To see what the diagnostics find, add a fault:
 | `--dead 3` / `--slip 1` / `--oneway 1` | no motor power / pot slipped on its shaft / half a bridge dead |
 | `--hunt 1` / `--pwmmax0 2` | unstable settings / PWMmax 0 |
 | `--simhub` | a fake SimHub driving all three motors |
+| `--layout lifts` / `--tl-left` | three lifts instead of front lifts + a traction-loss rear slide (the default) / the rear slide goes left for higher numbers |
 | `--reboot-at 30` | the board restarting |
 | `--fw 16` | older firmware behaviour |
 | `--imu 100` (or `10`) | a WT901C on the seat, sending 100 (or the factory 10) angles per second; `--sensor-on` switches it on |

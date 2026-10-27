@@ -3,6 +3,31 @@
 `smc3_scope` (the page) and `SMC3_R4` (the firmware) are versioned separately. The page works with older
 firmware too; the notes say which firmware a feature needs.
 
+## Page 2.1 (firmware 1.9, unchanged)
+
+Traction loss: rigs where motors 1 and 2 lift the front corners and motor 3, mounted horizontally, slides the rear
+left and right (the seat turning about a pivot at the front) - SimHub's 2DOF + traction loss.
+
+- **Settings, Motor names: what motor 3 does** - slides the rear (traction loss, the default) or lifts the seat like
+  the other two - and which way the rear goes for higher numbers.
+- **Seat setup**: motors 1 and 2 level the seat; motor 3 is **centred** (the seat pointing straight ahead) and the
+  page asks which way the rear went for +10. Motor 3 stops at the **traction loss you allow** - how far the seat may
+  turn each way, measured with the sensor's yaw - and the page measures how far it turns per count. Tilt reach, the
+  narrowing of combined moves and the tilt limits come from motors 1 and 2 only. The limits step shows how far the
+  seat turns each way inside motor 3's travel limits, and can centre it between its ends.
+- **3D view**: the rig is rebuilt for traction loss: two front lifts on a yoke with the pivot in its middle, a
+  horizontal rear actuator sliding a carriage on a rail, and the seat swinging about the front pivot. The rear's
+  position comes straight from motor 3's pot, so it moves exactly with the rig; an arc on the floor shows its travel
+  limits, the HUD and the in-world screen show the rear's turn, and a new **Rig** camera looks at the mechanics.
+- **Diagnostics**: for motor 3 the full check asks whether the rear went left or right (and remembers it); the seat
+  response is measured as the seat's turn; a lift that turns the seat, or a traction-loss motor that tilts it, is
+  flagged (wiring or the setting doesn't match the rig). Load map and drive-asymmetry texts no longer talk about
+  lifting weight for the rear slide.
+- **Auto-tune** judges motor 3 by how the seat turns (with the sensor).
+- **Recommendations** add a traction-loss tip per kind of sim.
+- **Simulator**: `--layout tl` (the default: front lifts + rear slide, yaw and yaw rate from the sensor) or
+  `--layout lifts`; `--tl-left`.
+
 ## Page 2.0 + firmware 1.9
 
 - **Seat setup** (new section, firmware 1.9): level first, then the limits.

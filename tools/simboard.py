@@ -22,8 +22,15 @@ Same TCP protocol, telemetry and control law as the firmware; worm-geared motor 
   --hunt M             motor M starts with Kp 1600 (hunts at rest)
   --fw N               13, 14, 15, 16, 17, 18 or 19 (default 19)
 
-Motion sensor (firmware 1.8): a seat on three actuators - roll from motors 1 and 2, pitch from their average
-against motor 3, 0.03 degrees per count - and a WT901C on it (mounted 1.3/-0.8 degrees off level):
+Rig layout (page 2.1):
+  --layout tl          default: motors 1 and 2 lift the front corners (roll from their difference, pitch from their
+                       average, 0.03 degrees per count, the rear rides on a pivot) and motor 3 slides the rear left
+                       and right - traction loss, the seat turning about a pivot at the front, 0.02 degrees per
+                       count, higher numbers = rear to the RIGHT
+  --layout lifts       three lifts: roll from motors 1 and 2, pitch from their average against motor 3
+  --tl-left            (tl) higher numbers move the rear to the LEFT instead
+
+Motion sensor (firmware 1.8): a WT901C on the seat (mounted 1.3/-0.8 degrees off level):
   --imu HZ             sensor fitted, sending at HZ (10 = factory setting, 100 after "set to 100 Hz")
   --imu-no-tx          the board's TX isn't wired to the sensor, so "set to 100 Hz" does nothing
   --imu-lost-at SEC    the sensor goes quiet SEC seconds after start
@@ -66,6 +73,8 @@ ap.add_argument("--sensor-on", action="store_true")
 ap.add_argument("--seat-tilt", default="")
 ap.add_argument("--stops", action="append", default=[])
 ap.add_argument("--seat-setup", action="store_true")
+ap.add_argument("--layout", choices=["tl", "lifts"], default="tl")
+ap.add_argument("--tl-left", action="store_true")
 ap.add_argument("--tuned", action="store_true", help="start with sane settings (Kp 250, Ki 0, Kd 0, PWMmin 30, dead zone 2)")
 args = ap.parse_args()
 
@@ -86,6 +95,8 @@ if args.slop:
     m_, c_ = args.slop.split(":")
     SLOP[int(m_) - 1] = float(c_)
 DEG_PER_COUNT = 0.03
+YAW_PER_COUNT = 0.02                          # --layout tl: degrees the seat turns per count of motor 3
+TL_DIR = -1 if args.tl_left else 1            # +1: higher numbers move the rear to the right
 SENSOR_OFFSET = (1.3, -0.8)                   # the sensor isn't mounted perfectly level
 SEAT_TILT = tuple(float(x) for x in args.seat_tilt.split(":")) if args.seat_tilt else (0.0, 0.0)
 STOPS = [[30.0, 993.0] for _ in range(3)]     # mechanical ends of each motor's travel (pot counts)
@@ -106,6 +117,7 @@ class Phys:                                   # the motor + linkage + pot
 class Seat:                                   # the seat on the three linkages, and the sensor on it
     def __init__(self):
         self.roll = self.pitch = 0.0; self.vr = self.vp = 0.0
+        self.yaw = 0.0; self.vy = 0.0; self.vy_prev = 0.0  # tl: the seat's turn, + = rear to the right (nose left)
         self.rate = args.imu; self.baud = 9600 if args.imu <= 20 else 115200
         self.last_out = 0.0; self.out = None      # last sensor reading (raw roll, raw pitch, yaw)
         self.packets = 0; self.bad = 0; self.found_at = None
@@ -316,21 +328,22 @@ def sensor_tick(now):
         return
     q = lambda d: round(d * 32768 / 180) * 180 / 32768
     SEAT.out = (q(SEAT.roll + SENSOR_OFFSET[0] + random.gauss(0, 0.015)),
-                q(SEAT.pitch + SENSOR_OFFSET[1] + random.gauss(0, 0.015)), q(37.5 + random.gauss(0, 0.05)))
+                q(SEAT.pitch + SENSOR_OFFSET[1] + random.gauss(0, 0.015)), q(((37.5 + SEAT.yaw + random.gauss(0, 0.05)) + 180) % 360 - 180))
     dt = max(1e-3, now - SEAT.last_out)
     SEAT.last_out = now; SEAT.packets += 3
     if SEAT.all:                              # acceleration (g) and gyro (deg/s) as the sensor sends them, raw
         rr, pp = math.radians(SEAT.out[0]), math.radians(SEAT.out[1])
         ar = (SEAT.vr - SEAT.vr_prev) / dt; ap_ = (SEAT.vp - SEAT.vp_prev) / dt      # deg/s^2
-        SEAT.vr_prev, SEAT.vp_prev = SEAT.vr, SEAT.vp
+        ay_ = (SEAT.vy - SEAT.vy_prev) / dt
+        SEAT.vr_prev, SEAT.vp_prev, SEAT.vy_prev = SEAT.vr, SEAT.vp, SEAT.vy
         lever = 0.35 / 9.81 * math.pi / 180.0                                          # 35 cm above the pivot
         gx = math.sin(pp) + ap_ * lever + random.gauss(0, 0.004)
-        gy = -math.sin(rr) * math.cos(pp) - ar * lever + random.gauss(0, 0.004)
+        gy = -math.sin(rr) * math.cos(pp) - ar * lever + ay_ * 1.0 / 9.81 * math.pi / 180.0 + random.gauss(0, 0.004)
         gz = math.cos(rr) * math.cos(pp) + random.gauss(0, 0.006)
         cl = lambda v: max(-32767, min(32767, int(round(v))))
         SEAT.acc = (cl(gx * 2048), cl(gy * 2048), cl(gz * 2048))
         SEAT.gyro = (cl((SEAT.vr + random.gauss(0, 0.08)) * 16.384), cl((SEAT.vp + random.gauss(0, 0.08)) * 16.384),
-                     cl(random.gauss(0, 0.05) * 16.384))
+                     cl((SEAT.vy + random.gauss(0, 0.05)) * 16.384))
         SEAT.acc_t = now; SEAT.acc_n += 1; SEAT.packets += 0
         SEAT.peak = max(SEAT.peak, int(abs(math.sqrt(gx * gx + gy * gy + gz * gz) - 1.0) * 1000))
     lim = board["tilt"]
@@ -448,9 +461,14 @@ def seat_tick():
     """Seat angle from the linkages: stiff (follows within a few ms) or, with --flex, a bouncy spring."""
     x1, x2, x3 = (P[i].link for i in range(3))
     roll_t = DEG_PER_COUNT * (x1 - x2) / 2.0 + SEAT_TILT[0]
-    pitch_t = DEG_PER_COUNT * ((x1 + x2) / 2.0 - x3) + SEAT_TILT[1]
+    if args.layout == "tl":                   # front lifts, the rear on a pivot; motor 3 turns the seat
+        pitch_t = DEG_PER_COUNT * ((x1 + x2) / 2.0 - 512) + SEAT_TILT[1]
+        yaw_t = YAW_PER_COUNT * TL_DIR * (x3 - 512)
+    else:
+        pitch_t = DEG_PER_COUNT * ((x1 + x2) / 2.0 - x3) + SEAT_TILT[1]
+        yaw_t = 0.0
     wn, z = (2 * math.pi * 4.0, 0.12) if args.flex else (2 * math.pi * 22.0, 0.8)
-    for ang, vel, tgt in (("roll", "vr", roll_t), ("pitch", "vp", pitch_t)):
+    for ang, vel, tgt in (("roll", "vr", roll_t), ("pitch", "vp", pitch_t), ("yaw", "vy", yaw_t)):
         a, v = getattr(SEAT, ang), getattr(SEAT, vel)
         acc = wn * wn * (tgt - a) - 2 * z * wn * v
         v += acc * DT; a += v * DT

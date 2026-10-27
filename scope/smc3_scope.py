@@ -47,7 +47,7 @@ v1.4: settings dialog (board address, port, find-board scan, auto-find), day/nig
       fixed a thread race that made the page flash "not reachable".
 """
 
-VERSION = "2.0"
+VERSION = "2.1"
 
 import argparse
 import base64
@@ -70,13 +70,34 @@ def log(msg):
     print(time.strftime("%Y-%m-%d %H:%M:%S"), msg, flush=True)
 
 
+TL_DEFAULT_DEG = 0.02          # degrees the seat turns per count of the traction-loss motor, until Seat setup measures it
+
+
+def tl_motor(cfg):
+    """Index of the traction-loss motor (2 = motor 3) when the rig has one, else None."""
+    if cfg is None:
+        return None
+    return 2 if cfg.get("layout") == "tl" and int(cfg.get("motors") or 3) >= 3 else None
+
+
+def lift_motors(cfg):
+    """The motors that tilt the seat (all in use except the traction-loss one)."""
+    n = int(cfg.get("motors") or 3) if cfg is not None else 3
+    t = tl_motor(cfg)
+    return [m for m in range(n) if m != t]
+
+
 # --------------------------------------------------------------------------------------------------------------
 # Persistent settings
 # --------------------------------------------------------------------------------------------------------------
 
 class Config:
     DEFAULTS = {"host": "", "port": 4210, "theme": "dark", "auto_find": True, "scan_subnet": "",
-                "motors": 3, "disable_unused": True, "motor_names": ["", "", ""]}
+                "motors": 3, "disable_unused": True, "motor_names": ["", "", ""],
+                "layout": "tl", "tl_dir": 1}
+    # layout: "tl" = motors 1 and 2 lift the front corners, motor 3 slides the rear left / right (traction loss,
+    #         the seat turning about a pivot at the front); "lifts" = all three motors lift the seat.
+    # tl_dir: +1 = higher numbers move the rear to the right, -1 = to the left (Seat setup or the full check asks).
 
     def __init__(self, data_dir, env_host, env_port):
         self.lock = threading.Lock()
@@ -308,7 +329,11 @@ class Board:
             time.sleep(0.03)
         deadline = time.time() + timeout
         expected = len(PARAM_CODES) - 4          # "!" (1.4+), "f" (1.6+), "l" and "i" (1.8+) are missing on older firmware
+        fw = self.fwnum()                         # known firmware: stop as soon as everything it can answer is in
+        need = (len(PARAM_CODES) - (fw < 14) - (fw < 16) - 2 * (fw < 18)) if fw else None
         while time.time() < deadline and len(self.params) < len(PARAM_CODES):
+            if need is not None and len(self.params) >= need:
+                break
             if len(self.params) >= expected and time.time() > deadline - timeout + 1.0:
                 break
             time.sleep(0.05)
@@ -889,7 +914,8 @@ class Tuner:
         r = analyze_step(got, self.motor, t_old, p["pwmmin"], p["pwmmax"], hold * 1000 - 100)
         if r is None:
             raise TuneAbort("Couldn't see the step in the telemetry (WiFi too slow?). Try again.")
-        seat = seat_step(self.board.since(seq0 - 20), self.motor, t_old)   # motion sensor: what the seat did
+        seat = seat_step(self.board.since(seq0 - 20), self.motor, t_old,      # motion sensor: what the seat did
+                         yaw=self.motor == tl_motor(self.board.cfg))         # (traction loss: how it turned)
         if seat and not seat.get("small") and seat.get("overshoot") is not None:
             r.update(seat_os=seat["overshoot"], seat_osc=seat["ringing"], seat_deg=seat["deg"],
                      seat_dpc=seat.get("deg_per_count"))
@@ -1062,15 +1088,19 @@ class Tuner:
             self.say(f"PWMmin {p['pwmmin']} (the easier direction; the harder one needs {max(found.values())}).")
             if gap > 15 and not do_ki:
                 do_ki = True
-                self.say("Large difference between directions (typical with a worm gear lifting your weight) - "
-                         "the Ki step will run to make up for it.")
+                self.say(("Large difference between directions (friction or binding in the rear slide, or the "
+                          "seat pulling to one side) - " if self.motor == tl_motor(self.board.cfg) else
+                          "Large difference between directions (typical with a worm gear lifting your weight) - ")
+                         + "the Ki step will run to make up for it.")
             self._ramp_to(c)
             self._settle(c, 3.0)
 
         # 3. Kp sweep
         s_now = self.board.latest()
         if s_now and s_now.get("roll") is not None:
-            self.say("Motion sensor is sending: the seat's own overshoot and ringing count too.")
+            self.say("Motion sensor is sending: the seat's own overshoot and ringing count too" +
+                     (" (how the seat turns, for the traction-loss motor)." if self.motor == tl_motor(self.board.cfg)
+                      else "."))
         self.stage, self.progress = "Sweeping Kp", 30
         p.update(ki=0, kd=0, ks=1, kp=KP_START)
         self._apply(p)
@@ -1399,7 +1429,8 @@ GENRES = [
      "simhub": ["Pitch and roll: a little smoothing, about 10-20%. Heave and road texture: little or none.",
                 "Global Motion Smoothing low, about 10%.",
                 "Washout isn't needed for circuit racing.",
-                "The main effects are surge (braking and acceleration) to pitch and sway (cornering) to roll."]},
+                "The main effects are surge (braking and acceleration) to pitch and sway (cornering) to roll."],
+     "simhub_tl": "Traction loss (motor 3): moderate gain with a little smoothing, so slides come through without the rear swinging on every small correction."},
     {"key": "rally", "title": "Rally & off-road", "short": "Gravel, jumps, rough roads - sharp with damping.",
      "blurb": "Rough surfaces and jumps: a sharper response, the shortest smoothing for every bump, a little more "
               "speed for big hits and some damping so hard impacts don't ring.",
@@ -1407,7 +1438,8 @@ GENRES = [
      "simhub": ["Heave and road texture up, with little smoothing - that's where rally detail lives.",
                 "Keep the crash filter on so landings and impacts don't slam the rig.",
                 "A soft limiter of 15-25% on heave cushions big landings instead of hitting the end of travel.",
-                "Global Motion Smoothing 0-10%."]},
+                "Global Motion Smoothing 0-10%."],
+     "simhub_tl": "Traction loss (motor 3): this is where it shines - higher gain, little smoothing, so the rear steps out with the car on gravel."},
     {"key": "flight", "title": "Flight", "short": "Planes and helicopters - smooth, held attitudes.",
      "blurb": "Aircraft change attitude slowly and hold it for a long time: a softer response, long smoothing, a "
               "speed cap against sudden lurches and enough Ki to hold a banked or pitched seat without sagging.",
@@ -1417,25 +1449,28 @@ GENRES = [
                 "More smoothing on pitch and roll, about 30-50%.",
                 "A soft limiter on pitch and roll lets sustained attitudes ease into the limit instead of stopping "
                 "hard.",
-                "Global Motion Smoothing about 20-30%."]},
+                "Global Motion Smoothing about 20-30%."],
+     "simhub_tl": "Motor 3 (the rear slide): map yaw to it with strong washout, or leave its output at zero - aircraft don't slide."},
     {"key": "space", "title": "Space & sci-fi", "short": "Elite, Star Citizen - floaty but responsive.",
      "blurb": "Spaceflight: sustained turns and thruster pushes, floaty but still responsive - between flight and "
               "racing.",
      "kp": 0.85, "ki_min": 10, "kd_min": None, "pwmmax": -10, "dz": 1, "smooth": 6, "rate": 2000,
      "simhub": ["Washout on pitch, roll and yaw, as for flight.",
                 "Moderate smoothing, about 20-30%.",
-                "Thruster surge and sway work well mapped to pitch and roll."]},
+                "Thruster surge and sway work well mapped to pitch and roll."],
+     "simhub_tl": "Motor 3 (the rear slide): yaw with washout, so turns swing the rear and it drifts back to centre."},
     {"key": "truck", "title": "Trucks & cruising", "short": "ETS2, ATS, relaxed driving - gentle and heavy.",
      "blurb": "Heavy vehicles and relaxed driving: gentle weight transfer and road feel without harshness, long "
               "smoothing and a speed cap.",
      "kp": 0.8, "ki_min": 5, "kd_min": None, "pwmmax": -10, "dz": 0, "smooth": 7, "rate": 1500,
      "simhub": ["Lower the surge gain - long braking and acceleration otherwise pin you at full pitch.",
                 "Road texture low and smoothed; trucks should feel heavy.",
-                "Global Motion Smoothing about 20%."]},
+                "Global Motion Smoothing about 20%."],
+     "simhub_tl": "Traction loss (motor 3): low gain and smoothed - a truck only slides on ice."},
 ]
 
 
-def genre_preview(base, key, fwnum):
+def genre_preview(base, key, fwnum, tl=False):
     g = next((x for x in GENRES if x["key"] == key), None)
     if g is None:
         raise ValueError("unknown recommendation")
@@ -1476,7 +1511,8 @@ def genre_preview(base, key, fwnum):
         notes.append("These look like the firmware's default settings. Run auto-tune first - the recommendation "
                      "adjusts from your tuned values, so a good baseline makes it much better.")
     out_rows = [{"name": k, "vals": v} for k, v in rows.items()]
-    return {"ok": True, "title": g["title"], "blurb": g["blurb"], "simhub": g["simhub"], "notes": notes,
+    return {"ok": True, "title": g["title"], "blurb": g["blurb"],
+            "simhub": g["simhub"] + ([g["simhub_tl"]] if tl and g.get("simhub_tl") else []), "notes": notes,
             "rows": out_rows, "params": p}
 
 
@@ -1807,39 +1843,59 @@ def sensor_rate(samples):
     return round(changes / span) if span > 0.2 else None
 
 
-def seat_step(samples, m, t_old):
-    """What the SEAT did (motion sensor) when motor m stepped away from t_old: how far it tilted, which way, its own
-    overshoot and ringing next to the motor's, how long it lagged, and how far the motor turned before the seat
-    started to follow (play in the linkage). None without sensor data."""
+def _wrap180(d):
+    return (d + 540.0) % 360.0 - 180.0
+
+
+def seat_step(samples, m, t_old, yaw=False):
+    """What the SEAT did (motion sensor) when motor m stepped away from t_old: how far it tilted (or, yaw=True, for
+    the traction-loss motor: how far it turned), which way, its own overshoot and ringing next to the motor's, how
+    long it lagged, and how far the motor turned before the seat started to follow (play in the linkage). None
+    without sensor data."""
     idx = next((i for i, x in enumerate(samples) if x["m"][m]["t"] != t_old), None)
     if idx is None or idx < 3:
         return None
     t_new, t0 = samples[idx]["m"][m]["t"], samples[idx]["ms"]
-    pre = [x for x in samples[max(0, idx - 15):idx] if x.get("roll") is not None]
-    post = [x for x in samples[idx:] if x.get("roll") is not None and x["m"][m]["t"] == t_new]
+    key = "yaw" if yaw else "roll"
+    pre = [x for x in samples[max(0, idx - 15):idx] if x.get(key) is not None]
+    post = [x for x in samples[idx:] if x.get(key) is not None and x["m"][m]["t"] == t_new]
     if len(pre) < 3 or len(post) < 25:
         return None
-    r0, p0 = _mean([x["roll"] for x in pre]), _mean([x["pitch"] for x in pre])
+    if yaw:                                          # the seat's turn relative to before the step, as (yaw, 0)
+        y_ref = pre[0]["yaw"]
+        ang = lambda x: (_wrap180(x["yaw"] - y_ref), 0.0)
+    else:
+        ang = lambda x: (x["roll"], x["pitch"])
+    r0, p0 = _mean([ang(x)[0] for x in pre]), _mean([ang(x)[1] for x in pre])
     tail = post[-25:]
-    dr, dp = _mean([x["roll"] for x in tail]) - r0, _mean([x["pitch"] for x in tail]) - p0
+    dr, dp = _mean([ang(x)[0] for x in tail]) - r0, _mean([ang(x)[1] for x in tail]) - p0
     mag = math.hypot(dr, dp)
     f0 = samples[idx - 1]["m"][m]["f"]
     dpot = _mean([x["m"][m]["f"] for x in tail]) - f0
     hz = sensor_rate(samples[max(0, idx - 15):])
     out = {"deg": round(mag, 2), "roll": round(dr, 2), "pitch": round(dp, 2),
-           "axis": "roll" if abs(dr) > 2 * abs(dp) else ("pitch" if abs(dp) > 2 * abs(dr) else "roll and pitch"),
+           "axis": "yaw" if yaw else ("roll" if abs(dr) > 2 * abs(dp) else
+                                      ("pitch" if abs(dp) > 2 * abs(dr) else "roll and pitch")),
            "deg_per_count": round(mag / abs(dpot), 4) if abs(dpot) >= 5 else None, "sensor_hz": hz}
+    if yaw:
+        out = dict(out, yaw=round(dr, 2))
+        del out["roll"], out["pitch"]
+    if mag < 1e-9:
+        out["noise_deg"], out["small"] = 0.0, True
+        return out
     # sensor noise along the direction of movement, from the settled end of the step
-    proj = [((x["roll"] - r0) * dr + (x["pitch"] - p0) * dp) / mag for x in tail]
+    proj = [((ang(x)[0] - r0) * dr + (ang(x)[1] - p0) * dp) / mag for x in tail]
     sigma = robust_sigma(proj) or 0.0
     out["noise_deg"] = round(sigma, 3)
-    if mag < max(0.25, 12 * sigma) or abs(dpot) < 5:   # too small next to the noise to judge the seat's response
+    # too small next to the noise to judge the seat's response (yaw is noisier, and a slide turns the seat less)
+    if mag < max(0.5 if yaw else 0.25, 12 * sigma) or abs(dpot) < 5:
         out["small"] = True
         return out
     band = max(0.06, 4 * sigma / mag)
     ys = []
     for x in post:
-        y = ((x["roll"] - r0) * dr + (x["pitch"] - p0) * dp) / (mag * mag)
+        a_ = ang(x)
+        y = ((a_[0] - r0) * dr + (a_[1] - p0) * dp) / (mag * mag)
         yp = (x["m"][m]["f"] - f0) / dpot
         ys.append((y, yp, x["ms"] - t0))
     peak, ppeak = max(y for y, _, _ in ys), max(yp for _, yp, _ in ys)
@@ -1848,9 +1904,17 @@ def seat_step(samples, m, t_old):
     t50 = next((t for y, _, t in ys if y >= 0.5), None)
     p50 = next((t for _, yp, t in ys if yp >= 0.5), None)
     out["lag_ms"] = (t50 - p50) if (t50 is not None and p50 is not None) else None
-    i10 = next((i for i, (y, _, _) in enumerate(ys) if y >= 0.1), None)
+    # play: how far the motor had gone when the seat had made 10% of its move. Only readings the sensor really sent
+    # (the telemetry repeats the last one at 100 Hz), and the 10% point interpolated between two of them, so the
+    # sensor's own update interval doesn't show up as play.
+    fresh = [ys[i] for i in range(len(ys)) if i == 0 or ang(post[i]) != ang(post[i - 1])]
+    i10 = next((i for i, (y, _, _) in enumerate(fresh) if y >= 0.1), None)
     if i10 is not None and hz and hz >= 50:
-        out["play_counts"] = round(max(0.0, ys[i10][1] - 0.1) * abs(dpot), 1)
+        yb, pb, _ = fresh[i10]
+        if i10 > 0 and yb > fresh[i10 - 1][0]:
+            ya, pa, _ = fresh[i10 - 1]
+            pb = pa + (pb - pa) * (0.1 - ya) / (yb - ya)
+        out["play_counts"] = round(max(0.0, pb - 0.1) * abs(dpot), 1)
     crossings, state = 0, 0
     for y, _, t in ys:
         if t50 is None or t < t50:
@@ -2753,8 +2817,11 @@ class MotionCheck:
             self.apply_orig()
             self.runaway_limit = 200
             room_up = self.hi - 20 - self.fb()
-            a = 50 if room_up >= 50 else -50
-            base = max(self.lo + 60, min(self.hi - 60, round(self.fb())))
+            # the rear slide turns the seat less per count than a lift tilts it, and the sensor's yaw is noisier:
+            # a bigger step so the seat's response stands out
+            sz = 80 if self.m == tl_motor(self.d.cfg) else 50
+            a = sz if room_up >= sz else -sz
+            base = max(self.lo + sz + 10, min(self.hi - sz - 10, round(self.fb())))
             self.ramp_to(base)
             self.wait(1.0)
             steps = []
@@ -2768,7 +2835,12 @@ class MotionCheck:
                 self.wait(0.15)
                 got = despike(b.since(seq0), m)
                 res = analyze_step(got, m, t_old, o["pwmmin"], o["pwmmax"], 1500)
-                seat = seat_step(b.since(seq0 - 20), m, t_old)   # needs a few samples from before the step
+                tl = tl_motor(self.d.cfg)
+                around = b.since(seq0 - 20)                     # needs a few samples from before the step
+                seat = seat_step(around, m, t_old, yaw=(m == tl))
+                # with a traction-loss rig, also the other kind of movement: a lift that turns the seat or a
+                # traction-loss motor that tilts it is set up (or wired) as something it isn't
+                other = seat_step(around, m, t_old, yaw=(m != tl)) if tl is not None else None
                 vmax = 0.0
                 for i in range(1, len(got)):
                     dt = got[i]["ms"] - got[i - 1]["ms"]
@@ -2779,6 +2851,9 @@ class MotionCheck:
                     res["speed_max"] = round(vmax)
                     if seat:
                         res["seat"] = seat
+                    if other and not other.get("small"):
+                        res["seat_other"] = {"deg": other["deg"], "axis": other["axis"],
+                                             "deg_per_count": other.get("deg_per_count")}
                 steps.append(res)
             r["step"] = {"size": abs(a), "first_direction": "up" if a > 0 else "down", "away": steps[0],
                          "back": steps[1]}
@@ -2843,6 +2918,8 @@ class MotionCheck:
     def ask_show_move(self, base):
         n = self.n
         ans = None
+        if self.m == tl_motor(self.d.cfg):
+            return self.ask_show_slide(base)
         for _ in range(3):
             self.d.set_prompt(self.m, f"Watch motor {n}'s corner of the seat: in a moment it moves towards HIGHER "
                               f"numbers (+60) and comes back.", [], info=True)
@@ -2856,6 +2933,33 @@ class MotionCheck:
                               ["unsure", "Not sure"], ["again", "Show me again"]], where=True)
             if ans["answer"] != "again":
                 break
+        return ans
+
+    def ask_show_slide(self, base):
+        """The traction-loss motor: which way does the REAR go for higher numbers? Sensors can't tell left from right
+        on the rig, and the 3D view needs it."""
+        n = self.n
+        ans = None
+        for _ in range(3):
+            self.d.set_prompt(self.m, f"Watch the REAR of the seat (motor {n}, traction loss): in a moment it moves "
+                              f"towards HIGHER numbers (+60) and comes back.", [], info=True)
+            self.wait(2.0)
+            self.ramp_to(base + 60, speed=200)
+            self.wait(1.0)
+            self.ramp_to(base, speed=200)
+            self.wait(0.3)
+            ans = self.d.ask(self, f"Sitting in the seat facing forward: which way did the REAR go when motor {n}'s "
+                             f"number went UP?",
+                             [["right", "The rear went RIGHT"], ["left", "The rear went LEFT"],
+                              ["updown", "It went up or down"], ["none", "I didn't see it move"],
+                              ["unsure", "Not sure"], ["again", "Show me again"]])
+            if ans["answer"] != "again":
+                break
+        if ans and ans.get("answer") in ("right", "left"):
+            want = 1 if ans["answer"] == "right" else -1
+            if int(self.d.cfg.get("tl_dir") or 1) != want:
+                self.d.cfg.update(tl_dir=want)
+                self.say(f"noted: higher numbers move the rear to the {ans['answer'].upper()} (the 3D view uses this)")
         return ans
 
     def ask_show_drive(self, lvl):
@@ -2912,6 +3016,18 @@ ABOUT = {
               "angles per second, tilt limit and trips, level offsets, raw angles. check[].step.*.seat: the seat's "
               "own response to each step - degrees moved, degrees per count, overshoot and ringing next to the "
               "motor's, lag, and play (counts the motor turns before the seat follows).",
+    "layout": "rig.layout: 'front lifts + rear traction loss' = motors 1 and 2 lift the front corners and motor 3 slides "
+              "the rear left/right (the seat turns about a pivot at the front; its seat response is measured as yaw); "
+              "'lifts' = every motor lifts the seat. rig.traction_loss_higher_numbers_move_rear = which way the rear "
+              "goes for higher numbers (asked in Seat setup or the full check).",
+    "seat_setup": "board.seat_setup (firmware 1.9, made by the page's Seat setup): trim = level trim per motor in counts, "
+                  "added by the board to every position command (SimHub's 512 lands on 512 + trim, the level seat - "
+                  "for the traction-loss motor: the rear centred, the seat pointing straight ahead); "
+                  "travel = [low, high] pot counts position commands never go past (with the SMC3 Clip, the tighter "
+                  "wins); end_stop = [low, high] pot counts past which the board switches the motor off (E1-E3; with "
+                  "the SMC3 Max limit, the tighter wins); tilt_limit = degrees each way (roll right = right side down, "
+                  "front up = pitch +) past which every motor stops (E4); saved = what runs is what is in EEPROM; "
+                  "page_holds / simhub_held = the page has the seat and how many SimHub positions were held back.",
     "wiring (firmware defaults)": "motor n: PWM on D9/D10/D11, bridge enable pins D2+D3 / D4+D5 / D6+D7, pots on "
                                   "A0/A1/A2. MODE2 = IBT-2 bridges. Motion sensor (optional): WT901C-232 TX -> "
                                   "MAX3232 -> D0, D1 -> MAX3232 -> sensor RX, 5 V.",
@@ -3156,8 +3272,13 @@ class Diagnostics:
                 board["seat_setup"] = dg["seat"]
         rep["board"] = board
         names = list(cfg.get("motor_names") or ["", "", ""])
+        tl = tl_motor(cfg)
         rep["rig"] = {"motors_in_use": nm, "switch_off_unused_motors": bool(cfg.get("disable_unused")),
-                      "motor_names": {f"motor {n}": (names[n - 1] or None) for n in motors}}
+                      "motor_names": {f"motor {n}": (names[n - 1] or None) for n in motors},
+                      "layout": "front lifts + rear traction loss" if tl is not None else "lifts",
+                      "traction_loss_motor": tl + 1 if tl is not None else None,
+                      "traction_loss_higher_numbers_move_rear": ("right" if int(cfg.get("tl_dir") or 1) > 0 else "left")
+                      if tl is not None else None}
         st = {"running": {f"motor {n}": motor_settings(params, n) for n in motors} if params.get("Kp1") is not None
               else None, "running_global": global_settings(params) if params.get("Kp1") is not None else None,
               "raw": canon(params) if params else None}
@@ -3307,6 +3428,7 @@ def analyze(rep):
     livem = {x["motor"]: x for x in live.get("motors", [])}
     checks = {x["motor"]: x for x in rep.get("check", [])} if isinstance(rep.get("check"), list) else {}
     pins = {1: ("D9", "D2/D3", "A0"), 2: ("D10", "D4/D5", "A1"), 3: ("D11", "D6/D7", "A2")}
+    tln = rep.get("rig", {}).get("traction_loss_motor")       # the motor that slides the rear (traction loss), or None
 
     # ---- connection and board ----
     if not board.get("connected"):
@@ -3602,12 +3724,17 @@ def analyze(rep):
             add("warn", f"Motor {n} struggles moving towards {d} numbers around pot {lo}-{hi}",
                 f"While SimHub drives, going that way it falls up to {lag:.0f} counts behind and runs at full allowed "
                 f"power up to {fp}% of the time there" + (f"; the other way it keeps up ({lag_o:.0f} counts)" if
-                lag_o is not None else "") + ". That is what lifting a heavy load looks like - a heavier driver, or "
-                "the seat's weight on that corner." + seat_txt,
-                "More drive for that direction: raise PWMmax 10-20 at a time and check the motor supply holds its "
-                "voltage under load; a little Ki helps hold against the weight (auto-tune adds it when it helps). "
-                "Mechanically: a longer lever, a spring or gas strut to carry the seat's weight, lubrication. Look at "
-                "it again after a session - the load map fills while you drive.", n, "load")
+                lag_o is not None else "") + ". " + (
+                    "The rear slide doesn't lift anything, so this is friction or binding on that side - the rail, its "
+                    "bearings, a cable or the seat's weight pulling sideways when the rig tilts." if n == tln else
+                    "That is what lifting a heavy load looks like - a heavier driver, or the seat's weight on that "
+                    "corner.") + seat_txt,
+                ("Check the rear slide for binding and lubricate the rail; then more drive for that direction: raise "
+                 "PWMmax 10-20 at a time and check the motor supply holds its voltage under load." if n == tln else
+                 "More drive for that direction: raise PWMmax 10-20 at a time and check the motor supply holds its "
+                 "voltage under load; a little Ki helps hold against the weight (auto-tune adds it when it helps). "
+                 "Mechanically: a longer lever, a spring or gas strut to carry the seat's weight, lubrication.")
+                + " Look at it again after a session - the load map fills while you drive.", n, "load")
     # ---- motion sensor (firmware 1.8) ----
     sen = board.get("sensor")
     seat_live = live.get("seat")
@@ -3736,9 +3863,12 @@ def analyze(rep):
                     "Small corrections get swallowed by friction - flat spots when the seat changes direction.",
                     f"Raise PWMmin to about {max(0, need - 10)} (auto-tune measures it precisely).", n, "pwmmin_low")
             if up and dn and max(up, dn) >= 2 * min(up, dn) and max(up, dn) - min(up, dn) >= 30:
-                add("info", f"Motor {n} needs much more drive {'up' if up > dn else 'down'} ({max(up, dn)} vs "
-                    f"{min(up, dn)})", "Usually the seat's weight on that corner. Fine unless it struggles.", motor=n,
-                    code="asym")
+                add("info", f"Motor {n} needs much more drive towards {'higher' if up > dn else 'lower'} numbers "
+                    f"({max(up, dn)} vs {min(up, dn)})",
+                    ("A horizontal slide shouldn't care which way it goes: friction or binding in the rear slide on "
+                     "that side, a tight belt or cable, or the rig not standing level so the seat pulls one way."
+                     if n == tln else "Usually the seat's weight on that corner.") + " Fine unless it struggles.",
+                    motor=n, code="asym")
             for name, r in (("away", a), ("back", bk)):
                 if not r:
                     continue
@@ -3763,20 +3893,42 @@ def analyze(rep):
                         "or PWMmax too low.", "Raise PWMmax / Kp, check the supply.", n, "slow")
                     break
             seats = [r["seat"] for r in (a, bk) if r and r.get("seat")]
-            if seats:
+            others = [r["seat_other"] for r in (a, bk) if r and r.get("seat_other")]
+            slide = n == tln
+            tilts, tilted = ("turns", "turned") if slide else ("tilts", "tilted")
+            wrong_kind = False
+            if tln is not None and others:
+                o_deg = max(x["deg"] for x in others)
+                m_deg = max((x["deg"] for x in seats if not x.get("small")), default=0.0)
+                if o_deg >= 0.5 and o_deg > 2 * m_deg:
+                    wrong_kind = True
+                    if slide:
+                        add("warn", f"Motor {n} tilts the seat, but it is set up as the traction-loss motor",
+                            f"A {stp.get('size')}-count step tilted the seat {o_deg:.2f}° ({others[0]['axis']}) and "
+                            f"hardly turned it.", "If all three motors lift your seat, set Settings, Motors on the rig, "
+                            "Motor 3 to 'Lift'. If the rear slide should be motor 3, its motor and pot are on another "
+                            "channel: the rear slide's IBT-2 goes to D11 / D6 / D7, its pot to A2.", n, "layout_tilts")
+                    else:
+                        add("warn", f"Motor {n} turns the seat (like traction loss), but it should lift it",
+                            f"A {stp.get('size')}-count step turned the seat {o_deg:.2f}° and hardly tilted it.",
+                            f"The rear slide seems to be on motor {n}'s channel. SimHub's traction loss goes to motor 3: "
+                            f"the rear slide's IBT-2 belongs on D11 / D6 / D7 and its pot on A2. (If your rig has no "
+                            f"traction loss, set Settings, Motors on the rig, Motor 3 to 'Lift'.)", n, "layout_turns")
+            if seats and not wrong_kind:
                 clip = (ck.get("settings") or {}).get("clip") or 100
                 dpc = [x["deg_per_count"] for x in seats if x.get("deg_per_count")]
                 if all(x.get("small") for x in seats):
-                    add("warn", f"The seat hardly moved when motor {n} moved",
-                        f"A {stp.get('size')}-count step tilted the seat only {max(x['deg'] for x in seats):.2f}°.",
+                    add("warn", f"The seat hardly {'turned' if slide else 'moved'} when motor {n} moved",
+                        f"A {stp.get('size')}-count step {tilted} the seat only {max(x['deg'] for x in seats):.2f}°.",
                         "Is the sensor fixed to the moving seat (not to the base frame)? Otherwise look for a loose or "
                         "broken link between this motor and the seat.", n, "seat_small")
                 elif dpc:
                     k = _mean(dpc)
                     rng = k * (1023 - 2 * clip) / 2.0
-                    add("info", f"Motor {n} tilts the seat {k:.3f}° per count ({seats[0]['axis']})",
-                        f"A {stp.get('size')}-count step moved the seat {seats[0]['deg']:.2f}°. Over its whole Clip "
-                        f"window that is about ±{rng:.1f}°.", motor=n, code="seat_geom")
+                    add("info", f"Motor {n} {tilts} the seat {k:.3f}° per count " +
+                        ("(traction loss)" if slide else f"({seats[0]['axis']})"),
+                        f"A {stp.get('size')}-count step {'turned' if slide else 'moved'} the seat {seats[0]['deg']:.2f}°. "
+                        f"Over its whole Clip window that is about ±{rng:.1f}°.", motor=n, code="seat_geom")
                     sos = max(x.get("overshoot", 0) for x in seats)
                     mos = max(x.get("motor_overshoot", 0) for x in seats)
                     ring = max(x.get("ringing", 0) for x in seats)
@@ -3860,7 +4012,20 @@ def analyze(rep):
         elif res in ("stopped", "simhub", "link"):
             add("info", f"Check of motor {n} was interrupted", msg, code="interrupted", motor=n)
         sa = (ck.get("seen") or {}).get("answer")
-        if sa in ("up", "down", "none"):
+        if n == tln and sa in ("right", "left"):
+            add("info", f"Higher numbers move the rear to the {sa.upper()} (motor {n}, traction loss)",
+                "Noted for the 3D view and Seat setup.",
+                "If the rear slides the wrong way in games (in a right-hand slide the rear should swing out to the "
+                "LEFT), tick Invert on SimHub's traction-loss output.", n, "tl_dir")
+        elif n == tln and sa in ("updown", "up", "down"):
+            add("warn", f"Motor {n} moved the seat up or down, but it is set up as the traction-loss motor",
+                "You saw it lift or lower the seat instead of moving the rear sideways.",
+                "If all three motors lift your seat, set Settings, Motors on the rig, Motor 3 to 'Lift'. Otherwise the "
+                "rear slide's motor and pot are on another channel: its IBT-2 belongs on D11 / D6 / D7, its pot on A2.",
+                n, "layout_seen")
+        elif n == tln and sa == "none":
+            seen[n] = (sa, "")
+        elif sa in ("up", "down", "none"):
             seen[n] = (sa, (ck.get("seen") or {}).get("where", ""))
     if seen:
         dirs = {n: a for n, (a, _) in seen.items()}
@@ -3876,7 +4041,7 @@ def analyze(rep):
         if ups and downs:
             add("warn", "The motors don't all go the same way for higher numbers",
                 f"Up: motor {', '.join(map(str, ups))}; down: motor {', '.join(map(str, downs))}. SimHub expects every "
-                f"actuator to rise for higher numbers (or all to fall).",
+                f"lift to rise for higher numbers (or all to fall).",
                 "Easiest: in SimHub invert the output of the odd one out. Or swap BOTH that motor's two wires and its "
                 "pot's two outer wires (swapping only one makes it run away).", code="mixed_dirs")
         elif downs and not ups:
@@ -3884,7 +4049,8 @@ def analyze(rep):
                 "Fine if SimHub's outputs are set up for that; otherwise the whole motion is upside down.",
                 "If pitch and roll feel inverted in games, invert the outputs in SimHub.", code="all_down")
         elif ups:
-            add("ok", "Every motor checked goes UP for higher numbers", code="dirs_ok")
+            add("ok", "Every lift checked goes UP for higher numbers" if tln else
+                "Every motor checked goes UP for higher numbers", code="dirs_ok")
         if wh:
             add("info", "Where the motors are", wh + ".", code="where")
         given = rep.get("rig", {}).get("motor_names") or {}
@@ -3954,6 +4120,9 @@ def summary_text(rep, findings):
 # end stops (the motor switches off if it gets past one anyway) and tilt limits for each direction (every motor stops
 # if the seat tilts further), and saves them on the board. The board holds SimHub's position commands back while
 # this page moves the seat ([kH n]).
+# A traction-loss rig (page 2.1, the default layout): motors 1 and 2 lift the front corners and level the seat; motor
+# 3 slides the rear left / right, so it is centred (the seat pointing straight ahead) instead of levelled, and it
+# stops at the traction loss you allow (the seat's turn, from the sensor's yaw) instead of a tilt.
 # --------------------------------------------------------------------------------------------------------------
 
 SEAT_EXPLORE_SPEED = 60.0          # counts per second while looking for an end
@@ -3965,16 +4134,22 @@ SEAT_STALL_S = 0.4                 # pushing at full allowed drive this long wit
 SEAT_LAG_STOP = 40                 # counts behind its target while looking for an end = it can't go further
 SEAT_TRIM_MAX = 300                # the board's level trim range
 SEAT_DEFAULT_WANT = 10.0           # degrees each way, until the owner says otherwise
+SEAT_DEFAULT_TL = 10.0             # traction loss: degrees the seat may turn each way, until the owner says otherwise
 SEAT_TILT_MARGIN = 2.0             # tilt limit = the angle allowed + this
 SEAT_SOFT_MARGIN = 20              # travel limit this many counts inside the end found
 SEAT_END_MARGIN = 6                # end stop: this many counts inside an end it pushed against, outside other ends
 WHY_TEXT = {"you": "you stopped it", "angle": "reached the tilt you allow", "stall": "pushed against something",
             "lag": "couldn't keep up (struggling)", "window": "end of its Clip window", "cutoff": "its safety cutoff tripped",
-            "tilt": "the tilt limit tripped"}
+            "tilt": "the tilt limit tripped", "yaw": "reached the traction loss you allow"}
 
 
 class SeatAbort(Exception):
     pass
+
+
+def b_has(seat):
+    """True when the board reported its seat set-up (firmware 1.9)."""
+    return bool(seat and isinstance(seat.get("trim"), list))
 
 
 def _solve2(a, b):
@@ -4083,7 +4258,11 @@ class SeatSetup:
         self.J = None
         self.J_src = None
         self.ends = [[None, None] for _ in range(3)]
-        self.want = dict(self.saved.get("want") or {k: SEAT_DEFAULT_WANT for k in TILT_DIRS})
+        self.want = {k: SEAT_DEFAULT_WANT for k in TILT_DIRS}
+        self.want["traction"] = SEAT_DEFAULT_TL
+        self.want.update(self.saved.get("want") or {})
+        self.level_yaw = None                # the sensor's yaw with the seat level and centred (traction loss)
+        self.yaw_k = self.saved.get("yaw_k")  # traction loss: the seat's turn per count of motor 3 (sensor's sign)
         self.keep_inside = bool(self.saved.get("keep_inside", True))
         self.margins = {"soft": SEAT_SOFT_MARGIN, "end": SEAT_END_MARGIN, "tilt": SEAT_TILT_MARGIN}
         self.stop_flag = False
@@ -4103,6 +4282,20 @@ class SeatSetup:
 
     def motors(self):
         return list(range(int(self.cfg.get("motors") or 3)))
+
+    def tl(self):
+        """The traction-loss motor (sliding the rear), or None when every motor lifts the seat."""
+        return tl_motor(self.cfg)
+
+    def lifts(self):
+        return [m for m in self.motors() if m != self.tl()]
+
+    def tl_dir(self):
+        return 1 if int(self.cfg.get("tl_dir") or 1) > 0 else -1
+
+    def yaw_per_count(self):
+        """Degrees the seat turns per count of the traction-loss motor: measured, or a typical value."""
+        return abs(self.yaw_k) if self.yaw_k else TL_DEFAULT_DEG
 
     def sensor_ok(self):
         s = self.b.latest()
@@ -4197,6 +4390,16 @@ class SeatSetup:
                 return True
             time.sleep(0.05)
         return False
+
+    def _yaw(self, dur=0.4):
+        """Mean yaw over the next dur seconds (sensor), or None."""
+        seq = self.b.seq
+        self._wait(dur)
+        pts = [x["yaw"] for x in self.b.since(seq) if x.get("yaw") is not None]
+        if len(pts) < 3:
+            return None
+        ref = pts[0]
+        return ref + sum(_wrap180(y - ref) for y in pts) / len(pts)
 
     def _angles(self, dur=0.5):
         """Mean seat roll and pitch over the next dur seconds (sensor)."""
@@ -4335,7 +4538,7 @@ class SeatSetup:
         return self._run("level", self._auto_level)
 
     def _learn(self):
-        use = self.motors()
+        use = self.lifts()
         J = [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]
         base = list(self.targets)
         for i, m in enumerate(use):
@@ -4364,8 +4567,10 @@ class SeatSetup:
         return J
 
     def _auto_level(self):
-        use = self.motors()
-        self.say("Levelling with the motion sensor.")
+        use = self.lifts()
+        self.say("Levelling with the motion sensor" + (f" (motors {' and '.join(str(m + 1) for m in use)}; motor "
+                                                       f"{self.tl() + 1} slides the rear and stays where it is)."
+                                                       if self.tl() is not None else "."))
         self._settle(3.0, 0.3)
         J = self._learn()
         self.J, self.J_src = J, "levelling"
@@ -4400,7 +4605,9 @@ class SeatSetup:
         self.progress = 100
         ok = abs(e[0]) <= 0.25 and abs(e[1]) <= 0.25
         self.say(("Level" if ok else "As level as it gets") + f": roll {e[0]:+.2f}°, pitch {e[1]:+.2f}° with the motors at "
-                 + ", ".join(f"{self.targets[m]}" for m in use) + ".")
+                 + ", ".join(f"{self.targets[m]}" for m in use) + "." +
+                 (f" Now centre the rear (motor {self.tl() + 1}) so the seat points straight ahead."
+                  if self.tl() is not None else ""))
 
     def accept_level(self):
         if self.state != "open":
@@ -4417,16 +4624,42 @@ class SeatSetup:
         if self.sensor_ok():
             try:
                 self.level_ang = self._angles(0.4) if self.state == "open" else self.level_ang
+                if self.tl() is not None:
+                    self.level_yaw = self._yaw(0.3)
             except SeatAbort:
                 pass
         self.step = "travel"
-        self.say("Level accepted: motors at " + ", ".join(f"{self.level_pos[m]}" for m in use) +
-                 (f" (seat roll {self.level_ang[0]:+.2f}°, pitch {self.level_ang[1]:+.2f}°)" if self.level_ang else "") + ".")
+        tl = self.tl()
+        self.say("Level accepted: motors at " + ", ".join(f"{self.level_pos[m]}" for m in use if m != tl) +
+                 (f" (seat roll {self.level_ang[0]:+.2f}°, pitch {self.level_ang[1]:+.2f}°)" if self.level_ang else "") +
+                 (f"; the rear centred at {self.level_pos[tl]}" if tl is not None else "") + ".")
         return True, "ok"
+
+    def centre_tl(self):
+        """Centre the rear between the two ends found (traction loss)."""
+        tl = self.tl()
+        if tl is None or not self.level_pos:
+            return False, "Not now."
+        e = self.ends[tl]
+        if not (e[0] and e[1]):
+            return False, f"Find both ends of motor {tl + 1} first."
+        mid = int(round((e[0]["pot"] + e[1]["pot"]) / 2))
+        if abs(mid - 512) > SEAT_TRIM_MAX:
+            return False, f"The middle ({mid}) is more than {SEAT_TRIM_MAX} counts from 512 - the board can't centre there."
+        return self._run("move", self._centre_tl, tl, mid)
+
+    def _centre_tl(self, tl, mid):
+        self.msg = "Centring the rear"
+        self.level_pos[tl] = mid
+        self._move_to(self.level_pos)
+        self._settle(4.0, 0.4)
+        if self.has_sensor:
+            self.level_yaw = self._yaw(0.3)
+        self.say(f"Rear centred between its ends: motor {tl + 1} at {mid}.")
 
     # ---- step 3: travel ----
     def set_want(self, want):
-        for k in TILT_DIRS:
+        for k in TILT_DIRS + ("traction",):
             if k in want:
                 try:
                     self.want[k] = max(1.0, min(45.0, float(want[k])))
@@ -4466,6 +4699,11 @@ class SeatSetup:
         self._settle(4.0, 0.3)
         if self.has_sensor and self.level_ang is None:
             self.level_ang = self._angles(0.4)
+        slide = m == self.tl()
+        yaw_ref = self._yaw(0.3) if (slide and self.has_sensor) else None
+        if slide and yaw_ref is not None and self.level_yaw is None:
+            self.level_yaw = yaw_ref
+        yaw_over = 0
         if self.has_sensor:                                  # firmware safety net: a little past what is allowed
             for k, key in enumerate(TILT_DIRS):
                 b.seat_field(64 + k, int(round((self.want[key] + 3.0) * 10)))
@@ -4510,15 +4748,23 @@ class SeatSetup:
             for s in new:
                 mm = s["m"][m]
                 hist.append((s["ms"], mm["f"], mm["t"], mm["p"]))
-                if s.get("roll") is not None:
+                if slide:
+                    if yaw_ref is not None and s.get("yaw") is not None:
+                        self.samples[m][side].append((round(mm["f"], 1), round(_wrap180(s["yaw"] - yaw_ref), 3), 0.0))
+                elif s.get("roll") is not None:
                     rr = s["roll"] - (self.level_ang or [0, 0])[0]
                     pp = s["pitch"] - (self.level_ang or [0, 0])[1]
                     self.samples[m][side].append((round(mm["f"], 1), round(rr, 3), round(pp, 3)))
             s = b.latest()
             mm = s["m"][m]
-            self.msg = f"Motor {n} towards {what} numbers: pot {mm['f']:.0f}" + (
-                f", seat roll {s['roll'] - (self.level_ang or [0, 0])[0]:+.1f}°, pitch "
-                f"{s['pitch'] - (self.level_ang or [0, 0])[1]:+.1f}°" if s.get("roll") is not None else "")
+            yaw_rel = _wrap180(s["yaw"] - yaw_ref) if (yaw_ref is not None and s.get("yaw") is not None) else None
+            if slide:
+                self.msg = f"Motor {n} (rear) towards {what} numbers: pot {mm['f']:.0f}" + (
+                    f", seat turned {abs(yaw_rel):.1f}°" if yaw_rel is not None else "")
+            else:
+                self.msg = f"Motor {n} towards {what} numbers: pot {mm['f']:.0f}" + (
+                    f", seat roll {s['roll'] - (self.level_ang or [0, 0])[0]:+.1f}°, pitch "
+                    f"{s['pitch'] - (self.level_ang or [0, 0])[1]:+.1f}°" if s.get("roll") is not None else "")
             self.progress = int(100 * (job[0] + min(0.95, abs(x - self.level_pos[m]) / max(1, (hi_w - lo_w) / 2))) / job[1])
             # the tilt the owner allows
             if s.get("roll") is not None and self.has_sensor:
@@ -4527,6 +4773,12 @@ class SeatSetup:
                 if rr > self.want["roll_right"] or rr < -self.want["roll_left"] or \
                         pp > self.want["front_up"] or pp < -self.want["front_down"]:
                     why = "angle"
+                    break
+            # the traction loss the owner allows (3 readings in a row: one odd yaw reading doesn't stop it)
+            if yaw_rel is not None:
+                yaw_over = yaw_over + 1 if abs(yaw_rel) > self.want["traction"] else 0
+                if yaw_over >= 3:
+                    why = "yaw"
                     break
             # pushing against something: full allowed drive, not moving
             if hist and hist[-1][0] - hist[0][0] >= SEAT_STALL_S * 1000:
@@ -4550,15 +4802,18 @@ class SeatSetup:
         s = b.latest()
         f = s["m"][m]["f"]
         end = {"pot": int(round(f)), "why": why, "target": int(round(x))}
-        if s.get("roll") is not None and self.has_sensor:
+        if s.get("roll") is not None and self.has_sensor and not slide:
             end["roll"] = round(s["roll"] - (self.level_ang or [0, 0])[0], 2)
             end["pitch"] = round(s["pitch"] - (self.level_ang or [0, 0])[1], 2)
+        if slide and yaw_ref is not None and s.get("yaw") is not None:
+            end["yaw"] = round(abs(_wrap180(s["yaw"] - yaw_ref)), 2)
         if why in ("stall", "lag"):                          # back off what it pushed against at once
             with self.lock:
                 self._send(m, f - way * 15)
         self.ends[m][side] = end
         self.say(f"Motor {n} towards {what} numbers: end at pot {end['pot']} ({WHY_TEXT[why]})" +
-                 (f", seat roll {end['roll']:+.1f}°, pitch {end['pitch']:+.1f}°" if "roll" in end else "") + ".")
+                 (f", seat roll {end['roll']:+.1f}°, pitch {end['pitch']:+.1f}°" if "roll" in end else "") +
+                 (f", the seat turned {end['yaw']:.1f}°" if "yaw" in end else "") + ".")
         if why in ("cutoff", "tilt"):
             raise SeatAbort(f"Motor {n}: {WHY_TEXT[why]}. Press Enable Motors, then carry on - the end found so far "
                             f"is kept.")
@@ -4575,6 +4830,12 @@ class SeatSetup:
         pts = self.samples[m][0] + self.samples[m][1]
         lv = self.level_pos[m]
         xs = [p[0] - lv for p in pts]
+        if m == self.tl():                                   # traction loss: how far the seat turns per count
+            ky, r2 = fit_slope(xs, [p[1] for p in pts])
+            if ky is not None and len(pts) >= 20 and r2 >= 0.5 and abs(ky) >= 0.001:
+                self.yaw_k = ky
+                self.say(f"Motor {m + 1} turns the seat {abs(ky) * 100:.2f}° per 100 counts.")
+            return
         kr, r2r = fit_slope(xs, [p[1] for p in pts])
         kp, r2p = fit_slope(xs, [p[2] for p in pts])
         if kr is None or kp is None or len(pts) < 20:
@@ -4609,7 +4870,16 @@ class SeatSetup:
                 travel[m][side] = int(max(0, min(1023, round(soft))))
                 ends[m][side] = int(max(0, min(1023, round(hard))))
         out = {"trim": [self.level_pos[m] - 512 if m in use else 0 for m in range(3)], "travel": travel,
-               "end_stop": ends, "tilt": None, "reach": None, "polygon": None, "narrowed": False}
+               "end_stop": ends, "tilt": None, "reach": None, "polygon": None, "narrowed": False, "tl": None}
+        tl = self.tl()
+        if tl is not None and tl in use:
+            k, c, d = self.yaw_per_count(), self.level_pos[tl], self.tl_dir()
+            hi_side, lo_side = round(k * (travel[tl][1] - c), 1), round(k * (c - travel[tl][0]), 1)
+            e = self.ends[tl]
+            out["tl"] = {"motor": tl, "centre": c, "deg_per_count": round(k, 4), "measured": bool(self.yaw_k),
+                         "right": hi_side if d > 0 else lo_side, "left": lo_side if d > 0 else hi_side,
+                         "middle": int(round((e[0]["pot"] + e[1]["pot"]) / 2)) if (e[0] and e[1]) else None}
+        use = [m for m in use if m != tl]                    # tilt: the lifts only
         if self.J and self.has_sensor:
             J = self.J
             r = reach(J, self.level_pos, travel, use)
@@ -4727,7 +4997,8 @@ class SeatSetup:
         self.saved = {"when": self.result["when"], "level_pos": self.level_pos, "J": self.J, "J_src": self.J_src,
                       "ends": self.ends, "want": self.want, "keep_inside": self.keep_inside,
                       "travel": v["travel"], "end_stop": v["end_stop"], "tilt": tilt, "motors": use,
-                      "has_sensor": self.has_sensor}
+                      "has_sensor": self.has_sensor, "layout": self.cfg.get("layout"), "tl": self.tl(),
+                      "yaw_k": self.yaw_k}
         try:
             tmp = self.path + ".tmp"
             with open(tmp, "w") as f:
@@ -4735,7 +5006,9 @@ class SeatSetup:
             os.replace(tmp, self.path)
         except OSError as e:
             self.say(f"Couldn't keep a copy on the NAS ({e}) - the board has it anyway.")
-        text = ("Seat set-up saved on the board: level at " + ", ".join(f"motor {m + 1} {self.level_pos[m]}" for m in use)
+        tl = self.tl()
+        text = ("Seat set-up saved on the board: level at " + ", ".join(
+                    f"motor {m + 1} {self.level_pos[m]}" + (" (rear centre)" if m == tl else "") for m in use)
                 + "; travel " + ", ".join(f"{v['travel'][m][0]}-{v['travel'][m][1]}" for m in use)
                 + "; end stops " + ", ".join(f"{v['end_stop'][m][0]}/{v['end_stop'][m][1]}" for m in use)
                 + ("; tilt limits " + ", ".join(f"{k.replace('_', ' ')} {tilt[k]:g}°" for k in TILT_DIRS) if tilt else "")
@@ -4774,6 +5047,11 @@ class SeatSetup:
                 la = self.level_ang if (self.state != "idle" and self.level_ang) else [0, 0]
                 live["roll"], live["pitch"] = round(s["roll"] - la[0], 2), round(s["pitch"] - la[1], 2)
                 live["roll_abs"], live["pitch_abs"] = s["roll"], s["pitch"]
+            tl = self.tl()
+            if tl is not None:                       # the seat's turn from the rear's position: + = rear to the right
+                c = (self.level_pos[tl] if (self.state != "idle" and self.level_pos) else
+                     (self.b.centre(tl) if b.seat else 512))
+                live["tl_deg"] = round(self.tl_dir() * self.yaw_per_count() * (s["m"][tl]["f"] - c), 2)
         return {"state": self.state, "step": self.step, "action": self.action, "msg": self.msg,
                 "progress": self.progress, "log": self.lines[-60:], "error": self.error,
                 "fw_ok": b.fwnum() >= 19, "connected": b.connected, "motors": self.motors(),
@@ -4784,7 +5062,9 @@ class SeatSetup:
                 [self._window_raw(m) for m in range(3)],
                 "suggest": self.suggestion() if self.state != "idle" else None,
                 "board": b.seat, "saved": self.saved or None, "live": live,
-                "simhub_held": (b.seat or {}).get("simhub_held")}
+                "simhub_held": (b.seat or {}).get("simhub_held"),
+                "layout": self.cfg.get("layout"), "tl": self.tl(), "tl_dir": self.tl_dir(),
+                "yaw_k": self.yaw_k, "yaw_per_count": self.yaw_per_count()}
 
     def _window_raw(self, m):
         clip = (self.b.params.get(f"LIM{m + 1}") or [23, 100])[1]
@@ -4794,10 +5074,16 @@ class SeatSetup:
         """For the 3D view: how the motors tilt the seat, where it is level, the limits."""
         g = self.saved or {}
         seat = self.b.seat or {}
-        return {"J": g.get("J"), "level_pos": g.get("level_pos") or [self.b.centre(m) for m in range(3)],
+        tl = self.tl()
+        J = g.get("J")
+        if J and tl is not None and g.get("layout") != "tl":    # made for three lifts: motor 3 doesn't tilt any more
+            J = [[J[0][0], J[0][1], 0.0], [J[1][0], J[1][1], 0.0]]
+        return {"J": J, "level_pos": [self.b.centre(m) for m in range(3)] if b_has(seat) else (g.get("level_pos") or
+                                                                                              [512, 512, 512]),
                 "travel": seat.get("travel"), "end_stop": seat.get("end_stop"), "tilt": seat.get("tilt_limit"),
                 "trim": seat.get("trim"), "names": self.cfg.get("motor_names"), "motors": int(self.cfg.get("motors") or 3),
-                "when": g.get("when")}
+                "when": g.get("when"), "layout": "tl" if tl is not None else "lifts", "tl": tl, "tl_dir": self.tl_dir(),
+                "yaw_per_count": self.yaw_per_count(), "yaw_measured": bool(self.yaw_k)}
 
 
 # --------------------------------------------------------------------------------------------------------------
@@ -5475,6 +5761,7 @@ details.oks .flist{margin-top:6px}
   <div class="sspanel" data-p="start">
    <h3>Make the level seat SimHub's centre, and set how far it may go</h3>
    <p class="note">First the platform is levelled - by itself with the motion sensor, or by you with a spirit level - and that becomes the centre SimHub sends the seat to. Then each motor moves slowly away from level, one way and then the other, until the seat tilts as far as you allow, the motor pushes against something, or you press <b>Stop</b>. From that the page suggests <b>travel limits</b> (SimHub can never send a motor further), <b>end stops</b> (the motor switches off if it gets past one anyway) and <b>tilt limits</b> for each direction (every motor stops if the seat tilts further). They are saved on the board, so they work without this page.</p>
+   <p class="note" id="ss_tlstart" hidden>Your rig has <b>traction loss</b>: motors 1 and 2 lift the front and level the seat, and motor 3 - the rear slide - is <b>centred</b> instead (the seat pointing straight ahead). When its ends are found, it stops at the traction loss you allow: how far the seat may turn each way.</p>
    <ul class="chk2">
     <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M5 12l5 5 9-10"/></svg><span>SimHub can stay open: while Seat setup is open the board ignores SimHub's positions, and gives the seat back when you save or cancel.</span></li>
     <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M5 12l5 5 9-10"/></svg><span><b>Seat empty</b> the first time, the rig clear of hands, feet, cables and pets, and your hand near the <b>motor power switch</b>.</span></li>
@@ -5490,15 +5777,17 @@ details.oks .flist{margin-top:6px}
   <div class="sspanel" data-p="level" hidden>
    <h3>1 · Level the platform</h3>
    <p class="note" id="ss_levnote"></p>
-   <div class="ssacts" id="ss_autolev"><button class="btn b-blue" data-k="ss_auto" onclick="ssPost('level')"><svg class="i" viewBox="0 0 24 24"><rect x="2.5" y="9" width="19" height="6" rx="3"/><circle cx="12" cy="12" r="1.6"/></svg>Level automatically</button><span class="muted" style="font-size:13px">about 20 seconds - each motor moves a little first, to learn how it tilts the seat</span></div>
+   <div class="ssacts" id="ss_autolev"><button class="btn b-blue" data-k="ss_auto" onclick="ssPost('level')"><svg class="i" viewBox="0 0 24 24"><rect x="2.5" y="9" width="19" height="6" rx="3"/><circle cx="12" cy="12" r="1.6"/></svg>Level automatically</button><span class="muted" style="font-size:13px" id="ss_autolevtxt">about 20 seconds - each motor moves a little first, to learn how it tilts the seat</span></div>
    <table class="jog" id="ss_jog"></table>
+   <p class="note" id="ss_tllev" hidden></p>
    <div class="ssacts"><button class="btn b-green" data-k="ss_accept" onclick="ssPost('accept')">This is level - next</button><button class="btn b-grey" data-k="ss_cancel" onclick="ssCancel()">Cancel</button></div>
   </div>
 
   <div class="sspanel" data-p="travel" hidden>
    <h3>2 · Find how far each motor may go</h3>
    <div id="ss_wantbox"><p class="note">The most the seat may tilt each way, from level. A motor stops as soon as the seat gets there.</p>
-    <div class="want"><div><span class="lbl" data-k="ss_want">Roll right (right side down)</span><input type="number" id="w_rr" min="1" max="45" step="0.5"></div><div><span class="lbl" data-k="ss_want">Roll left</span><input type="number" id="w_rl" min="1" max="45" step="0.5"></div><div><span class="lbl" data-k="ss_want">Front up</span><input type="number" id="w_fu" min="1" max="45" step="0.5"></div><div><span class="lbl" data-k="ss_want">Front down</span><input type="number" id="w_fd" min="1" max="45" step="0.5"></div></div></div>
+    <div class="want"><div><span class="lbl" data-k="ss_want">Roll right (right side down)</span><input type="number" id="w_rr" min="1" max="45" step="0.5"></div><div><span class="lbl" data-k="ss_want">Roll left</span><input type="number" id="w_rl" min="1" max="45" step="0.5"></div><div><span class="lbl" data-k="ss_want">Front up</span><input type="number" id="w_fu" min="1" max="45" step="0.5"></div><div><span class="lbl" data-k="ss_want">Front down</span><input type="number" id="w_fd" min="1" max="45" step="0.5"></div></div>
+    <div class="want" id="w_trrow"><div><span class="lbl" data-k="ss_wanttl">Traction loss each way</span><input type="number" id="w_tr" min="1" max="45" step="0.5"></div></div></div>
    <p class="note" id="ss_travnote">Each motor moves slowly away from level and stops by itself when the seat reaches the tilt above, when it pushes against something (full drive, not moving), at the end of its Clip window - or when you press <b>Stop - this is the end</b> (or the space bar). Then it goes back to level.</p>
    <div class="ssacts"><button class="btn b-blue" data-k="ss_findall" onclick="ssExplore('all',1)">Find every end</button><button class="btn b-grey" data-k="ss_golevel" onclick="ssPost('goto_level')">Back to level</button></div>
    <table class="lim" id="ss_ends"></table>
@@ -5510,6 +5799,7 @@ details.oks .flist{margin-top:6px}
    <div class="limgrid">
     <div>
      <table class="lim" id="ss_limtab"></table>
+     <div class="note" id="ss_tltxt" hidden></div>
      <div id="ss_tiltbox"><span class="lbl" style="margin-top:12px">Tilt limits - every motor stops if the seat tilts further (°)</span>
       <div class="want"><div><span class="lbl">Roll right</span><input type="number" id="t_rr" min="0" max="45" step="0.5"></div><div><span class="lbl">Roll left</span><input type="number" id="t_rl" min="0" max="45" step="0.5"></div><div><span class="lbl">Front up</span><input type="number" id="t_fu" min="0" max="45" step="0.5"></div><div><span class="lbl">Front down</span><input type="number" id="t_fd" min="0" max="45" step="0.5"></div></div></div>
      <div class="frow" style="grid-template-columns:repeat(3,minmax(0,150px));margin-top:12px">
@@ -5537,7 +5827,7 @@ details.oks .flist{margin-top:6px}
  <section class="card sslive" style="grid-area:seatlive" data-views="seat">
   <div class="ct">Seat now</div>
   <div class="held" id="ss_held"><i class="dot"></i><span>SimHub is in charge of the seat.</span></div>
-  <div class="big" id="ss_big"><span><small>roll</small><b id="ss_r">-</b></span><span><small>pitch</small><b id="ss_p">-</b></span></div>
+  <div class="big" id="ss_big"><span><small>roll</small><b id="ss_r">-</b></span><span><small>pitch</small><b id="ss_p">-</b></span><span id="ss_tlbig" hidden><small>rear (traction loss)</small><b id="ss_tl">-</b></span></div>
   <svg class="bubble" id="ss_bub" viewBox="0 0 220 220"></svg>
   <div id="ss_minis"></div>
   <p class="note" style="font-size:12.5px">Green band: the travel limits. Red ticks: the end stops. White tick: level.</p>
@@ -5550,7 +5840,8 @@ details.oks .flist{margin-top:6px}
    <div class="hud tl"><div class="pn"><h5>Attitude</h5>
      <div class="row"><span class="dim">ROLL</span><b class="big" id="h_roll">--</b><div class="gbar" id="h_rollb"><u></u><i></i></div></div>
      <div class="row"><span class="dim">PITCH</span><b class="big" id="h_pitch">--</b><div class="gbar" id="h_pitchb"><u></u><i></i></div></div>
-     <div class="row"><span class="dim">YAW</span><b id="h_yaw">--</b><span class="dim" style="font-size:11px">since opened</span></div>
+     <div class="row" id="h_yawrow"><span class="dim">YAW</span><b id="h_yaw">--</b><span class="dim" style="font-size:11px">since opened</span></div>
+     <div class="row" id="h_tlrow" hidden><span class="dim">REAR</span><b id="h_tl" style="font-size:16px;white-space:nowrap">--</b><div class="gbar" id="h_tlb"><u></u><i></i></div></div>
      <span class="src" id="h_src">no data</span></div></div>
    <div class="hud tr"><div class="pn"><h5>Gyro · °/s</h5>
      <div class="row"><span class="dim">ROLL</span><b id="h_gx">--</b><div class="gbar" id="h_gxb"><u></u><i></i></div></div>
@@ -5565,7 +5856,7 @@ details.oks .flist{margin-top:6px}
    <div class="hud br"><div class="pn"><h5>Sensor</h5><div id="h_sen" class="dim">--</div></div></div>
    <svg class="att" id="h_att" viewBox="-80 -80 160 160"></svg>
    <div class="v3ctl" id="v3ctl">
-    <button data-cam="hero" class="on">3/4</button><button data-cam="chase">Chase</button><button data-cam="side">Side</button><button data-cam="front">Front</button><button data-cam="top">Top</button>
+    <button data-cam="hero" class="on">3/4</button><button data-cam="chase">Chase</button><button data-cam="side">Side</button><button data-cam="front">Front</button><button data-cam="top">Top</button><button data-cam="rig" data-k="v3rig">Rig</button>
     <button data-tog="orbit">Orbit</button><button data-tog="ghost" class="on" data-k="v3ghost">Commanded</button><button data-tog="trail" class="on">Trail</button><button data-tog="full">Full screen</button>
    </div>
    <div class="v3msg" id="v3msg" hidden><div></div></div>
@@ -5633,6 +5924,9 @@ details.oks .flist{margin-top:6px}
  <!-- motor names -->
  <section class="card" style="grid-area:mnames" data-views="settings">
   <div class="ct"><svg class="i" viewBox="0 0 24 24"><path d="M20.6 13.4l-7.2 7.2a2 2 0 0 1-2.8 0L3 13V3h10l7.6 7.6a2 2 0 0 1 0 2.8z"/><circle cx="7.5" cy="7.5" r="1.5"/></svg>Motor names</div>
+  <div class="field" data-k="s_layout" id="s_layoutf"><span>Motor 3</span><select id="s_layout" onchange="saveLayout()"><option value="tl">Slides the rear left / right (traction loss)</option><option value="lifts">Lifts the seat, like motors 1 and 2</option></select></div>
+  <div class="field" data-k="s_tldir" id="s_tldirf"><span>Higher numbers</span><select id="s_tldir" onchange="saveLayout()"><option value="1">move the rear to the right</option><option value="-1">move the rear to the left</option></select></div>
+  <p class="note" id="s_layoutnote"></p>
   <p class="note">Call each motor by where it sits on your rig. The names show on the motor cards, graphs, PID table, menus, auto-tune and diagnostics. The number stays next to them: the wiring, SimHub's outputs and the LED matrix (E1-E3) still go by number.</p>
   <div id="nrows"></div>
   <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:12px">
@@ -5706,13 +6000,13 @@ details.oks .flist{margin-top:6px}
    <div><h3>Auto-tune</h3><p>Measures friction (PWMmin) and pot noise (dead zone), raises Kp until it stops tracking any better, checks small road-sized moves, then adds Ki and Kd only if they help. With the motion sensor it also watches the seat, so a setting that makes the frame bounce doesn't count as calm. It stops by itself and restores the previous settings if SimHub moves the rig or anything looks wrong. Nothing is saved until you press Save to EEPROM.</p>
     <h3>Profiles and recommendations</h3><p>Save the settings that suit a car or game under a name and load them later. The recommendations (circuit, rally, flight, space, trucks) adjust your own tuned settings for that kind of sim and list the SimHub settings that matter most for it. Loading applies live; save to EEPROM to make it the power-on default.</p>
     <h3>Backups</h3><p>Every Save to EEPROM, and every bigger change, keeps a copy on the NAS (EEPROM section). Switch back to any of them live, or switch and save in one go.</p></div>
-   <div><h3>Motor names</h3><p>Settings, Motor names: call the motors Left, Right, Rear (or anything you like). The names appear everywhere in the page and in diagnostics files; the number stays alongside because the wiring, SimHub and the LED matrix use numbers.</p>
+   <div><h3>Motor names and the rig</h3><p>Settings, Motor names: call the motors Front left, Front right, Traction loss (or anything you like). The names appear everywhere in the page and in diagnostics files; the number stays alongside because the wiring, SimHub and the LED matrix use numbers. The same card says what <b>motor 3</b> does: on a <b>traction-loss</b> rig motors 1 and 2 lift the front corners and motor 3, mounted horizontally, swings the rear left and right about a pivot at the front; on a <b>three-lift</b> rig it lifts the rear. Seat setup, the full check, auto-tune and the 3D view follow that.</p>
     <h3>Selected motor</h3><p>Click a motor card or chart, or choose a motor in Test Signal or Auto-Tune: the same motor is highlighted everywhere. While a test signal or auto-tune runs, its chart is marked and the others fade.</p>
-    <h3>Diagnostics</h3><p>Settings section. <b>Quick check</b> reads the board and listens for a few seconds; <b>Full check</b> also moves each motor a little to see which way it goes, how much drive it needs, whether the wiring is swapped and how it answers a small step - and can ask you what you saw. Both make one file (saved on the NAS too) to download and give to whoever helps you. The page also watches while you drive and notes pot glitches, a motor moving the wrong way or stalling, hunting, cutoffs, the tilt limit and board restarts. It also keeps a <b>load map</b>: where each motor falls behind or runs at full power, each way across its travel - a quick check after a session names where the rig struggles (lifting a heavy driver, say). With the motion sensor, the full check also measures the seat itself: degrees per count, bounce and play in the linkage.</p>
+    <h3>Diagnostics</h3><p>Settings section. <b>Quick check</b> reads the board and listens for a few seconds; <b>Full check</b> also moves each motor a little to see which way it goes, how much drive it needs, whether the wiring is swapped and how it answers a small step - and can ask you what you saw. Both make one file (saved on the NAS too) to download and give to whoever helps you. The page also watches while you drive and notes pot glitches, a motor moving the wrong way or stalling, hunting, cutoffs, the tilt limit and board restarts. It also keeps a <b>load map</b>: where each motor falls behind or runs at full power, each way across its travel - a quick check after a session names where the rig struggles (lifting a heavy driver, say). With the motion sensor, the full check also measures the seat itself: degrees per count, bounce and play in the linkage - for the traction-loss motor, how far the seat turns. For the rear slide it asks whether the rear went left or right.</p>
     <h3>Status bar</h3><p>LOW POWER means no position commands for 15 s, so the board runs at quarter drive until SimHub or this page sends targets again.</p></div>
-   <div><h3>Seat setup (firmware 1.9)</h3><p>Levels the platform first and makes that SimHub's centre: the board adds a <b>level trim</b> to every position SimHub sends, so SimHub's middle (512) is the level seat - and the seat goes level at power-up. With the motion sensor it levels itself (each motor moves a little to learn how it tilts the seat, then the page moves them until the sensor reads level, choosing the level position nearest the middle of every motor); without it you nudge the motors with a spirit level on the seat.</p>
-    <p>Then each motor moves slowly away from level, both ways, and stops at the tilt you allow, when it pushes against something, at the end of its Clip window, or when you press Stop (space bar). From what it found the page suggests <b>travel limits</b> (the board never sends a motor past them), <b>end stops</b> (a motor that gets past one anyway is switched off: E1-E3) and <b>tilt limits</b> for each direction (every motor stops: E4). While Seat setup is open the board ignores SimHub's positions; Cancel puts everything back. Auto-tune, the test signal and the full check stay inside the travel limits.</p>
-    <h3>3D View</h3><p>The seat in a sci-fi cockpit, moving live: with the motion sensor it shows the seat's real attitude, otherwise an estimate from the motor positions (best after Seat setup). The actuators sit where Seat setup found each motor acts; a glowing outline shows where the motors are being sent when the seat lags behind. Panels show the angles, the sensor's gyro and acceleration (after Set up the sensor), the actuators and an attitude indicator with the tilt limits. Drag to turn the view, scroll to zoom, or pick a camera.</p></div>
+   <div><h3>Seat setup (firmware 1.9)</h3><p>Levels the platform first and makes that SimHub's centre: the board adds a <b>level trim</b> to every position SimHub sends, so SimHub's middle (512) is the level seat - and the seat goes level at power-up. With the motion sensor it levels itself (each motor moves a little to learn how it tilts the seat, then the page moves them until the sensor reads level, choosing the level position nearest the middle of every motor); without it you nudge the motors with a spirit level on the seat. On a traction-loss rig only motors 1 and 2 level the seat; you <b>centre</b> motor 3, the rear slide, so the seat points straight ahead, and tell the page which way the rear went for +10.</p>
+    <p>Then each motor moves slowly away from level, both ways, and stops at the tilt you allow, when it pushes against something, at the end of its Clip window, or when you press Stop (space bar). The rear slide stops at the <b>traction loss you allow</b> - how far the seat may turn each way, measured by the sensor. From what it found the page suggests <b>travel limits</b> (the board never sends a motor past them), <b>end stops</b> (a motor that gets past one anyway is switched off: E1-E3) and <b>tilt limits</b> for each direction (every motor stops: E4). While Seat setup is open the board ignores SimHub's positions; Cancel puts everything back. Auto-tune, the test signal and the full check stay inside the travel limits.</p>
+    <h3>3D View</h3><p>The seat in a sci-fi cockpit, moving live: with the motion sensor it shows the seat's real attitude, otherwise an estimate from the motor positions (best after Seat setup). On a traction-loss rig the two front actuators lift the front corners and the horizontal rear actuator swings the seat about the front pivot - the rear's position comes from motor 3's pot, so it moves exactly with the rig; on a three-lift rig the actuators sit where Seat setup found each motor acts. A glowing outline shows where the motors are being sent when the seat lags behind. Panels show the angles, the sensor's gyro and acceleration (after Set up the sensor), the actuators and an attitude indicator with the tilt limits. Drag to turn the view, scroll to zoom, or pick a camera.</p></div>
   </div>
   <div class="hwide"><h3>LED matrix on the board (firmware 1.8)</h3><p>After power-up <b>R4</b> shows while WiFi connects, then the board's address scrolls. After that it shows what you picked under Settings, LED matrix: <b>motor bars</b> (each motor's position; a dot blinks where a motor should be when it falls behind; a dash at the bottom = switched off on purpose), the <b>seat horizon</b> (motion sensor) or nothing. While SimHub is idle, a slow oscilloscope trace. Problems scroll in words, again and again while they last:</p>
     <table class="etab"><tr><th>Code</th><th>Means</th><th>What to do</th></tr>
@@ -5826,6 +6120,8 @@ const TIPS={
  b_dl:"Downloads this backup as a file.",
  b_del:"Removes this backup from the NAS.",
  s_motors:"How many motors your rig has. Unused motors are hidden from the cards, charts, PID table and motor menus.",
+ s_layout:"What motor 3 does on your rig. <b>Traction loss</b>: it slides the rear of the seat left and right (mounted horizontally), the seat turning about a pivot at the front - motors 1 and 2 lift the front corners. <b>Lift</b>: it lifts the rear like the other two. Seat setup, the full check, auto-tune and the 3D view follow this.",
+ s_tldir:"Which way the rear goes when motor 3's number goes up, seen from the seat. Seat setup and the full check ask it; the 3D view uses it. (Which way the rear should swing in a game is set in SimHub: Invert on the traction-loss output.)",
  s_unused:"Also switch the unused motors off on the board (as if Disable Motors was pressed for them), so an unconnected motor channel never drives. Needs firmware 1.5 or newer.",
  win:"How many seconds of history the charts show.",
  lg_t:"<b>Target</b> - the raw position SimHub (or the test signal) asks for.",
@@ -5862,7 +6158,7 @@ const TIPS={
  dg_quick:"<b>Quick check</b> - nothing moves. Reads every setting, the board's own counters (firmware 1.7), listens to the motors for 3 seconds, and adds what the page noticed while you drove. About 5 seconds; safe while SimHub runs.",
  dg_full:"<b>Full check</b> - moves each motor a little, one at a time: which way it goes, how much drive it needs each way, whether another motor moves instead (swapped wiring), and how it answers a small step. Stop SimHub's motion output first. About a minute.",
  dg_stop:"Stops the check at once. Motors are put back as they were; a report with what was measured so far is still made.",
- dg_ask:"During the full check, each motor nudges towards higher numbers and the page asks which way its corner of the seat went - the one thing sensors can't tell (is the motion upside down in games?).",
+ dg_ask:"During the full check, each motor nudges towards higher numbers and the page asks which way its corner of the seat went - the one thing sensors can't tell (is the motion upside down in games?). For the rear slide (traction loss) it asks whether the rear went left or right.",
  dg_inc:"Problems the page noticed by itself while watching the live data - also while you drive. Each keeps a few seconds of data from before and after, and goes into the diagnostics file.",
  dg_clear:"Forgets the recorded problems (the event log keeps a line about each).",
  dg_reports:"Every check is saved on the NAS (the newest 20). Download one to send it, or view its results again.",
@@ -5874,7 +6170,10 @@ const TIPS={
  n_save:"Saves the names on the NAS, so every browser shows them. Nothing changes on the board.",
  ss_start:"Opens Seat setup: the board holds SimHub's positions back, the old level trim and limits are switched off until you save (Cancel puts them back), and the seat stays where it is. Needs firmware 1.9.",
  ss_remove:"Takes the level trim, travel limits and end stops off the board (saved): SimHub's centre is 512 again and only the SMC3 Clip and Max limit protect the travel. The tilt limits stay.",
- ss_auto:"Each motor moves 30 counts each way to learn how it tilts the seat, then the page moves them until the sensor reads level - choosing the level position nearest the middle of every motor. About 20 seconds.",
+ ss_wanttl:"Traction loss: how far the seat may turn each way (the rear swinging left or right), in degrees. While finding motor 3's ends it stops as soon as the seat has turned that far - the motion sensor measures it.",
+ ss_tldir:"Which way the rear went when you pressed +10. Only you can see that - the 3D view and the full check use it.",
+ ss_centretl:"Moves the rear to the middle between the two ends found and makes that its centre (SimHub's 512 for motor 3). Only if the slide is symmetric - the seat should still point straight ahead.",
+ ss_auto:"Each lifting motor moves 30 counts each way to learn how it tilts the seat, then the page moves them until the sensor reads level - choosing the level position nearest the middle of every motor. The rear slide (traction loss) stays where it is: you centre it. About 15-20 seconds.",
  ss_accept:"The motors' positions now become SimHub's centre (a level trim on the board: SimHub's 512 lands here). With the sensor, this is also where it reads 0° / 0°.",
  ss_cancel:"Stops Seat setup without changing anything: the previous level trim and limits come back and SimHub gets the seat again.",
  ss_want:"How far the seat may tilt this way from level, in degrees. While finding the ends a motor stops as soon as the seat gets there; the travel limits keep SimHub inside it.",
@@ -5888,6 +6187,7 @@ const TIPS={
  ss_tm:"How far past the tilt you allow the tilt limit (the safety stop) goes, in degrees.",
  ss_keep:"Front up and down usually need several motors together. Ticked, the travel is narrowed so no combination can tilt the seat further than you allow. Unticked, each motor gets its full travel and combined moves can go further - the tilt limits are then set past that, so they only stop a fault.",
  ss_save:"Moves the seat to level, then saves the level trim, travel limits, end stops and tilt limits on the board (and levels the sensor). SimHub gets the seat back - its centre is the level seat from now on.",
+ v3rig:"Low down at the back: the mechanics - the front lifts on their yoke, the pivot the seat turns about, and the rear slide (traction loss) with its arc on the floor.",
  v3ghost:"Commanded: a glowing outline where the motors are being sent, when the seat lags behind it."
 };
 const ROWS=[['kp','Kp','Kp',1],['ki','Ki','Ki',1],['kd','Kd','Kd',1],['ks','Ks','Ks',1],['pwmmin','PWMmin','PWMmin'],['pwmmax','PWMmax','PWMmax'],['pwmrev','PWMrev','PWMrev'],['dz','Dead zone','DZ'],['lim','Max limit','LIM'],['clip','Clip','CLIP']];
@@ -5895,7 +6195,7 @@ const COLOR=['b-blue','b-orange','b-green'];
 let lastSeq=0,data=[],params={},misses=0,tuneRunning=false,cfg={},paused=false,fwnum=0,lastMove=0,lastT=null,connected=false;
 let NM=3,sel=0,prevView='dashboard',curView='dashboard',genMotor=null,tuneMotor=null,genres=[],gpv=null;
 let MNAMES=['','',''];
-const NAMEOPTS=['Left','Right','Rear','Front','Front left','Front right','Rear left','Rear right','Middle'];
+const NAMEOPTS=['Left','Right','Rear','Front','Front left','Front right','Rear left','Rear right','Middle','Traction loss','Rear slide'];
 let diagMotor=null,diagBusy=false,diagState='idle',diagRes=null,statusRes=null,dgPromptId=null,watch={count:0,newest:0},waitToast=0;
 try{sel=+(localStorage.getItem('smc3_sel')||0)||0;}catch(e){}
 const PKEYS=[1,2,3].flatMap(n=>['Kp','Ki','Kd','Ks','PWM','LIM','DZ'].map(k=>k+n)).concat(['STATUS','PWMFREQ','FILT']);
@@ -5984,14 +6284,23 @@ function applyTheme(t){const eff=t==='auto'?(mq.matches?'light':'dark'):t;docume
  document.querySelectorAll('[data-theme-set]').forEach(b=>b.classList.toggle('on',b.dataset.themeSet===t));draw();}
 mq.addEventListener('change',()=>applyTheme(cfg.theme||'dark'));
 document.querySelectorAll('[data-theme-set]').forEach(b=>b.onclick=async()=>{cfg.theme=b.dataset.themeSet;applyTheme(cfg.theme);cfg=await post('/config',{theme:cfg.theme});});
-async function loadConfig(){cfg=await (await fetch('/config')).json();MNAMES=(cfg.motor_names||['','','']).slice(0,3);applyTheme(cfg.theme||'dark');applyMotorCount();}
+async function loadConfig(){cfg=await (await fetch('/config')).json();MNAMES=(cfg.motor_names||['','','']).slice(0,3);applyTheme(cfg.theme||'dark');applyMotorCount();
+ if(curView==='settings')fillSettings();              // opened straight on Settings: fill the form with what was loaded
+ if(typeof v3LoadGeom==='function'&&V3)V3.layout(v3Geom);}
 
 // ---------- settings ----------
+// which motor slides the rear (traction loss, page 2.1): motor 3 when the layout says so and 3 motors are in use
+const TLM=()=>(cfg&&cfg.layout!=='lifts'&&NM>=3)?2:null;
+function fillLayout(){const tl=cfg.layout!=='lifts';$('s_layout').value=tl?'tl':'lifts';$('s_tldir').value=String(+cfg.tl_dir<0?-1:1);
+ $('s_layoutf').hidden=NM<3;$('s_tldirf').hidden=!tl||NM<3;
+ $('s_layoutnote').innerHTML=NM<3?'':tl?'Motors 1 and 2 lift the front corners and level the seat; motor 3 swings the rear left and right about a pivot at the front - SimHub\'s traction loss. Seat setup and the full check ask which way it goes.':'Every motor lifts the seat (motors 1 and 2 at the front, motor 3 at the rear).';}
+async function saveLayout(){cfg=await post('/config',{layout:$('s_layout').value,tl_dir:+$('s_tldir').value});fillLayout();if(typeof v3LoadGeom==='function')v3LoadGeom();
+ toast(cfg.layout==='lifts'?'Motor 3 is a lift, like motors 1 and 2.':'Motor 3 slides the rear (traction loss); higher numbers move it to the '+(+cfg.tl_dir<0?'left':'right')+'.');}
 function fillSettings(){$('s_host').value=cfg.host||'';$('s_port').value=cfg.port||4210;$('s_auto').checked=!!cfg.auto_find;$('s_subnet').value=cfg.scan_subnet||'';$('s_theme').value=cfg.theme||'dark';
- $('s_motors').value=cfg.motors||3;$('s_unused').checked=cfg.disable_unused!==false;fillNames();
+ $('s_motors').value=cfg.motors||3;$('s_unused').checked=cfg.disable_unused!==false;fillNames();fillLayout();
  $('s_msg').innerHTML=cfg.writable===false?'<span class="badc">Settings can\'t be saved - '+esc(cfg.path)+' is not writable.</span>':'';}
 async function saveSettings(){const before=cfg.motors;cfg=await post('/config',{host:$('s_host').value.trim(),port:+$('s_port').value||4210,auto_find:$('s_auto').checked,scan_subnet:$('s_subnet').value.trim(),theme:$('s_theme').value,motors:+$('s_motors').value,disable_unused:$('s_unused').checked});
- applyTheme(cfg.theme);if(cfg.motors!==before){applyMotorCount();fillNames();}$('s_msg').innerHTML='<span class="okc">Saved.</span> Board: '+esc(cfg.host)+', '+cfg.motors+' motor'+(cfg.motors>1?'s':'')+' in use.';}
+ applyTheme(cfg.theme);if(cfg.motors!==before){applyMotorCount();fillNames();fillLayout();}$('s_msg').innerHTML='<span class="okc">Saved.</span> Board: '+esc(cfg.host)+', '+cfg.motors+' motor'+(cfg.motors>1?'s':'')+' in use.';}
 async function scan(){$('scanBtn').disabled=true;$('s_msg').textContent='Searching the network…';
  try{const r=await post('/scan',{subnet:$('s_subnet').value.trim()});
   if(r.busy)$('s_msg').textContent='A search is already running.';
@@ -6327,7 +6636,7 @@ async function loadEvents(){const ev=await (await fetch('/diag/events?n=200')).j
 let ss=null,ssView='start',ssLastStep=null,ssTimer=null,ssFilled=null;
 const TD=['roll_right','roll_left','front_up','front_down'],TDID=['rr','rl','fu','fd'];
 const TDNAME={roll_right:'roll right',roll_left:'roll left',front_up:'front up',front_down:'front down'};
-const WHY={you:'you stopped it',angle:'reached the tilt you allow',stall:'pushed against something',lag:'struggled to keep up',window:'end of its Clip window',cutoff:'safety cutoff tripped',tilt:'tilt limit tripped'};
+const WHY={you:'you stopped it',angle:'reached the tilt you allow',yaw:'reached the traction loss you allow',stall:'pushed against something',lag:'struggled to keep up',window:'end of its Clip window',cutoff:'safety cutoff tripped',tilt:'tilt limit tripped'};
 const sgn=v=>(v>=0?'+':'')+v.toFixed(1)+'°';
 async function ssPoll(){clearTimeout(ssTimer);
  try{ss=await (await fetch('/seat/status')).json();ssRender();}catch(e){}
@@ -6343,9 +6652,12 @@ function ssAgain(){ssView='start';ssRender();}
 function ssStep(v){if(v==='limits'){ssFilled=null;ssOptions(true);}ssView=v;ssRender();}
 function ssExplore(m,way){ssOptions(true).then(()=>ssPost('explore',{motor:m,way:way}));}
 async function ssOptions(wantOnly){const want={};TD.forEach((k,i)=>{const v=parseFloat($('w_'+TDID[i]).value);if(v>0)want[k]=v;});
+ const vt=parseFloat($('w_tr').value);if(vt>0)want.traction=vt;
  const o={want:want};if(!wantOnly){o.keep_inside=$('ss_keep').checked;o.margins={soft:+$('mg_soft').value,end:+$('mg_end').value,tilt:+$('mg_tilt').value};}
  const r=await post('/seat/options',o);if(r.status){ss=r.status;ssFilled=null;ssRender();}}
 function ssJog(m,d){ssPost('jog',{motor:m,delta:d});}
+async function ssTlDir(d){await ssPost('tl_dir',{dir:d});cfg.tl_dir=d;if(typeof v3LoadGeom==='function')v3LoadGeom();}
+const tlSide=v=>v==null?'-':(Math.abs(v)<0.05?'0.0°':Math.abs(v).toFixed(1)+'° '+(v>0?'R':'L'));
 async function ssSave(){const st=ss;if(!st||!st.suggest)return;const use=st.motors;const num=id=>Math.round(+$(id).value);
  const values={travel:[0,1,2].map(m=>use.includes(m)?[num('tl'+m),num('th'+m)]:[0,1023]),end_stop:[0,1,2].map(m=>use.includes(m)?[num('el'+m),num('eh'+m)]:[0,1023])};
  if(st.suggest.tilt){values.tilt={};TD.forEach((k,i)=>values.tilt[k]=+$('t_'+TDID[i]).value||0);}
@@ -6376,6 +6688,7 @@ function ssRender(){if(!ss)return;const st=ss;
  const b=st.board,senOk=st.has_sensor;
  $('ss_senline').innerHTML=senOk?'<b>Motion sensor sending</b> - the seat levels itself and stops at the tilt you allow.':'<b>No motion sensor angles</b> - you level the seat by hand with a spirit level and stop each motor yourself where it should stop. (Fit the WT901C for the automatic version.)';
  $('ss_startbtn').disabled=!st.connected||!st.fw_ok||st.state!=='idle';
+ const tlm=st.tl;$('ss_tlstart').hidden=tlm==null;
  let cur_='';if(!st.connected)cur_='<span class="badc">The board is not connected.</span>';else if(!st.fw_ok)cur_='<span class="badc">Seat setup needs firmware 1.9 on the board.</span> Flash SMC3_R4_v1.9.ino (WiFi name and password near the top), then come back.';
  else if(b){const conf=b.trim.some(x=>x)||b.travel.some(t=>t[0]!==0||t[1]!==1023)||b.end_stop.some(t=>t[0]!==0||t[1]!==1023);
   const tl=TD.map(k=>b.tilt_limit[k]?`${TDNAME[k]} ${b.tilt_limit[k]}°`:'').filter(x=>x).join(', ');
@@ -6385,24 +6698,33 @@ function ssRender(){if(!ss)return;const st=ss;
  $('ss_current').innerHTML=cur_;
  // level panel
  $('ss_autolev').hidden=!senOk;
+ $('ss_autolevtxt').textContent=tlm!=null?'about 15 seconds - motors 1 and 2 move a little first, to learn how they tilt the seat':'about 20 seconds - each motor moves a little first, to learn how it tilts the seat';
+ $('ss_tllev').hidden=tlm==null;if(tlm!=null)$('ss_tllev').innerHTML=`<b>Motor ${tlm+1} slides the rear</b>, so it isn't levelled: nudge it until the seat points straight ahead (square to your screens), then press <b>This is level</b> - that becomes SimHub's centre for the rear too.`;
  $('ss_levnote').innerHTML=senOk?'<b>Level automatically</b> uses the sensor: level means level to gravity, as the sensor sees it - so it should sit flat on the seat frame. Check with a spirit level on the seat base if you like, and nudge the motors below until it is level; whatever you accept counts as level from now on.'
   :'Put a spirit level on the seat base (across, then front to back) and nudge the motors below until the seat is level. Then press <b>This is level</b>.';
  const use=st.motors||[0,1,2];const lv=st.live||{};
- let jh='';for(const m of use){jh+=`<tr data-m="${m}"><td><span class="badge">${m+1}</span></td><td><b>${esc(mtitle(m))}</b></td><td class="num">pot ${lv.pot?lv.pot[m].toFixed(0):'-'} · target ${lv.target?lv.target[m]:'-'}</td><td><div class="jb">${[-10,-1,1,10].map(d=>`<button class="btn b-grey" onclick="ssJog(${m},${d})">${d>0?'+':''}${d}</button>`).join('')}</div></td></tr>`;}
- if($('ss_jog').dataset.h!==jh){$('ss_jog').innerHTML=jh;$('ss_jog').dataset.h=jh;}
+ let jh='';for(const m of use){const sl=m===tlm;jh+=`<tr data-m="${m}"><td><span class="badge">${m+1}</span></td><td><b>${esc(mtitle(m))}</b>${sl?'<div class="muted" style="font-size:12px;font-weight:400">rear slide - centre it</div>':''}</td><td class="num">pot ${lv.pot?lv.pot[m].toFixed(0):'-'} · target ${lv.target?lv.target[m]:'-'}</td><td><div class="jb">${[-10,-1,1,10].map(d=>`<button class="btn b-grey" onclick="ssJog(${m},${d})">${d>0?'+':''}${d}</button>`).join('')}</div></td></tr>`;
+  if(sl)jh+=`<tr class="tlq"><td></td><td colspan="3"><span data-k="ss_tldir" class="muted" style="font-size:13px">After <b>+10</b> the rear went:</span> <button class="btn ${st.tl_dir>0?'b-blue':'b-grey'}" style="height:28px" onclick="ssTlDir(1)">Right</button> <button class="btn ${st.tl_dir<0?'b-blue':'b-grey'}" style="height:28px" onclick="ssTlDir(-1)">Left</button></td></tr>`;}
+ if($('ss_jog').dataset.h!==jh){$('ss_jog').innerHTML=jh;$('ss_jog').dataset.h=jh;tipAttach($('ss_jog'));}
  // travel panel
  $('ss_wantbox').hidden=!senOk;
- if(document.activeElement&&!document.activeElement.closest('.want'))TD.forEach((k,i)=>{const e=$('w_'+TDID[i]);if(e&&String(st.want[k])!==e.value&&document.activeElement!==e)e.value=st.want[k];});
+ if(document.activeElement&&!document.activeElement.closest('.want')){TD.forEach((k,i)=>{const e=$('w_'+TDID[i]);if(e&&String(st.want[k])!==e.value&&document.activeElement!==e)e.value=st.want[k];});
+  if(st.want.traction!=null&&String(st.want.traction)!==$('w_tr').value)$('w_tr').value=st.want.traction;}
+ $('w_trrow').hidden=tlm==null;
  let eh='<tr><th></th><th>Towards lower numbers</th><th></th><th>Towards higher numbers</th><th></th></tr>';
- const cell=e=>e?`<div class="endc"><b>pot ${e.pot}</b> <span class="why">- ${esc(WHY[e.why]||e.why)}</span>${e.roll!=null?`<div class="ang">seat ${sgn(e.roll)} roll, ${sgn(e.pitch)} pitch</div>`:''}</div>`:'<span class="muted">not checked yet</span>';
+ const cell=e=>e?`<div class="endc"><b>pot ${e.pot}</b> <span class="why">- ${esc(WHY[e.why]||e.why)}</span>${e.roll!=null?`<div class="ang">seat ${sgn(e.roll)} roll, ${sgn(e.pitch)} pitch</div>`:''}${e.yaw!=null?`<div class="ang">the seat turned ${e.yaw.toFixed(1)}°</div>`:''}</div>`:'<span class="muted">not checked yet</span>';
  for(const m of use){eh+=`<tr><td><span class="mtag m${m+1}">${esc(mshort(m))}</span></td><td>${cell(st.ends[m][0])}</td><td><button class="btn b-grey" style="height:30px" onclick="ssExplore(${m},-1)">Find</button></td><td>${cell(st.ends[m][1])}</td><td><button class="btn b-grey" style="height:30px" onclick="ssExplore(${m},1)">Find</button></td></tr>`;}
  if($('ss_ends').dataset.h!==eh){$('ss_ends').innerHTML=eh;$('ss_ends').dataset.h=eh;}
  // limits panel
  const sg=st.suggest;
  if(sg&&(ssView==='limits')&&ssFilled!==JSON.stringify(sg)){ssFilled=JSON.stringify(sg);
   let lh='<tr><th></th><th>Level at</th><th data-k="ss_travel">Travel limits</th><th data-k="ss_ends">End stops</th></tr>';
-  for(const m of use){lh+=`<tr><td><span class="mtag m${m+1}">${esc(mshort(m))}</span></td><td class="mono">${st.level_pos[m]}</td><td><input type="number" id="tl${m}" value="${sg.travel[m][0]}"> – <input type="number" id="th${m}" value="${sg.travel[m][1]}"></td><td><input type="number" id="el${m}" value="${sg.end_stop[m][0]}"> / <input type="number" id="eh${m}" value="${sg.end_stop[m][1]}"></td></tr>`;}
+  for(const m of use){lh+=`<tr><td><span class="mtag m${m+1}">${esc(mshort(m))}</span></td><td class="mono">${st.level_pos[m]}${m===tlm?' <span class="muted" style="font:12px var(--sans)">centre</span>':''}</td><td><input type="number" id="tl${m}" value="${sg.travel[m][0]}"> – <input type="number" id="th${m}" value="${sg.travel[m][1]}"></td><td><input type="number" id="el${m}" value="${sg.end_stop[m][0]}"> / <input type="number" id="eh${m}" value="${sg.end_stop[m][1]}"></td></tr>`;}
   $('ss_limtab').innerHTML=lh;tipAttach($('ss_limtab'));
+  const t3=sg.tl,tt=$('ss_tltxt');tt.hidden=!t3;
+  if(t3)tt.innerHTML=`<b>Rear slide (motor ${t3.motor+1})</b>: inside these travel limits the seat turns up to <b>${t3.left}° with the rear left</b> and <b>${t3.right}° with it right</b>`+
+   (t3.measured?' (measured with the sensor).':` (estimated at ${t3.deg_per_count}°/count - the sensor measures it).`)+
+   (t3.middle!=null&&Math.abs(t3.middle-t3.centre)>=6?` Its ends are at ${st.ends[t3.motor][0].pot} and ${st.ends[t3.motor][1].pot}; the middle is ${t3.middle}, you centred it at ${t3.centre}. <button class="btn b-grey" style="height:28px" data-k="ss_centretl" onclick="ssPost('centre_tl')">Centre between its ends</button>`:'');
   TD.forEach((k,i)=>{$('t_'+TDID[i]).value=sg.tilt?sg.tilt[k]:'';});
   $('mg_soft').value=st.margins.soft;$('mg_end').value=st.margins.end;$('mg_tilt').value=st.margins.tilt;$('ss_keep').checked=st.keep_inside;
   ['ss_tiltbox','ss_reachbox','mg_tiltbox','ss_keepl'].forEach(id=>$(id).hidden=!senOk||!sg.tilt);
@@ -6412,7 +6734,7 @@ function ssRender(){if(!ss)return;const st=ss;
     (!st.keep_inside&&TD.some(k=>r[k]>w[k]+0.1)?' <b>Combined moves can tilt further than you allow</b> - the tilt limits are set past that, so they only stop a fault.':'');
    ssReachSvg(sg.polygon,st.want,sg.tilt);}}
  // done panel
- if(ssView==='done'&&st.saved){const g=st.saved;$('ss_donetxt').innerHTML=`SimHub's centre is now the level seat (level at ${(g.motors||use).map(m=>esc(mshort(m))+' '+g.level_pos[m]).join(', ')}), and the seat powers up level. Travel limits ${(g.motors||use).map(m=>g.travel[m].join('-')).join(', ')}; end stops ${(g.motors||use).map(m=>g.end_stop[m].join('/')).join(', ')}`+(g.tilt?`; tilt limits ${TD.map(k=>TDNAME[k]+' '+g.tilt[k]+'°').join(', ')}`:'')+'. They work without this page. Auto-tune, the test signal and the full check stay inside the travel limits too.';}
+ if(ssView==='done'&&st.saved){const g=st.saved;$('ss_donetxt').innerHTML=`SimHub's centre is now the level seat (level at ${(g.motors||use).map(m=>esc(mshort(m))+' '+g.level_pos[m]+(m===g.tl?' - the rear centred':'')).join(', ')}), and the seat powers up level. Travel limits ${(g.motors||use).map(m=>g.travel[m].join('-')).join(', ')}; end stops ${(g.motors||use).map(m=>g.end_stop[m].join('/')).join(', ')}`+(g.tilt?`; tilt limits ${TD.map(k=>TDNAME[k]+' '+g.tilt[k]+'°').join(', ')}`:'')+'. They work without this page. Auto-tune, the test signal and the full check stay inside the travel limits too.';}
  // log
  const lg=$('ss_log'),t=nameify((st.log||[]).join('\n'));if(lg.textContent!==t){lg.textContent=t;lg.scrollTop=lg.scrollHeight;}
  ssLive(st);}
@@ -6431,6 +6753,7 @@ function ssLive(st){const lv=st.live||{},b=st.board;
  const held=st.state!=='idle'||(b&&b.page_holds);const he=$('ss_held');he.classList.toggle('on',held);
  he.innerHTML=held?`<i class="dot" style="background:var(--amber)"></i><span>This page has the seat - SimHub's positions are held back by the board${st.simhub_held?` (${st.simhub_held} so far)`:''}.</span>`:'<i class="dot on"></i><span>SimHub is in charge of the seat.</span>';
  $('ss_r').textContent=lv.roll!=null?sgn(lv.roll):'-';$('ss_p').textContent=lv.pitch!=null?sgn(lv.pitch):'-';
+ $('ss_tlbig').hidden=st.tl==null;$('ss_tl').textContent=tlSide(lv.tl_deg);
  // bubble: the seat's tilt, big ring = ±3° (or more when it tilts further)
  const r=lv.roll,p=lv.pitch,sv=$('ss_bub');
  if(r==null){sv.innerHTML='<text x="110" y="114" text-anchor="middle" font-size="13" fill="var(--dim)">no sensor angles</text>';}
@@ -6452,7 +6775,10 @@ function ssLive(st){const lv=st.live||{},b=st.board;
   mh+=`<div class="mini" data-m="${m}"><span class="badge">${m+1}</span><div class="mtrack">${tz}${ez}${lvl}${pot!=null?`<div class="pt" style="left:${pc(pot)}%"></div>`:''}</div><span class="num">${pot!=null?pot.toFixed(0):'-'}</span></div>`;}
  $('ss_minis').innerHTML=mh;}
 
-// ---------- 3D view (v2.0): a sci-fi cockpit seat moving with the motion sensor and the motors ----------
+// ---------- 3D view (v2.1): a sci-fi cockpit seat moving with the motion sensor and the motors ----------
+// Two rigs: traction loss (default: motors 1 and 2 lift the front corners through a yoke, motor 3 slides the rear
+// left / right on a rail, the seat turning about a pivot at the front) and three lifts (actuators placed from how
+// Seat setup found each motor tilts the seat, a ball joint in the middle).
 // three.js r160 is served by this page server (/vendor/three/...), so it works without internet access.
 let V3=null,v3Busy=false,v3Geom=null,v3Opts={ghost:true,trail:true,orbit:false};
 try{Object.assign(v3Opts,JSON.parse(localStorage.getItem('smc3_v3opts')||'{}'));}catch(e){}
@@ -6523,7 +6849,7 @@ async function v3Init(){
  const rim=new THREE.SpotLight(0x2fd0ff,13,9,0.32,0.7);rim.position.set(-1.6,2.6,-2.6);rim.target.position.set(0,1.0,0.25);scene.add(rim,rim.target);
  const warm=new THREE.PointLight(0xff8a1f,5,3.2);warm.position.set(1.4,0.45,0.9);scene.add(warm);
 
- // ---- fixed base ----
+ // ---- fixed base: three lifts (hex plate, centre column and ball joint) ----
  const base=new THREE.Group();scene.add(base);
  const hexPlate=new THREE.Mesh(new THREE.CylinderGeometry(0.66,0.7,0.07,6),new THREE.MeshStandardMaterial({color:0x1a2029,metalness:0.5,roughness:0.7,envMapIntensity:0.25}));hexPlate.position.y=0.035;hexPlate.rotation.y=Math.PI/6;hexPlate.castShadow=hexPlate.receiveShadow=true;base.add(hexPlate);
  const hexGlow=new THREE.Mesh(new THREE.TorusGeometry(0.69,0.007,6,6),M.cyan);hexGlow.rotation.x=Math.PI/2;hexGlow.rotation.z=Math.PI/6;hexGlow.position.y=0.072;base.add(hexGlow);
@@ -6532,14 +6858,55 @@ async function v3Init(){
  const joint=new THREE.Mesh(new THREE.SphereGeometry(0.06,24,16),M.chrome);joint.position.y=PIVOT;base.add(joint);
  const colGlow=ring(0.07,0.003,M.cyan,48);colGlow.position.y=0.12;base.add(colGlow);
 
+ // ---- fixed base: traction loss (frame, front lifts' cross member, rear rail with the slide's carriage) ----
+ const RJ=0.55,FP=0.62,LL=RJ+FP,W=0.44;          // rear joint and front pivot along the deck (deck centre 0, front -z)
+ const baseT=new THREE.Group();scene.add(baseT);
+ const beam=(w,h,d,x,y,z,mat=M.metal,par=baseT)=>{const b=new THREE.Mesh(new THREE.BoxGeometry(w,h,d),mat);b.position.set(x,y,z);if(mat!==M.cyan){b.castShadow=b.receiveShadow=true;}par.add(b);return b;};
+ const fz0=-FP-0.13,fz1=RJ+0.17,fx=0.58;
+ for(const sx of[-1,1]){beam(0.05,0.05,fz1-fz0,sx*fx,0.025,(fz0+fz1)/2);beam(0.006,0.004,fz1-fz0-0.06,sx*fx,0.052,(fz0+fz1)/2,M.cyan);}
+ for(const z of[fz0,fz1]){beam(2*fx+0.05,0.05,0.05,0,0.025,z);beam(2*fx-0.06,0.004,0.006,0,0.052,z,M.cyan);}
+ beam(2*fx,0.04,0.06,0,0.02,-FP);                                  // cross member under the front lifts
+ beam(0.96,0.03,0.08,0,0.062,RJ);                                   // the rear slide's rail
+ for(const dz of[-0.03,0.03])beam(0.94,0.004,0.006,0,0.079,RJ+dz,M.cyan);
+ const carriage=new THREE.Group();carriage.position.set(0,0,RJ);baseT.add(carriage);
+ const cBody=new THREE.Mesh(new RoundedBoxGeometry(0.13,0.05,0.12,3,0.012),M.dark);cBody.position.y=0.103;cBody.castShadow=true;carriage.add(cBody);
+ const cStripe=new THREE.Mesh(new THREE.BoxGeometry(0.134,0.006,0.03),new THREE.MeshStandardMaterial({color:0x000000,emissive:MC[2],emissiveIntensity:1.2}));cStripe.position.y=0.11;carriage.add(cStripe);
+ const cPost=new THREE.Mesh(new THREE.CylinderGeometry(0.028,0.04,PIVOT-0.175,16),M.dark);cPost.position.y=0.128+(PIVOT-0.175)/2;cPost.castShadow=true;carriage.add(cPost);
+ const cBall=new THREE.Mesh(new THREE.SphereGeometry(0.044,24,16),M.chrome);cBall.position.y=PIVOT-0.025;carriage.add(cBall);
+ const cRing=ring(0.05,0.004,M.cyan,40);cRing.position.y=PIVOT-0.05;carriage.add(cRing);
+ // motor 3: a horizontal linear actuator on the rail's right end, its rod pushing the carriage
+ const HX=0.68,HE=0.36;                                             // motor block, end of the housing
+ const hMot=new THREE.Mesh(new RoundedBoxGeometry(0.13,0.1,0.14,3,0.02),M.metal);hMot.position.set(HX,0.1,RJ);hMot.castShadow=true;baseT.add(hMot);
+ const hStripe=new THREE.Mesh(new THREE.BoxGeometry(0.135,0.012,0.145),new THREE.MeshStandardMaterial({color:0x000000,emissive:MC[2],emissiveIntensity:2.2}));hStripe.position.set(HX,0.11,RJ);baseT.add(hStripe);
+ const hHouse=new THREE.Mesh(new THREE.CylinderGeometry(0.036,0.042,HX-0.065-HE,20),M.dark);hHouse.rotation.z=Math.PI/2;hHouse.position.set((HX-0.065+HE)/2,0.105,RJ);hHouse.castShadow=true;baseT.add(hHouse);
+ const hGlowMat=new THREE.MeshStandardMaterial({color:0x000000,emissive:MC[2],emissiveIntensity:2});
+ const hGlow=new THREE.Mesh(new THREE.TorusGeometry(0.04,0.007,8,32),hGlowMat);hGlow.rotation.y=Math.PI/2;hGlow.position.set(HE,0.105,RJ);baseT.add(hGlow);
+ const hRod=new THREE.Mesh(new THREE.CylinderGeometry(0.016,0.016,1,16),M.chrome);hRod.rotation.z=Math.PI/2;hRod.position.set(0,0.105,RJ);hRod.castShadow=true;baseT.add(hRod);
+ // the traction-loss arc on the floor, round the front pivot: where the rear can swing, where it is, the travel limits
+ const arcG=new THREE.Group();arcG.position.set(0,0.008,-FP);baseT.add(arcG);
+ const ARC=0.5;const arc=new THREE.Mesh(new THREE.TorusGeometry(LL,0.0045,6,96,2*ARC),new THREE.MeshStandardMaterial({color:0x111111,emissive:0x2fd0ff,emissiveIntensity:1.4,transparent:true,opacity:0.75}));
+ arc.rotation.set(Math.PI/2,0,Math.PI/2-ARC);arcG.add(arc);
+ const arcTick=(mat,len=0.11,w=0.012)=>{const t=new THREE.Mesh(new THREE.BoxGeometry(w,0.006,len),mat);arcG.add(t);return t;};
+ const tlNow=arcTick(M.orange,0.16,0.016),tlLim=[arcTick(new THREE.MeshStandardMaterial({color:0x000000,emissive:0xff4a3a,emissiveIntensity:2.4})),arcTick(new THREE.MeshStandardMaterial({color:0x000000,emissive:0xff4a3a,emissiveIntensity:2.4}))];
+ const onArc=(t,deg)=>{const a=deg*Math.PI/180;t.position.set(LL*Math.sin(a),0,LL*Math.cos(a));t.rotation.y=a;};
+ // the front yoke: carried by the two front lifts, the seat turns about the pivot in its middle (the yaw point)
+ const yoke=new THREE.Group();yoke.rotation.order='YXZ';scene.add(yoke);
+ const YK=-0.04;const yk=new THREE.Group();yk.position.y=YK;yoke.add(yk);   // just under the deck
+ beam(2*W+0.1,0.045,0.07,0,0,0,M.metal,yk);beam(2*W,0.004,0.008,0,0.024,-0.036,M.cyan,yk);
+ for(const sx of[-1,1]){const e=new THREE.Mesh(new THREE.SphereGeometry(0.03,16,12),M.chrome);e.position.set(sx*W,0,0);yk.add(e);}
+ const pin=new THREE.Mesh(new THREE.CylinderGeometry(0.022,0.022,0.1,16),M.chrome);pin.position.y=0.03;yk.add(pin);
+ const pinGlow=ring(0.04,0.005,M.orange,40);pinGlow.position.y=0.026;yk.add(pinGlow);
+ const pinGlow2=ring(0.062,0.003,M.cyan,48);pinGlow2.position.y=0.026;yk.add(pinGlow2);
+
  // ---- moving platform (pivot at PIVOT) ----
  const plat=new THREE.Group();plat.position.y=PIVOT;plat.rotation.order='YXZ';scene.add(plat);
- const deck=new THREE.Mesh(new RoundedBoxGeometry(0.98,0.045,1.32,4,0.02),M.shell);deck.position.y=0.03;deck.castShadow=deck.receiveShadow=true;plat.add(deck);
- for(const sx of [-1,1]){const st=new THREE.Mesh(new THREE.BoxGeometry(0.012,0.012,1.24),M.blue);st.position.set(sx*0.492,0.035,0);plat.add(st);}
- const nose=new THREE.Mesh(new THREE.BoxGeometry(0.5,0.012,0.012),M.orange);nose.position.set(0,0.035,-0.66);plat.add(nose);
+ const body=new THREE.Group();plat.add(body);              // deck coordinates (traction loss: plat sits on the rear joint)
+ const deck=new THREE.Mesh(new RoundedBoxGeometry(0.98,0.045,1.32,4,0.02),M.shell);deck.position.y=0.03;deck.castShadow=deck.receiveShadow=true;body.add(deck);
+ for(const sx of [-1,1]){const st=new THREE.Mesh(new THREE.BoxGeometry(0.012,0.012,1.24),M.blue);st.position.set(sx*0.492,0.035,0);body.add(st);}
+ const nose=new THREE.Mesh(new THREE.BoxGeometry(0.5,0.012,0.012),M.orange);nose.position.set(0,0.035,-0.66);body.add(nose);
 
  // seat (faces -z: the front), built from extruded outlines. Seat space: origin at the rear of the pan, front = -z.
- const seat=new THREE.Group();seat.position.set(0,0.055,0.44);plat.add(seat);
+ const seat=new THREE.Group();seat.position.set(0,0.055,0.44);body.add(seat);
  const ext=(shape,depth,bevel)=>new THREE.ExtrudeGeometry(shape,{depth:depth,bevelEnabled:true,bevelThickness:bevel,bevelSize:bevel,bevelSegments:4,curveSegments:24});
  const rrect=(w,h,r,x=0,y=0)=>{const s=new THREE.Shape();s.moveTo(x-w/2+r,y-h/2);s.lineTo(x+w/2-r,y-h/2);s.quadraticCurveTo(x+w/2,y-h/2,x+w/2,y-h/2+r);s.lineTo(x+w/2,y+h/2-r);
   s.quadraticCurveTo(x+w/2,y+h/2,x+w/2-r,y+h/2);s.lineTo(x-w/2+r,y+h/2);s.quadraticCurveTo(x-w/2,y+h/2,x-w/2,y+h/2-r);s.lineTo(x-w/2,y-h/2+r);s.quadraticCurveTo(x-w/2,y-h/2,x-w/2+r,y-h/2);return s;};
@@ -6588,14 +6955,14 @@ async function v3Init(){
  for(const sx of [-1,1]){strap(inSeat(sx*0.085,0.55,-0.03),new THREE.Vector3(sx*0.03,0.21,-0.23));strap(new THREE.Vector3(sx*0.19,0.15,-0.06),new THREE.Vector3(sx*0.035,0.19,-0.24));}
 
  // cockpit: steering wheel, pedals, three curved screens, canopy ribs
- const colm=add(new THREE.CylinderGeometry(0.025,0.03,0.42,16),M.dark,plat);colm.position.set(0,0.3,-0.36);colm.rotation.x=0.55;
- const wheel=new THREE.Group();wheel.position.set(0,0.47,-0.28);wheel.rotation.x=-0.3;plat.add(wheel);
+ const colm=add(new THREE.CylinderGeometry(0.025,0.03,0.42,16),M.dark,body);colm.position.set(0,0.3,-0.36);colm.rotation.x=0.55;
+ const wheel=new THREE.Group();wheel.position.set(0,0.47,-0.28);wheel.rotation.x=-0.3;body.add(wheel);
  add(new THREE.TorusGeometry(0.15,0.016,12,48),M.alc,wheel);
  for(const a of [Math.PI,Math.PI/2,-Math.PI/2]){const sp=add(new THREE.BoxGeometry(0.018,0.13,0.012),M.metal,wheel);sp.rotation.z=a;sp.position.set(-Math.sin(a)*0.075,Math.cos(a)*0.075,0);}
  add(new THREE.CylinderGeometry(0.05,0.05,0.03,24),M.dark,wheel).rotation.x=Math.PI/2;
  const shift=[];for(let i=0;i<9;i++){const a=(i-4)*0.13;const l=new THREE.Mesh(new THREE.SphereGeometry(0.008,10,8),new THREE.MeshStandardMaterial({color:0x111111,emissive:i<3?0x2bd44f:(i<6?0xf5b301:0xe03b3b),emissiveIntensity:0.15}));
   l.position.set(Math.sin(a)*0.16,Math.cos(a)*0.16+0.005,0.012);wheel.add(l);shift.push(l);}
- const pedals=new THREE.Group();pedals.position.set(0,0.05,-0.56);plat.add(pedals);
+ const pedals=new THREE.Group();pedals.position.set(0,0.05,-0.56);body.add(pedals);
  add(new THREE.BoxGeometry(0.34,0.02,0.16),M.dark,pedals);
  for(const px of [-0.1,0,0.1]){const pd=add(new THREE.BoxGeometry(0.055,0.11,0.012),M.metal,pedals);pd.position.set(px,0.07,0.02);pd.rotation.x=-0.5;}
  const scrTex=tex(1024,320,()=>{});const scrCtx=scrTex.image.getContext('2d');
@@ -6607,19 +6974,20 @@ async function v3Init(){
  for(const a of [-0.55,0,0.55]){const leg=new THREE.Mesh(new THREE.CylinderGeometry(0.018,0.022,0.83,10),M.dark);leg.position.set(-Math.sin(Math.PI+a)*1.33*-1,0.41,Math.cos(Math.PI+a)*1.33);leg.castShadow=true;scene.add(leg);
   const ft=new THREE.Mesh(new THREE.CylinderGeometry(0.09,0.1,0.015,24),M.dark);ft.position.set(leg.position.x,0.008,leg.position.z);scene.add(ft);
   const fg=ring(0.1,0.004,M.cyan,40);fg.position.set(leg.position.x,0.017,leg.position.z);scene.add(fg);}
- for(const z of [-0.42,-0.05,0.32]){const rib=new THREE.Mesh(new THREE.TorusGeometry(0.6,0.011,8,64,Math.PI),M.dark);rib.position.set(0,0.06,z);rib.castShadow=true;plat.add(rib);
-  const rg=new THREE.Mesh(new THREE.TorusGeometry(0.6,0.0035,6,64,Math.PI),M.cyan);rg.position.set(0,0.06,z-0.012);plat.add(rg);}
+ for(const z of [-0.42,-0.05,0.32]){const rib=new THREE.Mesh(new THREE.TorusGeometry(0.6,0.011,8,64,Math.PI),M.dark);rib.position.set(0,0.06,z);rib.castShadow=true;body.add(rib);
+  const rg=new THREE.Mesh(new THREE.TorusGeometry(0.6,0.0035,6,64,Math.PI),M.cyan);rg.position.set(0,0.06,z-0.012);body.add(rg);}
 
  // g-load arrow on the deck: the tilt the driver feels as acceleration
- const gArrow=new THREE.Group();gArrow.position.set(0,0.06,0.1);plat.add(gArrow);
+ const gArrow=new THREE.Group();gArrow.position.set(0,0.06,0.1);body.add(gArrow);
  const gShaft=new THREE.Mesh(new THREE.CylinderGeometry(0.008,0.008,1,8),M.orange);gShaft.rotation.x=Math.PI/2;gArrow.add(gShaft);
  const gHead=new THREE.Mesh(new THREE.ConeGeometry(0.025,0.06,16),M.orange);gHead.rotation.x=-Math.PI/2;gArrow.add(gHead);
 
  // ghost: where the motors are being sent (commanded pose), as glowing outlines
  const ghost=new THREE.Group();ghost.position.y=PIVOT;ghost.rotation.order='YXZ';scene.add(ghost);
+ const gbody=new THREE.Group();ghost.add(gbody);
  const gmat=new THREE.LineBasicMaterial({color:0x2fd0ff,transparent:true,opacity:0.5});
- ghost.add(new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.BoxGeometry(0.98,0.045,1.32)),gmat));
- const gb=new THREE.Line(new THREE.BufferGeometry().setFromPoints(bs.getPoints(40).map(p=>new THREE.Vector3(p.x,p.y,0))),gmat);gb.position.set(0,0.135,0.44);gb.rotation.x=0.21;ghost.add(gb);
+ gbody.add(new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.BoxGeometry(0.98,0.045,1.32)),gmat));
+ const gb=new THREE.Line(new THREE.BufferGeometry().setFromPoints(bs.getPoints(40).map(p=>new THREE.Vector3(p.x,p.y,0))),gmat);gb.position.set(0,0.135,0.44);gb.rotation.x=0.21;gbody.add(gb);
 
  // trail of the headrest
  const TN=150,trailPos=new Float32Array(TN*3),trailCol=new Float32Array(TN*3);
@@ -6642,18 +7010,33 @@ async function v3Init(){
   acts.push({g,body,rod,glow,glowMat,top,stripe,baseLocal:new THREE.Vector3(),topLocal:new THREE.Vector3(),used:true});}
  const tmpA=new THREE.Vector3(),tmpB=new THREE.Vector3(),UP=new THREE.Vector3(0,1,0),q=new THREE.Quaternion();
 
- function layout(geo){                                   // where each actuator sits: from how it tilts the seat
+ let TL=false;                                           // traction-loss rig (motor 3 slides the rear)
+ function layout(geo){                                   // which rig, and where each actuator sits
   const n=(geo&&geo.motors)||NM;const J=geo&&geo.J;const names=(geo&&geo.names)||MNAMES;
+  TL=geo?geo.layout==='tl':(typeof TLM==='function'&&TLM()!=null);
+  base.visible=!TL;baseT.visible=TL;yoke.visible=TL;
+  body.position.z=TL?-RJ:0;gbody.position.z=TL?-RJ:0;
   const guess=m=>{const t=(names[m]||'').toLowerCase();let x=0,z=0;if(/left/.test(t))x=-1;if(/right/.test(t))x=1;if(/front/.test(t))z=-1;if(/rear|back/.test(t))z=1;
    if(!x&&!z)return [[-1,-1],[1,-1],[0,1]][m];if(!z&&x)z=-0.6;return [x,z];};
-  for(let m=0;m<3;m++){const a=acts[m];a.used=m<n;a.g.visible=a.used;if(!a.used)continue;
+  for(let m=0;m<3;m++){const a=acts[m];a.used=m<n&&!(TL&&m===2);a.g.visible=a.used;if(!a.used)continue;
+   if(TL){a.g.position.set(m===0?-W:W,0.07,-FP);continue;}  // the front lifts, under the yoke's ends
    let x,z;if(J&&Math.hypot(J[0][m],J[1][m])>0.004){x=-J[0][m];z=-J[1][m];}else[x,z]=guess(m);
    const L=Math.hypot(x,z)||1;x/=L;z/=L;const r=0.5;
-   a.baseLocal.set(x*r*0.92,0.0,z*r*1.15);a.topLocal.set(x*r*0.92,-0.005,z*r*1.15);a.g.position.set(a.baseLocal.x,0.07,a.baseLocal.z);}}
+   a.baseLocal.set(x*r*0.92,0.0,z*r*1.15);a.topLocal.set(x*r*0.92,-0.005,z*r*1.15);a.g.position.set(a.baseLocal.x,0.07,a.baseLocal.z);}
+  // the travel limits of the rear slide on the floor arc (degrees the seat turns there)
+  const k=tlK(geo),c=geo&&geo.level_pos?geo.level_pos[2]:512,tr=geo&&geo.travel?geo.travel[2]:null;
+  tlLim.forEach((t,i)=>{t.visible=TL&&!!tr&&!(tr[0]===0&&tr[1]===1023);if(t.visible)onArc(t,k*(tr[i]-c));});
+  V3&&(V3.S.lastHud=0);}
+ const tlK=geo=>((geo&&geo.yaw_per_count)||0.02)*((geo&&geo.tl_dir)<0?-1:1);   // + = rear to the right
+ // place a platform (plat or the ghost) for these angles: traction loss = turned about the front pivot, rear on its joint
+ const d2r=Math.PI/180,vF=new THREE.Vector3();
+ function place(g,roll,pitch,yaw){
+  if(TL){g.rotation.set(pitch*d2r,yaw*d2r,-roll*d2r);vF.set(0,0,-LL).applyEuler(g.rotation);g.position.set(-vF.x,PIVOT,RJ);}
+  else{g.rotation.set(pitch*d2r,-yaw*d2r,-roll*d2r);g.position.set(0,PIVOT,0);}}
  layout(null);
 
  // ---- in-world screen ----
- function drawScreen(roll,pitch,ok){const g=scrCtx,w=1024,h=320;g.clearRect(0,0,w,h);
+ function drawScreen(roll,pitch,ok,tl){const g=scrCtx,w=1024,h=320;g.clearRect(0,0,w,h);
   const gr=g.createLinearGradient(0,0,0,h);gr.addColorStop(0,'#04203a');gr.addColorStop(1,'#020a14');g.fillStyle=gr;g.fillRect(0,0,w,h);
   g.save();g.translate(w/2,h/2+pitch*6);g.rotate(roll*Math.PI/180);
   g.fillStyle='rgba(10,40,25,.9)';g.fillRect(-900,0,1800,400);g.strokeStyle='#2fd0ff';g.lineWidth=3;g.beginPath();g.moveTo(-900,0);g.lineTo(900,0);g.stroke();
@@ -6661,30 +7044,41 @@ async function v3Init(){
   g.strokeStyle='rgba(47,208,255,.35)';for(let i=-8;i<=8;i++){g.beginPath();g.moveTo(i*60,0);g.lineTo(i*160,300);g.stroke();}g.restore();
   g.strokeStyle='#ffb04d';g.lineWidth=4;g.beginPath();g.moveTo(w/2-70,h/2);g.lineTo(w/2-20,h/2);g.lineTo(w/2,h/2+16);g.lineTo(w/2+20,h/2);g.lineTo(w/2+70,h/2);g.stroke();
   g.font='600 30px ui-monospace,Consolas,monospace';g.fillStyle='#bfe9ff';g.fillText(ok?`ROLL ${roll>=0?'+':''}${roll.toFixed(1)}°`:'NO SIGNAL',40,52);g.fillText(ok?`PITCH ${pitch>=0?'+':''}${pitch.toFixed(1)}°`:'',w-300,52);
-  g.font='600 20px Segoe UI,Arial';g.fillStyle='#4aa8d8';g.fillText('SMC3 R4 · MOTION',40,h-26);scrTex.needsUpdate=true;}
+  g.font='600 20px Segoe UI,Arial';g.fillStyle='#4aa8d8';g.fillText('SMC3 R4 · MOTION',40,h-26);
+  if(tl!=null&&ok){g.font='600 26px ui-monospace,Consolas,monospace';g.fillStyle='#ffb04d';g.fillText(`REAR ${Math.abs(tl).toFixed(1)}° ${tl>=0.05?'R':(tl<=-0.05?'L':' ')}`,w-300,h-26);}
+  scrTex.needsUpdate=true;}
 
  // ---- state and the frame ----
- const S={roll:0,pitch:0,yaw:0,croll:0,cpitch:0,src:'none',f:[512,512,512],g:[512,512,512],p:[0,0,0],yaw0:null,play:null,lastHud:0,lastScr:0,lastTrail:0,peak:0};
- V3={THREE,R,scene,cam,ctl,comp,bloom,S,running:false,last:0,layout,
+ const S={roll:0,pitch:0,yaw:0,croll:0,cpitch:0,tl:0,ctl:0,src:'none',f:[512,512,512],g:[512,512,512],p:[0,0,0],yaw0:null,play:null,lastHud:0,lastScr:0,lastTrail:0,peak:0};
+ V3={THREE,R,scene,cam,ctl,comp,bloom,S,running:false,last:0,layout,isTL:()=>TL,tlK,
   resize(){const w=wrap.clientWidth,h=wrap.clientHeight;if(!w||!h)return;R.setSize(w,h,false);comp.setSize(w,h);cam.aspect=w/h;cam.updateProjectionMatrix();},
   camTo:null,
-  pose(dt){const J=(v3Geom&&v3Geom.J)||[[0.015,-0.015,0],[0.015,0.015,-0.03]];const lv=(v3Geom&&v3Geom.level_pos)||[512,512,512];
+  pose(dt){let J=(v3Geom&&v3Geom.J)||(TL?[[0.015,-0.015,0],[0.015,0.015,0]]:[[0.015,-0.015,0],[0.015,0.015,-0.03]]);
+   if(TL)J=[[J[0][0],J[0][1],0],[J[1][0],J[1][1],0]];      // the rear slide doesn't tilt the seat
+   const lv=(v3Geom&&v3Geom.level_pos)||[512,512,512];
    const s=v3Sample();if(!s){S.src='none';return;}
    for(let m=0;m<3;m++){S.f[m]=s.m[m].f;S.g[m]=s.m[m].g;S.p[m]=s.m[m].p;}
    let er=0,ep=0,cr=0,cp=0;for(let m=0;m<NM;m++){er+=J[0][m]*(S.f[m]-lv[m]);ep+=J[1][m]*(S.f[m]-lv[m]);cr+=J[0][m]*(S.g[m]-lv[m]);cp+=J[1][m]*(S.g[m]-lv[m]);}
+   // traction loss: the seat's turn straight from the rear slide's pot (and where it is being sent)
+   if(TL){const k=tlK(v3Geom);S.tl=k*(S.f[2]-lv[2]);S.ctl=k*(S.g[2]-lv[2]);}else S.tl=S.ctl=0;
    if(s.roll!=null){S.roll=s.roll;S.pitch=s.pitch;if(s.yaw!=null){if(S.yaw0==null)S.yaw0=s.yaw;let y=s.yaw-S.yaw0;y=((y+540)%360)-180;S.yaw=y;}S.src='sensor';
     // commanded pose: the sensor's reading, moved by what the motors are still being asked to do
     S.croll=s.roll+(cr-er);S.cpitch=s.pitch+(cp-ep);}
    else{S.roll=er;S.pitch=ep;S.yaw=0;S.croll=cr;S.cpitch=cp;S.src=v3Geom&&v3Geom.J?'motors':'assumed';}}};
  V3.resize();new ResizeObserver(()=>V3.resize()).observe(wrap);
- const d2r=Math.PI/180;
  V3.frame=(now)=>{const dt=Math.min(0.1,(now-V3.last)/1000);V3.last=now;V3.pose(dt);
-  plat.rotation.set(S.pitch*d2r,-S.yaw*d2r,-S.roll*d2r);
-  ghost.visible=v3Opts.ghost&&S.src!=='none'&&(Math.abs(S.croll-S.roll)>0.15||Math.abs(S.cpitch-S.pitch)>0.15);
-  ghost.rotation.set(S.cpitch*d2r,-S.yaw*d2r,-S.croll*d2r);
+  place(plat,S.roll,S.pitch,TL?S.tl:S.yaw);
+  ghost.visible=v3Opts.ghost&&S.src!=='none'&&(Math.abs(S.croll-S.roll)>0.15||Math.abs(S.cpitch-S.pitch)>0.15||Math.abs(S.ctl-S.tl)>0.15);
+  place(ghost,S.croll,S.cpitch,TL?S.ctl:S.yaw);
   plat.updateMatrixWorld(true);
+  if(TL){vF.set(0,0,-LL).applyEuler(plat.rotation).add(plat.position);  // the yoke: at the front pivot, tilted, not turned
+   yoke.position.copy(vF);yoke.rotation.set(S.pitch*d2r,0,-S.roll*d2r);yoke.updateMatrixWorld(true);
+   const xr=plat.position.x;carriage.position.x=xr;                    // the rear slide follows the rear joint
+   const rl=Math.max(0.02,HE-(xr+0.065));hRod.scale.y=rl;hRod.position.x=HE-rl/2;
+   hGlowMat.emissiveIntensity=1.2+Math.min(1,Math.abs(S.p[2])/255)*5;onArc(tlNow,S.tl);}
   for(let m=0;m<3;m++){const a=acts[m];if(!a.used)continue;
-   tmpA.set(a.baseLocal.x,0.07+0.1,a.baseLocal.z);tmpB.copy(a.topLocal);plat.localToWorld(tmpB);
+   if(TL){tmpA.set(a.g.position.x,0.07+0.1,a.g.position.z);tmpB.set(m===0?-W:W,YK,0);yoke.localToWorld(tmpB);}
+   else{tmpA.set(a.baseLocal.x,0.07+0.1,a.baseLocal.z);tmpB.copy(a.topLocal);body.localToWorld(tmpB);}
    const dir=tmpB.clone().sub(tmpA),L=dir.length();dir.normalize();
    a.body.position.set(0,0.1,0);q.setFromUnitVectors(UP,dir);a.body.quaternion.copy(q);
    const rl=Math.max(0.02,L-0.14);a.rod.scale.y=rl;a.rod.position.y=0.14+rl/2;a.top.position.copy(tmpB).sub(a.g.position);
@@ -6694,20 +7088,21 @@ async function v3Init(){
   gArrow.visible=gl>0.012;if(gArrow.visible){const len=Math.min(0.5,gl*2.2);gArrow.rotation.y=Math.atan2(-lat,-lon);gShaft.scale.y=len;gShaft.position.set(0,0,-len/2);gHead.position.set(0,0,-len-0.03);}
   const imu=V3.imu;S.peak=Math.max(S.peak*Math.exp(-dt*2.5),imu&&imu.peak_g||0);
   pulse.material.opacity=Math.min(0.9,S.peak*6);pulse.scale.setScalar(1+S.peak*1.5);
-  const rate=imu?Math.hypot(imu.gyro[0],imu.gyro[1]):0;shift.forEach((l,i)=>l.material.emissiveIntensity=i<Math.round(rate/12)?3.2:0.12);
+  const rate=imu?Math.hypot(imu.gyro[0],imu.gyro[1],TL?imu.gyro[2]:0):0;shift.forEach((l,i)=>l.material.emissiveIntensity=i<Math.round(rate/12)?3.2:0.12);
   if(v3Opts.trail&&now-S.lastTrail>16){S.lastTrail=now;head.getWorldPosition(tmpA);trailPos.copyWithin(3,0,(TN-1)*3);trailPos[0]=tmpA.x;trailPos[1]=tmpA.y;trailPos[2]=tmpA.z;trailN=Math.min(TN,trailN+1);
    for(let i=0;i<TN;i++){const f=i<trailN?Math.pow(1-i/TN,1.6):0;trailCol[i*3]=0.18*f;trailCol[i*3+1]=0.8*f;trailCol[i*3+2]=1.0*f;}
    for(let i=trailN;i<TN;i++){trailPos[i*3]=tmpA.x;trailPos[i*3+1]=tmpA.y;trailPos[i*3+2]=tmpA.z;}
    trailGeo.attributes.position.needsUpdate=true;trailGeo.attributes.color.needsUpdate=true;}
   trail.visible=v3Opts.trail;
-  if(now-S.lastScr>120){S.lastScr=now;drawScreen(S.roll,S.pitch,S.src!=='none');}
+  if(now-S.lastScr>120){S.lastScr=now;drawScreen(S.roll,S.pitch,S.src!=='none',TL?S.tl:null);}
   if(now-S.lastHud>90){S.lastHud=now;v3Hud();}
   if(V3.camTo){const c=V3.camTo,k=Math.min(1,(now-c.t0)/650),e=k<.5?2*k*k:1-Math.pow(-2*k+2,2)/2;cam.position.lerpVectors(c.p0,c.p1,e);ctl.target.lerpVectors(c.q0,c.q1,e);if(k>=1)V3.camTo=null;}
   ctl.autoRotate=v3Opts.orbit;ctl.update();comp.render();};
  // camera presets and toggles
- const CAMS={hero:[1.95,1.7,2.55],chase:[0.0,1.35,2.6],side:[3.3,1.05,0.15],front:[0.6,2.35,-3.0],top:[0.0,4.6,0.02]};
+ const CAMS={hero:[1.95,1.7,2.55],chase:[0.0,1.35,2.6],side:[3.3,1.05,0.15],front:[0.6,2.35,-3.0],top:[0.0,4.6,0.02],rig:[1.55,0.62,2.05]};
+ const TGT={top:[0,0.4,0],rig:[0,0.26,-0.08]};V3.CAMS=CAMS;V3.TGT=TGT;
  document.querySelectorAll('#v3ctl [data-cam]').forEach(b=>b.onclick=()=>{document.querySelectorAll('#v3ctl [data-cam]').forEach(x=>x.classList.toggle('on',x===b));
-  V3.camTo={t0:performance.now(),p0:cam.position.clone(),p1:new THREE.Vector3(...CAMS[b.dataset.cam]),q0:ctl.target.clone(),q1:new THREE.Vector3(0,b.dataset.cam==='top'?0.4:0.62,0)};});
+  V3.camTo={t0:performance.now(),p0:cam.position.clone(),p1:new THREE.Vector3(...CAMS[b.dataset.cam]),q0:ctl.target.clone(),q1:new THREE.Vector3(...(TGT[b.dataset.cam]||[0,0.62,0]))};});
  document.querySelectorAll('#v3ctl [data-tog]').forEach(b=>{const k=b.dataset.tog;if(k in v3Opts)b.classList.toggle('on',!!v3Opts[k]);
   b.onclick=()=>{if(k==='full'){const w=$('v3wrap');document.fullscreenElement?document.exitFullscreen():w.requestFullscreen&&w.requestFullscreen();return;}
    v3Opts[k]=!v3Opts[k];b.classList.toggle('on',v3Opts[k]);try{localStorage.setItem('smc3_v3opts',JSON.stringify(v3Opts));}catch(e){}};});
@@ -6728,6 +7123,9 @@ function v3Bar(id,v,full,lim){const e=$(id);if(!e)return;const i=e.querySelector
 function v3Hud(){const S=V3.S,imu=V3.imu,tl=(v3Geom&&v3Geom.tilt)||{};const f1=v=>(v>=0?'+':'')+v.toFixed(1);
  const has=S.src!=='none';
  $('h_roll').textContent=has?f1(S.roll)+'°':'--';$('h_pitch').textContent=has?f1(S.pitch)+'°':'--';$('h_yaw').textContent=S.src==='sensor'?f1(S.yaw)+'°':'--';
+ const tlOn=V3.isTL();$('h_tlrow').hidden=!tlOn;
+ if(tlOn){$('h_tl').textContent=has?tlSide(S.tl):'--';const g=v3Geom||{},k=Math.abs(V3.tlK(g)),c=(g.level_pos||[512,512,512])[2],tr=g.travel&&g.travel[2],dir=(g.tl_dir<0?-1:1);
+  const lim=tr&&!(tr[0]===0&&tr[1]===1023)?[dir*k*(tr[1]-c),dir*k*(tr[0]-c)]:[];v3Bar('h_tlb',S.tl,Math.max(6,...lim.map(Math.abs))+1,lim);}
  const fr=Math.max(10,tl.roll_right||0,tl.roll_left||0)+2,fp=Math.max(10,tl.front_up||0,tl.front_down||0)+2;
  v3Bar('h_rollb',S.roll,fr,[tl.roll_right,tl.roll_left!=null?-tl.roll_left:null]);v3Bar('h_pitchb',S.pitch,fp,[tl.front_up,tl.front_down!=null?-tl.front_down:null]);
  const src=$('h_src');src.className='src'+(S.src==='sensor'||S.src==='none'?'':' est');
@@ -7118,6 +7516,10 @@ class Handler(BaseHTTPRequestHandler):
             if isinstance(req.get("motor_names"), list):
                 names = [re.sub(r"[\x00-\x1f<>\"]", "", str(x)).strip()[:16] for x in req["motor_names"][:3]]
                 kw["motor_names"] = (names + ["", "", ""])[:3]
+            if req.get("layout") in ("tl", "lifts"):
+                kw["layout"] = req["layout"]
+            if req.get("tl_dir") in (1, -1, "1", "-1"):
+                kw["tl_dir"] = int(req["tl_dir"])
             before = {k: self.cfg.get(k) for k in kw}
             self.cfg.update(**kw)
             changed = [f"{k} {before[k]} -> {self.cfg.get(k)}" for k in kw if before[k] != self.cfg.get(k)]
@@ -7213,7 +7615,8 @@ class Handler(BaseHTTPRequestHandler):
                     if not self.board.connected:
                         raise ValueError("the board is not connected - choose a saved profile to start from instead")
                     base = self.board.read_params()
-                self._json(genre_preview(base, str(req.get("genre", "")), (self.board.fw_cache or [0, 0])[1]))
+                self._json(genre_preview(base, str(req.get("genre", "")), (self.board.fw_cache or [0, 0])[1],
+                                         tl_motor(self.cfg) is not None))
             except (ValueError, KeyError, TypeError) as e:
                 self._json({"ok": False, "error": f"Can't work that out: {e}."})
         elif p == "/profiles/save":
@@ -7305,6 +7708,14 @@ def _seat_post_impl(h, what, req):
         ok, msg = st.save(req.get("values"))
     elif what == "remove":
         ok, msg = st.remove()
+    elif what == "centre_tl":
+        ok, msg = st.centre_tl()
+    elif what == "tl_dir":                         # which way higher numbers move the rear (traction loss)
+        if req.get("dir") in (1, -1, "1", "-1"):
+            h.cfg.update(tl_dir=int(req["dir"]))
+            ok, msg = True, "ok"
+        else:
+            ok, msg = False, "Right (1) or left (-1)?"
     else:
         h._json({"ok": False, "error": "unknown"}, 404)
         return

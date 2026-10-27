@@ -7,8 +7,11 @@ Smoke test: start simulated rigs and the page, run diagnostics, check the result
 2. A rig with motor 2 wired backwards: the full check must say so and leave motor 2 switched off.
 3. A rig with a WT901C at its factory 10 Hz: the page finds it, switches it on, sets it to 100 Hz with gyro and
    acceleration, and the quick check is clean.
-4. Seat setup (firmware 1.9) on a seat that isn't level: it levels itself, finds one end, saves; the board then has
-   the level trim, travel limits and end stops, and the seat reads level.
+4. Seat setup (firmware 1.9) on a traction-loss rig (motors 1 and 2 lift the front, motor 3 slides the rear) whose
+   seat isn't level: motors 1 and 2 level it, motor 1 stops at the tilt allowed, motor 3 at the traction loss
+   allowed (the seat's turn), it saves; the board then has the level trim, travel limits and end stops, and the seat
+   reads level.
+5. The same on a three-lift rig: all three motors level the seat, and motor 3 stops at the tilt allowed.
 """
 import json, os, subprocess, sys, tempfile, time, urllib.request as u
 
@@ -119,24 +122,55 @@ try:
     post(base4, "/seat/level")
     st = seat_wait()
     check(st["error"] is None and abs(st["live"]["roll_abs"]) < 0.2 and abs(st["live"]["pitch_abs"]) < 0.2,
-          f"seat levels itself (roll {st['live']['roll_abs']:+.2f}, pitch {st['live']['pitch_abs']:+.2f})")
+          f"seat levels itself with motors 1 and 2 (roll {st['live']['roll_abs']:+.2f}, pitch {st['live']['pitch_abs']:+.2f})")
+    check(st["tl"] == 2 and st["J"][0][2] == 0 and st["J"][1][2] == 0, "motor 3 slides the rear: not used to level")
     r = post(base4, "/seat/accept")
     check(r["ok"], "level accepted")
     lv = r["status"]["level_pos"]
-    post(base4, "/seat/options", {"want": {"roll_right": 6, "roll_left": 6, "front_up": 5, "front_down": 5},
-                                   "keep_inside": False})   # only one end is explored here
+    post(base4, "/seat/options", {"want": {"roll_right": 5, "roll_left": 5, "front_up": 5, "front_down": 5,
+                                           "traction": 4}, "keep_inside": False})   # only some ends are explored here
+    post(base4, "/seat/explore", {"motor": 0, "way": 1})
+    st = seat_wait()
+    e1 = st["ends"][0][1]
+    check(e1 and e1["why"] == "angle" and max(e1["roll"], e1["pitch"]) >= 4.8, f"motor 1 stops at the tilt allowed ({e1})")
     post(base4, "/seat/explore", {"motor": 2, "way": 1})
     st = seat_wait()
-    e = st["ends"][2][1]
-    check(e and e["why"] == "angle" and abs(e["pitch"]) >= 4.8, f"motor 3 stops at the tilt allowed ({e})")
+    e3 = st["ends"][2][1]
+    check(e3 and e3["why"] == "yaw" and e3["yaw"] >= 3.8, f"motor 3 stops at the traction loss allowed ({e3})")
+    check(st["yaw_k"] and abs(abs(st["yaw_k"]) - 0.02) < 0.003, f"it measured how far the seat turns ({st['yaw_k']})")
     check(post(base4, "/seat/save")["ok"], "save starts")
     st = seat_wait()
     b = get(base4, "/board/settings")["seat"]
     check(st["step"] == "done" and b["saved"] and b["trim"] == [p - 512 for p in lv] and
-          b["travel"][2][1] == e["pot"] - 20, f"board has the set-up (trim {b['trim']}, travel {b['travel']})")
+          b["travel"][0][1] == e1["pot"] - 20 and b["travel"][2][1] == e3["pot"] - 20,
+          f"board has the set-up (trim {b['trim']}, travel {b['travel']})")
     time.sleep(1)
     s = get(base4, "/data?since=0")["samples"][-1]
     check(abs(s["roll"]) < 0.2 and abs(s["pitch"]) < 0.2, "the level seat reads 0° / 0°")
+    g = get(base4, "/seat/geometry")
+    check(g["layout"] == "tl" and g["tl"] == 2 and abs(g["yaw_per_count"] - 0.02) < 0.003, "the 3D view gets the rear slide")
+
+    # 5. three lifts
+    sim5, scope5, base5 = start(4714, 8714, "--imu", "100", "--sensor-on", "--layout", "lifts", "--seat-tilt", "1.5:-2.0")
+    procs += [sim5, scope5]
+    post(base5, "/config", {"layout": "lifts"})
+    check(post(base5, "/seat/start")["ok"], "three lifts: seat setup opens")
+    post(base5, "/seat/level")
+    t0 = time.time()
+    while time.time() - t0 < 120 and get(base5, "/seat/status")["action"]:
+        time.sleep(0.5)
+    st = get(base5, "/seat/status")
+    check(st["error"] is None and st["tl"] is None and abs(st["live"]["roll_abs"]) < 0.2 and abs(st["live"]["pitch_abs"]) < 0.2
+          and abs(st["J"][1][2]) > 0.01, f"three lifts: all three level the seat (J {st['J']})")
+    post(base5, "/seat/accept")
+    post(base5, "/seat/options", {"want": {"roll_right": 6, "roll_left": 6, "front_up": 5, "front_down": 5}})
+    post(base5, "/seat/explore", {"motor": 2, "way": 1})
+    t0 = time.time()
+    while time.time() - t0 < 120 and get(base5, "/seat/status")["action"]:
+        time.sleep(0.5)
+    e = get(base5, "/seat/status")["ends"][2][1]
+    check(e and e["why"] == "angle" and abs(e["pitch"]) >= 4.8, f"three lifts: motor 3 stops at the tilt allowed ({e})")
+    post(base5, "/seat/cancel")
 finally:
     for p in procs:
         p.terminate()
