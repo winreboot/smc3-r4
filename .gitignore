@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.DS_Store
+# settings, profiles, backups and diagnostics written by the page
+scope/data/
+smc3-scope-data/

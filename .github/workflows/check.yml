@@ -1,0 +1,28 @@
+name: check
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  smoke:
+    name: Page + simulated rig (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.8", "3.12"]   # 3.8 = the oldest Python smc3_scope.py supports
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6   # installs any Python version on any runner
+      - name: Compile
+        run: uv run --no-project --python ${{ matrix.python }} python -m py_compile scope/smc3_scope.py tools/simboard.py tools/smoke_test.py
+      - name: Quick and full diagnostics against simulated rigs
+        run: uv run --no-project --python ${{ matrix.python }} python tools/smoke_test.py
+
+  docker:
+    name: Docker image builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t smc3-scope scope

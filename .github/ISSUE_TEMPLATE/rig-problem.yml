@@ -1,0 +1,33 @@
+name: Problem with a rig
+description: Something doesn't work or behaves strangely - please attach a diagnostics file
+labels: ["question"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks! The fastest way to find the cause: in the page open **Settings → Diagnostics**, describe the
+        problem, run a **Full check** (seat empty, SimHub motion stopped) or a **Quick check**, press
+        **Download file** and attach the `.json` below. It contains settings and measurements - no passwords.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happens
+      description: Which motor, when (starting SimHub, over kerbs, after a while...), what it does.
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: Page version (Settings, next to "Connection & appearance") and firmware version (top bar).
+      placeholder: page 1.8.1, firmware 1.7
+  - type: textarea
+    id: hardware
+    attributes:
+      label: Hardware
+      description: Bridges, motors, power supply, rig type.
+  - type: textarea
+    id: file
+    attributes:
+      label: Diagnostics file
+      description: Drag the smc3-diagnostics_....json file here.
