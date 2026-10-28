@@ -44,6 +44,9 @@ are two separate bytes. The same commands work over USB (SimHub, SMC3Utils) and 
 | `[kSV]` `[kRL]` `[kCL]` | 1.9 | Save the seat set-up (EEPROM 66-104; `[sav]` saves it too) / reload the saved one / clear it (no trim, no travel limits or end stops; tilt limits stay) until saved or restarted. |
 | `[kHn]` | 1.9 | The page holds the seat for n × 100 ms: position commands from USB (SimHub) are counted but ignored meanwhile. n = 0 gives the seat back at once. Seat setup refreshes it every second. |
 | `[xe1]` `[xe0]` | 1.9 | WiFi only: send an "SM3X" frame (the sensor's acceleration and gyro) after every telemetry burst / stop. Off for every new connection. |
+| `[uP=]` `[uT=]` `[uI=]` `[uJ=]` | 1.9.2 | WiFi only. Firmware update: the value register is the page's web port / the file's number / the page's address bytes 1-2 / 3-4 (0 = the address the page connects from). The board fetches `http://<address>:<port>/ota/<number as 4 hex digits>.ota`. |
+| `[uGO]` `[uOK]` | 1.9.2 | WiFi only. Start the firmware update (below) / clear a finished or failed one. |
+| `[rdu]` | 1.9.2 | WiFi only. One "SM3U" frame (below): the update's state and this firmware's version text. |
 
 ### Seat set-up (firmware 1.9)
 
@@ -90,6 +93,19 @@ After `[xe1]` (firmware 1.9) every burst is followed, in the same write, by:
 Samples are taken every 10 ms and sent in bursts of five every 50 ms. Replies to `[rd?]` come back on the same
 connection as ordinary 5-byte SMC3 replies.
 
+Firmware 1.9.2 sends, after `[rdu]`, whenever the update's state changes and four times a second while it runs:
+
+```
+'S' 'M' '3' 'U'  uint8 version (1)  uint8 length (23)
+  uint8 state (0 idle, 1 stopping the motors, 2 starting, 3 downloading, 4 checking, 5 installing, 6 failed)
+  int16 code (0, or why it stopped: -100 SimHub is sending over USB, -101 WiFi module firmware older than 0.4.0,
+              -102 no address for the file, -103 the download stopped, -104 programming failed;
+              otherwise the WiFi module's own code: -6 can't connect, -10 CRC, -11 wrong board, -12 download broke off ...)
+  uint32 bytes downloaded   uint32 file size
+  uint8 flags (bit0 the download reports progress, bit1 WiFi details remembered)
+  uint8 WiFi module firmware major, minor, patch   char[8] this firmware's version ("1.9.2", zero-padded)
+```
+
 ## Diagnostics frame (`[rdd]`, firmware 1.7)
 
 ```
@@ -122,7 +138,13 @@ connection as ordinary 5-byte SMC3 replies.
   int16 raw acceleration x, y, z   int16 raw gyro x, y, z   int16 temperature ×100
   version 4 (1.9.1) continues:
   uint16 soft-start speed (counts/s, 0 = off)   uint8 motors still creeping to their position (bit n = motor n+1)
+  version 5 (1.9.2) continues:
+  uint8 WiFi module firmware major, minor, patch (0.0.0 = unknown)
+  uint8 WiFi flags: bit0 a WiFi name/password is remembered, bit1 joined with the remembered ones, bit2 this build has
+        the placeholders   uint8 update state (as in "SM3U")   int16 update code
 ```
+
+Why off: 4 = tilt limit (1.8), 5 = switched off for a firmware update (1.9.2).
 
 ### EEPROM 56-65 (firmware 1.8)
 
@@ -154,6 +176,42 @@ Written by `[kSV]` and `[sav]`. Without the block, the tilt limits come from 1.8
 | 106-107 | int16 soft-start speed in counts/s, big-endian (0 = off) |
 
 Written as soon as `[k 82 '=']` changes it.
+
+### EEPROM 112-210 (firmware 1.9.2): WiFi memory
+
+| Address | Content |
+|---|---|
+| 112 | 0xC7 = valid |
+| 113 | Length of the network name (1-32) |
+| 114-145 | Network name |
+| 146 | Length of the password (0-64) |
+| 147-210 | Password |
+
+Written after the board has joined the network with the name and password compiled into the sketch, if they differ
+from what is stored. A build that has the placeholders (`YourNetworkName`), or whose details don't work, joins with
+the stored ones. The diagnostics frame copies EEPROM 0-71 only, so the password never leaves the board.
+
+### Firmware update (firmware 1.9.2)
+
+1. The page converts the `.bin` exported by the Arduino IDE into the UNO R4 WiFi's `.ota` format: uint32 length,
+   uint32 CRC-32 (both little-endian, over the rest), uint32 magic 0x23411002, 8 version bytes (`00 … 00 40` =
+   compressed), then the `.bin` compressed with LZSS (Okumura, EI 11, EJ 4) - as Arduino's `lzss.py` + `bin2ota.py`.
+   It serves it with a Content-Length, in one write (the WiFi module reads the 20-byte header from the first piece).
+2. `[uP=]`, `[uT=]` (and optionally `[uI=]` `[uJ=]`), then `[uGO]`. The board refuses (state 6) when the page gave
+   no port, when anything came over USB in the last 3 s, or when its WiFi module runs firmware older than 0.4.0.
+3. The board switches every motor off (why off: 5), waits 300 ms, then asks its WiFi module (`OTAUpdate`):
+   `begin("/update.bin")`, `startDownload(url, "/update.bin")` and `downloadProgress()` every 200 ms (WiFi module
+   0.5.0+, boards package 1.3.0+), or the blocking `download(url, "/update.bin")` otherwise. No progress for 20 s =
+   -103.
+4. `verify()` checks the magic number and the CRC. If USB is still quiet, state 5 for 400 ms, then
+   `update("/update.bin")`: the WiFi module resets the board into its bootloader, programs it (as with a USB upload)
+   and starts the new firmware. That call only comes back if programming couldn't start (-104).
+5. The new firmware starts with the soft start. The page waits for the connection to come back and reads the version
+   from `[rdu]`.
+
+`[ena]` is ignored from state 1 to 5. While it runs, the matrix shows `UP` and a progress bar (blinking while the
+WiFi module checks and installs); after a failure it scrolls `ERROR E7 UPDATE FAILED` until `[uOK]` or the next
+update.
 
 ### Soft start (firmware 1.9.1)
 

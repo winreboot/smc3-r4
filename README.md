@@ -14,7 +14,8 @@ The page lets you:
 - see the seat's real angles with an optional motion sensor, and the seat itself moving in a **3D view**;
 - **level the platform** and make that SimHub's centre, then let each motor find how far it may go and save
   **travel limits, end stops and tilt limits** on the board;
-- find out why when something goes wrong, and where the rig struggles under load.
+- find out why when something goes wrong, and where the rig struggles under load;
+- **update the firmware over WiFi**: pick the `.bin` from the Arduino IDE and press Install.
 
 It knows two kinds of rig: **two front lifts plus a traction-loss motor** (motors 1 and 2 lift the front corners,
 motor 3 is mounted horizontally and swings the rear left and right about a pivot at the front - the default), and
@@ -31,7 +32,7 @@ the same time. You can open it from any browser, including your phone.
 
 | Folder | What it is |
 |---|---|
-| [`firmware/SMC3_R4`](firmware/SMC3_R4) | Firmware for the **Arduino UNO R4 WiFi**. It speaks the SMC3 v0.70 protocol, so SimHub, SimTools, FlyPT Mover and SMC3Utils work unchanged. It adds a 4 kHz control loop, 14-bit pot readings, quiet 25 kHz PWM, target smoothing, a fixed PID, WiFi telemetry at 100 samples a second, an LED matrix that shows live motor bars and problems in words, a level trim with travel limits and end stops for each motor, and an optional WT901C motion sensor with tilt limits for each direction. |
+| [`firmware/SMC3_R4`](firmware/SMC3_R4) | Firmware for the **Arduino UNO R4 WiFi**. It speaks the SMC3 v0.70 protocol, so SimHub, SimTools, FlyPT Mover and SMC3Utils work unchanged. It adds a 4 kHz control loop, 14-bit pot readings, quiet 25 kHz PWM, target smoothing, a fixed PID, WiFi telemetry at 100 samples a second, an LED matrix that shows live motor bars and problems in words, a level trim with travel limits and end stops for each motor, a soft start, firmware updates over WiFi from the page, and an optional WT901C motion sensor with tilt limits for each direction. |
 | [`scope/`](scope) | `smc3_scope.py`: the page server. It's one file using only the Python standard library, with a Dockerfile and compose file for a NAS or any PC. |
 | [`tools/simboard.py`](tools/simboard.py) | A simulated rig. You can try everything without hardware, and inject faults (reversed motor, swapped wiring, glitchy pot and more). |
 | [`firmware/SMC3_smooth`](firmware/SMC3_smooth) | The original SMC3 for the **UNO R3**, with target smoothing and the PID fixes, for anyone staying on an R3. |
@@ -237,6 +238,22 @@ acceleration arrive.
 
 ![LED matrix and motion sensor settings](docs/img/settings-board.png)
 
+**Firmware update** (firmware 1.9.2): install new firmware over WiFi - no USB cable, and SimHub can stay open.
+
+1. In the Arduino IDE, open the new `SMC3_R4.ino` and choose **Sketch, Export Compiled Binary**. The WiFi name and
+   password may stay as placeholders: the board remembers the ones it last joined with.
+2. In the page, choose that `.bin` (in the sketch's `build/arduino.renesas_uno.unor4wifi` folder) and press
+   **Install**, with the seat empty and SimHub's motion output paused.
+
+The page checks the file first (an SMC3_R4 build for the UNO R4 WiFi, which version) and converts it to the board's
+update format. The board switches the motors off, its WiFi module downloads the file, checks it and programs the
+board - the same way a USB upload does - and the board restarts; the seat creeps back with the soft start and the
+page confirms the new version. If anything fails before programming, the old firmware keeps running and the card
+says why. The first install of 1.9.2 itself goes over USB, and the WiFi module needs its own firmware 0.4.0 or newer
+(Arduino IDE, Tools, Firmware Updater).
+
+![Firmware update: SMC3_R4 1.9.3 installed over WiFi](docs/img/firmware-update.png)
+
 ### LED matrix
 
 The board's 12x8 matrix shows one thing at a time, readable from across the room. These previews are rendered from
@@ -362,6 +379,8 @@ wiring diagrams on xsimulator.net.
    [firmware/README.md](firmware/README.md).
 3. Upload. At power-up the board's IP address scrolls across the LED matrix. Reserve it in your router.
 
+From firmware 1.9.2 on, later versions can be installed from the page instead (Settings, Firmware update).
+
 Your SMC3Utils settings stay in EEPROM in the same layout. If the board had none, the defaults are written.
 
 ### 2. Run the page
@@ -389,7 +408,8 @@ SMC3_DATA=/volume1/docker/smc3-scope-data docker compose up -d --build
 python3 scope/smc3_scope.py --host 192.168.1.50 --bind 0.0.0.0 --web 8198
 ```
 
-`--bind 0.0.0.0` makes the page reachable from other devices; without it, the page is on this machine only.
+`--bind 0.0.0.0` makes the page reachable from other devices; without it, the page is on this machine only - and
+the board can't fetch firmware updates from it.
 
 ### 3. SimHub
 
@@ -454,7 +474,8 @@ noise. To see what the diagnostics find, add a fault:
   - 1.8: the LED matrix in words, and the motion sensor;
   - 1.9: Seat setup (level trim, travel limits, end stops, tilt limits for each direction), gyro and acceleration
     for the 3D view;
-  - 1.9.1: soft start.
+  - 1.9.1: soft start;
+  - 1.9.2: firmware updates from the page, and the board remembers its WiFi.
 
   See the [CHANGELOG](CHANGELOG.md).
 - New commands are documented in [docs/PROTOCOL.md](docs/PROTOCOL.md). They go over WiFi; USB stays plain SMC3.

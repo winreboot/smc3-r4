@@ -20,5 +20,6 @@ services:
       SMC3_WEB_PORT: "8198"
     ports:
       - "8198:8198"                  # host port : container port - keep both equal to SMC3_WEB_PORT
+                                     # (the board fetches firmware updates from this port, so leave it reachable)
     volumes:
       - ${SMC3_DATA:-./data}:/data

@@ -3,6 +3,36 @@
 `smc3_scope` (the page) and `SMC3_R4` (the firmware) are versioned separately. The page works with older
 firmware too; the notes say which firmware a feature needs.
 
+## Page 2.3 + firmware 1.9.2
+
+- **Firmware update over WiFi** (firmware 1.9.2). Settings, **Firmware update**: choose the `.bin` the Arduino IDE
+  exports (Sketch, Export Compiled Binary) and press Install - no USB cable, and SimHub can stay open (with its
+  motion output paused).
+  - The page checks the file: a program for the UNO R4 WiFi, SMC3_R4 firmware, which version, and whether that
+    version can itself be updated from the page and keep the board on the network. `.hex`, `.elf`, other sketches
+    and builds that would drop the board off the WiFi are refused.
+  - It converts the `.bin` into the UNO R4 WiFi's `.ota` format (LZSS + header, the same as Arduino's own tools) and
+    serves it at `http://<page>:<port>/ota/<number>.ota`.
+  - The board switches the motors off, and its WiFi module downloads the file, checks it and programs the board
+    through its bootloader - the same route as a USB upload. The board restarts, the seat creeps back with the soft
+    start, and the page confirms the new version. Progress, every step and the reason for any failure show in the
+    card; if anything fails before programming, the old firmware keeps running (the matrix scrolls
+    `ERROR E7 UPDATE FAILED`).
+  - Refused while SimHub (or SMC3Utils) is sending over USB, during Seat setup, auto-tune, a test signal or the
+    full check. Needs the WiFi module's own firmware 0.4.0 or newer (0.5.0+ shows progress).
+- **WiFi memory** (firmware 1.9.2): the board remembers the WiFi name and password it last joined with (EEPROM
+  112-210). A build that still has the placeholders - or a wrong password - uses the remembered ones.
+- Firmware: `[uP=] [uT=] [uI=] [uJ=] [uGO] [uOK]`, `[rdu]` and the "SM3U" frame; `[rdd]` frame version 5 (the WiFi
+  module's firmware version, WiFi memory, the last update); motors switched off for an update report "firmware
+  update"; compiles with every UNO R4 boards package from 1.0.5 on (the progress needs 1.3.0+).
+- Diagnostics: the WiFi module's firmware too old for updates (or for progress), a failed update, a board that
+  joined with the remembered WiFi, firmware 1.9.1 that can't be updated from the page yet; the file has the page's
+  own record of the last update.
+- Page: after a board restart (or any connection that is accepted and closed at once) the page no longer reconnects
+  in a tight loop.
+- Simulator: firmware 1.9.2 by default, with updates from the page (it fetches, decodes and checks the file like the
+  WiFi module and comes back as the version inside); `--fw191`, `--wifi-fw X.Y.Z`, `--ota-fail crc|flash`.
+
 ## Page 2.2 + firmware 1.9.1
 
 - **Soft start** (firmware 1.9.1). After the rig has been off the seat may have ridden down a little. At power-up,

@@ -48,8 +48,17 @@ Soft start (firmware 1.9.1): after power-up and Enable Motors each motor creeps 
   --start M:POT        motor M's pot reads POT at power-up (the seat rode down while the rig was off); the board then
                        heads for its centre (512 + level trim), as the real one does
   --old19              firmware 1.9 without the soft start (diagnostics frame version 3)
+
+Firmware update over WiFi (firmware 1.9.2, the default): [uP=] [uT=] [uI=] [uJ=] [uGO] [uOK] [rdu]; the board fetches
+http://<page>:<port>/ota/<token>.ota, decodes and checks it like the UNO R4 WiFi's WiFi module (magic, LZSS, CRC),
+"programs" itself - it drops the connection, stays away ~4 s and comes back as the version in the file (1.9.2+ with
+updates, 1.9.1 soft start only, 1.9 neither), with the soft start - and remembers its WiFi like 1.9.2 does.
+  --fw191              firmware 1.9.1 (soft start, no updates from the page; diagnostics frame version 4)
+  --wifi-fw X.Y.Z      the WiFi module's own firmware (default 0.5.2; 0.4.x = no progress while downloading,
+                       older = refused)
+  --ota-fail WHAT      crc = the file arrives damaged, flash = the WiFi module can't program the board
 """
-import argparse, math, random, socket, struct, threading, time
+import argparse, math, random, re, socket, struct, threading, time, urllib.request, zlib
 
 ap = argparse.ArgumentParser()
 ap.add_argument("port", type=int)
@@ -81,6 +90,9 @@ ap.add_argument("--seat-setup", action="store_true")
 ap.add_argument("--layout", choices=["tl", "lifts"], default="tl")
 ap.add_argument("--start", action="append", default=[])
 ap.add_argument("--old19", action="store_true")
+ap.add_argument("--fw191", action="store_true")
+ap.add_argument("--wifi-fw", default="0.5.2")
+ap.add_argument("--ota-fail", choices=["crc", "flash"], default=None)
 ap.add_argument("--tl-left", action="store_true")
 ap.add_argument("--tuned", action="store_true", help="start with sane settings (Kp 250, Ki 0, Kd 0, PWMmin 30, dead zone 2)")
 args = ap.parse_args()
@@ -111,7 +123,28 @@ START = {}                                    # --start: where the pots are at p
 for st_ in args.start:
     m_, pot_ = st_.split(":")
     START[int(m_) - 1] = float(pot_)
-SOFT_FW = args.fw >= 19 and not args.old19    # firmware 1.9.1: soft start
+FW = {"ver": ("1.9" if args.old19 else ("1.9.1" if args.fw191 else "1.9.2")) if args.fw >= 19 else f"{args.fw // 10}.{args.fw % 10}"}
+
+
+def _vt(v):
+    try:
+        return tuple(int(x) for x in v.split("."))
+    except ValueError:
+        return (0,)
+
+
+def soft_fw():                                # firmware 1.9.1: soft start
+    return args.fw >= 19 and _vt(FW["ver"]) >= (1, 9, 1)
+
+
+def ota_fw():                                 # firmware 1.9.2: updates from the page, WiFi memory
+    return args.fw >= 19 and _vt(FW["ver"]) >= (1, 9, 2)
+
+
+WIFI_FW = tuple(int(x) for x in args.wifi_fw.split("."))
+OTA = {"state": 0, "code": 0, "done": 0, "total": 0, "progress": False, "seq": 0, "port": 0, "token": 0, "ip": [0, 0],
+       "url": "", "blocked": False, "placeholder": False}
+OFFLINE_UNTIL = [0.0]                         # "programming": the board doesn't answer until then
 SOFT = {"rate": 60}                           # counts/s (0 = off), EEPROM 105-107
 for st_ in args.stops:
     m_, lo_, hi_ = st_.split(":")
@@ -196,7 +229,7 @@ def any_soft():
 
 
 def enable(c):
-    if c.disabled and SOFT_FW and SOFT["rate"] > 0:
+    if c.disabled and soft_fw() and SOFT["rate"] > 0:
         soft_start_from(c)
     c.disabled, c.reason = False, 0
 
@@ -244,7 +277,7 @@ def boot(cold=True):
                      baud_idx=eeprom[65] % 7)
     if args.fw >= 19:
         load_seat()
-    if SOFT_FW and eeprom[105] == 0xB5:
+    if soft_fw() and eeprom[105] == 0xB5:
         SOFT["rate"] = struct.unpack(">h", bytes(eeprom[106:108]))[0]
     SEAT.found_at = None; SEAT.packets = 0
     for c in C:
@@ -651,10 +684,116 @@ def diag_frame():
         (8 if time.time() < HOLD[0] else 0)
     hz = int(SEAT.rate) if (fresh and SEAT.all) else 0
     pl += struct.pack("<BIHH3h3hh", fl, usb.get("held", 0), hz, hz, *SEAT.acc, *SEAT.gyro, 2950)
-    if not SOFT_FW:
+    if not soft_fw():
         return b"SM3D" + bytes([3, len(pl)]) + pl
     pl += struct.pack("<HB", SOFT["rate"], sum(1 << i for i, c in enumerate(C) if c.soft and not c.disabled))
-    return b"SM3D" + bytes([4, len(pl)]) + pl
+    if not ota_fw():
+        return b"SM3D" + bytes([4, len(pl)]) + pl
+    wf = 1 | (6 if OTA["placeholder"] else 0)     # remembered; joined with it + a build with the placeholders
+    pl += struct.pack("<3BBBh", *WIFI_FW, wf, OTA["state"], OTA["code"])
+    return b"SM3D" + bytes([5, len(pl)]) + pl
+
+
+def ota_frame():
+    """1.9.2 "SM3U": firmware update state."""
+    fl = (1 if OTA["progress"] else 0) | 2
+    pl = struct.pack("<BhIIBBBB", OTA["state"], OTA["code"], OTA["done"], OTA["total"], fl, *WIFI_FW)
+    pl += FW["ver"].encode()[:8].ljust(8, b"\0")
+    return b"SM3U" + bytes([1, len(pl)]) + pl
+
+
+def ota_set(**kw):
+    OTA.update(kw)
+    OTA["seq"] += 1
+
+
+def ota_fail(code):
+    ota_set(state=6, code=code, progress=False, blocked=False)
+
+
+def lzss_decode_stream(data):
+    """The WiFi module's LZSSDecoder (EI 11, EJ 4), all at once."""
+    N, F = 2048, 17
+    buf = bytearray(b" " * (N - F) + bytes(N + F))
+    r, st, bb, bs, i0 = N - F, 0, 0, 0, 0
+    out = bytearray()
+    need = {0: 1, 1: 8, 2: 11, 3: 4}
+    for byte in data:
+        bb = (bb << 8) | byte; bs += 8
+        while bs >= need[st]:
+            n = need[st]; c = bb >> (bs - n); bb &= (1 << (bs - n)) - 1; bs -= n
+            if st == 0: st = 1 if c else 2
+            elif st == 1:
+                out.append(c); buf[r] = c; r = (r + 1) & (N - 1); st = 0
+            elif st == 2: i0 = c; st = 3
+            else:
+                for k in range(c + 2):
+                    v = buf[(i0 + k) & (N - 1)]; out.append(v); buf[r] = v; r = (r + 1) & (N - 1)
+                st = 0
+    return bytes(out)
+
+
+def ota_run():
+    """[uGO]: what the firmware and its WiFi module do, in a thread."""
+    time.sleep(0.3)                           # the brakes
+    ota_set(state=2)
+    blocking = WIFI_FW < (0, 5, 0)
+    try:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        resp = opener.open(OTA["url"], timeout=10)
+    except urllib.error.HTTPError:
+        ota_fail(-14); return
+    except OSError:
+        ota_fail(-6); return
+    total = resp.headers.get("Content-Length")
+    if total is None:
+        ota_fail(-7); return
+    total = int(total)
+    ota_set(state=3, total=total, done=0, progress=not blocking, blocked=blocking)
+    data = bytearray()
+    while len(data) < total:
+        chunk = resp.read(min(2048, total - len(data)))
+        if not chunk:
+            ota_fail(-12); return
+        data += chunk
+        if len(data) >= 12 and int.from_bytes(data[8:12], "little") != 0x23411002:
+            ota_fail(-11); return
+        if not blocking:
+            OTA["done"] = len(data)
+        time.sleep(0.04)                      # ~50 kB/s, so the progress shows
+    OTA["done"] = len(data)
+    if args.ota_fail == "crc":
+        data[100] ^= 0x55
+    ota_set(state=4, blocked=False)
+    time.sleep(0.3)
+    if (zlib.crc32(bytes(data[8:])) & 0xFFFFFFFF) != int.from_bytes(data[4:8], "little"):
+        ota_fail(-10); return
+    binary = lzss_decode_stream(bytes(data[20:]))
+    if time.time() - usb["last"] < 3:         # SimHub sending over USB: not while programming
+        ota_fail(-100); return
+    ota_set(state=5)
+    time.sleep(0.45)
+    if args.ota_fail == "flash" or time.time() - usb["last"] < 3:
+        ota_fail(-104 if args.ota_fail == "flash" else -100); return
+    m = re.search(rb"SMC3_R4 v(\d+\.\d+(?:\.\d+)?)", binary)
+    new = m.group(1).decode() if m else "?"
+    print(f"simboard: programming firmware {new} ({len(binary)} bytes)", flush=True)
+    OFFLINE_UNTIL[0] = time.time() + 4.0      # programming; the board restarts
+    with lock:
+        for cn in list(clients):
+            try: cn.close()
+            except OSError: pass
+        clients.clear()
+    time.sleep(1.0)
+    with lock:
+        FW["ver"] = new
+        OTA.update(state=0, code=0, done=0, total=0, progress=False, blocked=False,
+                   placeholder=b"YourNetworkName" in binary)
+        OTA["seq"] += 1
+        for i, c in enumerate(C):             # the seat sank a little while the motors were off
+            START[i] = P[potmap[i]].pot_x
+        boot(cold=False)
+        samples.clear()
 
 
 def extras_frame():
@@ -695,7 +834,7 @@ def handle_cmd(c, a, b, out, cl=None):
                 elif a in (80, 81):
                     if -9000 <= v <= 9000:
                         board["lv_r" if a == 80 else "lv_p"] = v; save_board()
-                elif a == 82 and SOFT_FW:
+                elif a == 82 and soft_fw():
                     if 0 <= v <= 1000:
                         SOFT["rate"] = v; eeprom[105] = 0xB5; eeprom[106:108] = struct.pack(">h", v)
                 elif (a >> 4) < 3:
@@ -751,11 +890,37 @@ def handle_cmd(c, a, b, out, cl=None):
             elif ord("1") <= b <= ord("3"): C[b - ord("1")].disabled, C[b - ord("1")].reason = True, 2
         elif c == "f" and args.fw >= 16:
             fshift, frate = min(a, 8), b * 100
+        elif c == "u" and ota_fw() and cl is not None:   # 1.9.2: firmware update (from the page only)
+            v = VREG[0] & 0xFFFF
+            if b == ord("="):
+                if a == ord("P"): OTA["port"] = v
+                elif a == ord("T"): OTA["token"] = v
+                elif a == ord("I"): OTA["ip"][0] = v
+                elif a == ord("J"): OTA["ip"][1] = v
+            elif (a, b) == (ord("O"), ord("K")) and not (1 <= OTA["state"] <= 5):
+                ota_set(state=0, code=0, done=0, total=0)
+            elif (a, b) == (ord("G"), ord("O")) and not (1 <= OTA["state"] <= 5):
+                OTA.update(code=0, done=0, total=0, progress=False)
+                hi, lo = OTA["ip"]
+                ip = f"{hi >> 8}.{hi & 255}.{lo >> 8}.{lo & 255}" if (hi or lo) else cl.get("peer", "")
+                if not OTA["port"] or not ip:
+                    ota_fail(-102)
+                elif time.time() - usb["last"] < 3:
+                    ota_fail(-100)
+                elif WIFI_FW < (0, 4, 0):
+                    ota_fail(-101)
+                else:
+                    OTA["url"] = f"http://{ip}:{OTA['port']}/ota/{OTA['token']:04x}.ota"
+                    for ch in C: ch.disabled, ch.reason = True, 5
+                    ota_set(state=1)
+                    threading.Thread(target=ota_run, daemon=True).start()
         elif c == "z" and a == ord("s"):          # simulator only: fake SimHub on/off
             SIMHUB[0] = (b == ord("1"))
         elif c == "s" and a == ord("a") and b == ord("v"):
             save_eeprom()
             if args.fw >= 19: save_seat()
+        elif c == "e" and a == ord("n") and 1 <= OTA["state"] <= 5:
+            pass                                  # 1.9.2: not during a firmware update
         elif c == "e" and a == ord("n"):
             if b == ord("a"):
                 for ch in C: enable(ch)
@@ -779,16 +944,25 @@ def handle_cmd(c, a, b, out, cl=None):
             elif k == "i" and args.fw >= 18: out.append(reply2("i", sensor_state(time.time()), tilt_deg()))
             elif k == "f" and args.fw >= 16: out.append(reply2("f", fshift, frate // 100))
             elif k == "d" and args.fw >= 17: out.append(diag_frame())
+            elif k == "u" and ota_fw(): out.append(ota_frame())
 
 
 def client(conn):
+    if time.time() < OFFLINE_UNTIL[0]:        # being programmed: nobody answers
+        conn.close()
+        return
+    try:
+        peer = conn.getpeername()[0]
+    except OSError:
+        peer = ""
     conn.setblocking(False)
     if first_client[0] is None:
         first_client[0] = time.time()
     with lock:
         clients.append(conn)
     buf = b""; last_send = time.time()
-    cl = {"extras": False}
+    cl = {"extras": False, "peer": peer}
+    ota_seq, ota_last = OTA["seq"], 0.0
     while True:
         time.sleep(0.02)
         if conn not in clients:
@@ -807,6 +981,13 @@ def client(conn):
                 handle_cmd(chr(buf[1]), buf[2], buf[3], out, cl); buf = buf[5:]
             else:
                 buf = buf[1:]
+        if OTA["blocked"]:                        # WiFi module 0.4.x: the board's loop waits for the download
+            out = []
+            time.sleep(0.05)
+            continue
+        if ota_fw() and (OTA["seq"] != ota_seq or (1 <= OTA["state"] <= 5 and time.time() - ota_last >= 0.25)):
+            ota_seq, ota_last = OTA["seq"], time.time()
+            out.append(ota_frame())
         if time.time() - last_send >= 0.05:
             last_send = time.time()
             with lock:

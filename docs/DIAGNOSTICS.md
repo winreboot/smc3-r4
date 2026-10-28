@@ -93,6 +93,9 @@ cover:
   linkage, how many degrees each motor tilts the seat (or, for the rear slide, turns it);
 - the rig layout: a lift that turns the seat, a traction-loss motor that tilts it or that you saw lift the seat;
 - soft start (firmware 1.9.1): off, or a motor still creeping to its position; firmware 1.9 without it;
+- firmware updates (1.9.2): the WiFi module's own firmware too old to update from the page (or to show progress), the
+  last update failed and why, the board joined WiFi with the details it remembers, firmware 1.9.1 that can't be
+  updated from the page yet;
 - the seat set-up (firmware 1.9): none yet, running but not saved (Seat setup left open), a motor switched off by
   its end stop, the page holding SimHub's positions back;
 - motors that don't agree on which way is up;
@@ -109,7 +112,8 @@ The newest 20 are kept in `diagnostics/reports/` and can be downloaded from the 
 | `made`, `kind`, `problem` | When, quick or full, and what the owner typed |
 | `summary` | The findings as plain text |
 | `findings` | The findings, structured |
-| `board` | Connection, firmware, build options, uptime, last start cause, WiFi, USB counters, per-motor counters, motion sensor and LED matrix (1.8), seat set-up: level trim, travel limits, end stops, tilt limits (1.9) |
+| `board` | Connection, firmware, build options, uptime, last start cause, WiFi, USB counters, per-motor counters, motion sensor and LED matrix (1.8), seat set-up: level trim, travel limits, end stops, tilt limits (1.9), soft start (1.9.1), the WiFi module's firmware, WiFi memory and the last update (1.9.2) |
+| `firmware_update` | The page's own record of the last firmware update: from and to which version, every step, the result |
 | `rig` | Motors in use, motor names, layout (front lifts + rear traction loss, or lifts), which motor is the rear slide and which way it goes for higher numbers |
 | `settings` | Running settings, saved settings (EEPROM), the differences, the last save made from the page |
 | `live` | The 3-second listen |
@@ -124,7 +128,8 @@ Traces are CSV text: a `columns` header and one row per sample. `t`, `g`, `f` an
 and PID output; `off` holds three 0/1 flags for motors switched off; `low` is 1 at quarter power; `roll` and
 `pitch` (degrees) appear when the motion sensor sends.
 
-The file contains no passwords. It does contain your board's network address and motor names.
+The file contains no passwords - not even the WiFi password the board remembers (1.9.2). It does contain your
+board's network address and motor names.
 
 [examples/diagnostics-full-check.json](examples/diagnostics-full-check.json) is a full check from the simulated
 rig with motor 2 wired backwards, a glitchy pot on motor 3, and the motion sensor finding play in motor 3's

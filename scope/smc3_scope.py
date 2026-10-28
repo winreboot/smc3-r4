@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-smc3_scope v2.0 - live scope, tuner and auto-tuner for the SMC3_R4 motion controller (Arduino UNO R4 WiFi).
+smc3_scope v2.3 - live scope, tuner and auto-tuner for the SMC3_R4 motion controller (Arduino UNO R4 WiFi).
 
 Connects to the board's TCP telemetry port, keeps a rolling buffer of samples and serves a web page with live
 charts, a parameter editor (sends ordinary SMC3 commands back to the board), test signals and a per-motor
@@ -12,6 +12,12 @@ Every option can also come from the environment (Docker): SMC3_HOST, SMC3_PORT, 
 SMC3_DATA_DIR.  Settings changed in the page (board address, theme, auto-find) are saved to
 <data dir>/config.json and survive restarts and upgrades.  Standard-library Python 3.8+ only.
 
+v2.3: firmware update over WiFi (firmware 1.9.2): Settings, Firmware update - pick the .bin the Arduino IDE exports
+      (Sketch, Export Compiled Binary); the page checks it, converts it to the UNO R4 WiFi's .ota format and serves
+      it, the board's WiFi module downloads, checks and installs it, and the page confirms the new version. The
+      board also remembers its WiFi name and password, so builds with the placeholders keep it on the network.
+v2.2: soft start (firmware 1.9.1): the motors creep to their positions after power-up and Enable Motors.
+v2.1: traction-loss rigs: motor 3 slides the rear about a front pivot; Seat setup, diagnostics and the 3D view follow.
 v2.0: firmware 1.9 support. Seat setup (new section): level the platform first (by itself with the motion sensor),
       then make that SimHub's centre; find each motor's safe travel both ways (it stops at the angle you allow, when
       it pushes against something, or when you press Stop); then save travel limits, end stops and tilt limits for
@@ -47,7 +53,7 @@ v1.4: settings dialog (board address, port, find-board scan, auto-find), day/nig
       fixed a thread race that made the page flash "not reachable".
 """
 
-VERSION = "2.2"
+VERSION = "2.3"
 
 import argparse
 import base64
@@ -55,12 +61,14 @@ import collections
 import json
 import math
 import os
+import random
 import re
 import socket
 import statistics
 import struct
 import threading
 import time
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -70,10 +78,18 @@ def log(msg):
     print(time.strftime("%Y-%m-%d %H:%M:%S"), msg, flush=True)
 
 
-def fw_text(num, diag=None):
-    """Firmware version for people: 19 -> "1.9", or "1.9.1" when its diagnostics frame has the soft start."""
+def fw_text(num, diag=None, ver=None):
+    """Firmware version for people: the board's own text when it sends it (1.9.2+), else 19 -> "1.9", or "1.9.1"
+    when its diagnostics frame has the soft start, "1.9.2" when it has the WiFi module's version."""
+    if ver:
+        return ver
     t = f"{num // 10}.{num % 10}"
-    return t + ".1" if num == 19 and isinstance(diag, dict) and "soft_start" in diag else t
+    if num == 19 and isinstance(diag, dict):
+        if "wifi" in diag:
+            return t + ".2"
+        if "soft_start" in diag:
+            return t + ".1"
+    return t
 
 
 TL_DEFAULT_DEG = 0.02          # degrees the seat turns per count of the traction-loss motor, until Seat setup measures it
@@ -210,6 +226,11 @@ class Board:
         self.seat = None                     # firmware 1.9 seat set-up running on the board (from [rdd])
         self.imu = None                      # firmware 1.9 "SM3X": the sensor's acceleration and gyro, latest
         self.imu_seq = 0
+        self.ota = None                      # firmware 1.9.2 "SM3U": firmware update state (and the version text)
+        self.ota_seq = 0
+        self.fw_version = None               # e.g. "1.9.2", from the last "SM3U" frame of this connection
+        self.conn_id = 0                     # counts connections, so work for one that already dropped can stop
+        self.connected_at = 0.0
 
     def start(self):
         """Start connecting - called once everything that reacts to a connection is set up."""
@@ -362,6 +383,8 @@ class Board:
                     s.settimeout(1.0)
                     with self.lock:
                         self.sock = s
+                    self.conn_id += 1
+                    self.connected_at = time.time()
                     self.connected = True
                     self.current_host = host
                     self.last_rx = time.time()
@@ -387,7 +410,10 @@ class Board:
                     self._drop()
                 continue
             except (OSError, AttributeError):
+                quick = time.time() - self.connected_at < 2.0
                 self._drop()
+                if quick:                            # accepted and closed at once (a board restarting, being
+                    time.sleep(1.0)                  # programmed, or busy with another client): don't hammer it
                 continue
             buf = self._parse(buf)
 
@@ -405,6 +431,7 @@ class Board:
             log("disconnected from board")
             self._ev("link", "Disconnected from the board.", quiet=True)
         self.connected = False
+        self.fw_version = None
 
     def _parse(self, buf):
         while True:
@@ -432,6 +459,22 @@ class Board:
                                 "gyro": [round(v / 16.384, 2) for v in (gx, gy, gz)], "temp": temp / 100.0,
                                 "peak_g": peak / 1000.0, "accel_ok": bool(fl & 1), "gyro_ok": bool(fl & 2), "n": n}
                     self.imu_seq += 1
+                buf = buf[need:]
+            elif buf[:4] == b"SM3U":                       # firmware 1.9.2: firmware update state
+                if len(buf) < 6:
+                    return buf
+                need = 6 + buf[5]
+                if len(buf) < need:
+                    return buf
+                if buf[5] >= 15:
+                    st, code, done, total, fl, ma, mi, pa = struct.unpack_from("<BhIIBBBB", buf, 6)
+                    ver = buf[21:need].split(b"\0")[0].decode("ascii", "replace") if buf[5] >= 23 else None
+                    self.ota = {"t": time.time(), "state": st, "code": code, "done": done, "total": total,
+                                "progress": bool(fl & 1), "remembered": bool(fl & 2),
+                                "module": f"{ma}.{mi}.{pa}" if (ma or mi or pa) else None, "version": ver or None}
+                    if ver:
+                        self.fw_version = ver
+                    self.ota_seq += 1
                 buf = buf[need:]
             elif buf[:4] == b"SM3D":                       # firmware 1.7 diagnostics frame
                 if len(buf) < 6:
@@ -1583,14 +1626,15 @@ DIAG_MOTOR = struct.Struct("<BHhHHHH")
 DIAG_SENSOR = struct.Struct("<BBBIHIHHhhhhhHBBB")  # firmware 1.8 (frame version 2): after the EEPROM copy
 DIAG_SEAT = struct.Struct("<15h4hBIHH3h3hh")      # firmware 1.9 (frame version 3): seat set-up, acceleration, gyro
 DIAG_SOFT = struct.Struct("<HB")                    # firmware 1.9.1 (frame version 4): soft-start speed, motors creeping
+DIAG_WIFI = struct.Struct("<3BBBh")                 # firmware 1.9.2 (frame version 5): WiFi module, WiFi memory, update
 TILT_DIRS = ("roll_right", "roll_left", "front_up", "front_down")   # roll +, roll -, pitch +, pitch - (firmware order)
 ACC_G = 32768.0 / 16.0                            # WitMotion raw -> g
 GYRO_DPS = 32768.0 / 2000.0                       # WitMotion raw -> degrees per second
 OFF_REASONS = {0: "on", 1: "safety cutoff", 2: "switched off by command", 3: "not enabled since power-up",
-               4: "tilt limit"}
+               4: "tilt limit", 5: "firmware update"}
 LED_VIEWS = {0: "motor bars", 1: "seat horizon", 2: "quiet"}
 MATRIX_ERRORS = {0: "E0 WIFI MODULE", 1: "E1 MOTOR 1 CUTOFF", 2: "E2 MOTOR 2 CUTOFF", 3: "E3 MOTOR 3 CUTOFF",
-                 4: "E4 TILT LIMIT", 5: "E5 NO SENSOR", 8: "E8 NO IP ADDRESS", 9: "E9 NO WIFI"}
+                 4: "E4 TILT LIMIT", 5: "E5 NO SENSOR", 7: "E7 UPDATE FAILED", 8: "E8 NO IP ADDRESS", 9: "E9 NO WIFI"}
 GLITCH_COUNTS = 60          # pot change within one 10 ms telemetry sample that no motor can make (6000 counts/s)
 INC_KEEP = 40               # incident recordings kept on the NAS
 NOTE_LIMIT = {"pot_glitch": 60, "pot_glitch_fw": 300, "hunting": 120, "wrong_direction": 20, "stall": 30,
@@ -1687,6 +1731,15 @@ def decode_diag(pl, ver=1):
     if ver >= 4 and len(pl) >= off + DIAG_SOFT.size:
         rate, creeping = DIAG_SOFT.unpack_from(pl, off)
         d["soft_start"] = {"rate": rate, "creeping": [m + 1 for m in range(3) if creeping & (1 << m)]}
+        off += DIAG_SOFT.size
+    if ver >= 5 and len(pl) >= off + DIAG_WIFI.size:
+        ma, mi, pa, wf, ust, ucode = DIAG_WIFI.unpack_from(pl, off)
+        known = bool(ma or mi or pa)
+        d["wifi"] = {"module_fw": f"{ma}.{mi}.{pa}" if known else None,
+                     "module_fw_num": (ma << 16) | (mi << 8) | pa if known else 0,
+                     "remembered": bool(wf & 1), "joined_with_remembered": bool(wf & 2),
+                     "sketch_has_wifi": not (wf & 4)}
+        d["update"] = {"state": OTA_STATES.get(ust, str(ust)), "code": ucode}
     return d
 
 
@@ -3027,6 +3080,12 @@ ABOUT = {
               "angles per second, tilt limit and trips, level offsets, raw angles. check[].step.*.seat: the seat's "
               "own response to each step - degrees moved, degrees per count, overshoot and ringing next to the "
               "motor's, lag, and play (counts the motor turns before the seat follows).",
+    "wifi": "board.wifi (firmware 1.9.2): module_fw = the WiFi module's own firmware (updating from the page needs 0.4.0+, "
+            "progress 0.5.0+); remembered = the board keeps the WiFi name and password it last joined with; "
+            "joined_with_remembered = it is on the network with those (the sketch's own details were placeholders or "
+            "didn't work); sketch_has_wifi = the running build has real details compiled in. No password is in this file.",
+    "firmware_update": "board.firmware_update (firmware 1.9.2): the last update from the page - state and, if it failed, "
+                       "code and meaning. firmware_update (top level): the page's own record of the last update.",
     "soft_start": "board.soft_start (firmware 1.9.1): rate = how fast, in counts/s, each motor creeps to its position "
                   "after power-up and Enable Motors instead of jumping there (0 = off); creeping = motors still on their "
                   "way (normal once caught up).",
@@ -3286,7 +3345,16 @@ class Diagnostics:
                 board["seat_setup"] = dg["seat"]
             if "soft_start" in dg:                   # firmware 1.9.1: soft start
                 board["soft_start"] = dg["soft_start"]
+            if "wifi" in dg:                         # firmware 1.9.2: WiFi module, WiFi memory, firmware update
+                board["wifi"] = {k: v for k, v in dg["wifi"].items() if k != "module_fw_num"}
+                board["firmware_update"] = dict(dg["update"])
+                if dg["update"]["code"]:
+                    board["firmware_update"]["meaning"] = ota_error_text(dg["update"]["code"])
         rep["board"] = board
+        fwup = getattr(self, "fwup", None)              # page 2.3: the page's own record of the last firmware update
+        if fwup is not None and fwup.state != "idle":
+            fst = fwup.status()
+            rep["firmware_update"] = {k: fst.get(k) for k in ("state", "msg", "from", "file", "log")}
         names = list(cfg.get("motor_names") or ["", "", ""])
         tl = tl_motor(cfg)
         rep["rig"] = {"motors_in_use": nm, "switch_off_unused_motors": bool(cfg.get("disable_unused")),
@@ -3612,7 +3680,9 @@ def analyze(rep):
                                                  "or a safety stop by auto-tune / the full check).",
                       "not enabled since power-up": "It hasn't been enabled since power-up.",
                       "tilt limit": "The motion sensor's tilt limit stopped every motor: the seat tilted further than "
-                                    "the limit set under Settings, Motion sensor."}.get(why, "It is off.")
+                                    "the limit set under Settings, Motion sensor.",
+                      "firmware update": "It was switched off for a firmware update from the page (an update that "
+                                         "finishes restarts the board, so this one stopped part-way)."}.get(why, "It is off.")
             if why == "tilt limit":
                 fix = ("Find out why the seat tilted so far (a pot slipped or came loose, a motor wired backwards, "
                        "SimHub's output too strong), then press Enable Motors. If the limit is simply too tight for "
@@ -3836,10 +3906,42 @@ def analyze(rep):
             add("info", "Motor " + " and ".join(map(str, sst["creeping"])) + " still creeping to its position "
                 "(soft start)", f"At {sst['rate']} counts/s after power-up or Enable Motors; normal once it has caught "
                 "up.", code="soft_creeping")
-    elif board.get("seat_setup") is not None:
-        add("info", "Firmware 1.9.1 adds a soft start",
+    elif board.get("seat_setup") is not None and board.get("wifi") is None:
+        add("info", "Firmware 1.9.2 adds a soft start and updates from this page",
             "With 1.9 the motors go straight to their positions at power-up - a seat that rode down while the rig "
-            "was off jumps back.", "Flash SMC3_R4_v1.9.1.ino.", code="soft_fw")
+            "was off jumps back. 1.9.2 also lets you install later firmware from Settings, Firmware update.",
+            "Flash SMC3_R4_v1.9.2.ino over USB with the Arduino IDE.", code="soft_fw")
+    # ---- firmware update over WiFi (firmware 1.9.2) ----
+    wfi = board.get("wifi")
+    fup = board.get("firmware_update") or {}
+    if wfi is not None:
+        mod = wfi.get("module_fw")
+        try:
+            mnum = tuple(int(x) for x in mod.split("."))[:3] if mod else None
+        except ValueError:
+            mnum = None
+        if mnum and mnum < (0, 4, 0):
+            add("warn", f"The board's WiFi module runs firmware {mod}",
+                "Updating the board from this page needs 0.4.0 or newer (0.5.0 or newer shows the progress).",
+                "Update the WiFi module once with the Arduino IDE: Tools, Firmware Updater (over USB).",
+                code="wifi_module_old")
+        elif mnum and mnum < (0, 5, 0):
+            add("info", f"The board's WiFi module runs firmware {mod}",
+                "Updates from this page work, but without a progress bar (0.5.0 or newer shows it).",
+                "Optional: Arduino IDE, Tools, Firmware Updater.", code="wifi_module_noprogress")
+        if fup.get("state") == "failed":
+            add("warn", "The last firmware update from the page failed",
+                fup.get("meaning") or f"Code {fup.get('code')}.",
+                "The old firmware is still running. Settings, Firmware update: try again (the LED matrix scrolls "
+                "ERROR E7 UPDATE FAILED until then).", code="update_failed")
+        if wfi.get("joined_with_remembered"):
+            add("ok", "The board joined WiFi with the name and password it remembers",
+                "This build has no WiFi details of its own (or they didn't work), so it used the ones it last joined "
+                "with.", code="wifi_remembered")
+    elif sst is not None:
+        add("info", "Firmware 1.9.2 can be updated from this page",
+            "Settings, Firmware update installs later firmware over WiFi - no USB cable, SimHub can stay open.",
+            "Flash SMC3_R4_v1.9.2.ino over USB once with the Arduino IDE.", code="update_fw")
     # ---- seat set-up (firmware 1.9) ----
     ss = board.get("seat_setup")
     if ss:
@@ -5119,6 +5221,516 @@ class SeatSetup:
 
 
 # --------------------------------------------------------------------------------------------------------------
+# Firmware update over WiFi (2.3): turn the .bin the Arduino IDE exports into the .ota file the UNO R4 WiFi's
+# WiFi module downloads, decodes and flashes (the same route as its USB uploads, so nothing new on the board side).
+#
+#   .ota = len (4, LE) + crc32 (4, LE) + magic 0x23411002 (4, LE) + version (8 bytes, only the "compressed" flag)
+#          + the .bin compressed with LZSS (Okumura; EI 11, EJ 4, P 1 - the decoder the WiFi module uses).
+#   len and crc32 cover magic + version + compressed data (Arduino's bin2ota.py).
+# --------------------------------------------------------------------------------------------------------------
+
+OTA_MAGIC_R4WIFI = 0x23411002
+OTA_VERSION_FIELD = bytes([0, 0, 0, 0, 0, 0, 0, 0x40])
+LZ_EI, LZ_EJ = 11, 4
+LZ_N = 1 << LZ_EI                      # ring buffer
+LZ_F = (1 << LZ_EJ) + 1                # longest match (17)
+LZ_MAXD = LZ_N - LZ_F                  # how far back a match may start (as in Arduino's encoder)
+R4_APP_START, R4_FLASH_END = 0x4000, 0x40000
+R4_RAM_START, R4_RAM_END = 0x20000000, 0x20008000
+FW_MAX_BYTES = R4_FLASH_END - R4_APP_START
+
+
+def lzss_encode(data):
+    """LZSS stream that Arduino's decoders (lzss.c decode, the WiFi module's LZSSDecoder) turn back into `data`.
+    Greedy, with a hash chain on 3-byte prefixes: a 150 kB firmware takes a couple of seconds."""
+    data = bytes(data)
+    n = len(data)
+    out = bytearray()
+    acc, nbits = 0, 0
+    chains = {}
+    p = 0
+    base = LZ_N - LZ_F                 # ring position of output byte 0
+    while p < n:
+        maxlen = min(LZ_F, n - p)
+        best_len, best_q = 1, -1
+        if maxlen >= 3:
+            cand = chains.get(data[p:p + 3])
+            if cand:
+                tries = 0
+                for k in range(len(cand) - 1, -1, -1):
+                    q = cand[k]
+                    if p - q > LZ_MAXD:
+                        break
+                    L = 3
+                    while L < maxlen and data[q + L] == data[p + L]:
+                        L += 1
+                    if L > best_len:
+                        best_len, best_q = L, q
+                        if L == maxlen:
+                            break
+                    tries += 1
+                    if tries >= 96:
+                        break
+        if best_len >= 3:
+            x = (base + best_q) & (LZ_N - 1)
+            acc = (acc << 16) | (x << LZ_EJ) | (best_len - 2)       # 0, EI bits position, EJ bits length - 2
+            nbits += 16
+            step = best_len
+        else:
+            acc = (acc << 9) | 0x100 | data[p]                       # 1, 8 bits
+            nbits += 9
+            step = 1
+        while nbits >= 8:
+            nbits -= 8
+            out.append((acc >> nbits) & 0xFF)
+        acc &= (1 << nbits) - 1
+        for i in range(p, p + step):
+            if i + 3 <= n:
+                key = data[i:i + 3]
+                lst = chains.get(key)
+                if lst is None:
+                    chains[key] = [i]
+                else:
+                    lst.append(i)
+                    if len(lst) > 4096:                              # keep the chains short
+                        del lst[:2048]
+        p += step
+    if nbits:
+        out.append((acc << (8 - nbits)) & 0xFF)
+    return bytes(out)
+
+
+class LzssStreamDecoder:
+    """Python copy of the WiFi module's LZSSDecoder (Arduino_ESP32_OTA, decompress/lzss.cpp): fed in chunks,
+    no end marker - it stops when the input runs out."""
+
+    def __init__(self):
+        self.buf = bytearray(b" " * (LZ_N - LZ_F) + bytes(LZ_N + LZ_F))
+        self.r = LZ_N - LZ_F
+        self.state = 0
+        self.bitbuf, self.bitsize = 0, 0
+        self.i = 0
+        self.out = bytearray()
+
+    def _need(self):
+        return {0: 1, 1: 8, 2: LZ_EI, 3: LZ_EJ}[self.state]
+
+    def feed(self, chunk):
+        for byte in chunk:
+            self.bitbuf = (self.bitbuf << 8) | byte
+            self.bitsize += 8
+            while self.bitsize >= self._need():
+                n = self._need()
+                c = self.bitbuf >> (self.bitsize - n)
+                self.bitbuf &= (1 << (self.bitsize - n)) - 1
+                self.bitsize -= n
+                if self.state == 0:
+                    self.state = 1 if c else 2
+                elif self.state == 1:
+                    self.out.append(c)
+                    self.buf[self.r] = c
+                    self.r = (self.r + 1) & (LZ_N - 1)
+                    self.state = 0
+                elif self.state == 2:
+                    self.i = c
+                    self.state = 3
+                else:
+                    for k in range(c + 2):
+                        v = self.buf[(self.i + k) & (LZ_N - 1)]
+                        self.out.append(v)
+                        self.buf[self.r] = v
+                        self.r = (self.r + 1) & (LZ_N - 1)
+                    self.state = 0
+
+
+def ota_wrap(compressed, magic=OTA_MAGIC_R4WIFI):
+    body = magic.to_bytes(4, "little") + OTA_VERSION_FIELD + compressed
+    return len(body).to_bytes(4, "little") + (zlib.crc32(body) & 0xFFFFFFFF).to_bytes(4, "little") + body
+
+
+def bin_to_ota(binary):
+    return ota_wrap(lzss_encode(binary))
+
+
+def ota_unwrap(ota):
+    """(binary, problem) - checks it the way the WiFi module does (magic, CRC) and decompresses it."""
+    if len(ota) < 21:
+        return None, "The file is too short to be an .ota file."
+    ln = int.from_bytes(ota[0:4], "little")
+    crc = int.from_bytes(ota[4:8], "little")
+    magic = int.from_bytes(ota[8:12], "little")
+    if magic != OTA_MAGIC_R4WIFI:
+        return None, f"This .ota file is for another board (magic number 0x{magic:08X}, the UNO R4 WiFi needs 0x23411002)."
+    if ln != len(ota) - 8:
+        return None, "The .ota file is cut short or has extra bytes at the end."
+    if (zlib.crc32(ota[8:]) & 0xFFFFFFFF) != crc:
+        return None, "The .ota file is damaged (its checksum doesn't match)."
+    d = LzssStreamDecoder()
+    d.feed(ota[20:])
+    return bytes(d.out), None
+
+
+FW_ID_RE = re.compile(rb"SMC3_R4 v(\d+\.\d+(?:\.\d+)?)")
+FW_CAPS_RE = re.compile(rb"SMC3CAPS:([a-z0-9,]+)")
+FW_WIFI_PLACEHOLDER = b"YourNetworkName"
+
+
+def inspect_firmware(raw, name=""):
+    """Look at an uploaded file. Returns a dict: ok, problem (why it can't be installed), warnings, version, caps,
+    binary (the plain .bin), ota (what the board downloads), sizes."""
+    info = {"ok": False, "problem": None, "warnings": [], "version": None, "caps": [], "name": name,
+            "bin_bytes": 0, "ota_bytes": 0}
+    raw = bytes(raw)
+    lname = (name or "").lower()
+    if raw[:4] == b"\x7fELF":
+        info["problem"] = ("That's the .elf file. Pick the .bin next to it (Sketch, Export Compiled Binary puts both "
+                           "in the sketch's build folder).")
+        return info
+    if raw[:1] == b":" and all(c in b"0123456789ABCDEFabcdef:\r\n" for c in raw[:200]):
+        info["problem"] = "That's the .hex file. Pick the .bin next to it."
+        return info
+    if lname.endswith(".ota") or (len(raw) > 12 and int.from_bytes(raw[8:12], "little") == OTA_MAGIC_R4WIFI):
+        binary, prob = ota_unwrap(raw)
+        if prob:
+            info["problem"] = prob
+            return info
+        ota = raw
+    else:
+        binary, ota = raw, None
+    info["bin_bytes"] = len(binary)
+    if len(binary) < 4096:
+        info["problem"] = "The file is far too small to be the firmware."
+        return info
+    if len(binary) > FW_MAX_BYTES:
+        info["problem"] = f"The file is larger than the board's program memory ({len(binary)} > {FW_MAX_BYTES} bytes)."
+        return info
+    sp = int.from_bytes(binary[0:4], "little")
+    reset = int.from_bytes(binary[4:8], "little")
+    if not (R4_RAM_START < sp <= R4_RAM_END and R4_APP_START <= (reset & ~1) < R4_APP_START + len(binary)
+            and reset & 1):
+        info["problem"] = ("This isn't a program for the UNO R4 WiFi (its start doesn't look like one). Compile for "
+                           "Arduino UNO R4 WiFi and pick the .bin from Sketch, Export Compiled Binary.")
+        return info
+    m = FW_ID_RE.search(binary)
+    if not m:
+        info["problem"] = ("This is a sketch for the UNO R4 WiFi, but not SMC3_R4 firmware. Installing it would replace "
+                           "the motor controller - use the Arduino IDE over USB if that is really what you want.")
+        return info
+    info["version"] = m.group(1).decode()
+    c = FW_CAPS_RE.search(binary)
+    info["caps"] = sorted(set(c.group(1).decode().split(","))) if c else []
+    if FW_WIFI_PLACEHOLDER in binary and "wifimem1" not in info["caps"]:
+        info["problem"] = ("This build still has the WiFi name placeholder (YourNetworkName) and this firmware version "
+                           "can't use the WiFi details the board remembers: after installing it the board would drop "
+                           "off the network. Put your WiFi name and password in near the top of the sketch, export "
+                           "again and pick the new .bin.")
+        return info
+    if "ota1" not in info["caps"]:
+        info["warnings"].append(f"Firmware {info['version']} can't be updated from this page: after installing it, the "
+                                "next update needs the Arduino IDE and USB again.")
+    if ota is None:
+        ota = bin_to_ota(binary)
+    info["ota"] = ota
+    info["binary"] = binary
+    info["ota_bytes"] = len(ota)
+    info["ok"] = True
+    return info
+
+
+OTA_STATES = {0: "idle", 1: "stopping the motors", 2: "starting", 3: "downloading", 4: "checking", 5: "installing",
+              6: "failed"}
+OTA_ERRORS = {
+    -100: "SimHub (or SMC3Utils) is sending to the board over USB. The WiFi module programs the board over that same "
+          "link, so pause SimHub's motion output (or close SimHub), wait a few seconds and try again.",
+    -101: "The board's WiFi module runs firmware older than 0.4.0, which can't do this. Update the WiFi module once "
+          "with the Arduino IDE (Tools, Firmware Updater), then try again.",
+    -102: "The board didn't get the page's address - try again.",
+    -103: "The download stopped moving. Can the board reach this page (same network, the page's port open on the NAS)?",
+    -104: "The WiFi module could not start programming the board. The old firmware is still running - try again; if it "
+          "keeps failing, upload over USB with the Arduino IDE.",
+    -2: "The WiFi module has no storage for the file - update its firmware (Arduino IDE, Tools, Firmware Updater).",
+    -3: "The WiFi module couldn't prepare its storage - try again; if it keeps failing, update its firmware.",
+    -4: "The WiFi module couldn't finish writing the file - try again.",
+    -5: "The WiFi module couldn't read the file's address.",
+    -6: "The board couldn't connect to this page to fetch the file. Is the NAS's port for the page reachable from "
+        "the board (firewall)?",
+    -7: "The page's answer to the board was not understood (HTTP header).",
+    -8: "The page's answer to the board was not understood (HTTP header).",
+    -9: "The file's header was wrong.",
+    -10: "The file arrived damaged (checksum) - try again.",
+    -11: "The file is for another board type.",
+    -12: "The download broke off - try again.",
+    -13: "The board waited too long for the file - try again.",
+    -14: "The page didn't answer the board's request properly.",
+    -25: "The firmware's update library reported an error.",
+    -26: "The WiFi module didn't answer - try again.",
+}
+
+
+def ota_error_text(code):
+    return OTA_ERRORS.get(code, f"The board's WiFi module reported error {code}.")
+
+
+class FirmwareUpdate:
+    """The page's side of a firmware update: holds the file, serves it to the board, follows the board's "SM3U" reports
+    and checks the new version once the board is back."""
+
+    def __init__(self, board, cfg, events, bind):
+        self.board, self.cfg, self.events, self.bind = board, cfg, events, bind
+        self.port = 0                        # the page's web port, set once the server has bound it
+        self.lock = threading.Lock()
+        self.file = None                     # inspect_firmware() result
+        self.state = "idle"                  # idle | ready | running | done | failed
+        self.stage = ""
+        self.msg = ""
+        self.token = None
+        self.served = 0                      # bytes of the file sent to the board
+        self.fetches = 0
+        self.started = 0.0
+        self.log = []                        # (seconds since start, text)
+        self.from_version = None
+        self.board_state = None              # last "SM3U" seen during this update
+        self.busy_check = None               # callable -> text if something else is moving the motors
+
+    def _note(self, text):
+        self.log.append((round(time.time() - self.started, 1) if self.started else 0.0, text))
+        self.stage = text
+
+    # ---- what the board can do ----
+    def board_view(self, fresh=False):
+        b = self.board
+        v = {"connected": b.connected, "fw": None, "capable": False, "module": None, "remembered": None,
+             "sketch_wifi": None, "problem": None}
+        if not b.connected:
+            v["problem"] = "The board is not connected."
+            return v
+        d = (b.read_diag() if fresh or not b.diag else b.diag) or b.diag or {}
+        fwn = b.fwnum()
+        v["fw"] = fw_text(fwn, d, b.fw_version) if fwn else None
+        w = d.get("wifi")
+        if w:
+            v.update({"capable": True, "module": w.get("module_fw"), "remembered": w.get("remembered"),
+                      "sketch_wifi": w.get("sketch_has_wifi")})
+            mod = w.get("module_fw_num") or 0
+            if mod and mod < 0x000400:
+                v["capable"] = False
+                v["problem"] = (f"The board's WiFi module runs firmware {w.get('module_fw')}; updating from the page needs "
+                                "0.4.0 or newer. Update it once with the Arduino IDE (Tools, Firmware Updater).")
+        else:
+            v["problem"] = ("The board runs firmware " + (v["fw"] or "older than 1.7") + ", which can't be updated from "
+                            "the page. Flash SMC3_R4_v1.9.2.ino over USB with the Arduino IDE once - from then on "
+                            "updates can come from here.")
+        if self.bind in ("127.0.0.1", "localhost", "::1"):
+            v["capable"] = False
+            v["problem"] = ("This page only listens on this computer (bind 127.0.0.1), so the board can't fetch the file "
+                            "from it. Start it with --bind 0.0.0.0 (the Docker image does).")
+        return v
+
+    # ---- the file ----
+    def prepare(self, raw, name):
+        with self.lock:
+            if self.state == "running":
+                return {"ok": False, "error": "An update is running."}
+            info = inspect_firmware(raw, name)
+            if not info["ok"]:
+                return {"ok": False, "error": info["problem"], "file": self._file_public(info)}
+            self.file = info
+            self.state, self.msg, self.stage, self.log = "ready", "", "", []
+            self.token = None
+        self.events.add("setting", f"Firmware file {name!r} ready to install: SMC3_R4 {info['version']} "
+                        f"({info['bin_bytes']} bytes).", quiet=True)
+        return {"ok": True, **self.status()}
+
+    @staticmethod
+    def _file_public(info):
+        if not info:
+            return None
+        return {k: info.get(k) for k in ("name", "version", "caps", "warnings", "bin_bytes", "ota_bytes", "problem")}
+
+    def clear(self):
+        with self.lock:
+            if self.state == "running":
+                return {"ok": False, "error": "An update is running."}
+            self.file = None
+            self.state, self.msg, self.stage, self.log, self.token = "idle", "", "", [], None
+        d = self.board.diag or {}
+        if (d.get("update") or {}).get("state") == "failed":
+            self.board.send(b"[uOK]")
+        return {"ok": True, **self.status()}
+
+    # ---- the board fetches it ----
+    def serve(self, name):
+        """Bytes for GET /ota/<token>.ota, or None."""
+        with self.lock:
+            if self.state != "running" or not self.file or self.token is None or name != f"{self.token:04x}.ota":
+                return None
+            self.fetches += 1
+            body = self.file["ota"]
+        self._note(f"The board is fetching the file ({round(len(body) / 1024)} kB).")
+        return body
+
+    def sent(self, n):
+        self.served += n
+
+    # ---- the update ----
+    def install(self):
+        with self.lock:
+            if self.state == "running":
+                return {"ok": False, "error": "An update is already running."}
+            if not self.file:
+                return {"ok": False, "error": "Pick the firmware file first."}
+        bv = self.board_view(fresh=True)
+        if not bv["capable"]:
+            return {"ok": False, "error": bv["problem"] or "The board can't be updated from the page."}
+        why = self.busy_check() if self.busy_check else None
+        if why:
+            return {"ok": False, "error": why}
+        with self.lock:
+            self.token = random.randint(1, 0xFFFF)
+            self.state, self.msg, self.log = "running", "", []
+            self.served, self.fetches = 0, 0
+            self.started = time.time()
+            self.from_version = bv["fw"]
+            self.board_state = None
+        self._note(f"Starting: {bv['fw']} → {self.file['version']}.")
+        self.events.add("board", f"Firmware update started: {bv['fw']} → {self.file['version']}.", quiet=False)
+        b = self.board
+        for code, val in ((b"P", self.port), (b"T", self.token), (b"I", 0), (b"J", 0)):
+            b.send(b"[w" + bytes([(val >> 8) & 0xFF, val & 0xFF]) + b"]")
+            b.send(b"[u" + code + b"=]")
+        b.ota = None
+        b.send(b"[uGO]")
+        threading.Thread(target=self._follow, daemon=True).start()
+        return {"ok": True, **self.status()}
+
+    def _finish(self, ok, msg):
+        with self.lock:
+            self.state = "done" if ok else "failed"
+            self.msg = msg
+            self.token = None
+        self._note(msg)
+        self.events.add("board", ("Firmware update: " if ok else "Firmware update failed: ") + msg, quiet=False)
+
+    def _follow(self):
+        b = self.board
+        target = self.file["version"]
+        seen_install = None                       # time the board said "installing" (or had the whole file and went)
+        ms_at_install = None                      # board uptime then: a smaller one later = it restarted
+        lost_at = None
+        up_since = None                           # the connection has been up since (it flickers while flashing)
+        last_state = None
+        while True:
+            time.sleep(0.2)
+            now = time.time()
+            if now - self.started > 300:
+                self._finish(False, "No result after 5 minutes. Check the board: if it doesn't answer, press its reset "
+                                    "button, or upload over USB with the Arduino IDE.")
+                return
+            u = b.ota
+            if seen_install is None:
+                if u and u["t"] >= self.started:
+                    self.board_state = u
+                    if u["state"] != last_state:
+                        last_state = u["state"]
+                        self._note({1: "The board switched the motors off.",
+                                    2: "The board asks its WiFi module to fetch the file.",
+                                    3: "Downloading.", 4: "The WiFi module is checking the file.",
+                                    5: "Installing: the WiFi module is programming the board (about 20 s)."}.get(
+                                        u["state"], OTA_STATES.get(u["state"], "")))
+                    if u["state"] == 6:
+                        self._finish(False, ota_error_text(u["code"]))
+                        return
+                    if u["state"] == 5:
+                        seen_install = now
+                        s = b.latest()
+                        ms_at_install = s["ms"] if s else None
+                        continue
+                if not b.connected and self.served >= len(self.file["ota"]) and now - self.started > 5:
+                    seen_install = now                    # it had the whole file and went quiet: it is installing
+                    lost_at = now
+                    self._note("The board restarts with the new firmware...")
+                    continue
+                if not b.connected and now - self.started > 30:
+                    self._finish(False, "Lost the board before it had the file. Nothing was installed - check the "
+                                        "connection and try again.")
+                    return
+                if b.connected and now - self.started > 20 and not (u and u["t"] >= self.started):
+                    self._finish(False, "The board didn't start the update (no answer to the request).")
+                    return
+                continue
+            # installing: the board drops off, restarts with the new firmware and comes back
+            if lost_at is None and u and u["t"] > seen_install and u["state"] == 6:
+                self._finish(False, ota_error_text(u["code"]))   # programming could not even start
+                return
+            up_since = (up_since or now) if b.connected else None
+            s = b.latest()
+            restarted = (s is not None and ms_at_install is not None and s["ms"] < ms_at_install
+                         and now - b.last_rx < 1.0)
+            if lost_at is None and (not b.connected or restarted):
+                lost_at = now
+                self._note("The board restarts with the new firmware...")
+            if lost_at is not None and up_since is not None and now - up_since > 2.0 and now - b.last_rx < 1.0:
+                v = self._read_version()
+                if v is None:
+                    if now - lost_at > 90:
+                        self._finish(False, "The board is back but doesn't say which firmware it runs - check the "
+                                            "status bar, and try again if it isn't the new one.")
+                        return
+                    continue
+                if v == target:
+                    self._finish(True, f"Firmware {target} is running. The motors crept back to their positions with "
+                                       "the soft start.")
+                else:
+                    self._finish(False, f"The board restarted but still runs {v} - the WiFi module couldn't program it. "
+                                        "Try again; if it keeps failing, upload over USB with the Arduino IDE.")
+                return
+            if lost_at is None and now - seen_install > 120:
+                self._finish(False, "The board didn't restart after installing. Press its reset button; if its LED keeps "
+                                    "pulsing, upload the firmware over USB with the Arduino IDE.")
+                return
+            if lost_at is not None and now - lost_at > 120:
+                self._finish(False, "The board hasn't come back after installing. If its LED pulses slowly it is waiting "
+                                    "in its bootloader: press reset, or upload over USB with the Arduino IDE.")
+                return
+
+    def _read_version(self, wait=8.0):
+        """The firmware version on this connection: the text in an "SM3U" frame (1.9.2+, b.fw_version is cleared
+        whenever the connection drops), else - firmware without it - the number from [rd!] and a fresh [rdd]."""
+        b = self.board
+        end = time.time() + wait
+        while time.time() < end:
+            if not b.connected:
+                return None
+            if b.fw_version:
+                return b.fw_version
+            b.send(b"[rdu]")
+            t1 = time.time() + 1.0
+            while time.time() < t1:
+                if b.fw_version:
+                    return b.fw_version
+                time.sleep(0.05)
+        if b.connected and b.ping() is not None and b.fw_cache:
+            return fw_text(b.fw_cache[1], b.read_diag() or {})
+        return None
+
+    def status(self):
+        with self.lock:
+            st = {"state": self.state, "stage": self.stage, "msg": self.msg, "file": self._file_public(self.file),
+                  "log": list(self.log[-12:]), "from": self.from_version}
+        u = self.board_state if self.state == "running" else None
+        pct = None
+        if self.state == "running":
+            total = (u or {}).get("total") or (len(self.file["ota"]) if self.file else 0)
+            done = (u or {}).get("done") if (u and u.get("progress")) else self.served
+            if u and u["state"] >= 4:
+                done = total
+            pct = int(min(100, 100 * (done or 0) / total)) if total else None
+        st["progress"] = pct
+        st["board_state"] = OTA_STATES.get((u or {}).get("state"), None) if u else None
+        return st
+
+
+# --------------------------------------------------------------------------------------------------------------
 # Web page and artwork (seat logo, rig and motor pictures cropped from the dashboard design; Michroma font,
 # SIL Open Font License 1.1, Copyright 2011 The Michroma Project Authors)
 # --------------------------------------------------------------------------------------------------------------
@@ -5221,7 +5833,7 @@ svg.i{width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:1.8;stro
 .pill>span:first-child{border-left:0;color:var(--chrome-text);font-weight:600;display:flex;align-items:center;gap:9px}
 .pill .bad{color:#ff5757}.pill .ok{color:#4ade6a}
 .dot{width:13px;height:13px;border-radius:50%;background:#7b8796;display:inline-block;flex:none}
-.dot.on{background:#3ee35b;box-shadow:0 0 8px rgba(62,227,91,.55)}.dot.off{background:#ff4d4f}
+.dot.on{background:#3ee35b;box-shadow:0 0 8px rgba(62,227,91,.55)}.dot.off{background:#ff4d4f}.dot.warn{background:#ffb020}
 .seg{display:flex;border:1px solid var(--chrome-line);border-radius:10px;overflow:hidden;background:#0c141d;height:46px}
 .seg button{display:flex;align-items:center;gap:8px;padding:0 16px;border:0;background:transparent;color:var(--chrome-dim);cursor:pointer;border-left:1px solid var(--chrome-line)}
 .seg button:first-child{border-left:0}
@@ -5253,7 +5865,7 @@ main[data-view=tools]{grid-template-columns:minmax(0,1.75fr) minmax(0,1fr);grid-
 main[data-view=profiles]{grid-template-columns:minmax(0,1fr) minmax(360px,430px);grid-template-areas:"genres pid" "profiles pid"}
 main[data-view=autotune]{grid-template-columns:minmax(360px,430px) minmax(0,1fr);grid-template-areas:"tune tunelog" "graphs graphs"}
 main[data-view=eeprom]{grid-template-columns:minmax(0,1fr) minmax(360px,430px);grid-template-areas:"eeprom pid" "backups pid"}
-main[data-view=settings]{grid-template-columns:repeat(2,minmax(0,1fr));grid-template-areas:"settings global" "settings mnames" "led sensor" "diag diag"}
+main[data-view=settings]{grid-template-columns:repeat(2,minmax(0,1fr));grid-template-areas:"settings global" "settings mnames" "led sensor" "fwupd fwupd" "diag diag"}
 main[data-view=help]{grid-template-columns:1fr;grid-template-areas:"help"}
 main[data-view=seat]{grid-template-columns:minmax(0,1fr) minmax(300px,380px);grid-template-areas:"seat seatlive" "graphs graphs"}
 main[data-view=view3d]{grid-template-columns:1fr;grid-template-areas:"v3d"}
@@ -5433,7 +6045,14 @@ ul.tips{margin:6px 0 10px;padding-left:18px}ul.tips li{color:var(--dim);margin:4
 .help p,.help li{color:var(--dim);max-width:72ch}
 .help ol,.help ul{padding-left:20px;margin:6px 0}
 .msg{margin-top:10px;font-size:13.5px}
-.okc{color:var(--c-f)}.badc{color:var(--red)}
+.okc{color:var(--c-f)}.badc{color:var(--red)}.warnc{color:var(--orange);margin-top:6px}
+.fwpick{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:2px 0 8px}
+.fwpick input[type=file]{position:absolute;width:1px;height:1px;opacity:0;pointer-events:none}
+.fwpick label.btn{cursor:pointer}.fwpick input:disabled+label{opacity:.5;pointer-events:none}
+#fw_board{flex-wrap:nowrap;align-items:flex-start}#fw_board .dot{margin-top:3px}#fw_board span{flex:1;min-width:0}
+.fwinfo{font-size:14px;margin:6px 0 2px;line-height:1.5}.fwinfo b{font-family:var(--mono)}
+.fwhow ol{margin:4px 0 8px;padding-left:20px;font-size:14px;line-height:1.5}.fwhow li{margin:4px 0}
+.fwlog{font-family:var(--mono);font-size:12.5px;color:var(--dim);margin-top:6px;line-height:1.55}
 
 /* tooltips */
 [data-tip]{cursor:help}
@@ -6000,6 +6619,34 @@ details.oks .flist{margin-top:6px}
   <div class="msg" id="sn_msg"></div>
  </section>
 
+ <!-- firmware update (page 2.3, firmware 1.9.2) -->
+ <section class="card wide" id="fwcard" style="grid-area:fwupd" data-views="settings">
+  <div class="ct"><svg class="i" viewBox="0 0 24 24"><path d="M12 15V3M7 8l5-5 5 5"/><path d="M5 15v4a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-4"/></svg>Firmware update <small>over WiFi</small></div>
+  <div class="dgrid">
+   <div>
+    <div class="sstat" id="fw_board"><i class="dot"></i><span>Not read yet</span></div>
+    <span class="lbl" data-k="fw_file">Firmware file - the .bin the Arduino IDE exports (or an .ota)</span>
+    <div class="fwpick"><input type="file" id="fw_file" accept=".bin,.ota" onchange="fwPick()"><label for="fw_file" class="btn b-grey" data-k="fw_file">Choose file…</label><span class="muted" id="fw_fname">No file chosen</span></div>
+    <div class="fwinfo" id="fw_info"></div>
+    <div class="sbtns">
+     <button class="btn b-orange" id="fw_go" data-k="fw_go" onclick="fwAsk()" disabled>Install on the board</button>
+     <button class="btn b-grey" id="fw_clear" data-k="fw_clear" onclick="fwClear()" hidden>Forget the file</button>
+    </div>
+    <div id="fw_run" hidden><div class="bar"><div id="fw_bar"></div></div><div class="muted" id="fw_stage"></div></div>
+    <div class="msg" id="fw_msg"></div>
+    <div class="fwlog" id="fw_log"></div>
+   </div>
+   <div class="fwhow">
+    <ol>
+     <li>Open the new <b>SMC3_R4 .ino</b> in the Arduino IDE (board: Arduino UNO R4 WiFi). The WiFi name and password may stay as placeholders - the board remembers its own.</li>
+     <li><b>Sketch, Export Compiled Binary</b>. The .bin lands in the sketch's folder, under <code>build/arduino.renesas_uno.unor4wifi</code>.</li>
+     <li>Choose that .bin here and press <b>Install</b>.</li>
+    </ol>
+    <p class="note">The motors switch off, the board's WiFi module downloads the file, checks it and installs it (under a minute), then the board restarts and the seat creeps back with the soft start. Keep the seat empty and pause SimHub's motion output - the update stops if SimHub is sending. If anything fails before installing, the old firmware keeps running.</p>
+   </div>
+  </div>
+ </section>
+
  <!-- diagnostics -->
  <section class="card wide" id="diagcard" style="grid-area:diag" data-views="settings">
   <div class="ct"><svg class="i" viewBox="0 0 24 24"><path d="M3 12h4l2-5 4 10 2-5h6"/><circle cx="20" cy="12" r="1.2"/></svg>Diagnostics</div>
@@ -6041,6 +6688,7 @@ details.oks .flist{margin-top:6px}
     <h3>Selected motor</h3><p>Click a motor card or chart, or choose a motor in Test Signal or Auto-Tune: the same motor is highlighted everywhere. While a test signal or auto-tune runs, its chart is marked and the others fade.</p>
     <h3>Diagnostics</h3><p>Settings section. <b>Quick check</b> reads the board and listens for a few seconds; <b>Full check</b> also moves each motor a little to see which way it goes, how much drive it needs, whether the wiring is swapped and how it answers a small step - and can ask you what you saw. Both make one file (saved on the NAS too) to download and give to whoever helps you. The page also watches while you drive and notes pot glitches, a motor moving the wrong way or stalling, hunting, cutoffs, the tilt limit and board restarts. It also keeps a <b>load map</b>: where each motor falls behind or runs at full power, each way across its travel - a quick check after a session names where the rig struggles (lifting a heavy driver, say). With the motion sensor, the full check also measures the seat itself: degrees per count, bounce and play in the linkage - for the traction-loss motor, how far the seat turns. For the rear slide it asks whether the rear went left or right.</p>
     <h3>Status bar</h3><p>LOW POWER means no position commands for 15 s, so the board runs at quarter drive until SimHub or this page sends targets again.</p>
+    <h3>Firmware update (firmware 1.9.2)</h3><p>Settings, Firmware update installs new firmware over WiFi - no USB cable, and SimHub can stay open (with its motion output paused). In the Arduino IDE open the new .ino and use <b>Sketch, Export Compiled Binary</b>; choose that .bin on the page and press Install. The page checks the file (an SMC3_R4 build for the UNO R4 WiFi, and which version), the board switches the motors off, its WiFi module downloads and checks the file and installs it, and the page confirms the new version once the board is back. The board remembers the WiFi name and password it last joined with, so a build with the placeholders still connects. Needs the WiFi module's own firmware 0.4.0 or newer (0.5.0+ shows progress). The first install of 1.9.2 itself goes over USB.</p>
     <h3>Soft start (firmware 1.9.1)</h3><p>After the rig has been off the seat may have ridden down a little. At power-up, and when you press Enable Motors, each motor creeps from wherever it is to its position (SimHub's centre at power-up) instead of jumping there - 60 counts/s by default, easing in and out. Once it has caught up everything runs normally. A seat that rode down past an end stop is allowed to come back (only going further out switches the motor off), the tilt limit waits, and the board keeps full power meanwhile. Settings, Loop, PWM &amp; smoothing: Soft start.</p></div>
    <div><h3>Seat setup (firmware 1.9)</h3><p>Levels the platform first and makes that SimHub's centre: the board adds a <b>level trim</b> to every position SimHub sends, so SimHub's middle (512) is the level seat - and the seat goes level at power-up. With the motion sensor it levels itself (each motor moves a little to learn how it tilts the seat, then the page moves them until the sensor reads level, choosing the level position nearest the middle of every motor); without it you nudge the motors with a spirit level on the seat. On a traction-loss rig only motors 1 and 2 level the seat; you <b>centre</b> motor 3, the rear slide, so the seat points straight ahead, and tell the page which way the rear went for +10.</p>
     <p>Then each motor moves slowly away from level, both ways, and stops at the tilt you allow, when it pushes against something, at the end of its Clip window, or when you press Stop (space bar). The rear slide stops at the <b>traction loss you allow</b> - how far the seat may turn each way, measured by the sensor. From what it found the page suggests <b>travel limits</b> (the board never sends a motor past them), <b>end stops</b> (a motor that gets past one anyway is switched off: E1-E3) and <b>tilt limits</b> for each direction (every motor stops: E4). While Seat setup is open the board ignores SimHub's positions; Cancel puts everything back. Auto-tune, the test signal and the full check stay inside the travel limits.</p>
@@ -6051,7 +6699,8 @@ details.oks .flist{margin-top:6px}
      <tr><td>E1 E2 E3</td><td><code>ERROR E2 MOTOR 2 CUTOFF</code> - that motor's pot went past its safety cutoff (Max limit) or one of its end stops (Seat setup, firmware 1.9), so the board switched the motor off. Its bar blinks.</td><td>Look for the cause: pot slipped on its shaft or came loose, motor wired backwards (it ran to the end), broken pot wire, Max limit too close to the real travel, an end stop too close to its travel limit (raise the End stop margin in Seat setup). Then Enable Motors. The Diagnostics full check pinpoints most of these.</td></tr>
      <tr><td>E4</td><td><code>ERROR E4 TILT LIMIT</code> - the motion sensor saw the seat tilt past one of your tilt limits, so every motor stopped.</td><td>Find why the seat went that far (a slipped pot, a motor that ran away, SimHub's output too strong), then Enable Motors. If nothing was wrong, the limit is too tight for your games - raise it under Settings, Motion sensor, or run Seat setup with "Keep combined moves within the tilt I allow" ticked.</td></tr>
      <tr><td>E5</td><td><code>ERROR E5 NO SENSOR</code> - the sensor is switched on, but nothing arrives from it, so the tilt limit can't protect the rig.</td><td>Sensor VCC to 5V, GND to GND, the sensor's TX (yellow) through the MAX3232 to D0, the MAX3232 powered from 5V. Or switch the sensor off in Settings if you removed it.</td></tr>
-     <tr><td>E9</td><td><code>ERROR E9 NO WIFI</code> - can't join the network, or the WiFi dropped. It retries every 30 s while SimHub is idle.</td><td>WIFI_SSID / WIFI_PASS in the firmware; the network must be 2.4 GHz with WPA2 (not WPA3-only); signal strength where the rig is. SimHub over USB keeps working.</td></tr>
+     <tr><td>E7</td><td><code>ERROR E7 UPDATE FAILED</code> - a firmware update from this page stopped before installing (firmware 1.9.2). The old firmware is running; the motors stay off.</td><td>Settings, Firmware update says why. Try again (Forget the file clears the message), or Enable Motors to carry on with the old firmware.</td></tr>
+     <tr><td>E9</td><td><code>ERROR E9 NO WIFI</code> - can't join the network, or the WiFi dropped. It retries every 30 s while SimHub is idle.</td><td>WIFI_SSID / WIFI_PASS in the firmware (1.9.2 remembers the last ones that worked); the network must be 2.4 GHz with WPA2 (not WPA3-only); signal strength where the rig is. SimHub over USB keeps working.</td></tr>
      <tr><td>E8</td><td><code>ERROR E8 NO IP ADDRESS</code> - joined the network, but the router hasn't given it an address yet. It keeps asking.</td><td>Check the router's DHCP; reserve an address for the board (it shows as smc3-r4). SimHub over USB keeps working.</td></tr>
      <tr><td>E0</td><td><code>ERROR E0 WIFI MODULE</code> - the board's WiFi chip doesn't answer.</td><td>Unplug the board for 10 s. Update the UNO R4 WiFi's radio firmware (Arduino IDE: Tools, Firmware Updater). SimHub over USB keeps working.</td></tr>
     </table><p class="muted" style="font-size:12.5px">Firmware 1.7 and older show dots along the bottom row and "E" plus motor numbers instead.</p>
@@ -6071,6 +6720,17 @@ details.oks .flist{margin-top:6px}
   <li>Takes about 2-3 minutes. Nothing is saved until you press <b>Save to EEPROM</b>; <b>Revert</b> undoes it.</li>
  </ul>
  <div style="display:flex;gap:10px;margin-top:12px"><button class="btn b-green" onclick="tuneStart()">Start auto-tune</button><button class="btn b-grey" onclick="closeModal('mTune')">Cancel</button></div>
+</div></div>
+
+<div class="modal" id="mFw"><div class="box">
+ <h2>Install firmware <span id="mf_v"></span></h2>
+ <ul>
+  <li><b>Seat empty</b>, your hand near the <b>motor power switch</b>. The motors switch off now and creep back to their positions when the new firmware starts.</li>
+  <li>SimHub's motion output <b>paused</b> (or SimHub closed). The board's WiFi module installs the firmware over the same link SimHub uses, so the update stops if SimHub is sending.</li>
+  <li>Takes under a minute. Don't switch the rig off meanwhile. If it fails before installing, the old firmware keeps running; if the board doesn't come back, press its reset button or upload over USB.</li>
+ </ul>
+ <p class="note" id="mf_note"></p>
+ <div style="display:flex;gap:10px;margin-top:12px"><button class="btn b-orange" onclick="fwInstall()">Install</button><button class="btn b-grey" onclick="closeModal('mFw')">Cancel</button></div>
 </div></div>
 
 <div class="modal" id="mDiag"><div class="box">
@@ -6145,6 +6805,9 @@ const TIPS={
  sn_setup:"The WT901C leaves the factory at 10 readings per second. This sets it to 100 per second at 115200 baud - with firmware 1.9 angles, gyro and acceleration (for the 3D view), with 1.8 angles only - and saves that in the sensor. Needs the board's D1 wired through the MAX3232 to the sensor's RX (green). If SimHub also reads the sensor, set it in WitMotion's PC software instead.",
  sn_search:"The board tries the usual baud rates until the sensor answers - normally by itself while the sensor is switched on. This makes it look again for 30 s.",
  smooth:"<b>Target smoothing</b> - how softly the motor eases into each new position SimHub sends (a low-pass filter on the target).<br><br><b>Off / 4 ms:</b> raw, every bump and kerb comes through - rally.<br><b>8-16 ms:</b> crisp but not jagged - circuit racing.<br><b>32-64 ms:</b> soft and floaty - flight, space, trucks.<br><br>Times are at Fpid/1 (double them at Fpid/2). Needs firmware 1.6.",
+ fw_file:"<b>Firmware file</b> (firmware 1.9.2 on the board). In the Arduino IDE: open the new SMC3_R4 .ino, choose Arduino UNO R4 WiFi, then <b>Sketch, Export Compiled Binary</b>. Pick the <b>.bin</b> it writes into the sketch's build folder (not the .hex or .elf). The page checks it before anything is sent to the board.",
+ fw_go:"<b>Install on the board</b>: the motors switch off, the board's WiFi module downloads the file from this page, checks it and installs it, the board restarts and the seat creeps back with the soft start. Under a minute. Pause SimHub's motion output first.",
+ fw_clear:"Forget the chosen file (and clear a failed update's message on the board and the matrix).",
  soft:"<b>Soft start</b> (firmware 1.9.1). When the rig has been off, the seat may have ridden down a little. At power-up - and when you press Enable Motors - each motor creeps from wherever it is to where it should be at this speed, easing in and out, instead of jumping there; once it has caught up everything runs normally. 60 counts/s moves a lift about 2° a second. Meanwhile a seat that rode down past an end stop may come back, and the tilt limit waits. Saved on the board at once.",
  applySoft:"Sends the soft-start speed to the board; it is saved there at once (no Save to EEPROM needed).",
  maxrate:"<b>Max speed</b> - the fastest the target may move, in counts per second (full travel is about 820 counts). 0 = no limit.<br><br>A cap like 1500-2000 stops sudden lurches (crashes, game resets) and makes flight feel calmer. Needs firmware 1.6.",
@@ -6313,7 +6976,7 @@ function showView(){let v=location.hash.slice(1);if(!VIEWS.includes(v))v='dashbo
  document.querySelectorAll('#nav a').forEach(a=>a.classList.toggle('on',a.getAttribute('href')==='#'+v));
  const eb=$('expBtn');eb.dataset.k=v==='graphs'?'collapse':'expand';eb.dataset.tip=TIPS[eb.dataset.k];
  eb.innerHTML=v==='graphs'?'<svg class="i" viewBox="0 0 24 24"><path d="M4 14h6v6M20 10h-6V4M14 10l7-7M3 21l7-7"/></svg>':'<svg class="i" viewBox="0 0 24 24"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>';
- if(v==='profiles'){loadProfiles();loadGenres();} if(v==='settings'){fillSettings();diagLists();loadBoard(true);} if(v==='tuning')loadBoard(true); if(v==='eeprom')loadBackups();
+ if(v==='profiles'){loadProfiles();loadGenres();} if(v==='settings'){fillSettings();diagLists();loadBoard(true);fwLoad(true);} if(v==='tuning')loadBoard(true); if(v==='eeprom')loadBackups();
  if(v==='seat'){ssFilled=null;ssPoll();} if(typeof v3Show==='function')v3Show(v==='view3d');
  chartHeight();}
 window.addEventListener('hashchange',showView);
@@ -6349,6 +7012,44 @@ async function scan(){$('scanBtn').disabled=true;$('s_msg').textContent='Searchi
   else $('s_msg').innerHTML='Found: '+r.found.map(h=>'<button class="btn b-blue" onclick="useHost(\''+esc(h)+'\')">Use '+esc(h)+'</button>').join(' ');
  }finally{$('scanBtn').disabled=false;}}
 function useHost(h){$('s_host').value=h;saveSettings();}
+
+// ---------- firmware update over WiFi (page 2.3, firmware 1.9.2) ----------
+let fwSt=null,fwTimer=null;
+const kB=n=>Math.round((n||0)/1024)+' kB';
+async function fwLoad(fresh){try{fwShow(await (await fetch('/fw/status'+(fresh?'?fresh=1':''))).json());}catch(e){}}
+function fwShow(r){fwSt=r;const b=r.board||{},f=r.file,running=r.state==='running';
+ let cls,h;
+ if(!b.connected){cls='off';h='The board is not connected.';}
+ else if(!b.capable){cls='warn';h=esc(b.problem||'This board can\'t be updated from the page.');}
+ else{cls='on';h='Board runs firmware <b>'+esc(b.fw||'?')+'</b> · WiFi module '+esc(b.module||'unknown')+(b.remembered?' · remembers its WiFi':'');}
+ $('fw_board').innerHTML=`<i class="dot ${cls}"></i><span>${h}</span>`;
+ $('fw_info').innerHTML=f?`<b>SMC3_R4 ${esc(f.version)}</b> · ${esc(f.name||'')} · ${kB(f.bin_bytes)} (${kB(f.ota_bytes)} to download)`
+   +(b.fw&&f.version===b.fw?' <span class="muted">- the version the board runs now</span>':'')
+   +(f.warnings||[]).map(w=>`<div class="warnc">${esc(w)}</div>`).join(''):'';
+ if(f)$('fw_fname').textContent=f.name||'';else if(!running)$('fw_fname').textContent='No file chosen';
+ $('fw_go').disabled=!f||!b.capable||running;$('fw_clear').hidden=(!f&&r.state!=='failed')||running;$('fw_file').disabled=running;
+ $('fw_run').hidden=!running&&r.state!=='done';
+ $('fw_bar').style.width=(r.state==='done'?100:(r.progress||0))+'%';
+ $('fw_stage').textContent=running?(r.stage||'Starting…')+(r.progress!=null&&r.board_state==='downloading'?` ${r.progress}%`:''):'';
+ $('fw_msg').innerHTML=r.state==='done'?'<span class="okc">'+esc(r.msg)+'</span>':(r.state==='failed'?'<span class="badc">'+esc(r.msg)+'</span>':'');
+ $('fw_log').innerHTML=(running||r.state==='failed'||r.state==='done')?(r.log||[]).map(l=>`${l[0].toFixed(1).padStart(5,' ')} s  ${esc(l[1])}`).join('<br>'):'';
+ if(running&&!fwTimer)fwTimer=setInterval(()=>fwLoad(false),700);
+ if(!running&&fwTimer){clearInterval(fwTimer);fwTimer=null;if(r.state==='done'){toast(esc(r.msg));loadBoard(true);}else if(r.state==='failed')toast('Firmware update failed - see Settings.');}}
+async function fwPick(){const inp=$('fw_file'),file=inp.files&&inp.files[0];if(!file)return;
+ $('fw_fname').textContent=file.name;$('fw_msg').textContent='Checking the file…';$('fw_info').innerHTML='';$('fw_go').disabled=true;
+ try{const r=await (await fetch('/fw/upload?name='+encodeURIComponent(file.name),{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:await file.arrayBuffer()})).json();
+  if(!r.ok){$('fw_msg').innerHTML='<span class="badc">'+esc(r.error||'That file can\'t be used.')+'</span>';return;}
+  $('fw_msg').textContent='';fwShow({...r,board:(fwSt||{}).board||r.board});fwLoad(true);}
+ catch(e){$('fw_msg').innerHTML='<span class="badc">Couldn\'t send the file to the page.</span>';}
+ finally{inp.value='';}}
+function fwAsk(){const f=fwSt&&fwSt.file,b=(fwSt||{}).board||{};if(!f)return;
+ $('mf_v').textContent=f.version;
+ $('mf_note').innerHTML=(b.fw?`The board runs ${esc(b.fw)} now`+(b.fw===f.version?' - the same version (installing it again is fine).':'.'):'')+(f.warnings||[]).map(w=>' '+esc(w)).join('');
+ openModal('mFw');}
+async function fwInstall(){closeModal('mFw');const r=await post('/fw/install',{});
+ if(!r.ok){$('fw_msg').innerHTML='<span class="badc">'+esc(r.error||'The update didn\'t start.')+'</span>';return;}
+ fwShow({...r,board:(fwSt||{}).board});}
+async function fwClear(){await post('/fw/clear',{});fwLoad(true);}
 
 // ---------- board settings (firmware 1.8): LED matrix and motion sensor ----------
 let boardSet=null;
@@ -7259,6 +7960,7 @@ class Handler(BaseHTTPRequestHandler):
     monitor: Monitor = None
     diag: Diagnostics = None
     seat: "SeatSetup" = None
+    fwup: "FirmwareUpdate" = None
 
     def log_message(self, *a):          # quiet
         pass
@@ -7283,7 +7985,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def _fw(self):
         fw = self.board.fw_cache
-        return fw_text(fw[1], self.board.diag) if fw else ("≤1.3" if self.board.params.get("Kp1") is not None else "")
+        return fw_text(fw[1], self.board.diag, self.board.fw_version) if fw else \
+            ("≤1.3" if self.board.params.get("Kp1") is not None else "")
 
     def do_GET(self):
         u = urlparse(self.path)
@@ -7317,6 +8020,25 @@ class Handler(BaseHTTPRequestHandler):
                                  "trim": [self.board.trim(m) for m in range(3)]}})
         elif u.path == "/config":
             self._json(self.cfg.public())
+        elif u.path == "/fw/status":                     # 2.3: firmware update
+            st = self.fwup.status()
+            st["board"] = self.fwup.board_view(fresh=parse_qs(u.query).get("fresh", ["0"])[0] == "1")
+            self._json(st)
+        elif u.path.startswith("/ota/"):                 # 2.3: the board's WiFi module fetches the firmware here
+            body = self.fwup.serve(u.path[5:])
+            if body is None:
+                self._json({"error": "not found"}, 404)
+                return
+            head = (f"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {len(body)}\r\n"
+                    "Cache-Control: no-store\r\nConnection: close\r\n\r\n").encode()
+            self.close_connection = True
+            try:
+                # one write: the WiFi module reads the file's 20-byte header from the first piece it receives
+                self.wfile.write(head + body)
+                self.wfile.flush()
+                self.fwup.sent(len(body))
+            except OSError:
+                pass
         elif u.path == "/seat/status":
             self._json(self.seat.status())
         elif u.path == "/seat/geometry":
@@ -7476,11 +8198,26 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         n = int(self.headers.get("Content-Length", "0") or 0)
+        if self.path.startswith("/fw/upload"):           # 2.3: the firmware file, as it is
+            if n <= 0 or n > 2_000_000:
+                self.rfile.read(min(max(n, 0), 2_000_000))
+                self._json({"ok": False, "error": "That file is empty or far too big for the board."})
+                return
+            raw = self.rfile.read(n)
+            name = parse_qs(urlparse(self.path).query).get("name", ["firmware.bin"])[0][:120]
+            self._json(self.fwup.prepare(raw, name))
+            return
         try:
             req = json.loads(self.rfile.read(n) or b"{}")
         except ValueError:
             req = {}
         p = self.path
+        if p == "/fw/install":
+            self._json(self.fwup.install())
+            return
+        if p == "/fw/clear":
+            self._json(self.fwup.clear())
+            return
         if p == "/cmd":
             ok = False
             if self.diag.moving() and ("word" in req or "pair" in req):
@@ -7817,12 +8554,29 @@ def main():
     Handler.monitor.diag = Handler.diag
     Handler.seat = SeatSetup(board, gen, Handler.tuner, Handler.diag, cfg, events, args.data)
     Handler.monitor.seat_setup = Handler.seat
+    Handler.fwup = FirmwareUpdate(board, cfg, events, args.bind)
+
+    def busy():
+        if Handler.seat.state != "idle":
+            return "Seat setup is open - finish or cancel it first."
+        if Handler.diag.moving():
+            return "The diagnostics check is moving the motors - wait for it or stop it."
+        if Handler.tuner.running():
+            return "Auto-tune is running - wait for it or stop it."
+        if gen.mode != "off":
+            return "A test signal is running - stop it first."
+        return None
+    Handler.fwup.busy_check = busy
+    Handler.diag.fwup = Handler.fwup
     events.add("scope", f"smc3_scope v{VERSION} started (board {cfg.get('host') or 'not set'}:{cfg.get('port')}, "
                f"{cfg.get('motors')} motors in use).", quiet=True)
 
     def on_connect():
         # remember what the board runs when we first see it, and keep unused motors off
+        cid = board.conn_id
         time.sleep(1.5)
+        if board.conn_id != cid or not board.connected:  # that connection is gone already
+            return
         pr = board.read_params()
         if pr.get("Kp1") is not None:
             Handler.backups.add("auto", "Settings found on the board when the page connected", pr)
@@ -7833,6 +8587,7 @@ def main():
         sync_unused(board, cfg)
         if board.fwnum() >= 19:
             board.send(b"[xe1]")                         # the sensor's acceleration + gyro after every burst (3D view)
+            board.send(b"[rdu]")                         # 1.9.2+: firmware update state and the version text
             board.read_diag()                            # the seat set-up running on the board
     board.on_connect = on_connect
     board.start()
@@ -7847,6 +8602,7 @@ def main():
     if srv is None:
         raise SystemExit("no free port found")
     srv.daemon_threads = True
+    Handler.fwup.port = srv.server_address[1]           # the board fetches firmware updates from this port
     where = "localhost" if args.bind == "127.0.0.1" else "<this machine's IP>"
     log(f"smc3_scope v{VERSION}   board {cfg.get('host') or '(not set)'}:{cfg.get('port')}   "
         f"page http://{where}:{port}   settings {cfg.path}")

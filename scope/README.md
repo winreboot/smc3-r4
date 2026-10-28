@@ -27,7 +27,7 @@ python3 smc3_scope.py --host 192.168.1.50 --bind 0.0.0.0 --web 8198
 | `--host` | `SMC3_HOST` | (none) | The board's address. You can also set it in the page; the page's setting wins after the first start. |
 | `--port` | `SMC3_PORT` | 4210 | `TELEMETRY_PORT` in the firmware. |
 | `--web` | `SMC3_WEB_PORT` | 8080 (compose: 8198) | Port of the page. If it's busy, the next free one is used. |
-| `--bind` | `SMC3_BIND` | 127.0.0.1 (Docker: 0.0.0.0) | 127.0.0.1 = this machine only; 0.0.0.0 = the whole LAN. |
+| `--bind` | `SMC3_BIND` | 127.0.0.1 (Docker: 0.0.0.0) | 127.0.0.1 = this machine only; 0.0.0.0 = the whole LAN (the board fetches firmware updates from the page, so updates need it). |
 | `--data` | `SMC3_DATA_DIR` | `./smc3-scope-data` (Docker: `/data`) | Where everything below is kept. |
 
 ## The data folder
@@ -46,6 +46,12 @@ To upgrade, rebuild with the new `smc3_scope.py`. Keep the data folder, and ever
 
 The LED matrix and motion sensor settings (firmware 1.8) and the seat set-up (firmware 1.9: level trim, travel
 limits, end stops, tilt limits) are not in the data folder: they live on the board itself, so they stay with the rig.
+
+## Firmware updates
+
+Settings, Firmware update (firmware 1.9.2 on the board) keeps the chosen file in memory only. While an update runs
+the board fetches it from `http://<this machine>:<web port>/ota/<number>.ota`; that address answers only during an
+update and only for its number.
 
 ## Security
 

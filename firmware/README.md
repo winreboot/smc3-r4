@@ -27,6 +27,11 @@ What the R4 hardware adds:
 - **Soft start** (1.9.1): at power-up and after Enable Motors each motor creeps from wherever it is to its
   position (60 counts/s by default, set in the page) instead of jumping there - a seat that rode down while the rig
   was off comes back gently.
+- **Firmware update over WiFi** (1.9.2): the page serves the new firmware and the board's WiFi module downloads,
+  checks and installs it - the same route as a USB upload. The motors are switched off first; the new firmware
+  starts with the soft start.
+- **WiFi memory** (1.9.2): the board remembers the WiFi name and password it last joined with, so a build with the
+  placeholders (or an old password) still connects.
 - **WiFi telemetry** at 100 samples a second to `smc3_scope`, plus live tuning and diagnostics. See
   [docs/PROTOCOL.md](../docs/PROTOCOL.md).
 
@@ -35,6 +40,29 @@ What the R4 hardware adds:
 1. In the Arduino IDE, use Boards Manager to install **Arduino UNO R4 Boards**, then select **Arduino UNO R4 WiFi**.
 2. Open `SMC3_R4/SMC3_R4.ino` and set **`WIFI_SSID`** and **`WIFI_PASS`** (2.4 GHz only).
 3. Upload. The address scrolls across the matrix at power-up.
+
+### Updating from the page (1.9.2 and later)
+
+Once the board runs 1.9.2, later firmware can be installed over WiFi:
+
+1. Open the new sketch and choose **Sketch, Export Compiled Binary**. `WIFI_SSID` / `WIFI_PASS` may stay as
+   placeholders - the board uses the details it remembers.
+2. In the page, Settings, **Firmware update**: choose the `.bin` from the sketch's `build/arduino.renesas_uno.unor4wifi`
+   folder and press Install, with the seat empty and SimHub's motion output paused.
+
+The page converts the `.bin` into the UNO R4 WiFi's `.ota` format and serves it. The board switches the motors off;
+its WiFi module downloads the file into its own storage, checks it (magic number, CRC) and programs the board through
+its bootloader. The board restarts with the new firmware and the page checks the version.
+
+- It needs the WiFi module's own firmware **0.4.0 or newer**; 0.5.0 or newer also reports progress. Update it once
+  with the Arduino IDE, Tools, Firmware Updater.
+- It is refused while anything is sent over USB in the last 3 s (SimHub, SMC3Utils): the WiFi module programs the
+  board over that same serial link.
+- If the download or the check fails, the old firmware keeps running and the matrix scrolls
+  `ERROR E7 UPDATE FAILED` until the page clears it. If programming itself fails half-way, the board waits in its
+  bootloader (its LED pulses): press reset, or upload over USB.
+- The sketch includes `OTAUpdate.h`, which comes with the UNO R4 boards package (1.0.5 or newer; 1.3.0 or newer for
+  the progress). Nothing to install.
 
 ### Options (top of the sketch)
 
@@ -123,6 +151,7 @@ lapses by itself after 3 s if the page goes away). The commands are in [docs/PRO
 
 | Version | Change |
 |---|---|
+| 1.9.2 | Firmware update over WiFi from the page (`[u..]`, `[rdu]`, "SM3U"; uses the board's WiFi module and `OTAUpdate.h` from the boards package). The board remembers the WiFi name and password it last joined with (EEPROM 112-210). `[rdd]` frame version 5. Matrix: `ERROR E7 UPDATE FAILED`. |
 | 1.9.1 | Soft start: after power-up and Enable Motors each motor creeps to its position instead of jumping (`[k 82 '=']` sets the speed, EEPROM 105-107); a seat that rode down past an end stop may come back, PWMrev stays off and the tilt limit waits meanwhile. `[rdd]` frame version 4. |
 | 1.9 | Seat set-up: level trim, travel limits and end stops per motor and direction, tilt limits per direction (`[w..]`, `[k..]`, EEPROM 66-104). The page can hold SimHub off while it moves the seat (`[kH n]`). The sensor's gyro and acceleration are read and sent to the page (`[xe1]`, "SM3X"); `[iS..]` can ask for them. `[rdd]` frame version 3. |
 | 1.8.1 | Compiles in the Arduino IDE (1.8 didn't). Same features. |

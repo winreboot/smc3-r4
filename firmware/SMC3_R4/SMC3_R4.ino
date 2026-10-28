@@ -41,8 +41,22 @@
 // Pots: wiper must stay within 0-5 V (the R4 is a 5 V board, so existing wiring is fine).
 //****************************************************************************************************************
 
-#define FW_VERSION     "1.9.1"         // shown in the USB boot banner; [ver] still answers 70 for SMC3Utils
+#define FW_VERSION     "1.9.2"         // shown in the USB boot banner; [ver] still answers 70 for SMC3Utils
 #define FW_VERSION_NUM 19              // reported by [rd!] so smc3_scope can check what it is talking to (1.9.x = 19)
+#define FW_CAPS        "SMC3CAPS:ota1,wifimem1"   // 1.9.2: what this build can do - smc3_scope looks for it in a .bin
+
+// v1.9.2 changes: firmware update over WiFi, from smc3_scope's Settings.  The page converts the .bin the Arduino IDE
+//                exports (Sketch, Export Compiled Binary) into the UNO R4 WiFi's .ota format and serves it; the board's
+//                WiFi module downloads it, checks it and flashes the board - the same way it does a USB upload - and the
+//                new firmware starts with the soft start.  The motors are switched off first; it is refused while
+//                SimHub is sending over USB (the WiFi module flashes the board over that same link).  Needs the WiFi
+//                module's firmware 0.4.0 or newer (0.5.0 or newer for a progress bar).
+//                [w hi lo] + [uP=] / [uT=] set the page's web port and the file's number, [uI=] [uJ=] the page's
+//                address (optional: by default the address the page connects from), [uGO] starts, [uOK] clears a
+//                finished or failed update.  "SM3U" frames report how it is going.
+//                The board remembers the WiFi name and password it last joined with (EEPROM 112-210): a build that
+//                still has the placeholders (or a wrong password) uses the remembered ones.
+//                [rdd] frame version 5 adds the WiFi module's firmware version, the WiFi memory and the last update.
 
 // v1.9.1 changes: soft start.  At power-up, and when a motor is switched back on (Enable Motors), each motor creeps
 //                from wherever it is to where it should be - SimHub's centre at power-up - at the soft-start speed
@@ -164,6 +178,8 @@
 #define ENABLE_WIFI    1                   // 0 = no networking at all
 #define WIFI_SSID      "YourNetworkName"   // 2.4 GHz network (the ESP32-S3 module has no 5 GHz)
 #define WIFI_PASS      "YourPassword"
+// 1.9.2: the board remembers the name and password it last joined with. Leave the placeholders above and it uses the
+// remembered ones (handy for builds you install from the page); put new ones in to change network.
 #define WIFI_HOSTNAME  "smc3-r4"           // shows up in your router's client list
 #define TELEMETRY_PORT 4210                // TCP port smc3_scope.py connects to
 
@@ -241,6 +257,10 @@
 //                              f = 82: soft-start speed, counts/s, 0 = off (saved at once) - 1.9.1
 //    [kSV] [kRL] [kCL] [kHn]   Seat set-up: save, reload saved, clear, page holds the seat n x 100 ms - 1.9
 //    [xe1] / [xe0]             Sensor acceleration + gyro after every telemetry burst on / off - 1.9
+//    [uP=] [uT=] [uI=] [uJ=]   Firmware update (WiFi client only): value register = the page's web port, the
+//                              file's number (http://<page>:<port>/ota/<number, 4 hex digits>.ota), the page's
+//                              address bytes 1-2 / 3-4 (0 = the address the page connects from) - 1.9.2
+//    [uGO] / [uOK]             Start the update / clear a finished or failed one - 1.9.2
 //    [sav]                     Save parameters to EEPROM (and the seat set-up, 1.9)
 //    [ver]                     Software version (replies 70 so SMC3Utils is happy)
 
@@ -252,6 +272,7 @@
 #endif
 #if ENABLE_WIFI
 #include <WiFiS3.h>
+#include <OTAUpdate.h>                         // 1.9.2: comes with the UNO R4 boards package (no install needed)
 #endif
 
 //----------------------------------------------------------------------------------------------------------------
@@ -346,6 +367,7 @@ volatile uint32_t IsrCyclesMax = 0;                            // worst-case ISR
 #define DIS_COMMAND 2                                          // [dis]/[di1-3] - Disable Motors or unused motor
 #define DIS_BOOT    3                                          // not enabled yet after power-up
 #define DIS_TILT    4                                          // 1.8: the seat tilted past the tilt limit
+#define DIS_UPDATE  5                                          // 1.9.2: switched off for a firmware update
 
 volatile uint8_t  DisableReason[NUM_MOTORS] = {DIS_BOOT, DIS_BOOT, DIS_BOOT};
 volatile uint16_t CutoffTrips[NUM_MOTORS]   = {0, 0, 0};       // since power-up
@@ -401,7 +423,77 @@ unsigned int  TcpRxBuffer[5] = {0};
 uint8_t       TelBuf[6 + TEL_MAX_SAMPLES * TEL_SAMPLE_BYTES + 6 + TEL_EXTRA_BYTES];
 uint8_t       TelCount = 0;
 bool          TelExtras = false;               // [xe1]: the page wants "SM3X" frames (off for every new client)
+
+// 1.9.2: WiFi memory - the name and password the board last joined with.  EEPROM 112 = 0xC7 "valid", 113 = length of
+// the name, 114-145 the name, 146 = length of the password, 147-210 the password.
+#define WIFI_EE        112
+#define WIFI_EE_PASS   146
+char          WifiMemSsid[33] = "";
+char          WifiMemPass[65] = "";
+bool          WifiMem = false;                 // EEPROM holds a name and password
+uint8_t       WifiFrom = 0;                    // joined with 0 = the sketch's name and password, 1 = the remembered ones
+uint32_t      WifiFw = 0;                      // the WiFi module's firmware, 0xMMmmpp (0 = unknown)
+
+// 1.9.2: firmware update over WiFi
+#define OTA_IDLE         0
+#define OTA_PREP         1                     // motors braking
+#define OTA_BEGIN        2                     // asking the WiFi module to fetch the file
+#define OTA_DOWNLOAD     3
+#define OTA_VERIFY       4                     // the WiFi module checks the file
+#define OTA_FLASH        5                     // the WiFi module programs the board (this firmware stops here)
+#define OTA_FAILED       6
+#define OTA_FILE         "/update.bin"         // on the WiFi module's own storage
+#define OTA_ERR_SIMHUB   -100                  // SimHub (or SMC3Utils) is sending over USB
+#define OTA_ERR_OLDWIFI  -101                  // WiFi module firmware older than 0.4.0
+#define OTA_ERR_NOURL    -102                  // the page didn't say where the file is
+#define OTA_ERR_STALLED  -103                  // the download stopped moving
+#define OTA_ERR_FLASH    -104                  // the WiFi module could not program the board
+#define OTA_NO_PROGRESS  -1000                 // this boards package has no non-blocking download (before 1.3.0)
+OTAUpdate     Ota;
+uint8_t       OtaState = OTA_IDLE;
+int16_t       OtaCode = 0;                     // 0 = fine, < 0 = why it stopped (OTA_ERR_... or the WiFi module's code)
+uint32_t      OtaDone = 0, OtaTotal = 0;       // bytes downloaded / size of the file
+bool          OtaProgress = false;             // the download reports its progress
+uint16_t      OtaPort = 0, OtaToken = 0;       // [uP=] [uT=]
+uint16_t      OtaIpHi = 0, OtaIpLo = 0;        // [uI=] [uJ=] (0 = the address the page connects from)
+char          OtaUrl[64] = "";
+unsigned long OtaSince = 0, OtaLastPoll = 0, OtaLastMove = 0, OtaLastFrame = 0;
+bool          OtaFrameDue = false;             // send an "SM3U" frame with the next network service
 #endif
+
+static inline bool UpdateRunning()             // 1.9.2: a firmware update is under way (the motors stay off)
+{
+#if ENABLE_WIFI
+    return OtaState >= OTA_PREP && OtaState <= OTA_FLASH;
+#else
+    return false;
+#endif
+}
+
+int8_t UpdateShow()                            // 1.9.2, for the matrix: -1 no update, 0-100 downloaded %, 101 installing
+{
+#if ENABLE_WIFI
+    if (!UpdateRunning()) { return -1; }
+    if (OtaState >= OTA_VERIFY) { return 101; }
+    if (OtaState == OTA_DOWNLOAD && OtaTotal > 0 && OtaProgress)
+    {
+        uint32_t pct = (OtaDone >= OtaTotal) ? 100UL : (OtaDone * 100UL) / OtaTotal;
+        return (int8_t)pct;
+    }
+    return 0;
+#else
+    return -1;
+#endif
+}
+
+static inline bool UpdateFailed()              // 1.9.2: the last update failed (the matrix says so until it is cleared)
+{
+#if ENABLE_WIFI
+    return OtaState == OTA_FAILED;
+#else
+    return false;
+#endif
+}
 
 //----------------------------------------------------------------------------------------------------------------
 //  Motion sensor (WT901C) and LED matrix settings - 1.8.  Saved at once in EEPROM 56-65 (56 = 0xA6 "valid").
@@ -603,6 +695,7 @@ void SoftStartFrom(uint8_t m)        // 1.9.1: creep from where the motor is now
 
 void EnableMotor(uint8_t m)           // loop() only
 {
+    if (UpdateRunning()) { return; }   // 1.9.2: not during a firmware update
     TiltGraceUntil = millis() + 1500;  // let the seat come back inside the tilt limit first
     if (Disable[m] != 0 && SoftRate > 0) { SoftStartFrom(m); }   // 1.9.1: no jump - it creeps to its target
     DisableReason[m] = DIS_ON;
@@ -1299,6 +1392,8 @@ static inline bool PageHolds()                   // 1.9: the page has the seat (
 
 #if ENABLE_WIFI
 void SendDiag();
+void SendOtaFrame();
+void OtaCommand(uint8_t a, uint8_t b);
 #endif
 void ImuCommand(uint8_t a, uint8_t b);
 static inline uint8_t SensorState();
@@ -1390,6 +1485,7 @@ void ParseCommand(const unsigned int *buf, uint8_t source)
                     case 'i': SendTwoValues('i', SensorState(), TiltLimitDeg); break;  // 1.8: sensor state + tilt limit
 #if ENABLE_WIFI
                     case 'd': if (source == 1) { SendDiag(); } break;      // 1.7: diagnostics frame (WiFi only)
+                    case 'u': if (source == 1) { SendOtaFrame(); } break;  // 1.9.2: firmware update state
 #endif
                     default: break;
                 }
@@ -1441,6 +1537,9 @@ void ParseCommand(const unsigned int *buf, uint8_t source)
 #if ENABLE_WIFI
         case 'x':                                                // 1.9: sensor acceleration + gyro frames
             if (b1 == 'e' && source == 1) { TelExtras = (b2 == '1' || b2 == 1); }
+            break;
+        case 'u':                                                // 1.9.2: firmware update (from the page only)
+            if (source == 1) { OtaCommand((uint8_t)b1, (uint8_t)b2); }
             break;
 #endif
         case 'm':
@@ -1795,6 +1894,57 @@ static inline void Put32(uint8_t *p, uint32_t v) { p[0] = v & 0xFF; p[1] = (v >>
 
 bool ReadIpText();
 
+// ---- WiFi memory (1.9.2) ----
+
+static inline bool SketchHasWifi()             // the sketch has a real network name, not the placeholder
+{
+    return WIFI_SSID[0] != 0 && strcmp(WIFI_SSID, "YourNetworkName") != 0;
+}
+
+void ReadWifiMemory()
+{
+    WifiMem = false;
+    if (EEPROM.read(WIFI_EE) != 0xC7) { return; }
+    uint8_t n = EEPROM.read(WIFI_EE + 1), k = EEPROM.read(WIFI_EE_PASS);
+    if (n == 0 || n > 32 || k > 64) { return; }
+    for (uint8_t i = 0; i < n; i++) { WifiMemSsid[i] = (char)EEPROM.read(WIFI_EE + 2 + i); }
+    WifiMemSsid[n] = 0;
+    for (uint8_t i = 0; i < k; i++) { WifiMemPass[i] = (char)EEPROM.read(WIFI_EE_PASS + 1 + i); }
+    WifiMemPass[k] = 0;
+    WifiMem = true;
+}
+
+void WriteWifiMemory(const char *ssid, const char *pass)
+{
+    size_t n = strlen(ssid), k = strlen(pass);
+    if (n == 0 || n > 32 || k > 64) { return; }
+    if (WifiMem && strcmp(ssid, WifiMemSsid) == 0 && strcmp(pass, WifiMemPass) == 0) { return; }   // nothing new
+    EEPROM.update(WIFI_EE, 0);                  // not valid while it is being written
+    EEPROM.update(WIFI_EE + 1, (uint8_t)n);
+    for (size_t i = 0; i < n; i++) { EEPROM.update(WIFI_EE + 2 + (int)i, (uint8_t)ssid[i]); }
+    EEPROM.update(WIFI_EE_PASS, (uint8_t)k);
+    for (size_t i = 0; i < k; i++) { EEPROM.update(WIFI_EE_PASS + 1 + (int)i, (uint8_t)pass[i]); }
+    EEPROM.update(WIFI_EE, 0xC7);
+    strcpy(WifiMemSsid, ssid);
+    strcpy(WifiMemPass, pass);
+    WifiMem = true;
+}
+
+uint32_t ParseWifiFw(const char *s)            // "0.5.2" -> 0x000502; 0 = unknown ("99.99.99" = no answer)
+{
+    uint32_t part[3] = {0, 0, 0};
+    uint8_t i = 0;
+    bool digit = false;
+    for (; s && *s && i < 3; s++)
+    {
+        if (*s >= '0' && *s <= '9') { part[i] = part[i] * 10 + (uint32_t)(*s - '0'); digit = true; if (part[i] > 255) { return 0; } }
+        else if (*s == '.') { i++; }
+        else { break; }
+    }
+    if (!digit || part[0] >= 99) { return 0; }
+    return (part[0] << 16) | (part[1] << 8) | part[2];
+}
+
 bool ConnectWifi()
 {
     WifiLastAttempt = millis();
@@ -1804,12 +1954,26 @@ bool ConnectWifi()
         WifiUp = false;
         return false;
     }
+    if (WifiFw == 0) { WifiFw = ParseWifiFw(WiFi.firmwareVersion()); }   // 1.9.2: for the firmware update
     WiFi.setHostname(WIFI_HOSTNAME);
 #if WIFI_STATIC_IP
     WiFi.config(IPAddress(WIFI_IP), IPAddress(WIFI_DNS), IPAddress(WIFI_GATEWAY), IPAddress(WIFI_SUBNET));
 #endif
     WiFi.setTimeout(WIFI_CONNECT_TIMEOUT_MS);
-    int st = WiFi.begin(WIFI_SSID, WIFI_PASS);
+    // 1.9.2: the sketch's name and password first (remembered once they work), then the remembered ones - so a build
+    // that still has the placeholders, or an old password, keeps the board on the network
+    int st = WL_CONNECT_FAILED;
+    bool sketch = SketchHasWifi();
+    if (sketch)
+    {
+        st = WiFi.begin(WIFI_SSID, WIFI_PASS);
+        if (st == WL_CONNECTED) { WifiFrom = 0; WriteWifiMemory(WIFI_SSID, WIFI_PASS); }
+    }
+    if (st != WL_CONNECTED && WifiMem && !(sketch && strcmp(WifiMemSsid, WIFI_SSID) == 0 && strcmp(WifiMemPass, WIFI_PASS) == 0))
+    {
+        st = WiFi.begin(WifiMemSsid, WifiMemPass);
+        if (st == WL_CONNECTED) { WifiFrom = 1; }
+    }
     if (st != WL_CONNECTED)
     {
         strcpy(WifiText, "E9");
@@ -2014,11 +2178,204 @@ void SendDiag()
     uint8_t cr = 0;
     for (uint8_t m = 0; m < NUM_MOTORS; m++) { if (SoftStart[m] && Disable[m] == 0) { cr |= (uint8_t)(1 << m); } }
     *p++ = cr;
+    *p++ = (uint8_t)(WifiFw >> 16);              // version 5 (1.9.2): WiFi module firmware, WiFi memory, last update
+    *p++ = (uint8_t)(WifiFw >> 8);
+    *p++ = (uint8_t)WifiFw;
+    uint8_t wf = 0;
+    if (WifiMem) { wf |= 1; }
+    if (WifiFrom == 1) { wf |= 2; }
+    if (!SketchHasWifi()) { wf |= 4; }
+    *p++ = wf;
+    *p++ = OtaState;
+    Put16(p, OtaCode); p += 2;
     size_t len = (size_t)(p - (buf + 6));
     buf[0] = 'S'; buf[1] = 'M'; buf[2] = '3'; buf[3] = 'D';
-    buf[4] = 4;
+    buf[4] = 5;
     buf[5] = (uint8_t)len;
     if (TcpClient.write(buf, 6 + len) == 0) { ClientUp = false; }
+}
+
+//****************************************************************************************************************
+//    Firmware update over WiFi (1.9.2).  The page converts the .bin into the UNO R4 WiFi's .ota format and serves it at
+//    http://<page>:<port>/ota/<token>.ota; the WiFi module downloads it into its own storage, checks it (magic number,
+//    CRC) and programs this board through its bootloader - exactly as it does a USB upload - then starts it.  If
+//    anything goes wrong before the programming starts, the running firmware carries on and says why.
+//
+//    "SM3U" frame (after [rdu], on every change and 4 times a second while it runs), little-endian:
+//      'S' 'M' '3' 'U', uint8 version (1), uint8 length (23), then uint8 state (0 idle, 1 stopping the motors,
+//      2 starting, 3 downloading, 4 checking, 5 installing, 6 failed) | int16 code (0, or why it stopped: -100 SimHub
+//      is sending over USB, -101 WiFi module firmware too old, -102 no address for the file, -103 the download stopped,
+//      -104 programming failed, else the WiFi module's code) | uint32 bytes downloaded | uint32 file size | uint8
+//      flags (bit0 the download reports progress, bit1 WiFi details remembered) | uint8 WiFi module firmware major,
+//      minor, patch | char[8] this firmware's version ("1.9.2", zero-padded) - the page checks it after an update.
+//****************************************************************************************************************
+
+// UNO R4 boards package 1.3.0 added the non-blocking download (WiFi module 0.5.0); older ones only have the blocking one
+struct OtaCompat
+{
+    template <typename T> static auto Start(T &o, const char *url, int) -> decltype((int)o.startDownload(url, OTA_FILE))
+    {
+        return (int)o.startDownload(url, OTA_FILE);
+    }
+    template <typename T> static int Start(T &, const char *, long) { return OTA_NO_PROGRESS; }
+    template <typename T> static auto Progress(T &o, int) -> decltype((int)o.downloadProgress())
+    {
+        return (int)o.downloadProgress();
+    }
+    template <typename T> static int Progress(T &, long) { return OTA_NO_PROGRESS; }
+};
+
+void SendOtaFrame()
+{
+    uint8_t b[6 + 23];
+    uint8_t *p = b + 6;
+    *p++ = OtaState;
+    Put16(p, OtaCode); p += 2;
+    Put32(p, OtaDone); p += 4;
+    Put32(p, OtaTotal); p += 4;
+    *p++ = (uint8_t)((OtaProgress ? 1 : 0) | (WifiMem ? 2 : 0));
+    *p++ = (uint8_t)(WifiFw >> 16);
+    *p++ = (uint8_t)(WifiFw >> 8);
+    *p++ = (uint8_t)WifiFw;
+    const char *v = FW_VERSION;
+    for (uint8_t i = 0; i < 8; i++) { *p++ = (uint8_t)(*v ? *v++ : 0); }
+    b[0] = 'S'; b[1] = 'M'; b[2] = '3'; b[3] = 'U'; b[4] = 1; b[5] = 23;
+    OtaFrameDue = false;
+    OtaLastFrame = millis();
+    if (ClientUp && TcpClient.write(b, sizeof(b)) == 0) { ClientUp = false; }
+}
+
+void OtaFail(int code)
+{
+    OtaCode = (int16_t)constrain(code, -32768, 32767);
+    if (OtaCode == 0) { OtaCode = OTA_ERR_FLASH; }
+    OtaState = OTA_FAILED;
+    OtaFrameDue = true;
+}
+
+static inline bool UsbBusy(unsigned long now)  // SimHub / SMC3Utils sent something over USB in the last 3 s
+{
+    return LastUsbPacketMillis != 0 && (now - LastUsbPacketMillis) < 3000UL;
+}
+
+void OtaStart()
+{
+    if (UpdateRunning()) { return; }
+    unsigned long now = millis();
+    OtaCode = 0;
+    OtaDone = OtaTotal = 0;
+    OtaProgress = false;
+    // where the file is: the page's address (as given, or the one it connects from), its web port, the file's number
+    uint8_t ip[4] = {(uint8_t)(OtaIpHi >> 8), (uint8_t)OtaIpHi, (uint8_t)(OtaIpLo >> 8), (uint8_t)OtaIpLo};
+    if (OtaIpHi == 0 && OtaIpLo == 0 && ClientUp)
+    {
+        IPAddress a = TcpClient.remoteIP();
+        for (uint8_t i = 0; i < 4; i++) { ip[i] = a[i]; }
+    }
+    if ((ip[0] | ip[1] | ip[2] | ip[3]) == 0 || OtaPort == 0) { OtaFail(OTA_ERR_NOURL); return; }
+    snprintf(OtaUrl, sizeof(OtaUrl), "http://%u.%u.%u.%u:%u/ota/%04x.ota", ip[0], ip[1], ip[2], ip[3],
+             (unsigned)OtaPort, (unsigned)OtaToken);
+    if (UsbBusy(now)) { OtaFail(OTA_ERR_SIMHUB); return; }
+    if (WifiFw == 0) { WifiFw = ParseWifiFw(WiFi.firmwareVersion()); }
+    if (WifiFw != 0 && WifiFw < 0x000400UL) { OtaFail(OTA_ERR_OLDWIFI); return; }
+    for (uint8_t m = 0; m < NUM_MOTORS; m++) { DisableReason[m] = DIS_UPDATE; DisableMotor(m); }
+    OtaState = OTA_PREP;
+    OtaSince = now;
+    OtaFrameDue = true;
+}
+
+// [u a b] from the page
+void OtaCommand(uint8_t a, uint8_t b)
+{
+    if (b == '=')
+    {
+        uint16_t v = (uint16_t)ValueReg;
+        if (a == 'P') { OtaPort = v; }
+        else if (a == 'T') { OtaToken = v; }
+        else if (a == 'I') { OtaIpHi = v; }
+        else if (a == 'J') { OtaIpLo = v; }
+    }
+    else if (a == 'G' && b == 'O') { OtaStart(); }
+    else if (a == 'O' && b == 'K')
+    {
+        if (!UpdateRunning()) { OtaState = OTA_IDLE; OtaCode = 0; OtaDone = OtaTotal = 0; OtaFrameDue = true; }
+    }
+}
+
+void ServiceOta(unsigned long now)             // loop(): one step at a time
+{
+    switch (OtaState)
+    {
+        case OTA_PREP:                           // give the brakes a moment
+            if (now - OtaSince < 300) { return; }
+            OtaState = OTA_BEGIN;
+            OtaFrameDue = true;
+            return;
+
+        case OTA_BEGIN:
+        {
+            int r = (int)Ota.begin(OTA_FILE);    // clears the WiFi module's storage for the file
+            if (r != 0) { OtaFail(r); return; }
+            int size = (WifiFw == 0 || WifiFw >= 0x000500UL) ? OtaCompat::Start(Ota, OtaUrl, 0) : OTA_NO_PROGRESS;
+            if (size == OTA_NO_PROGRESS)
+            {
+                // WiFi module 0.4.x, or a boards package before 1.3.0: a blocking download (up to a minute, no
+                // progress; the page waits and the matrix shows the update)
+                OtaState = OTA_DOWNLOAD;
+                OtaProgress = false;
+                if (ClientUp) { SendOtaFrame(); }
+                size = Ota.download(OtaUrl, OTA_FILE);
+                if (size <= 0) { OtaFail(size == 0 ? OTA_ERR_STALLED : size); return; }
+                OtaTotal = OtaDone = (uint32_t)size;
+                OtaState = OTA_VERIFY;
+                OtaFrameDue = true;
+                return;
+            }
+            if (size <= 0) { OtaFail(size == 0 ? OTA_ERR_STALLED : size); return; }
+            OtaTotal = (uint32_t)size;
+            OtaDone = 0;
+            OtaProgress = true;
+            OtaState = OTA_DOWNLOAD;
+            OtaLastPoll = OtaLastMove = now;
+            OtaFrameDue = true;
+            return;
+        }
+
+        case OTA_DOWNLOAD:
+        {
+            if (now - OtaLastPoll < 200) { return; }
+            OtaLastPoll = now;
+            int p = OtaCompat::Progress(Ota, 0);
+            if (p < 0) { OtaFail(p); return; }
+            if ((uint32_t)p != OtaDone) { OtaDone = (uint32_t)p; OtaLastMove = now; }
+            if (OtaDone >= OtaTotal) { OtaState = OTA_VERIFY; OtaFrameDue = true; }
+            else if (now - OtaLastMove > 20000UL) { OtaFail(OTA_ERR_STALLED); }
+            return;
+        }
+
+        case OTA_VERIFY:
+        {
+            int r = (int)Ota.verify();           // magic number and CRC of what arrived
+            if (r != 0) { OtaFail(r); return; }
+            if (UsbBusy(now)) { OtaFail(OTA_ERR_SIMHUB); return; }   // programming goes over the USB link's serial line
+            OtaState = OTA_FLASH;
+            OtaSince = now;
+            OtaFrameDue = true;
+            return;
+        }
+
+        case OTA_FLASH:
+            if (now - OtaSince < 400) { return; }   // the "installing" frame and the matrix get out first
+            if (UsbBusy(now)) { OtaFail(OTA_ERR_SIMHUB); return; }
+            // The WiFi module resets this board into its bootloader, programs it and starts the new firmware; this call
+            // only comes back if that could not even begin.
+            (void)Ota.update(OTA_FILE);
+            OtaFail(OTA_ERR_FLASH);
+            return;
+
+        default:
+            return;
+    }
 }
 
 void FeedTcpByte(unsigned int c)
@@ -2103,6 +2460,8 @@ void ServiceNetwork(unsigned long now)
             avail -= n;
         }
     }
+    // 1.9.2: firmware update state - on every change, and 4 times a second while it runs
+    if (ClientUp && (OtaFrameDue || (UpdateRunning() && now - OtaLastFrame >= 250))) { SendOtaFrame(); }
     if (ClientUp && now - NetLastCheck >= 2000)         // one round-trip; detect a vanished client
     {
         NetLastCheck = now;
@@ -2125,7 +2484,8 @@ void ServiceNetwork(unsigned long now)
 //      * motor bars view while SimHub is idle: a slow oscilloscope trace.
 //    The code between the BEGIN/END markers only uses the globals listed here, so the preview tool can build it on
 //    a PC: Frame, Disable, DisableReason, Feedback_q, Goal_q, TargetLo/Hi, SeatRoll/SeatPitch, SensorFresh(),
-//    SensorFlags, LedView, LedFlags, LastPosMillis, WifiText, WifiUp, ClientUp, PendingIpScroll, LastIpScroll.
+//    SensorFlags, LedView, LedFlags, LastPosMillis, WifiText, WifiUp, ClientUp, PendingIpScroll, LastIpScroll,
+//    UpdateShow(), UpdateFailed() (1.9.2).
 //****************************************************************************************************************
 
 // ==== LED MATRIX BEGIN ====
@@ -2261,7 +2621,8 @@ void DrawMarquee(unsigned long now)
 }
 
 // ---- Problems ----
-// Codes: 0 WiFi module, 1-3 motor cutoff, 4 tilt limit, 5 sensor switched on but silent, 8 no IP address, 9 no WiFi.
+// Codes: 0 WiFi module, 1-3 motor cutoff, 4 tilt limit, 5 sensor switched on but silent, 7 firmware update failed
+// (1.9.2), 8 no IP address, 9 no WiFi.
 
 #define ERR_MAX 8
 uint8_t       ErrCodes[ERR_MAX];
@@ -2280,6 +2641,7 @@ void CollectErrors(unsigned long now)
     }
     if (tilt) { ErrCodes[ErrN++] = 4; }
     if ((SensorFlags & 1) && !SensorFresh() && now > 8000) { ErrCodes[ErrN++] = 5; }
+    if (UpdateFailed()) { ErrCodes[ErrN++] = 7; }   // 1.9.2: until the page clears it, or the next update
 #if ENABLE_WIFI
     if (WifiText[0] == 'E') { ErrCodes[ErrN++] = (uint8_t)(WifiText[1] - '0'); }
     else if (!WifiUp) { ErrCodes[ErrN++] = 9; }
@@ -2300,6 +2662,7 @@ void ErrorText(uint8_t code, char *out, size_t n)
         case 1: case 2: case 3: snprintf(out, n, "ERROR E%u MOTOR %u CUTOFF", (unsigned)code, (unsigned)code); break;
         case 4:  snprintf(out, n, "ERROR E4 TILT LIMIT"); break;
         case 5:  snprintf(out, n, "ERROR E5 NO SENSOR"); break;
+        case 7:  snprintf(out, n, "ERROR E7 UPDATE FAILED"); break;
         case 8:  snprintf(out, n, "ERROR E8 NO IP ADDRESS"); break;
         case 9:  snprintf(out, n, "ERROR E9 NO WIFI"); break;
         default: snprintf(out, n, "ERROR E%u", (unsigned)code); break;
@@ -2396,6 +2759,24 @@ void UpdateMatrix()
 
     FrameClear();
     CollectErrors(now);
+
+    int8_t up = UpdateShow();                    // 1.9.2: firmware update - "UP" and how far the download got
+    if (up >= 0)
+    {
+        DrawText(2, 0, "UP");
+        if (up > 100)                            // the WiFi module checks and installs it: the bar blinks
+        {
+            if (blink) { for (int c = 0; c < 12; c++) { FramePixel(7, c, 1); } }
+        }
+        else
+        {
+            int n = (up * 12 + 50) / 100;
+            for (int c = 0; c < n; c++) { FramePixel(7, c, 1); }
+            if (n < 12) { FramePixel(7, n, blink); }
+        }
+        Matrix.renderBitmap(Frame, 8, 12);
+        return;
+    }
 
     if (!MarqueeActive)
     {
@@ -2531,12 +2912,13 @@ void setup()
 
     // 3b. WiFi - done before the motors are enabled because WiFi.begin() blocks for up to the timeout.
 #if ENABLE_WIFI
+    ReadWifiMemory();                           // 1.9.2: the name and password it last joined with
     bool wifiOk = ConnectWifi();
     if (Serial)                                 // a terminal has the USB port open: print one text line
     {
         Serial.print(wifiOk ? "SMC3_R4 v" FW_VERSION " WiFi connected, IP " : "SMC3_R4 v" FW_VERSION " WiFi failed, code ");
         Serial.print(WifiText);
-        Serial.print("\r\n");
+        Serial.print(" " FW_CAPS "\r\n");       // 1.9.2: the page finds this text in a .bin to see what it can do
     }
 #if LED_MATRIX
     if (wifiOk && WifiText[0] != 'E') { PendingIpScroll = true; }   // the address scrolls once the loop runs
@@ -2589,6 +2971,7 @@ void loop()
     }
 
 #if ENABLE_WIFI
+    ServiceOta(now);                            // 1.9.2: firmware update, one step per pass
     ServiceNetwork(now);
 #endif
 

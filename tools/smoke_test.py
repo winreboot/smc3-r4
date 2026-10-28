@@ -14,6 +14,9 @@ Smoke test: start simulated rigs and the page, run diagnostics, check the result
 5. The same on a three-lift rig: all three motors level the seat, and motor 3 stops at the tilt allowed.
 6. Soft start (firmware 1.9.1): a seat that rode down while the rig was off creeps back to its centre at power-up,
    no faster than the soft-start speed, and the speed can be changed.
+7. Firmware update over WiFi (firmware 1.9.2): a .bin that isn't SMC3_R4 is refused; an SMC3_R4 one is converted to
+   the UNO R4 WiFi's .ota format, the simulated board fetches it from the page, checks it, "installs" it and comes
+   back with the new version.
 """
 import json, os, subprocess, sys, tempfile, time, urllib.request as u
 
@@ -30,13 +33,13 @@ def post(base, p, o=None):
     return json.loads(u.urlopen(u.Request(base + p, data=json.dumps(o or {}).encode(), method="POST"), timeout=60).read())
 
 
-def start(port, web, *sim_args):
+def start(port, web, *sim_args, bind=None):
     data = tempfile.mkdtemp(prefix="smc3-smoke-")
     sim = subprocess.Popen([sys.executable, SIM, str(port), "--tuned", *sim_args], stdout=subprocess.DEVNULL)
     time.sleep(0.5)
     log = open(os.path.join(data, "scope.log"), "w")
     scope = subprocess.Popen([sys.executable, SCOPE, "--host", "127.0.0.1", "--port", str(port), "--web", str(web),
-                              "--data", data], stdout=log, stderr=subprocess.STDOUT)
+                              "--data", data] + (["--bind", bind] if bind else []), stdout=log, stderr=subprocess.STDOUT)
     scope.log_path = log.name
     base = f"http://127.0.0.1:{web}"
     for _ in range(60):
@@ -191,6 +194,36 @@ try:
           not any(x["dis"][0] for x in got), f"soft start: crept to 530 (now {last['f']:.0f}), fastest {fastest:.0f} counts/s")
     r = post(base6, "/board/soft", {"rate": 120})
     check(r.get("ok") and r["soft_start"]["rate"] == 120, f"soft start speed set to 120 ({r.get('soft_start')})")
+
+    # 7. firmware update over WiFi (the page must listen beyond localhost so the board can fetch the file)
+    sim7, scope7, base7 = start(4716, 8716, bind="0.0.0.0")
+    procs += [sim7, scope7]
+
+    def firmware(version, marker=b"SMC3_R4 v"):
+        body = bytearray((0x20007F00).to_bytes(4, "little") + (0x4000 + 0x1F5).to_bytes(4, "little"))
+        body += bytes(range(256)) * 200 + marker + version.encode() + b" WiFi connected, IP \0"
+        body += b" SMC3CAPS:ota1,wifimem1\r\n\0HomeNet\0"
+        return bytes(body)
+
+    def upload(base, raw, name):
+        req = u.Request(base + "/fw/upload?name=" + name, data=raw, method="POST",
+                        headers={"Content-Type": "application/octet-stream"})
+        return json.loads(u.urlopen(req, timeout=30).read())
+
+    r = upload(base7, firmware("1.9.9", marker=b"Blinky  v"), "blink.ino.bin")
+    check(not r["ok"] and "not SMC3_R4" in r["error"], f"update: another sketch refused ({r.get('error', '')[:50]})")
+    r = upload(base7, firmware("1.9.9"), "SMC3_R4_v1.9.9.ino.bin")
+    check(r["ok"] and r["file"]["version"] == "1.9.9", f"update: SMC3_R4 1.9.9 ready ({r.get('file')})")
+    r = post(base7, "/fw/install")
+    check(r.get("ok"), f"update: started ({r.get('error')})")
+    t0 = time.time()
+    st = get(base7, "/fw/status")
+    while time.time() - t0 < 90 and st["state"] == "running":
+        time.sleep(0.5)
+        st = get(base7, "/fw/status")
+    time.sleep(1.0)
+    check(st["state"] == "done" and get(base7, "/data?since=0")["fw"] == "1.9.9",
+          f"update: the board came back with 1.9.9 ({st['state']}: {st.get('msg')})")
 finally:
     for p in procs:
         p.terminate()
