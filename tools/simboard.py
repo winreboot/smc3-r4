@@ -49,7 +49,7 @@ Soft start (firmware 1.9.1): after power-up and Enable Motors each motor creeps 
                        heads for its centre (512 + level trim), as the real one does
   --old19              firmware 1.9 without the soft start (diagnostics frame version 3)
 
-Firmware update over WiFi (firmware 1.9.2, the default): [uP=] [uT=] [uI=] [uJ=] [uGO] [uOK] [rdu]; the board fetches
+Firmware update over WiFi (firmware 1.9.2+; the simulator says 1.9.3, the default): [uP=] [uT=] [uI=] [uJ=] [uGO] [uOK] [rdu]; the board fetches
 http://<page>:<port>/ota/<token>.ota, decodes and checks it like the UNO R4 WiFi's WiFi module (magic, LZSS, CRC),
 "programs" itself - it drops the connection, stays away ~4 s and comes back as the version in the file (1.9.2+ with
 updates, 1.9.1 soft start only, 1.9 neither), with the soft start - and remembers its WiFi like 1.9.2 does.
@@ -123,7 +123,7 @@ START = {}                                    # --start: where the pots are at p
 for st_ in args.start:
     m_, pot_ = st_.split(":")
     START[int(m_) - 1] = float(pot_)
-FW = {"ver": ("1.9" if args.old19 else ("1.9.1" if args.fw191 else "1.9.2")) if args.fw >= 19 else f"{args.fw // 10}.{args.fw % 10}"}
+FW = {"ver": ("1.9" if args.old19 else ("1.9.1" if args.fw191 else "1.9.3")) if args.fw >= 19 else f"{args.fw // 10}.{args.fw % 10}"}
 
 
 def _vt(v):

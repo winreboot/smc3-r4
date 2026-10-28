@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-smc3_scope v2.3 - live scope, tuner and auto-tuner for the SMC3_R4 motion controller (Arduino UNO R4 WiFi).
+smc3_scope v2.3.1 - live scope, tuner and auto-tuner for the SMC3_R4 motion controller (Arduino UNO R4 WiFi).
 
 Connects to the board's TCP telemetry port, keeps a rolling buffer of samples and serves a web page with live
 charts, a parameter editor (sends ordinary SMC3 commands back to the board), test signals and a per-motor
@@ -12,6 +12,8 @@ Every option can also come from the environment (Docker): SMC3_HOST, SMC3_PORT, 
 SMC3_DATA_DIR.  Settings changed in the page (board address, theme, auto-find) are saved to
 <data dir>/config.json and survive restarts and upgrades.  Standard-library Python 3.8+ only.
 
+v2.3.1: ships with firmware 1.9.3 - 1.9.2 didn't compile in the Arduino IDE (the boards package's GCC 7). The page
+      names SMC3_R4_v1.9.3.ino where it tells you what to flash; nothing else changed.
 v2.3: firmware update over WiFi (firmware 1.9.2): Settings, Firmware update - pick the .bin the Arduino IDE exports
       (Sketch, Export Compiled Binary); the page checks it, converts it to the UNO R4 WiFi's .ota format and serves
       it, the board's WiFi module downloads, checks and installs it, and the page confirms the new version. The
@@ -53,7 +55,7 @@ v1.4: settings dialog (board address, port, find-board scan, auto-find), day/nig
       fixed a thread race that made the page flash "not reachable".
 """
 
-VERSION = "2.3"
+VERSION = "2.3.1"
 
 import argparse
 import base64
@@ -3907,10 +3909,10 @@ def analyze(rep):
                 "(soft start)", f"At {sst['rate']} counts/s after power-up or Enable Motors; normal once it has caught "
                 "up.", code="soft_creeping")
     elif board.get("seat_setup") is not None and board.get("wifi") is None:
-        add("info", "Firmware 1.9.2 adds a soft start and updates from this page",
+        add("info", "Firmware 1.9.3 adds a soft start and updates from this page",
             "With 1.9 the motors go straight to their positions at power-up - a seat that rode down while the rig "
-            "was off jumps back. 1.9.2 also lets you install later firmware from Settings, Firmware update.",
-            "Flash SMC3_R4_v1.9.2.ino over USB with the Arduino IDE.", code="soft_fw")
+            "was off jumps back. 1.9.3 also lets you install later firmware from Settings, Firmware update.",
+            "Flash SMC3_R4_v1.9.3.ino over USB with the Arduino IDE.", code="soft_fw")
     # ---- firmware update over WiFi (firmware 1.9.2) ----
     wfi = board.get("wifi")
     fup = board.get("firmware_update") or {}
@@ -3939,9 +3941,9 @@ def analyze(rep):
                 "This build has no WiFi details of its own (or they didn't work), so it used the ones it last joined "
                 "with.", code="wifi_remembered")
     elif sst is not None:
-        add("info", "Firmware 1.9.2 can be updated from this page",
+        add("info", "Firmware 1.9.3 can be updated from this page",
             "Settings, Firmware update installs later firmware over WiFi - no USB cable, SimHub can stay open.",
-            "Flash SMC3_R4_v1.9.2.ino over USB once with the Arduino IDE.", code="update_fw")
+            "Flash SMC3_R4_v1.9.3.ino over USB once with the Arduino IDE.", code="update_fw")
     # ---- seat set-up (firmware 1.9) ----
     ss = board.get("seat_setup")
     if ss:
@@ -5518,7 +5520,7 @@ class FirmwareUpdate:
                                 "0.4.0 or newer. Update it once with the Arduino IDE (Tools, Firmware Updater).")
         else:
             v["problem"] = ("The board runs firmware " + (v["fw"] or "older than 1.7") + ", which can't be updated from "
-                            "the page. Flash SMC3_R4_v1.9.2.ino over USB with the Arduino IDE once - from then on "
+                            "the page. Flash SMC3_R4_v1.9.3.ino over USB with the Arduino IDE once - from then on "
                             "updates can come from here.")
         if self.bind in ("127.0.0.1", "localhost", "::1"):
             v["capable"] = False
@@ -6688,7 +6690,7 @@ details.oks .flist{margin-top:6px}
     <h3>Selected motor</h3><p>Click a motor card or chart, or choose a motor in Test Signal or Auto-Tune: the same motor is highlighted everywhere. While a test signal or auto-tune runs, its chart is marked and the others fade.</p>
     <h3>Diagnostics</h3><p>Settings section. <b>Quick check</b> reads the board and listens for a few seconds; <b>Full check</b> also moves each motor a little to see which way it goes, how much drive it needs, whether the wiring is swapped and how it answers a small step - and can ask you what you saw. Both make one file (saved on the NAS too) to download and give to whoever helps you. The page also watches while you drive and notes pot glitches, a motor moving the wrong way or stalling, hunting, cutoffs, the tilt limit and board restarts. It also keeps a <b>load map</b>: where each motor falls behind or runs at full power, each way across its travel - a quick check after a session names where the rig struggles (lifting a heavy driver, say). With the motion sensor, the full check also measures the seat itself: degrees per count, bounce and play in the linkage - for the traction-loss motor, how far the seat turns. For the rear slide it asks whether the rear went left or right.</p>
     <h3>Status bar</h3><p>LOW POWER means no position commands for 15 s, so the board runs at quarter drive until SimHub or this page sends targets again.</p>
-    <h3>Firmware update (firmware 1.9.2)</h3><p>Settings, Firmware update installs new firmware over WiFi - no USB cable, and SimHub can stay open (with its motion output paused). In the Arduino IDE open the new .ino and use <b>Sketch, Export Compiled Binary</b>; choose that .bin on the page and press Install. The page checks the file (an SMC3_R4 build for the UNO R4 WiFi, and which version), the board switches the motors off, its WiFi module downloads and checks the file and installs it, and the page confirms the new version once the board is back. The board remembers the WiFi name and password it last joined with, so a build with the placeholders still connects. Needs the WiFi module's own firmware 0.4.0 or newer (0.5.0+ shows progress). The first install of 1.9.2 itself goes over USB.</p>
+    <h3>Firmware update (firmware 1.9.2)</h3><p>Settings, Firmware update installs new firmware over WiFi - no USB cable, and SimHub can stay open (with its motion output paused). In the Arduino IDE open the new .ino and use <b>Sketch, Export Compiled Binary</b>; choose that .bin on the page and press Install. The page checks the file (an SMC3_R4 build for the UNO R4 WiFi, and which version), the board switches the motors off, its WiFi module downloads and checks the file and installs it, and the page confirms the new version once the board is back. The board remembers the WiFi name and password it last joined with, so a build with the placeholders still connects. Needs the WiFi module's own firmware 0.4.0 or newer (0.5.0+ shows progress). The first install of it (SMC3_R4_v1.9.3.ino - 1.9.2 didn't compile in the Arduino IDE) goes over USB.</p>
     <h3>Soft start (firmware 1.9.1)</h3><p>After the rig has been off the seat may have ridden down a little. At power-up, and when you press Enable Motors, each motor creeps from wherever it is to its position (SimHub's centre at power-up) instead of jumping there - 60 counts/s by default, easing in and out. Once it has caught up everything runs normally. A seat that rode down past an end stop is allowed to come back (only going further out switches the motor off), the tilt limit waits, and the board keeps full power meanwhile. Settings, Loop, PWM &amp; smoothing: Soft start.</p></div>
    <div><h3>Seat setup (firmware 1.9)</h3><p>Levels the platform first and makes that SimHub's centre: the board adds a <b>level trim</b> to every position SimHub sends, so SimHub's middle (512) is the level seat - and the seat goes level at power-up. With the motion sensor it levels itself (each motor moves a little to learn how it tilts the seat, then the page moves them until the sensor reads level, choosing the level position nearest the middle of every motor); without it you nudge the motors with a spirit level on the seat. On a traction-loss rig only motors 1 and 2 level the seat; you <b>centre</b> motor 3, the rear slide, so the seat points straight ahead, and tell the page which way the rear went for +10.</p>
     <p>Then each motor moves slowly away from level, both ways, and stops at the tilt you allow, when it pushes against something, at the end of its Clip window, or when you press Stop (space bar). The rear slide stops at the <b>traction loss you allow</b> - how far the seat may turn each way, measured by the sensor. From what it found the page suggests <b>travel limits</b> (the board never sends a motor past them), <b>end stops</b> (a motor that gets past one anyway is switched off: E1-E3) and <b>tilt limits</b> for each direction (every motor stops: E4). While Seat setup is open the board ignores SimHub's positions; Cancel puts everything back. Auto-tune, the test signal and the full check stay inside the travel limits.</p>
@@ -6805,7 +6807,7 @@ const TIPS={
  sn_setup:"The WT901C leaves the factory at 10 readings per second. This sets it to 100 per second at 115200 baud - with firmware 1.9 angles, gyro and acceleration (for the 3D view), with 1.8 angles only - and saves that in the sensor. Needs the board's D1 wired through the MAX3232 to the sensor's RX (green). If SimHub also reads the sensor, set it in WitMotion's PC software instead.",
  sn_search:"The board tries the usual baud rates until the sensor answers - normally by itself while the sensor is switched on. This makes it look again for 30 s.",
  smooth:"<b>Target smoothing</b> - how softly the motor eases into each new position SimHub sends (a low-pass filter on the target).<br><br><b>Off / 4 ms:</b> raw, every bump and kerb comes through - rally.<br><b>8-16 ms:</b> crisp but not jagged - circuit racing.<br><b>32-64 ms:</b> soft and floaty - flight, space, trucks.<br><br>Times are at Fpid/1 (double them at Fpid/2). Needs firmware 1.6.",
- fw_file:"<b>Firmware file</b> (firmware 1.9.2 on the board). In the Arduino IDE: open the new SMC3_R4 .ino, choose Arduino UNO R4 WiFi, then <b>Sketch, Export Compiled Binary</b>. Pick the <b>.bin</b> it writes into the sketch's build folder (not the .hex or .elf). The page checks it before anything is sent to the board.",
+ fw_file:"<b>Firmware file</b> (firmware 1.9.2 or newer on the board). In the Arduino IDE: open the new SMC3_R4 .ino, choose Arduino UNO R4 WiFi, then <b>Sketch, Export Compiled Binary</b>. Pick the <b>.bin</b> it writes into the sketch's build folder (not the .hex or .elf). The page checks it before anything is sent to the board.",
  fw_go:"<b>Install on the board</b>: the motors switch off, the board's WiFi module downloads the file from this page, checks it and installs it, the board restarts and the seat creeps back with the soft start. Under a minute. Pause SimHub's motion output first.",
  fw_clear:"Forget the chosen file (and clear a failed update's message on the board and the matrix).",
  soft:"<b>Soft start</b> (firmware 1.9.1). When the rig has been off, the seat may have ridden down a little. At power-up - and when you press Enable Motors - each motor creeps from wherever it is to where it should be at this speed, easing in and out, instead of jumping there; once it has caught up everything runs normally. 60 counts/s moves a lift about 2° a second. Meanwhile a seat that rode down past an end stop may come back, and the tilt limit waits. Saved on the board at once.",

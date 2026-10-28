@@ -3,6 +3,13 @@
 `smc3_scope` (the page) and `SMC3_R4` (the firmware) are versioned separately. The page works with older
 firmware too; the notes say which firmware a feature needs.
 
+## Page 2.3.1 + firmware 1.9.3
+
+- **Firmware 1.9.3 compiles in the Arduino IDE.** 1.9.2 stopped with "sorry, unimplemented: string literal in
+  function template signature": the UNO R4 boards package compiles with GCC 7, which can't have the update file's
+  name inside a template's signature. It is a parameter now. Nothing else changed.
+- Page 2.3.1 names `SMC3_R4_v1.9.3.ino` where it tells you what to flash; the simulator reports 1.9.3.
+
 ## Page 2.3 + firmware 1.9.2
 
 - **Firmware update over WiFi** (firmware 1.9.2). Settings, **Firmware update**: choose the `.bin` the Arduino IDE

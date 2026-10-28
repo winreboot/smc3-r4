@@ -41,9 +41,14 @@
 // Pots: wiper must stay within 0-5 V (the R4 is a 5 V board, so existing wiring is fine).
 //****************************************************************************************************************
 
-#define FW_VERSION     "1.9.2"         // shown in the USB boot banner; [ver] still answers 70 for SMC3Utils
+#define FW_VERSION     "1.9.3"         // shown in the USB boot banner; [ver] still answers 70 for SMC3Utils
 #define FW_VERSION_NUM 19              // reported by [rd!] so smc3_scope can check what it is talking to (1.9.x = 19)
 #define FW_CAPS        "SMC3CAPS:ota1,wifimem1"   // 1.9.2: what this build can do - smc3_scope looks for it in a .bin
+
+// v1.9.3 changes: compiles in the Arduino IDE.  1.9.2 stopped with "sorry, unimplemented: string literal in function
+//                template signature": the UNO R4 boards package compiles with GCC 7, which can't have the update
+//                file's name ("/update.bin") inside a template's signature; it is a parameter now.  Nothing else
+//                changed.
 
 // v1.9.2 changes: firmware update over WiFi, from smc3_scope's Settings.  The page converts the .bin the Arduino IDE
 //                exports (Sketch, Export Compiled Binary) into the UNO R4 WiFi's .ota format and serves it; the board's
@@ -2210,14 +2215,16 @@ void SendDiag()
 //      minor, patch | char[8] this firmware's version ("1.9.2", zero-padded) - the page checks it after an update.
 //****************************************************************************************************************
 
-// UNO R4 boards package 1.3.0 added the non-blocking download (WiFi module 0.5.0); older ones only have the blocking one
+// UNO R4 boards package 1.3.0 added the non-blocking download (WiFi module 0.5.0); older ones only have the blocking one.
+// (1.9.3: no string literal in these signatures - the boards package's GCC 7 can't compile that.)
 struct OtaCompat
 {
-    template <typename T> static auto Start(T &o, const char *url, int) -> decltype((int)o.startDownload(url, OTA_FILE))
+    template <typename T> static auto Start(T &o, const char *url, const char *path, int)
+        -> decltype((int)o.startDownload(url, path))
     {
-        return (int)o.startDownload(url, OTA_FILE);
+        return (int)o.startDownload(url, path);
     }
-    template <typename T> static int Start(T &, const char *, long) { return OTA_NO_PROGRESS; }
+    template <typename T> static int Start(T &, const char *, const char *, long) { return OTA_NO_PROGRESS; }
     template <typename T> static auto Progress(T &o, int) -> decltype((int)o.downloadProgress())
     {
         return (int)o.downloadProgress();
@@ -2316,7 +2323,7 @@ void ServiceOta(unsigned long now)             // loop(): one step at a time
         {
             int r = (int)Ota.begin(OTA_FILE);    // clears the WiFi module's storage for the file
             if (r != 0) { OtaFail(r); return; }
-            int size = (WifiFw == 0 || WifiFw >= 0x000500UL) ? OtaCompat::Start(Ota, OtaUrl, 0) : OTA_NO_PROGRESS;
+            int size = (WifiFw == 0 || WifiFw >= 0x000500UL) ? OtaCompat::Start(Ota, OtaUrl, OTA_FILE, 0) : OTA_NO_PROGRESS;
             if (size == OTA_NO_PROGRESS)
             {
                 // WiFi module 0.4.x, or a boards package before 1.3.0: a blocking download (up to a minute, no

@@ -249,7 +249,7 @@ The page checks the file first (an SMC3_R4 build for the UNO R4 WiFi, which vers
 update format. The board switches the motors off, its WiFi module downloads the file, checks it and programs the
 board - the same way a USB upload does - and the board restarts; the seat creeps back with the soft start and the
 page confirms the new version. If anything fails before programming, the old firmware keeps running and the card
-says why. The first install of 1.9.2 itself goes over USB, and the WiFi module needs its own firmware 0.4.0 or newer
+says why. The first install of it (1.9.3; 1.9.2 didn't compile) goes over USB, and the WiFi module needs its own firmware 0.4.0 or newer
 (Arduino IDE, Tools, Firmware Updater).
 
 ![Firmware update: SMC3_R4 1.9.3 installed over WiFi](docs/img/firmware-update.png)
@@ -475,7 +475,8 @@ noise. To see what the diagnostics find, add a fault:
   - 1.9: Seat setup (level trim, travel limits, end stops, tilt limits for each direction), gyro and acceleration
     for the 3D view;
   - 1.9.1: soft start;
-  - 1.9.2: firmware updates from the page, and the board remembers its WiFi.
+  - 1.9.2: firmware updates from the page, and the board remembers its WiFi;
+  - 1.9.3: the same, and it compiles in the Arduino IDE (1.9.2 didn't).
 
   See the [CHANGELOG](CHANGELOG.md).
 - New commands are documented in [docs/PROTOCOL.md](docs/PROTOCOL.md). They go over WiFi; USB stays plain SMC3.

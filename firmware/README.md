@@ -43,7 +43,7 @@ What the R4 hardware adds:
 
 ### Updating from the page (1.9.2 and later)
 
-Once the board runs 1.9.2, later firmware can be installed over WiFi:
+Once the board runs 1.9.3 (1.9.2 didn't compile in the Arduino IDE), later firmware can be installed over WiFi:
 
 1. Open the new sketch and choose **Sketch, Export Compiled Binary**. `WIFI_SSID` / `WIFI_PASS` may stay as
    placeholders - the board uses the details it remembers.
@@ -151,6 +151,7 @@ lapses by itself after 3 s if the page goes away). The commands are in [docs/PRO
 
 | Version | Change |
 |---|---|
+| 1.9.3 | Compiles in the Arduino IDE: 1.9.2 stopped with "sorry, unimplemented: string literal in function template signature" (the boards package's GCC 7). Same features. |
 | 1.9.2 | Firmware update over WiFi from the page (`[u..]`, `[rdu]`, "SM3U"; uses the board's WiFi module and `OTAUpdate.h` from the boards package). The board remembers the WiFi name and password it last joined with (EEPROM 112-210). `[rdd]` frame version 5. Matrix: `ERROR E7 UPDATE FAILED`. |
 | 1.9.1 | Soft start: after power-up and Enable Motors each motor creeps to its position instead of jumping (`[k 82 '=']` sets the speed, EEPROM 105-107); a seat that rode down past an end stop may come back, PWMrev stays off and the tilt limit waits meanwhile. `[rdd]` frame version 4. |
 | 1.9 | Seat set-up: level trim, travel limits and end stops per motor and direction, tilt limits per direction (`[w..]`, `[k..]`, EEPROM 66-104). The page can hold SimHub off while it moves the seat (`[kH n]`). The sensor's gyro and acceleration are read and sent to the page (`[xe1]`, "SM3X"); `[iS..]` can ask for them. `[rdd]` frame version 3. |
