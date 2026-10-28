@@ -12,6 +12,8 @@ Smoke test: start simulated rigs and the page, run diagnostics, check the result
    allowed (the seat's turn), it saves; the board then has the level trim, travel limits and end stops, and the seat
    reads level.
 5. The same on a three-lift rig: all three motors level the seat, and motor 3 stops at the tilt allowed.
+6. Soft start (firmware 1.9.1): a seat that rode down while the rig was off creeps back to its centre at power-up,
+   no faster than the soft-start speed, and the speed can be changed.
 """
 import json, os, subprocess, sys, tempfile, time, urllib.request as u
 
@@ -171,6 +173,24 @@ try:
     e = get(base5, "/seat/status")["ends"][2][1]
     check(e and e["why"] == "angle" and abs(e["pitch"]) >= 4.8, f"three lifts: motor 3 stops at the tilt allowed ({e})")
     post(base5, "/seat/cancel")
+
+    # 6. soft start: motor 1 at 300 at power-up, its centre (level trim 18) at 530
+    sim6, scope6, base6 = start(4715, 8715, "--seat-setup", "--start", "1:300")
+    procs += [sim6, scope6]
+    seq, got, t0 = 0, [], time.time()
+    while time.time() - t0 < 9:
+        d = get(base6, f"/data?since={seq}")
+        if d["samples"]:
+            got += d["samples"]; seq = d["samples"][-1]["seq"]
+        time.sleep(0.25)
+    gs = [(x["ms"], x["m"][0]["g"]) for x in got]
+    fastest = max((abs(gs[i + 10][1] - gs[i][1]) * 1000.0 / max(1, gs[i + 10][0] - gs[i][0]) for i in range(0, len(gs) - 10, 10)),
+                  default=0)
+    last = got[-1]["m"][0] if got else {"g": 0, "f": 0}
+    check(bool(got) and fastest < 70 and abs(last["g"] - 530) <= 3 and abs(last["f"] - 530) <= 8 and
+          not any(x["dis"][0] for x in got), f"soft start: crept to 530 (now {last['f']:.0f}), fastest {fastest:.0f} counts/s")
+    r = post(base6, "/board/soft", {"rate": 120})
+    check(r.get("ok") and r["soft_start"]["rate"] == 120, f"soft start speed set to 120 ({r.get('soft_start')})")
 finally:
     for p in procs:
         p.terminate()

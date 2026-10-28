@@ -47,7 +47,7 @@ v1.4: settings dialog (board address, port, find-board scan, auto-find), day/nig
       fixed a thread race that made the page flash "not reachable".
 """
 
-VERSION = "2.1"
+VERSION = "2.2"
 
 import argparse
 import base64
@@ -68,6 +68,12 @@ from urllib.parse import parse_qs, urlparse
 
 def log(msg):
     print(time.strftime("%Y-%m-%d %H:%M:%S"), msg, flush=True)
+
+
+def fw_text(num, diag=None):
+    """Firmware version for people: 19 -> "1.9", or "1.9.1" when its diagnostics frame has the soft start."""
+    t = f"{num // 10}.{num % 10}"
+    return t + ".1" if num == 19 and isinstance(diag, dict) and "soft_start" in diag else t
 
 
 TL_DEFAULT_DEG = 0.02          # degrees the seat turns per count of the traction-loss motor, until Seat setup measures it
@@ -308,7 +314,7 @@ class Board:
         if not d or "sensor" not in d:
             return None
         return {"sensor": d["sensor"], "matrix": d["matrix"], "saved": decode_board_block(d["eeprom"]),
-                "seat": d.get("seat")}
+                "seat": d.get("seat"), "soft_start": d.get("soft_start")}
 
     def ping(self, timeout=1.5):
         """Round trip of one read command in ms (firmware 1.4+), None if no answer."""
@@ -1576,6 +1582,7 @@ DIAG_HEAD = struct.Struct("<I3BB4I2HIbBB")       # firmware 1.7 [rdd] frame, see
 DIAG_MOTOR = struct.Struct("<BHhHHHH")
 DIAG_SENSOR = struct.Struct("<BBBIHIHHhhhhhHBBB")  # firmware 1.8 (frame version 2): after the EEPROM copy
 DIAG_SEAT = struct.Struct("<15h4hBIHH3h3hh")      # firmware 1.9 (frame version 3): seat set-up, acceleration, gyro
+DIAG_SOFT = struct.Struct("<HB")                    # firmware 1.9.1 (frame version 4): soft-start speed, motors creeping
 TILT_DIRS = ("roll_right", "roll_left", "front_up", "front_down")   # roll +, roll -, pitch +, pitch - (firmware order)
 ACC_G = 32768.0 / 16.0                            # WitMotion raw -> g
 GYRO_DPS = 32768.0 / 2000.0                       # WitMotion raw -> degrees per second
@@ -1676,6 +1683,10 @@ def decode_diag(pl, ver=1):
                                 "accel_g": [round(a / ACC_G, 3) for a in acc], "gyro_dps": [round(g / GYRO_DPS, 2) for g in gyro],
                                 "temp_c": round(temp / 100.0, 1),
                                 "tilt_limits": d["seat"]["tilt_limit"]})
+        off += DIAG_SEAT.size
+    if ver >= 4 and len(pl) >= off + DIAG_SOFT.size:
+        rate, creeping = DIAG_SOFT.unpack_from(pl, off)
+        d["soft_start"] = {"rate": rate, "creeping": [m + 1 for m in range(3) if creeping & (1 << m)]}
     return d
 
 
@@ -3016,6 +3027,9 @@ ABOUT = {
               "angles per second, tilt limit and trips, level offsets, raw angles. check[].step.*.seat: the seat's "
               "own response to each step - degrees moved, degrees per count, overshoot and ringing next to the "
               "motor's, lag, and play (counts the motor turns before the seat follows).",
+    "soft_start": "board.soft_start (firmware 1.9.1): rate = how fast, in counts/s, each motor creeps to its position "
+                  "after power-up and Enable Motors instead of jumping there (0 = off); creeping = motors still on their "
+                  "way (normal once caught up).",
     "layout": "rig.layout: 'front lifts + rear traction loss' = motors 1 and 2 lift the front corners and motor 3 slides "
               "the rear left/right (the seat turns about a pivot at the front; its seat response is measured as yaw); "
               "'lifts' = every motor lifts the seat. rig.traction_loss_higher_numbers_move_rear = which way the rear "
@@ -3237,7 +3251,7 @@ class Diagnostics:
         dg = b.read_diag() if connected and fw[1] >= 17 else None
         s = b.latest() if connected else None
         board = {"connected": connected, "address": f"{cfg.get('host')}:{cfg.get('port')}",
-                 "firmware": f"{fw[1] // 10}.{fw[1] % 10}" if fw[1] else ("1.3 or older" if params.get("Kp1") is not None else None),
+                 "firmware": fw_text(fw[1], dg) if fw[1] else ("1.3 or older" if params.get("Kp1") is not None else None),
                  "fw_num": fw[1], "reverse_motor1": bool(fw[0] & 1)}
         if not connected:
             board["disconnected_for"] = _ago(time.time() - b.disconnected_since)
@@ -3270,6 +3284,8 @@ class Diagnostics:
                 board["led_matrix"] = dg["matrix"]
             if "seat" in dg:                         # firmware 1.9: level trim, travel limits, end stops, tilt limits
                 board["seat_setup"] = dg["seat"]
+            if "soft_start" in dg:                   # firmware 1.9.1: soft start
+                board["soft_start"] = dg["soft_start"]
         rep["board"] = board
         names = list(cfg.get("motor_names") or ["", "", ""])
         tl = tl_motor(cfg)
@@ -3808,6 +3824,22 @@ def analyze(rep):
                 f"{seat_w['roll_range'][1]:+.1f}°, pitch {seat_w['pitch_range'][0]:+.1f}° to "
                 f"{seat_w['pitch_range'][1]:+.1f}°", f"Fastest movement {seat_w['speed_max_deg_s']:.0f}°/s.",
                 code="seat_range")
+    # ---- soft start (firmware 1.9.1) ----
+    sst = board.get("soft_start")
+    if sst is not None:
+        if not sst.get("rate"):
+            add("info", "Soft start is off",
+                "After power-up and Enable Motors the motors go straight to their positions - a seat that rode down "
+                "while the rig was off jumps back.",
+                "Settings, Loop, PWM & smoothing: Soft start, e.g. 60 counts/s.", code="soft_off")
+        elif sst.get("creeping"):
+            add("info", "Motor " + " and ".join(map(str, sst["creeping"])) + " still creeping to its position "
+                "(soft start)", f"At {sst['rate']} counts/s after power-up or Enable Motors; normal once it has caught "
+                "up.", code="soft_creeping")
+    elif board.get("seat_setup") is not None:
+        add("info", "Firmware 1.9.1 adds a soft start",
+            "With 1.9 the motors go straight to their positions at power-up - a seat that rode down while the rig "
+            "was off jumps back.", "Flash SMC3_R4_v1.9.1.ino.", code="soft_fw")
     # ---- seat set-up (firmware 1.9) ----
     ss = board.get("seat_setup")
     if ss:
@@ -5693,6 +5725,11 @@ details.oks .flist{margin-top:6px}
    <button class="btn b-blue ap" id="fapply" data-k="applyFilt" onclick="applyFilt()">Apply</button>
   </div>
   <p class="note" id="fnote">Takes effect immediately; press Save to EEPROM to keep it after a power cycle.</p>
+  <div class="frow" style="grid-template-columns:1.3fr auto;margin-top:12px">
+   <div><span class="lbl" data-k="soft">Soft start - after power-up and Enable Motors</span><select id="fsoft" disabled><option value="0">Off - straight to the position</option><option value="30">30 counts/s - very gentle</option><option value="60">60 counts/s - gentle (default)</option><option value="120">120 counts/s</option><option value="250">250 counts/s - quick</option></select></div>
+   <button class="btn b-blue ap" id="softapply" data-k="applySoft" onclick="applySoft()" disabled>Apply</button>
+  </div>
+  <p class="note" id="softnote"></p>
  </section>
 
  <!-- test signal -->
@@ -6003,7 +6040,8 @@ details.oks .flist{margin-top:6px}
    <div><h3>Motor names and the rig</h3><p>Settings, Motor names: call the motors Front left, Front right, Traction loss (or anything you like). The names appear everywhere in the page and in diagnostics files; the number stays alongside because the wiring, SimHub and the LED matrix use numbers. The same card says what <b>motor 3</b> does: on a <b>traction-loss</b> rig motors 1 and 2 lift the front corners and motor 3, mounted horizontally, swings the rear left and right about a pivot at the front; on a <b>three-lift</b> rig it lifts the rear. Seat setup, the full check, auto-tune and the 3D view follow that.</p>
     <h3>Selected motor</h3><p>Click a motor card or chart, or choose a motor in Test Signal or Auto-Tune: the same motor is highlighted everywhere. While a test signal or auto-tune runs, its chart is marked and the others fade.</p>
     <h3>Diagnostics</h3><p>Settings section. <b>Quick check</b> reads the board and listens for a few seconds; <b>Full check</b> also moves each motor a little to see which way it goes, how much drive it needs, whether the wiring is swapped and how it answers a small step - and can ask you what you saw. Both make one file (saved on the NAS too) to download and give to whoever helps you. The page also watches while you drive and notes pot glitches, a motor moving the wrong way or stalling, hunting, cutoffs, the tilt limit and board restarts. It also keeps a <b>load map</b>: where each motor falls behind or runs at full power, each way across its travel - a quick check after a session names where the rig struggles (lifting a heavy driver, say). With the motion sensor, the full check also measures the seat itself: degrees per count, bounce and play in the linkage - for the traction-loss motor, how far the seat turns. For the rear slide it asks whether the rear went left or right.</p>
-    <h3>Status bar</h3><p>LOW POWER means no position commands for 15 s, so the board runs at quarter drive until SimHub or this page sends targets again.</p></div>
+    <h3>Status bar</h3><p>LOW POWER means no position commands for 15 s, so the board runs at quarter drive until SimHub or this page sends targets again.</p>
+    <h3>Soft start (firmware 1.9.1)</h3><p>After the rig has been off the seat may have ridden down a little. At power-up, and when you press Enable Motors, each motor creeps from wherever it is to its position (SimHub's centre at power-up) instead of jumping there - 60 counts/s by default, easing in and out. Once it has caught up everything runs normally. A seat that rode down past an end stop is allowed to come back (only going further out switches the motor off), the tilt limit waits, and the board keeps full power meanwhile. Settings, Loop, PWM &amp; smoothing: Soft start.</p></div>
    <div><h3>Seat setup (firmware 1.9)</h3><p>Levels the platform first and makes that SimHub's centre: the board adds a <b>level trim</b> to every position SimHub sends, so SimHub's middle (512) is the level seat - and the seat goes level at power-up. With the motion sensor it levels itself (each motor moves a little to learn how it tilts the seat, then the page moves them until the sensor reads level, choosing the level position nearest the middle of every motor); without it you nudge the motors with a spirit level on the seat. On a traction-loss rig only motors 1 and 2 level the seat; you <b>centre</b> motor 3, the rear slide, so the seat points straight ahead, and tell the page which way the rear went for +10.</p>
     <p>Then each motor moves slowly away from level, both ways, and stops at the tilt you allow, when it pushes against something, at the end of its Clip window, or when you press Stop (space bar). The rear slide stops at the <b>traction loss you allow</b> - how far the seat may turn each way, measured by the sensor. From what it found the page suggests <b>travel limits</b> (the board never sends a motor past them), <b>end stops</b> (a motor that gets past one anyway is switched off: E1-E3) and <b>tilt limits</b> for each direction (every motor stops: E4). While Seat setup is open the board ignores SimHub's positions; Cancel puts everything back. Auto-tune, the test signal and the full check stay inside the travel limits.</p>
     <h3>3D View</h3><p>The seat in a sci-fi cockpit, moving live: with the motion sensor it shows the seat's real attitude, otherwise an estimate from the motor positions (best after Seat setup). On a traction-loss rig the two front actuators lift the front corners and the horizontal rear actuator swings the seat about the front pivot - the rear's position comes from motor 3's pot, so it moves exactly with the rig; on a three-lift rig the actuators sit where Seat setup found each motor acts. A glowing outline shows where the motors are being sent when the seat lags behind. Panels show the angles, the sensor's gyro and acceleration (after Set up the sensor), the actuators and an attitude indicator with the tilt limits. Drag to turn the view, scroll to zoom, or pick a camera.</p></div>
@@ -6107,6 +6145,8 @@ const TIPS={
  sn_setup:"The WT901C leaves the factory at 10 readings per second. This sets it to 100 per second at 115200 baud - with firmware 1.9 angles, gyro and acceleration (for the 3D view), with 1.8 angles only - and saves that in the sensor. Needs the board's D1 wired through the MAX3232 to the sensor's RX (green). If SimHub also reads the sensor, set it in WitMotion's PC software instead.",
  sn_search:"The board tries the usual baud rates until the sensor answers - normally by itself while the sensor is switched on. This makes it look again for 30 s.",
  smooth:"<b>Target smoothing</b> - how softly the motor eases into each new position SimHub sends (a low-pass filter on the target).<br><br><b>Off / 4 ms:</b> raw, every bump and kerb comes through - rally.<br><b>8-16 ms:</b> crisp but not jagged - circuit racing.<br><b>32-64 ms:</b> soft and floaty - flight, space, trucks.<br><br>Times are at Fpid/1 (double them at Fpid/2). Needs firmware 1.6.",
+ soft:"<b>Soft start</b> (firmware 1.9.1). When the rig has been off, the seat may have ridden down a little. At power-up - and when you press Enable Motors - each motor creeps from wherever it is to where it should be at this speed, easing in and out, instead of jumping there; once it has caught up everything runs normally. 60 counts/s moves a lift about 2° a second. Meanwhile a seat that rode down past an end stop may come back, and the tilt limit waits. Saved on the board at once.",
+ applySoft:"Sends the soft-start speed to the board; it is saved there at once (no Save to EEPROM needed).",
  maxrate:"<b>Max speed</b> - the fastest the target may move, in counts per second (full travel is about 820 counts). 0 = no limit.<br><br>A cap like 1500-2000 stops sudden lurches (crashes, game resets) and makes flight feel calmer. Needs firmware 1.6.",
  applyFilt:"Sends smoothing and max speed to the board now (not saved until Save to EEPROM).",
  g_base:"The settings the recommendation starts from: what's running on the board now, or one of your saved profiles.",
@@ -6273,7 +6313,7 @@ function showView(){let v=location.hash.slice(1);if(!VIEWS.includes(v))v='dashbo
  document.querySelectorAll('#nav a').forEach(a=>a.classList.toggle('on',a.getAttribute('href')==='#'+v));
  const eb=$('expBtn');eb.dataset.k=v==='graphs'?'collapse':'expand';eb.dataset.tip=TIPS[eb.dataset.k];
  eb.innerHTML=v==='graphs'?'<svg class="i" viewBox="0 0 24 24"><path d="M4 14h6v6M20 10h-6V4M14 10l7-7M3 21l7-7"/></svg>':'<svg class="i" viewBox="0 0 24 24"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>';
- if(v==='profiles'){loadProfiles();loadGenres();} if(v==='settings'){fillSettings();diagLists();loadBoard(true);} if(v==='eeprom')loadBackups();
+ if(v==='profiles'){loadProfiles();loadGenres();} if(v==='settings'){fillSettings();diagLists();loadBoard(true);} if(v==='tuning')loadBoard(true); if(v==='eeprom')loadBackups();
  if(v==='seat'){ssFilled=null;ssPoll();} if(typeof v3Show==='function')v3Show(v==='view3d');
  chartHeight();}
 window.addEventListener('hashchange',showView);
@@ -6313,7 +6353,13 @@ function useHost(h){$('s_host').value=h;saveSettings();}
 // ---------- board settings (firmware 1.8): LED matrix and motion sensor ----------
 let boardSet=null;
 async function loadBoard(fillInputs){try{const r=await (await fetch('/board/settings')).json();boardSet=r;showBoard(r,fillInputs);}catch(e){}}
-function showBoard(r,fillInputs){const ok=r.ok;
+function showSoft(r,fill){const s=r&&r.soft_start;const ok=!!(r&&r.ok&&s);$('fsoft').disabled=!ok;$('softapply').disabled=!ok;
+ $('softnote').innerHTML=!r||!r.connected?'':(ok?(s.creeping&&s.creeping.length?`<span class="okc">Motor ${s.creeping.join(' and ')} still creeping to its position.</span>`:'Saved on the board at once.')
+  :(r.ok&&r.fwnum>=18?'<span class="muted">Needs firmware 1.9.1 on the board (SMC3_R4_v1.9.1.ino).</span>':''));
+ if(ok&&fill&&document.activeElement!==$('fsoft')){const v=String(s.rate);if(![...$('fsoft').options].some(o=>o.value===v))$('fsoft').insertAdjacentHTML('beforeend',`<option value="${v}">${v} counts/s</option>`);$('fsoft').value=v;}}
+async function applySoft(){const v=+$('fsoft').value;const r=await post('/board/soft',{rate:v});
+ if(r.ok){boardSet=r;showSoft(r,true);toast(v?`Soft start: ${v} counts/s after power-up and Enable Motors - saved on the board.`:'Soft start off - motors go straight to their positions.');}else toast(r.error||'No answer from the board.');}
+function showBoard(r,fillInputs){const ok=r.ok;showSoft(r,fillInputs);
  document.querySelectorAll('#ledcard select,#ledcard input,#l_save,#sencard select,#sencard input,#sencard .sn').forEach(e=>e.disabled=!ok);
  const one=ok&&r.fwnum<19;['sn_t_rl','sn_t_fu','sn_t_fd'].forEach(id=>$(id).disabled=!ok||one);
  const need=!r.connected?'The board is not connected.':(r.fwnum&&r.fwnum<18?'Needs firmware 1.8 on the board (yours: '+(r.fwnum/10).toFixed(1)+').':(!ok?'No answer from the board - try again.':''));
@@ -7237,7 +7283,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _fw(self):
         fw = self.board.fw_cache
-        return f"{fw[1] // 10}.{fw[1] % 10}" if fw else ("≤1.3" if self.board.params.get("Kp1") is not None else "")
+        return fw_text(fw[1], self.board.diag) if fw else ("≤1.3" if self.board.params.get("Kp1") is not None else "")
 
     def do_GET(self):
         u = urlparse(self.path)
@@ -7354,7 +7400,16 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": False, "error": "This needs firmware 1.8 on the board."})
             return
         try:
-            if p == "/board/led":
+            if p == "/board/soft":
+                # firmware 1.9.1: how fast the motors creep to their positions after power-up and Enable Motors
+                if "soft_start" not in (b.diag or {}) and "soft_start" not in (b.read_diag() or {}):
+                    self._json({"ok": False, "error": "Soft start needs firmware 1.9.1 on the board."})
+                    return
+                rate = max(0, min(1000, int(req.get("rate", 60))))
+                b.seat_field(82, rate)
+                self.events.add("setting", f"Soft start: {f'{rate} counts/s' if rate else 'off'} after power-up and "
+                                f"Enable Motors.", quiet=True)
+            elif p == "/board/led":
                 view = max(0, min(2, int(req.get("view", 0))))
                 flags = (1 if req.get("idle", True) else 0) | (2 if req.get("repeat", True) else 0)
                 b.cmd_pair("l", view, flags)
@@ -7468,7 +7523,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"ok": False, "error": "Check the test-signal numbers."})
                 return
             self._json({"ok": True})
-        elif p in ("/board/led", "/board/sensor", "/board/sensor/action"):
+        elif p in ("/board/led", "/board/sensor", "/board/sensor/action", "/board/soft"):
             self._board_setting(p, req)
         elif p.startswith("/seat/"):
             self._seat_post(p[6:], req)

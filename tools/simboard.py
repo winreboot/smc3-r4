@@ -43,6 +43,11 @@ Seat set-up (firmware 1.9):
   --seat-tilt R:P      the seat isn't level with every motor at 512: R degrees roll, P degrees pitch
   --stops M:LO:HI      motor M hits a mechanical stop at pot LO and HI (default 30 and 993 for every motor)
   --seat-setup         start with a saved seat set-up (level trims, travel limits, end stops, tilt limits)
+
+Soft start (firmware 1.9.1): after power-up and Enable Motors each motor creeps to its position (60 counts/s):
+  --start M:POT        motor M's pot reads POT at power-up (the seat rode down while the rig was off); the board then
+                       heads for its centre (512 + level trim), as the real one does
+  --old19              firmware 1.9 without the soft start (diagnostics frame version 3)
 """
 import argparse, math, random, socket, struct, threading, time
 
@@ -74,6 +79,8 @@ ap.add_argument("--seat-tilt", default="")
 ap.add_argument("--stops", action="append", default=[])
 ap.add_argument("--seat-setup", action="store_true")
 ap.add_argument("--layout", choices=["tl", "lifts"], default="tl")
+ap.add_argument("--start", action="append", default=[])
+ap.add_argument("--old19", action="store_true")
 ap.add_argument("--tl-left", action="store_true")
 ap.add_argument("--tuned", action="store_true", help="start with sane settings (Kp 250, Ki 0, Kd 0, PWMmin 30, dead zone 2)")
 args = ap.parse_args()
@@ -100,6 +107,12 @@ TL_DIR = -1 if args.tl_left else 1            # +1: higher numbers move the rear
 SENSOR_OFFSET = (1.3, -0.8)                   # the sensor isn't mounted perfectly level
 SEAT_TILT = tuple(float(x) for x in args.seat_tilt.split(":")) if args.seat_tilt else (0.0, 0.0)
 STOPS = [[30.0, 993.0] for _ in range(3)]     # mechanical ends of each motor's travel (pot counts)
+START = {}                                    # --start: where the pots are at power-up
+for st_ in args.start:
+    m_, pot_ = st_.split(":")
+    START[int(m_) - 1] = float(pot_)
+SOFT_FW = args.fw >= 19 and not args.old19    # firmware 1.9.1: soft start
+SOFT = {"rate": 60}                           # counts/s (0 = off), EEPROM 105-107
 for st_ in args.stops:
     m_, lo_, hi_ = st_.split(":")
     STOPS[int(m_) - 1] = [float(lo_), float(hi_)]
@@ -109,7 +122,7 @@ BAUDS = [9600, 115200, 230400, 57600, 38400, 19200, 4800]
 class Phys:                                   # the motor + linkage + pot
     def __init__(self, i):
         self.i = i
-        self.x = 512.0 + random.uniform(-30, 30); self.v = 0.0; self.dl = 0.0; self.drive = 0.0; self.brake = True
+        self.x = START.get(i, 512.0 + random.uniform(-30, 30)); self.v = 0.0; self.dl = 0.0; self.drive = 0.0; self.brake = True
         self.pot_x = self.x                       # where the pot thinks it is (differs only with --slip)
         self.link = self.x                        # where the seat's end of the linkage is (differs with --slop)
 
@@ -140,6 +153,7 @@ class Chan:                                   # the firmware's per-motor state
         self.disabled = True; self.reason = 3; self.fb_q = 512 << 4; self.pid_q = 0
         self.trips = 0; self.trip_at = -1; self.jumps = 0; self.jmax = 0; self.fmin = 16383; self.fmax = 0
         self.trim, self.tlo, self.thi, self.elo, self.ehi = 0, 0, 1023, 0, 1023     # 1.9 seat set-up
+        self.soft, self.soft_ticks, self.soft_out, self.soft_since = False, 0, 0, 0.0   # 1.9.1 soft start
         self.update_ilim()
 
     def window(self):                         # target limits in force: SMC3 clip and the travel limits (1.9)
@@ -166,6 +180,27 @@ SIMHUB = [False]                          # switched with [zs1] / [zs0] from any
 HOLD = [0.0]                              # 1.9 [kH n]: SimHub's positions are ignored until then
 EXTRAS_ANY = [False]
 VREG = [0]                                # 1.9 [w hi lo]
+def soft_start_from(c):
+    """1.9.1: creep from where the motor is to its target (EnableMotor / power-up)."""
+    lo, hi = c.cut_window()
+    fb = c.fb_q
+    c.soft_out = (lo * 16 - fb) if fb < lo * 16 else ((fb - hi * 16) if fb > hi * 16 else 0)
+    c.soft_ticks, c.soft = 0, True
+    c.goal_acc = fb << 8; c.goal_q = fb
+    c.cum = 0; c.lastpos = fb; c.dterm = 0
+    c.soft_since = time.time()
+
+
+def any_soft():
+    return any(c.soft and not c.disabled for c in C)
+
+
+def enable(c):
+    if c.disabled and SOFT_FW and SOFT["rate"] > 0:
+        soft_start_from(c)
+    c.disabled, c.reason = False, 0
+
+
 TILT4 = [0, 0, 0, 0]                      # 1.9 tilt limits x10: roll +, roll -, pitch +, pitch -
 state = {}
 
@@ -209,17 +244,20 @@ def boot(cold=True):
                      baud_idx=eeprom[65] % 7)
     if args.fw >= 19:
         load_seat()
+    if SOFT_FW and eeprom[105] == 0xB5:
+        SOFT["rate"] = struct.unpack(">h", bytes(eeprom[106:108]))[0]
     SEAT.found_at = None; SEAT.packets = 0
     for c in C:
         p = P[potmap[c.i]]
         c.fb_q = int(p.pot_x * 16); c.lastpos = c.fb_q
         lo, hi = c.window()
         c.goal_acc = (max(lo, min(hi, int(p.pot_x))) << 12); c.goal_q = c.goal_acc >> 8
-        if args.fw >= 19 and any(ch.trim for ch in C):
+        if args.fw >= 19 and (any(ch.trim for ch in C) or START):
             c.set_target(512)                 # 1.9 with a seat set-up: the centre - the level seat
         else:                                 # (simplified: the real board also heads for 512 without one)
             c.target = max(lo, min(hi, int(p.pot_x)))
-        c.disabled, c.reason = False, 0
+        c.disabled, c.reason = True, 3
+        enable(c)                             # 1.9.1: creeps from where it is
     power_scale = 7
     last_target_t = 0.0
     t0 = time.time()
@@ -352,6 +390,8 @@ def sensor_tick(now):
         past = ((TILT4[0] and r > TILT4[0] / 10.0) or (TILT4[1] and r < -TILT4[1] / 10.0)
                 or (TILT4[2] and p > TILT4[2] / 10.0) or (TILT4[3] and p < -TILT4[3] / 10.0))
         lim = 1 if any(TILT4) else 0
+    if any_soft():                            # 1.9.1: the tilt limit waits while the seat creeps back
+        board["grace"] = now + 1.5
     if (board["sflags"] & 1) and lim and now >= board["grace"]:
         r, p = seat_angles()
         if (past if args.fw >= 19 else (abs(r) > lim or abs(p) > lim)):
@@ -391,6 +431,17 @@ def chan_tick(c):
     if step == 0: step = diff
     if frate:
         lim = int(frate * 4096 / 4000); step = max(-lim, min(lim, step))
+    if c.soft:                                # 1.9.1: creeping after power-up / Enable Motors
+        ad = abs(diff)
+        sstep = int(SOFT["rate"] * 4096 / 4000)
+        if ad <= (2 << 12) or sstep <= 0:
+            c.soft = False
+        else:
+            lim = sstep
+            if c.soft_ticks < 2400:
+                c.soft_ticks += 1; lim = lim * c.soft_ticks // 2400
+            lim = max(1, min(lim, (ad >> 10) + 1))
+            step = max(-lim, min(lim, step))
     c.goal_acc += step
     c.goal_q = (c.goal_acc + 128) >> 8
     p = P[potmap[c.i]]
@@ -405,7 +456,16 @@ def chan_tick(c):
     c.jmax = max(c.jmax, j); c.fmin = min(c.fmin, fb); c.fmax = max(c.fmax, fb)
     c.fb_q = fb
     clo, chi = c.cut_window() if args.fw >= 19 else (c.cut, 1023 - c.cut)
-    if fb > (chi << 4) or fb < (clo << 4):
+    past = fb > (chi << 4) or fb < (clo << 4)
+    if past and c.soft and c.soft_out > 0:   # 1.9.1: coming back from past an end stop after power-up
+        out_q = (clo << 4) - fb if fb < (clo << 4) else fb - (chi << 4)
+        hard = fb > ((1023 - c.cut) << 4) or fb < (c.cut << 4)
+        if not hard and out_q <= c.soft_out + (16 << 4):
+            past = False; c.soft_out = min(c.soft_out, out_q)
+    elif not past and c.soft_out:             # well inside (16 counts): the end stops count as usual again
+        inside = min(fb - (clo << 4), (chi << 4) - fb)
+        c.soft_out = 0 if (inside > (16 << 4) or not c.soft) else 1
+    if past:
         if not c.disabled:
             c.trips += 1; c.trip_at = fb >> 4; c.reason = 1
         c.disabled = True
@@ -426,8 +486,9 @@ def chan_tick(c):
         return 0.0, True
     cmax, cmin = (1023 - c.clip) << 4, c.clip << 4
     offq, maxq, revq = c.pwmmin << 4, c.pwmmax << 4, c.pwmrev << 4
-    if fb > cmax and c.pwmrev: return -revq / FULL, False
-    if fb < cmin and c.pwmrev: return revq / FULL, False
+    rev = c.pwmrev and not c.soft             # 1.9.1: no PWMrev drive while creeping
+    if fb > cmax and rev: return -revq / FULL, False
+    if fb < cmin and rev: return revq / FULL, False
     if c.goal_q > fb + dzq or c.goal_q < fb - dzq:
         if out >= 0: return min(out + offq, maxq) / FULL, False
         return -min(-out + offq, maxq) / FULL, False
@@ -496,7 +557,11 @@ def sim_loop():
                     try: c.close()
                     except OSError: pass
                 clients.clear()
-            power_scale = 9 if (time.time() - last_target_t) > 15 else 7
+            soft_now = any_soft()                 # 1.9.1: full power while creeping; give up after 40 s
+            power_scale = 9 if ((time.time() - last_target_t) > 15 and not soft_now) else 7
+            if soft_now:
+                for c in C:
+                    if c.soft and time.time() - c.soft_since > 40: c.soft = False
             for _ in range(SUB):
                 out = [chan_tick(c) for c in C]
                 for i in range(3):
@@ -586,7 +651,10 @@ def diag_frame():
         (8 if time.time() < HOLD[0] else 0)
     hz = int(SEAT.rate) if (fresh and SEAT.all) else 0
     pl += struct.pack("<BIHH3h3hh", fl, usb.get("held", 0), hz, hz, *SEAT.acc, *SEAT.gyro, 2950)
-    return b"SM3D" + bytes([3, len(pl)]) + pl
+    if not SOFT_FW:
+        return b"SM3D" + bytes([3, len(pl)]) + pl
+    pl += struct.pack("<HB", SOFT["rate"], sum(1 << i for i, c in enumerate(C) if c.soft and not c.disabled))
+    return b"SM3D" + bytes([4, len(pl)]) + pl
 
 
 def extras_frame():
@@ -627,6 +695,9 @@ def handle_cmd(c, a, b, out, cl=None):
                 elif a in (80, 81):
                     if -9000 <= v <= 9000:
                         board["lv_r" if a == 80 else "lv_p"] = v; save_board()
+                elif a == 82 and SOFT_FW:
+                    if 0 <= v <= 1000:
+                        SOFT["rate"] = v; eeprom[105] = 0xB5; eeprom[106:108] = struct.pack(">h", v)
                 elif (a >> 4) < 3:
                     ch, k = C[a >> 4], a & 15
                     if k == 0 and -300 <= v <= 300: ch.trim = v
@@ -687,8 +758,8 @@ def handle_cmd(c, a, b, out, cl=None):
             if args.fw >= 19: save_seat()
         elif c == "e" and a == ord("n"):
             if b == ord("a"):
-                for ch in C: ch.disabled, ch.reason = False, 0
-            elif ord("1") <= b <= ord("3"): C[b - ord("1")].disabled, C[b - ord("1")].reason = False, 0
+                for ch in C: enable(ch)
+            elif ord("1") <= b <= ord("3"): enable(C[b - ord("1")])
             board["grace"] = time.time() + 1.5
         elif c == "r" and a == ord("d"):
             k = chr(b)

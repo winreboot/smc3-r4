@@ -405,7 +405,11 @@ traction loss, let each motor find its safe travel, and save. SimHub's centre is
 
 ### 5. Tune
 
-Run **auto-tune** on each motor (seat empty first, then seated), try it in a game, and **Save to EEPROM**. Then
+Run **auto-tune** on each motor (seat empty first, then seated), try it in a game, and **Save to EEPROM**.
+
+**Soft start** (firmware 1.9.1): after the rig has been off the seat may have ridden down a little. At power-up, and
+when you press Enable Motors, each motor creeps back to its position instead of jumping there, then runs normally.
+The speed (60 counts/s by default, or off) is under Settings, Loop, PWM & smoothing. Then
 try the **recommendations** for the sims you play and save them as profiles.
 
 ## Try it without a rig
@@ -449,7 +453,8 @@ noise. To see what the diagnostics find, add a fault:
   - 1.7: full diagnostics;
   - 1.8: the LED matrix in words, and the motion sensor;
   - 1.9: Seat setup (level trim, travel limits, end stops, tilt limits for each direction), gyro and acceleration
-    for the 3D view.
+    for the 3D view;
+  - 1.9.1: soft start.
 
   See the [CHANGELOG](CHANGELOG.md).
 - New commands are documented in [docs/PROTOCOL.md](docs/PROTOCOL.md). They go over WiFi; USB stays plain SMC3.

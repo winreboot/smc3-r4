@@ -3,6 +3,21 @@
 `smc3_scope` (the page) and `SMC3_R4` (the firmware) are versioned separately. The page works with older
 firmware too; the notes say which firmware a feature needs.
 
+## Page 2.2 + firmware 1.9.1
+
+- **Soft start** (firmware 1.9.1). After the rig has been off the seat may have ridden down a little. At power-up,
+  and when you press Enable Motors, each motor now creeps from wherever it is to its position - SimHub's centre at
+  power-up - instead of jumping there: 60 counts/s by default, easing in and out. Once it has caught up everything
+  runs normally; position commands that arrive meanwhile are followed at that speed until it has.
+  - A seat that rode down past an end stop may come back; going further out (or past the SMC3 cutoff, e.g. a broken
+    pot) still switches the motor off.
+  - The original SMC3's PWMrev drive (full duty back from past the Clip window) stays off while a motor creeps.
+  - The tilt limit waits until every motor has caught up; the board keeps full power meanwhile.
+  - Settings, Loop, PWM & smoothing: **Soft start** - off, 30, 60, 120 or 250 counts/s, saved on the board at once
+    (`[k 82 '=']`, EEPROM 105-107). `[rdd]` frame version 4 reports it and which motors still creep.
+- Diagnostics: soft start off, a motor still creeping, or firmware 1.9 without it.
+- Simulator: `--start M:POT` (where a pot is at power-up), `--old19` (firmware 1.9 without the soft start).
+
 ## Page 2.1 (firmware 1.9, unchanged)
 
 Traction loss: rigs where motors 1 and 2 lift the front corners and motor 3, mounted horizontally, slides the rear

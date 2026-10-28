@@ -40,7 +40,7 @@ are two separate bytes. The same commands work over USB (SimHub, SMC3Utils) and 
 | `[iR?]` | 1.8 | Look for the sensor again (try the baud rates for 30 s). |
 | `[ift]` | 1.9 | As in 1.8, but t = 255 leaves the tilt limits alone (t ≤ 60 sets all four directions to t). `[rdi]` answers the tightest of the four, whole degrees; state bit7 = gyro + acceleration arriving. |
 | `[whl]` | 1.9 | Value register = h × 256 + l, signed, for the next `[k f =]`. |
-| `[kf=]` | 1.9 | Seat set-up field f = value register. f = 16 × motor (0-2) + 0 level trim (counts, −300…300), 1 travel low, 2 travel high, 3 end stop low, 4 end stop high (pot counts 0-1023); f = 64 + d: tilt limit × 10 for d = 0 roll + (right side down), 1 roll −, 2 pitch + (front up), 3 pitch − (0 = none); f = 80 / 81: the sensor's level roll / pitch (raw × 100, saved at once). |
+| `[kf=]` | 1.9 | Seat set-up field f = value register. f = 16 × motor (0-2) + 0 level trim (counts, −300…300), 1 travel low, 2 travel high, 3 end stop low, 4 end stop high (pot counts 0-1023); f = 64 + d: tilt limit × 10 for d = 0 roll + (right side down), 1 roll −, 2 pitch + (front up), 3 pitch − (0 = none); f = 80 / 81: the sensor's level roll / pitch (raw × 100, saved at once); f = 82 (1.9.1): soft-start speed in counts/s, 0 = off (saved at once in EEPROM 105-107). |
 | `[kSV]` `[kRL]` `[kCL]` | 1.9 | Save the seat set-up (EEPROM 66-104; `[sav]` saves it too) / reload the saved one / clear it (no trim, no travel limits or end stops; tilt limits stay) until saved or restarted. |
 | `[kHn]` | 1.9 | The page holds the seat for n × 100 ms: position commands from USB (SimHub) are counted but ignored meanwhile. n = 0 gives the seat back at once. Seat setup refreshes it every second. |
 | `[xe1]` `[xe0]` | 1.9 | WiFi only: send an "SM3X" frame (the sensor's acceleration and gyro) after every telemetry burst / stop. Off for every new connection. |
@@ -120,6 +120,8 @@ connection as ordinary 5-byte SMC3 replies.
   uint8 flags: bit0 the seat set-up running is the saved one, bit1 one is saved, bit2 "SM3X" frames on, bit3 the page holds the seat
   uint32 SimHub position commands ignored while held   uint16 acceleration packets, gyro packets in the last second
   int16 raw acceleration x, y, z   int16 raw gyro x, y, z   int16 temperature ×100
+  version 4 (1.9.1) continues:
+  uint16 soft-start speed (counts/s, 0 = off)   uint8 motors still creeping to their position (bit n = motor n+1)
 ```
 
 ### EEPROM 56-65 (firmware 1.8)
@@ -143,6 +145,26 @@ They are written when the setting changes, not by `[sav]`, so the SMC3 tuning st
 | 97-104 | int16 tilt limits ×10: roll +, roll −, pitch +, pitch − |
 
 Written by `[kSV]` and `[sav]`. Without the block, the tilt limits come from 1.8's single limit (byte 60).
+
+### EEPROM 105-107 (firmware 1.9.1): soft start
+
+| Address | Content |
+|---|---|
+| 105 | 0xB5 = valid (otherwise the default, 60 counts/s) |
+| 106-107 | int16 soft-start speed in counts/s, big-endian (0 = off) |
+
+Written as soon as `[k 82 '=']` changes it.
+
+### Soft start (firmware 1.9.1)
+
+When a motor is switched on - at power-up, and by `[ena]` / `[enN]` after it was off - its smoothed goal starts
+exactly at the pot reading and moves to the target at no more than the soft-start speed, easing in over 0.6 s and out
+over the last ~15 counts. Position commands still set the target meanwhile; the goal follows them at that speed until
+it has caught up (within 2 counts), then everything is normal. It gives up after 40 s. While a motor creeps:
+PWMrev (the original's full-duty drive back from past the Clip window) is not used; a motor that starts past one of
+its 1.9 end stops may come back (it is switched off only if it goes 16 counts further out than it has been, or past
+the SMC3 cutoff, until it is 16 counts inside); the tilt limit waits until no motor creeps any more, plus 1.5 s; the
+board keeps full power without position commands.
 
 RSTSR2 bit0 (CWSF) reads 0 after a real power-on, or after a supply dip deep enough to restart the chip. The
 firmware sets it to 1 at boot, so a later reset by the button, an upload or the WiFi/USB chip reads 1. The first

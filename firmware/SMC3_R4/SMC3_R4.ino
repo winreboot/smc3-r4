@@ -41,8 +41,20 @@
 // Pots: wiper must stay within 0-5 V (the R4 is a 5 V board, so existing wiring is fine).
 //****************************************************************************************************************
 
-#define FW_VERSION     "1.9"           // shown in the USB boot banner; [ver] still answers 70 for SMC3Utils
+#define FW_VERSION     "1.9.1"         // shown in the USB boot banner; [ver] still answers 70 for SMC3Utils
 #define FW_VERSION_NUM 19              // reported by [rd!] so smc3_scope can check what it is talking to (1.9.x = 19)
+
+// v1.9.1 changes: soft start.  At power-up, and when a motor is switched back on (Enable Motors), each motor creeps
+//                from wherever it is to where it should be - SimHub's centre at power-up - at the soft-start speed
+//                (default 60 counts/s, easing in and out), instead of jumping there.  Once it has caught up it runs
+//                normally.  Meanwhile:
+//                * a seat that rode down past an end stop while the rig was off may come back (it is switched off
+//                  only if it goes 16 counts further out, or past the SMC3 cutoff - a broken pot still trips at once);
+//                * the PWMrev "drive back at full reverse duty" of the original stays off, so nothing slams;
+//                * the tilt limit waits until every motor has caught up (and 1.5 s more);
+//                * the board stays at full power even without position commands.
+//                [k 82 '='] sets the speed (counts/s, 0 = off), saved at once in EEPROM 105-107.
+//                [rdd] frame version 4 adds the soft-start speed and which motors are still creeping.
 
 // v1.9 changes:  seat set-up, made by smc3_scope's Seat setup:
 //                * level trim per motor: added to every position command, so SimHub's centre (512) is the level seat
@@ -118,6 +130,10 @@
 // Hard limit on how fast the commanded position may move, in SMC3 counts (0-1023) per second. 0 = off.
 // 2000 = full travel in about half a second. Also gives a gentle move to centre at power-up. Steps of 100.
 #define TARGET_MAX_RATE 0
+
+// Soft start (1.9.1): after power-up and Enable Motors each motor moves to its position at this speed, in counts per
+// second (0 = off: straight there, as before). smc3_scope can change it; it is saved on the board.
+#define SOFT_START_RATE 60
 
 // Extra low-pass on the derivative term (0 = off, 2-4 sensible).
 #define D_FILTER_SHIFT 3
@@ -221,7 +237,8 @@
 //    [kf=]                     Seat set-up field f = value register: f = 16*motor(0-2) + 0 trim, 1 travel low,
 //                              2 travel high, 3 end stop low, 4 end stop high (pot counts); f = 64 + d: tilt
 //                              limit in 0.1 degree for d = 0 roll +, 1 roll -, 2 pitch +, 3 pitch - (0 = none);
-//                              f = 80 / 81: the sensor's level roll / pitch x100 (saved at once) - 1.9
+//                              f = 80 / 81: the sensor's level roll / pitch x100 (saved at once) - 1.9;
+//                              f = 82: soft-start speed, counts/s, 0 = off (saved at once) - 1.9.1
 //    [kSV] [kRL] [kCL] [kHn]   Seat set-up: save, reload saved, clear, page holds the seat n x 100 ms - 1.9
 //    [xe1] / [xe0]             Sensor acceleration + gyro after every telemetry burst on / off - 1.9
 //    [sav]                     Save parameters to EEPROM (and the seat set-up, 1.9)
@@ -295,6 +312,17 @@ long          GoalAcc[NUM_MOTORS]    = {0, 0, 0};              // smoothing accu
 long          SlewStepQ12 = 0;                                 // max goal change per PID cycle, Q12 (0 = none)
 volatile uint8_t  SmoothShift = TARGET_SMOOTH_SHIFT;           // run-time smoothing (0-8)
 unsigned int      MaxRate = TARGET_MAX_RATE;                   // run-time max speed, counts/s (0 = off)
+
+// Soft start (1.9.1): a motor that has just been switched on creeps to its target, then runs normally
+unsigned int      SoftRate = SOFT_START_RATE;                  // counts/s (0 = off)
+long              SoftStepQ12 = 0;                             // max goal change per PID cycle while creeping, Q12
+uint16_t          SoftEaseCycles = 2400;                       // PID cycles to reach full creeping speed (0.6 s)
+volatile uint8_t  SoftStart[NUM_MOTORS] = {0, 0, 0};           // 1 = still creeping towards its target
+volatile uint16_t SoftTicks[NUM_MOTORS] = {0, 0, 0};           // PID cycles since it started creeping
+volatile int      SoftOutQ[NUM_MOTORS]  = {0, 0, 0};           // how far past an end stop it is, Q4 (0 = inside)
+unsigned long     SoftSince[NUM_MOTORS] = {0, 0, 0};           // millis() when it started (gives up after 40 s)
+#define SOFT_MAX_MS  40000UL
+#define SOFT_EE      105                                       // EEPROM 105 = 0xB5 "valid", 106-107 = speed
 
 long          PidCumError[NUM_MOTORS]      = {0, 0, 0};
 long          PidIntegralLimit[NUM_MOTORS] = {0, 0, 0};
@@ -522,6 +550,17 @@ void UpdateSmoothingRate()
     long q = ((long)MaxRate * 4096L / PID_RATE_HZ) * PIDProcessDivider;
     if (MaxRate > 0 && q < 1) { q = 1; }
     SlewStepQ12 = q;
+    q = ((long)SoftRate * 4096L / PID_RATE_HZ) * PIDProcessDivider;    // 1.9.1: soft start
+    if (SoftRate > 0 && q < 1) { q = 1; }
+    SoftStepQ12 = q;
+    long e = (long)PID_RATE_HZ * 6 / 10 / (PIDProcessDivider > 0 ? PIDProcessDivider : 1);
+    SoftEaseCycles = (uint16_t)(e < 1 ? 1 : (e > 60000 ? 60000 : e));
+}
+
+bool AnySoftStart()                             // 1.9.1: is any switched-on motor still creeping to its target?
+{
+    for (uint8_t m = 0; m < NUM_MOTORS; m++) { if (SoftStart[m] && Disable[m] == 0) { return true; } }
+    return false;
 }
 
 void UpdatePIDLimits()
@@ -545,9 +584,27 @@ void DisableMotor(uint8_t m)          // brakes on; may be called from the ISR
     SetPwmQ(m, 0);
 }
 
+void SoftStartFrom(uint8_t m)        // 1.9.1: creep from where the motor is now to its target (loop() only)
+{
+    // No interrupt lock needed: once SoftStart is set the ISR only lets the goal creep, so whatever it does between
+    // these lines is overwritten (GoalAcc is one 32-bit store) or is a step of a fraction of a count.
+    int fb = Feedback_q[m];
+    int lo = CutLo[m] << POS_SHIFT, hi = CutHi[m] << POS_SHIFT;
+    SoftOutQ[m] = (fb < lo) ? (lo - fb) : ((fb > hi) ? (fb - hi) : 0);
+    SoftTicks[m] = 0;
+    SoftStart[m] = 1;
+    GoalAcc[m] = (long)fb << 8;                  // Q4 -> Q12: the goal starts exactly where the motor is
+    Goal_q[m] = fb;
+    PidCumError[m] = 0;                          // nothing wound up while it was off
+    PidLastPosition[m] = fb;
+    PidDTerm_x100[m] = 0;
+    SoftSince[m] = millis();
+}
+
 void EnableMotor(uint8_t m)           // loop() only
 {
     TiltGraceUntil = millis() + 1500;  // let the seat come back inside the tilt limit first
+    if (Disable[m] != 0 && SoftRate > 0) { SoftStartFrom(m); }   // 1.9.1: no jump - it creeps to its target
     DisableReason[m] = DIS_ON;
     Disable[m] = 0;
 #ifdef MODE2
@@ -579,6 +636,29 @@ static inline int SmoothTarget(uint8_t m, int target10)
     {
         if (step > SlewStepQ12) { step = SlewStepQ12; }
         else if (step < -SlewStepQ12) { step = -SlewStepQ12; }
+    }
+    if (SoftStart[m])                           // 1.9.1: creeping after power-up / Enable Motors
+    {
+        long ad = (diff < 0) ? -diff : diff;
+        if (ad <= (2L << 12) || SoftStepQ12 <= 0)
+        {
+            SoftStart[m] = 0;                    // caught up: normal from now on
+        }
+        else
+        {
+            long lim = SoftStepQ12;
+            uint16_t t = SoftTicks[m];
+            if (t < SoftEaseCycles)              // ease in: from standstill to full creeping speed in 0.6 s
+            {
+                SoftTicks[m] = t + 1;
+                lim = lim * (long)(t + 1) / (long)SoftEaseCycles;
+            }
+            long outLim = (ad >> 10) * PIDProcessDivider + 1;   // ease out: slows down over the last ~15 counts
+            if (lim > outLim) { lim = outLim; }
+            if (lim < 1) { lim = 1; }
+            if (step > lim) { step = lim; }
+            else if (step < -lim) { step = -lim; }
+        }
     }
     GoalAcc[m] += step;
     return (int)((GoalAcc[m] + 128) >> 8);      // Q12 -> Q4
@@ -644,14 +724,15 @@ static inline void SetOutputsMotor(uint8_t m)
     int rev_q     = PWMrev[m]    << PWM_FRAC;
     int lift_q    = LiftFactor[m] << PWM_FRAC;
 
+    bool rev = (PWMrev[m] != 0) && !SoftStart[m];   // 1.9.1: no full-duty "drive back" while creeping
 #ifdef MODE1
-    if ((fb > clipMax_q) && (PWMrev[m] != 0))
+    if ((fb > clipMax_q) && rev)
     {
         out = rev_q;
         digitalWrite(ENApin[m], LOW);  digitalWrite(ENBpin[m], HIGH);
         SetPwmQ(m, rev_q);
     }
-    else if ((fb < clipMin_q) && (PWMrev[m] != 0))
+    else if ((fb < clipMin_q) && rev)
     {
         out = rev_q;
         digitalWrite(ENApin[m], HIGH); digitalWrite(ENBpin[m], LOW);
@@ -682,13 +763,13 @@ static inline void SetOutputsMotor(uint8_t m)
 #endif
 
 #ifdef MODE2
-    if ((fb > clipMax_q) && (PWMrev[m] != 0))
+    if ((fb > clipMax_q) && rev)
     {
         out = rev_q;
         digitalWrite(ENApin[m], LOW);
         SetPwmQ(m, rev_q);
     }
-    else if ((fb < clipMin_q) && (PWMrev[m] != 0))
+    else if ((fb < clipMin_q) && rev)
     {
         out = rev_q;
         digitalWrite(ENApin[m], HIGH);
@@ -750,7 +831,30 @@ void PidIsr(timer_callback_args_t *p_args)
         if (fb > FbMax_q[m]) { FbMax_q[m] = fb; }
         Feedback_q[m] = fb;
 
-        if ((fb > (CutHi[m] << POS_SHIFT)) || (fb < (CutLo[m] << POS_SHIFT)))     // SMC3 cutoff + 1.9 end stops
+        bool past = (fb > (CutHi[m] << POS_SHIFT)) || (fb < (CutLo[m] << POS_SHIFT));   // SMC3 cutoff + 1.9 end stops
+        if (past && SoftStart[m] && SoftOutQ[m] > 0)
+        {
+            // 1.9.1: creeping back after power-up / Enable Motors from past an END STOP (the seat rode down while the
+            // rig was off) is allowed - as long as it doesn't go 16 counts further out than it has been, and stays
+            // inside the SMC3 cutoff (a broken pot reads 0 or 1023 and still trips at once)
+            int lo = CutLo[m] << POS_SHIFT, hi = CutHi[m] << POS_SHIFT;
+            int out = (fb < lo) ? (lo - fb) : (fb - hi);
+            bool hard = (fb > (CutoffLimitMax[m] << POS_SHIFT)) || (fb < (CutoffLimitMin[m] << POS_SHIFT));
+            if (!hard && out <= SoftOutQ[m] + (16 << POS_SHIFT))
+            {
+                past = false;
+                if (out < SoftOutQ[m]) { SoftOutQ[m] = out; }
+            }
+        }
+        else if (!past && SoftOutQ[m] != 0)
+        {
+            // back inside: once well inside (16 counts) the end stops count as usual again; just inside, pot noise
+            // may still cross the end stop for a moment
+            int lo = CutLo[m] << POS_SHIFT, hi = CutHi[m] << POS_SHIFT;
+            int in = (fb - lo < hi - fb) ? (fb - lo) : (hi - fb);
+            SoftOutQ[m] = (in > (16 << POS_SHIFT) || !SoftStart[m]) ? 0 : 1;
+        }
+        if (past)
         {
             if (Disable[m] == 0)                    // a new trip (not a motor that is already off)
             {
@@ -977,6 +1081,20 @@ void WriteSeatSetup()
     EEPROM.update(SEAT_EE, 0xB9);
 }
 
+// 1.9.1: soft-start speed in EEPROM 105-107: 105 = 0xB5 "valid", 106-107 = counts/s (big-endian).
+void WriteSoftStart()
+{
+    EEPromPut16(SOFT_EE + 1, (int16_t)SoftRate);
+    EEPROM.update(SOFT_EE, 0xB5);
+}
+
+void ReadSoftStart()
+{
+    if (EEPROM.read(SOFT_EE) != 0xB5) { return; }   // never set: the default
+    int16_t v = EEPromGet16(SOFT_EE + 1);
+    if (v >= 0 && v <= 1000) { SoftRate = (unsigned int)v; }
+}
+
 bool SeatSetupSaved()                            // what runs is what is saved
 {
     if (EEPROM.read(SEAT_EE) != 0xB9)
@@ -1042,6 +1160,16 @@ void SeatCommand(uint8_t f, uint8_t c)
         if (f >= 64 && f < 68)
         {
             if (v >= 0 && v <= 900) { TiltLim_x10[f - 64] = v; }
+        }
+        else if (f == 82)                        // 1.9.1: soft-start speed, counts/s (0 = off), saved at once
+        {
+            if (v >= 0 && v <= 1000)
+            {
+                SoftRate = (unsigned int)v;
+                UpdateSmoothingRate();
+                WriteSoftStart();
+            }
+            return;
         }
         else if (f == 80 || f == 81)             // the sensor's level (raw angles x100 that count as level), saved at once
         {
@@ -1431,6 +1559,7 @@ void UpdateSeatAngles()
 void CheckTilt(unsigned long now)
 {
     bool any = TiltLim_x10[0] || TiltLim_x10[1] || TiltLim_x10[2] || TiltLim_x10[3];
+    if (AnySoftStart()) { TiltGraceUntil = now + 1500; }   // 1.9.1: the seat is still creeping back - wait for it
     if (!(SensorFlags & 1) || !any || (long)(now - TiltGraceUntil) < 0) { TiltHits = 0; return; }
     bool past = (TiltLim_x10[0] && SeatRoll  >  TiltLim_x10[0] * 0.1f) || (TiltLim_x10[1] && SeatRoll  < -TiltLim_x10[1] * 0.1f)
              || (TiltLim_x10[2] && SeatPitch >  TiltLim_x10[2] * 0.1f) || (TiltLim_x10[3] && SeatPitch < -TiltLim_x10[3] * 0.1f);
@@ -1793,6 +1922,8 @@ void TelemetrySend()
 //   EEPROM), bit1 a seat set-up is in EEPROM, bit2 "SM3X" frames on, bit3 the page holds the seat | uint32 SimHub
 //   position commands ignored while the page held the seat | uint16 acceleration and gyro packets in the last
 //   second | int16 raw acceleration x, y, z, raw gyro x, y, z, temperature x100.
+//   Version 4 (1.9.1) adds:  uint16 soft-start speed (counts/s, 0 = off) | uint8 motors still creeping (bit n =
+//   motor n+1).
 // Only ever sent to the WiFi client, so SimHub and SMC3Utils on USB never see it.
 uint8_t MatrixError();
 
@@ -1879,9 +2010,13 @@ void SendDiag()
     for (uint8_t i = 0; i < 3; i++) { Put16(p, ImuAcc[i]);  p += 2; }
     for (uint8_t i = 0; i < 3; i++) { Put16(p, ImuGyro[i]); p += 2; }
     Put16(p, ImuTemp_x100); p += 2;
+    Put16(p, (int)SoftRate); p += 2;            // version 4 (1.9.1): soft start
+    uint8_t cr = 0;
+    for (uint8_t m = 0; m < NUM_MOTORS; m++) { if (SoftStart[m] && Disable[m] == 0) { cr |= (uint8_t)(1 << m); } }
+    *p++ = cr;
     size_t len = (size_t)(p - (buf + 6));
     buf[0] = 'S'; buf[1] = 'M'; buf[2] = '3'; buf[3] = 'D';
-    buf[4] = 3;
+    buf[4] = 4;
     buf[5] = (uint8_t)len;
     if (TcpClient.write(buf, 6 + len) == 0) { ClientUp = false; }
 }
@@ -2360,6 +2495,7 @@ void setup()
     ReadEEProm();
     ReadBoardSettings();
     ReadSeatSetup();                            // 1.9: level trim and limits (needs the two above)
+    ReadSoftStart();                            // 1.9.1: soft-start speed
 #if IMU_PORT
     Serial1.begin(ImuBauds[ImuBaudIdx]);        // the baud rate that worked last time (9600 if never)
     ImuBaudSince = millis();
@@ -2370,14 +2506,16 @@ void setup()
     UpdateSmoothingRate();
 
     // 2. Start the smoothed goals from wherever the motors actually are; the target is the centre - with a level
-    //    trim (1.9) that is the level seat
+    //    trim (1.9) that is the level seat.  1.9.1: with the soft start the goal starts exactly at the pot (even
+    //    past a travel limit - the seat may have ridden down while the rig was off) and creeps to the centre once
+    //    the motors are switched on (EnableMotor() below); without it, as before, from inside the travel limits.
     for (uint8_t m = 0; m < NUM_MOTORS; m++)
     {
         SetTarget(m, 512);
         int fb = analogRead(FeedbackPin[m]);
         int fb10 = constrain(fb >> POS_SHIFT, TargetLo[m], TargetHi[m]);
-        GoalAcc[m] = (long)fb10 << 12;
-        Goal_q[m] = fb10 << POS_SHIFT;
+        GoalAcc[m] = (SoftRate > 0) ? ((long)fb << 8) : ((long)fb10 << 12);
+        Goal_q[m] = (SoftRate > 0) ? fb : (fb10 << POS_SHIFT);
         Feedback_q[m] = fb;
         PidLastPosition[m] = fb;
     }
@@ -2438,8 +2576,17 @@ void loop()
         SendMonitorData();
     }
 
-    // Comms timeout -> quarter power, as in the original (PowerScale 9 instead of 7)
-    PowerScale = ((now - LastPacketMillis) > COMMS_TIMEOUT_MS) ? 9 : 7;
+    // Comms timeout -> quarter power, as in the original (PowerScale 9 instead of 7) - 1.9.1: not while a motor is
+    // still creeping to its position after power-up (it may need full power to lift the seat back)
+    bool creeping = AnySoftStart();
+    PowerScale = ((now - LastPacketMillis) > COMMS_TIMEOUT_MS && !creeping) ? 9 : 7;
+    if (creeping)
+    {
+        for (uint8_t m = 0; m < NUM_MOTORS; m++)
+        {
+            if (SoftStart[m] && (now - SoftSince[m]) > SOFT_MAX_MS) { SoftStart[m] = 0; }   // never stuck creeping
+        }
+    }
 
 #if ENABLE_WIFI
     ServiceNetwork(now);

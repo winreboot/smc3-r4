@@ -24,6 +24,9 @@ What the R4 hardware adds:
 - **Seat set-up** (1.9, made by the page's Seat setup): a level trim per motor, so SimHub's centre is the level seat
   (and the seat goes level at power-up), travel limits and end stops for each motor and each direction, and the
   tilt limits. Saved on the board, so they work whatever drives it.
+- **Soft start** (1.9.1): at power-up and after Enable Motors each motor creeps from wherever it is to its
+  position (60 counts/s by default, set in the page) instead of jumping there - a seat that rode down while the rig
+  was off comes back gently.
 - **WiFi telemetry** at 100 samples a second to `smc3_scope`, plus live tuning and diagnostics. See
   [docs/PROTOCOL.md](../docs/PROTOCOL.md).
 
@@ -106,7 +109,7 @@ from the SMC3 tuning. The seat set-up (EEPROM 66-104) is saved by Seat setup, an
 Made by the page's **Seat setup** and stored on the board:
 
 - **Level trim** per motor: added to every position command, so SimHub's 512 is the level seat. At power-up the
-  seat goes there when the motors are enabled.
+  seat goes there when the motors are enabled - creeping, with the soft start (1.9.1).
 - **Travel limits** per motor, low and high separately: no position command goes past them (with the SMC3 Clip,
   the tighter wins).
 - **End stops** per motor: the motor switches off (E1-E3) if its pot gets past one anyway (with the SMC3 Max limit,
@@ -120,6 +123,7 @@ lapses by itself after 3 s if the page goes away). The commands are in [docs/PRO
 
 | Version | Change |
 |---|---|
+| 1.9.1 | Soft start: after power-up and Enable Motors each motor creeps to its position instead of jumping (`[k 82 '=']` sets the speed, EEPROM 105-107); a seat that rode down past an end stop may come back, PWMrev stays off and the tilt limit waits meanwhile. `[rdd]` frame version 4. |
 | 1.9 | Seat set-up: level trim, travel limits and end stops per motor and direction, tilt limits per direction (`[w..]`, `[k..]`, EEPROM 66-104). The page can hold SimHub off while it moves the seat (`[kH n]`). The sensor's gyro and acceleration are read and sent to the page (`[xe1]`, "SM3X"); `[iS..]` can ask for them. `[rdd]` frame version 3. |
 | 1.8.1 | Compiles in the Arduino IDE (1.8 didn't). Same features. |
 | 1.8 | LED matrix redone (motor bars, seat horizon, idle trace, problems in words). WT901C sensor at run time: `[i..]` on/off, mounting, level, tilt limit, set to 100 Hz; `[l..]` matrix view. `[rdd]` frame version 2 adds the sensor and matrix state. |

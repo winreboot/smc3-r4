@@ -92,6 +92,7 @@ cover:
   not levelled, wobbling, sending angles only (1.9 can add gyro and acceleration); the seat bouncing, play in a
   linkage, how many degrees each motor tilts the seat (or, for the rear slide, turns it);
 - the rig layout: a lift that turns the seat, a traction-loss motor that tilts it or that you saw lift the seat;
+- soft start (firmware 1.9.1): off, or a motor still creeping to its position; firmware 1.9 without it;
 - the seat set-up (firmware 1.9): none yet, running but not saved (Seat setup left open), a motor switched off by
   its end stop, the page holding SimHub's positions back;
 - motors that don't agree on which way is up;
