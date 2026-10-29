@@ -3,6 +3,39 @@
 `smc3_scope` (the page) and `SMC3_R4` (the firmware) are versioned separately. The page works with older
 firmware too; the notes say which firmware a feature needs.
 
+## Page 2.4.1 (firmware 1.9.3, unchanged)
+
+Fixes for rigs whose pots glitch (the wiper losing contact now and then: single readings 16-40 counts off, sometimes
+a few in a row), found in a real diagnostics file:
+
+- **The full check no longer reports "Motors 1 and 2 are mixed up" for a glitchy pot.** Its crosstalk test compared
+  two single readings in a row against 12 counts; now it looks at the median of the last 11 readings (crossed wiring
+  moves the other motor and it stays moved, a glitch doesn't), and the motor's own checks at the median of 7 - from
+  the first reading of each check on.
+- **Moving a motor from the page judges it on 5-reading medians.** 2.4 could switch a motor off as "moved AWAY ...
+  wired backwards" because of a glitch. And it now tells the cases apart: a motor that runs away fast (more than
+  120 counts/s the wrong way: wired backwards) is switched off as before; one that sinks slowly, is stuck or falls
+  behind (too weak, blocked, no motor power) is held where it is - switching it off would let a seat that sinks
+  sink further.
+- The watcher's "kept swinging around its target" needs median-filtered swings around the target itself, so a
+  glitchy pot - or a motor stuck away from its target with the motor power off - no longer counts as hunting.
+- Auto-tune's travel and run-away checks use a 5-reading median too.
+- **The full check calls a motor "WRONG way" only when it goes the wrong way both ways** - like auto-tune since 2.4.
+  One that sinks under its load at the lowest drive while it moves the right way the other way is tried with more
+  drive and reported as "sinks under its load when the drive is weak" (its gearbox can be driven backwards), not as
+  wired backwards.
+- While the full check measures how the other motors drift (2.4), it keeps watching the motor it is about to test: one
+  that runs away from its target on its own is stopped at once and reported as wired backwards.
+- "Moved away from its target while driven" no longer says to swap the motor wires when the full check found the
+  motor goes the right way (then it's the load: the seat's weight moved it while the drive was too weak). "Pushed at
+  full power without moving" says that every motor at once means the motor power was off.
+- Old WiFi module: the page and the diagnostics give the steps - close SimHub (it keeps the USB port busy), Arduino
+  IDE, Tools, Firmware Updater, then upload SMC3_R4 again (the updater erases the sketch on the board) - and name
+  Arduino's stand-alone updater if the IDE's fails.
+- A crossed-wiring stop in the full check records the reference, the reading, the drift and how many readings it
+  saw.
+- Simulator: `--pot-glitches M:N`, `--sag-pull X`. Smoke test: a full check and moves from the page on glitchy pots.
+
 ## Page 2.4 (firmware 1.9.3, unchanged)
 
 - **Move the motors from the page** (firmware 1.9). Drag a motor card's knob and that motor follows: up to
@@ -17,7 +50,7 @@ firmware too; the notes say which firmware a feature needs.
   test signal, Seat setup, the full check, a firmware update).
 - A motor that doesn't follow the page is switched off before the firmware's cutoff would trip: within 0.1 s if it
   moves away from where it is sent (wired backwards), within 0.4 s if it falls more than 120 counts behind (blocked,
-  too weak). The page keeps the seat.
+  too weak). The page keeps the seat. (2.4.1: a slow one is held where it is instead.)
 - **Auto-tune works with a noisy pot, and with a seat that sinks under its weight.** 2.3.1 could stop at once with
   "moved the wrong way - the motor or the pot is wired backwards" although nothing was wrong:
   - The minimum-drive search compared two single pot readings against 6 counts. A pot that reads ±2 counts at

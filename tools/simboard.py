@@ -41,6 +41,9 @@ Motion sensor (firmware 1.8): a WT901C on the seat (mounted 1.3/-0.8 degrees off
                        wires pick up the motor's PWM (page 2.4: auto-tune must not take that for a wrong-way move)
   --sag M              motor M's gearbox can be driven backwards: the seat's weight pulls it towards lower numbers
                        whenever the drive is weak (it sinks while gently driven up)
+  --sag-pull X         how hard (drive units, default 0.09; 0.2 = it sinks even at a fifth of full drive)
+  --pot-glitches M:N   motor M's pot wiper loses contact about N times a second: single readings 16-40 counts off,
+                       now and then a burst of them lasting up to 25 ms (page 2.4.1: nothing may take that for a move)
   --sensor-on          start with the sensor switched on in the board's settings
 
 Seat set-up (firmware 1.9):
@@ -89,6 +92,8 @@ ap.add_argument("--slop", default="")
 ap.add_argument("--heavy", type=int, default=0)
 ap.add_argument("--pot-noise", default="")
 ap.add_argument("--sag", type=int, default=0)
+ap.add_argument("--sag-pull", type=float, default=0.09)
+ap.add_argument("--pot-glitches", action="append", default=[])
 ap.add_argument("--sensor-on", action="store_true")
 ap.add_argument("--seat-tilt", default="")
 ap.add_argument("--stops", action="append", default=[])
@@ -120,7 +125,12 @@ POT_NOISE = {}                                # --pot-noise: motor index -> sigm
 if args.pot_noise:
     m_, c_ = args.pot_noise.split(":")
     POT_NOISE[int(m_) - 1] = float(c_)
-SAG_PULL = 0.09                               # --sag: the seat's weight, in drive units (1 = full PWM)
+SAG_PULL = args.sag_pull                      # --sag: the seat's weight, in drive units (1 = full PWM)
+POT_GLITCH = {}                               # --pot-glitches: motor index -> glitches per second
+for g_ in args.pot_glitches:
+    m_, n_ = g_.split(":")
+    POT_GLITCH[int(m_) - 1] = float(n_)
+GLITCH_BURST = [{"left": 0, "off": 0.0} for _ in range(3)]
 if args.slop:
     m_, c_ = args.slop.split(":")
     SLOP[int(m_) - 1] = float(c_)
@@ -493,6 +503,17 @@ def chan_tick(c):
     pos = p.pot_x + random.gauss(0, noise)
     if c.i in POT_NOISE and random.random() < 0.02:                  # --pot-noise: the odd bigger spike
         pos += random.choice((-1, 1)) * random.uniform(2.0, 4.0) * noise
+    if c.i in POT_GLITCH:                                            # --pot-glitches: the wiper loses contact
+        gb = GLITCH_BURST[c.i]
+        if gb["left"] > 0:
+            gb["left"] -= 1
+            if random.random() < 0.5:
+                pos += gb["off"]
+        elif random.random() < POT_GLITCH[c.i] / PID_HZ:
+            off = random.choice((-1, 1)) * random.uniform(16.0, 40.0)
+            if random.random() < 0.15:                               # contact bounce: a burst up to 25 ms
+                gb["left"], gb["off"] = random.randint(4, 100), off
+            pos += off
     TICKS[0] += 1
     if args.glitch == c.i + 1 and (TICKS[0] // 3) % 6000 < 4:     # wiper drops out for ~1 ms every 1.5 s
         pos = random.uniform(150, 300)

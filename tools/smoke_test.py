@@ -21,6 +21,9 @@ Smoke test: start simulated rigs and the page, run diagnostics, check the result
    its centre and keeps it there; Resume SimHub gives the seat back.
 9. Auto-tune on a noisy pot (page 2.4): a motor whose pot reads +-2.3 counts at rest gets through the minimum-drive
    search instead of being called "wired backwards".
+10. Glitchy pots (page 2.4.1): pots whose wipers lose contact now and then (single readings 16-40 counts off, sometimes
+   a few in a row): the full check finds no crossed wiring and no wrong direction, and a motor dragged from the page is
+   never switched off.
 """
 import json, os, subprocess, sys, tempfile, time, urllib.request as u
 
@@ -261,6 +264,23 @@ try:
     check(st["progress"] >= 31 and not any("wrong way" in l for l in st["log"]),
           f"noisy pot: auto-tune got past the minimum drive ({st['state']}, {st['progress']}%"
           f"{', ' + st['log'][-1][9:90] if st['log'] else ''})")
+
+    # 10. glitchy pots: no false wiring or direction findings, no false stop when moved from the page
+    sim10, scope10, base10 = start(4719, 8719, "--pot-glitches", "2:80", "--pot-glitches", "1:20")
+    procs += [sim10, scope10]
+    s = run_check(base10, "full")
+    bad = [f["title"] for f in s["result"]["findings"] if f["level"] == "fail" and
+           ("mixed up" in f["title"] or "WRONG" in f["title"])]
+    check(s["state"] == "done" and not bad, f"glitchy pots, full check: no false wiring or direction finding {bad}")
+    time.sleep(2)
+    t = get(base10, "/data?since=0")["samples"][-1]["m"][1]["t"]
+    for k in range(4):
+        post(base10, "/manual/move", {"motor": 1, "pos": t + (120 if k % 2 == 0 else -120)})
+        time.sleep(2.5)
+    d = get(base10, "/data?since=0")
+    check(not d["samples"][-1]["dis"][1] and not d["manual"]["msg"],
+          f"glitchy pot, motor 2 dragged 4 times: stays on ({d['manual']['msg'][:60] or 'no stop'})")
+    post(base10, "/manual/release")
 finally:
     for p in procs:
         p.terminate()

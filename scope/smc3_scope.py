@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-smc3_scope v2.4 - live scope, tuner and auto-tuner for the SMC3_R4 motion controller (Arduino UNO R4 WiFi).
+smc3_scope v2.4.1 - live scope, tuner and auto-tuner for the SMC3_R4 motion controller (Arduino UNO R4 WiFi).
 
 Connects to the board's TCP telemetry port, keeps a rolling buffer of samples and serves a web page with live
 charts, a parameter editor (sends ordinary SMC3 commands back to the board), test signals and a per-motor
@@ -12,6 +12,17 @@ Every option can also come from the environment (Docker): SMC3_HOST, SMC3_PORT, 
 SMC3_DATA_DIR.  Settings changed in the page (board address, theme, auto-find) are saved to
 <data dir>/config.json and survive restarts and upgrades.  Standard-library Python 3.8+ only.
 
+v2.4.1: a pot whose wiper loses contact now and then (readings 20-40 counts off, sometimes a few in a row) no longer
+      fakes a fault: the full check's crosstalk test ("motors mixed up") looks at an 11-reading median and its own
+      checks at 7, from the first reading on; moving a motor from the page judges it on 5-reading medians; the
+      watcher's "swinging around its target" needs median-filtered swings around the target itself. Moving a motor
+      from the page: one that runs away fast (wired backwards) is switched off as before, but one that sinks slowly,
+      is stuck or falls behind is now held where it is (switching it off would let a seat that sinks sink further).
+      "Moved away from its target while driven" no longer says to swap motor wires when the full check found the
+      motor goes the right way. The full check calls a motor "WRONG way" only when it goes the wrong way both ways
+      (one that sinks under its load at low drive is retried with more drive and reported as sinking), and keeps
+      watching the motor it is about to test while it measures how the others drift. Old WiFi module: step-by-step (close SimHub, Firmware Updater, then upload SMC3_R4
+      again - the updater erases the sketch). Simulator: --pot-glitches M:N.
 v2.4: move the motors from the page (firmware 1.9): drag a motor card's knob and the motor follows (up to 200
       counts/s, easing in and out, inside its Clip window and travel limits); Quick Controls, Return to center
       brings every motor back to its neutral position (SimHub's 0 - the level seat) and Resume SimHub gives the seat
@@ -65,7 +76,7 @@ v1.4: settings dialog (board address, port, find-board scan, auto-find), day/nig
       fixed a thread race that made the page flash "not reachable".
 """
 
-VERSION = "2.4"
+VERSION = "2.4.1"
 
 import argparse
 import base64
@@ -700,11 +711,27 @@ def _std(xs):
     return statistics.pstdev(xs) if len(xs) > 1 else 0.0
 
 
+def _rstd(xs):
+    """Spread that a few glitchy readings can't inflate (2.4.1): 1.4826 x the median absolute deviation."""
+    if len(xs) < 5:
+        return _std(xs)
+    med = statistics.median(xs)
+    return 1.4826 * statistics.median(abs(x - med) for x in xs)
+
+
 def _med3(xs):
     """3-reading running median: a single noisy pot reading can't cross a threshold on its own."""
     if len(xs) < 3:
         return list(xs)
     return [xs[0]] + [sorted(xs[i - 1:i + 2])[1] for i in range(1, len(xs) - 1)] + [xs[-1]]
+
+
+def _med5(xs):
+    """5-reading running median (2.4.1): a burst of glitchy readings (a few in a row) can't become a step's peak - a
+    motor's real overshoot lasts far longer than 30 ms."""
+    if len(xs) < 5:
+        return list(xs)
+    return xs[:2] + [sorted(xs[i - 2:i + 3])[2] for i in range(2, len(xs) - 2)] + xs[-2:]
 
 
 def analyze_step(samples, m, t_old, pwmmin, pwmmax, window_ms, noise=0.0):
@@ -725,8 +752,8 @@ def analyze_step(samples, m, t_old, pwmmin, pwmmax, window_ms, noise=0.0):
     if size < 8:     # the seat was already (nearly) there - nothing to measure except where it rests
         fb_tail = [s["m"][m]["f"] for s in post[-30:]]
         return {"size": size, "rise": 0.0, "reached": True, "os": 0.0, "settle": 0.0, "settled": True,
-                "sse": abs(t_new - _mean(fb_tail)), "osc": 0, "fb_std": _std(fb_tail),
-                "pid_std": _std([s["m"][m]["p"] for s in post[-30:]]), "sat": 0.0, "wrong": False}
+                "sse": abs(t_new - _mean(fb_tail)), "osc": 0, "fb_std": _rstd(fb_tail),
+                "pid_std": _rstd([s["m"][m]["p"] for s in post[-30:]]), "sat": 0.0, "wrong": False}
     sgn = 1 if t_new >= f0 else -1
     fs = _med3([s["m"][m]["f"] for s in post])
     ys = [((f - f0) * sgn / size, s["ms"] - t0, s) for f, s in zip(fs, post)]
@@ -741,7 +768,7 @@ def analyze_step(samples, m, t_old, pwmmin, pwmmax, window_ms, noise=0.0):
     # error (sag) don't masquerade as slow settling or overshoot.
     yf = (final - f0) * sgn / size
     tol = max(3.0, 0.03 * size, 3.0 * noise)
-    peak = max(y for y, _, _ in ys)
+    peak = max(_med5([y for y, _, _ in ys]))
     os_pct = max(0.0, (peak - yf) * 100.0)
     last_out = None
     for y, t, _ in ys:
@@ -772,8 +799,8 @@ def analyze_step(samples, m, t_old, pwmmin, pwmmax, window_ms, noise=0.0):
     return {
         "size": size, "rise": (t90 - t10) if (t10 is not None and t90 is not None) else None,
         "reached": t90 is not None, "os": os_pct, "settle": settle, "settled": settled,
-        "sse": abs(sse), "osc": crossings, "fb_std": _std(fb_tail),
-        "pid_std": _std([s["m"][m]["p"] for s in tail]), "sat": sat, "wrong": wrong,
+        "sse": abs(sse), "osc": crossings, "fb_std": _rstd(fb_tail),
+        "pid_std": _rstd([s["m"][m]["p"] for s in tail]), "sat": sat, "wrong": wrong,
     }
 
 
@@ -826,6 +853,7 @@ class Tuner:
         self.lo, self.hi = 100, 923              # where targets may go: Clip window + travel limits (firmware 1.9)
         self.events = None
         self.noise_sd = 0.5                      # the pot's noise at rest (1 sigma, counts), measured at the start
+        self.fwin = collections.deque(maxlen=5)  # the last 5 pot readings: per-reading checks use their median (2.4.1)
 
     # ---- public ----
     def running(self):
@@ -942,6 +970,8 @@ class Tuner:
         lo_ok, hi_ok = self.lo - 25, self.hi + 25
         for s in new:
             mm = s["m"][m]
+            self.fwin.append(mm["f"])
+            fmed = statistics.median(self.fwin)                # a glitchy pot reading can't end the tune
             if s["dis"][m]:
                 raise TuneAbort(f"Motor {n} was shut off by its safety cutoff (feedback went past Max limit).",
                                 "unsafe")
@@ -955,11 +985,11 @@ class Tuner:
                 if self.interf >= 6:
                     raise TuneAbort(f"Something else is moving motor {n} (SimHub?). Stop SimHub's motion "
                                     f"output and start again.")
-            if abs(mm["t"] - mm["f"]) > self.runaway_limit:
+            if abs(mm["t"] - fmed) > self.runaway_limit:
                 raise TuneAbort(f"Motor {n} ran away from its target - most likely the motor or the pot is wired "
                                 f"backwards (or the pot slipped on its shaft).", "unsafe")
-            if mm["f"] < lo_ok or mm["f"] > hi_ok:
-                raise TuneAbort(f"Motor {n} went outside its allowed travel ({mm['f']:.0f}).")
+            if fmed < lo_ok or fmed > hi_ok:
+                raise TuneAbort(f"Motor {n} went outside its allowed travel ({fmed:.0f}).")
             self.hist.append((s["ms"], mm["f"], mm["t"] - mm["f"], mm["p"]))
         # wrong-direction watch: pushing towards the target for 250 ms but moving away from it (the median of the
         # first and last few readings, and more than the pot's noise - one noisy reading can't trigger it)
@@ -1069,6 +1099,7 @@ class Tuner:
         sag_dir = None                       # the way the load pulls it, once that's clear
         thr_move = max(5.0, 2.5 * sigma)
         thr_wrong = max(6.0, 3.0 * sigma)
+        step = int(max(12, round(2.0 * thr_move)))       # far enough that a move can show above the noise
         way = lambda d: "higher" if d > 0 else "lower"
         cap = int(min(80, p["pwmmax"] - 5))
         for pm in range(0, cap + 1, 2):
@@ -1082,7 +1113,7 @@ class Tuner:
                 for _ in range(2):
                     self.wait(0.12)
                     f0 = self._fb_med()
-                    self.set_target(round(f0) + d * 12)
+                    self.set_target(round(f0) + d * step)
                     self.wait(0.6)
                     f1 = self._fb_med()
                     moved = (f1 - f0) * d
@@ -1214,7 +1245,8 @@ class Tuner:
         fs = [x["m"][m]["f"] for x in b.since(seq)]
         # noise = what's left after removing slow movement (5-sample moving average)
         resid = [fs[i] - _mean(fs[i - 2:i + 3]) for i in range(2, len(fs) - 2)]
-        sigma = _std(resid) * 1.12
+        sigma = _rstd(resid) * 1.12                      # 2.4.1: glitchy readings don't count as noise
+        plain = _std(resid) * 1.12
         self.noise_sd = max(0.3, sigma)
         if do_friction:
             p["dz"] = int(min(4, max(1, math.ceil(3 * sigma) + 1)))
@@ -1224,6 +1256,10 @@ class Tuner:
         if sigma > 1.5:
             self.say(f"That's a noisy pot (usual is ±0.3-1): the tests below allow for it. A 100 nF capacitor from the "
                      f"pot's wiper to GND at the Arduino, and pot wires kept away from the motor wires, usually fix it.")
+        if plain > max(2.0, 2.0 * sigma):
+            self.say(f"The pot also glitches: now and then a reading far off (spread ±{plain:.1f} with them). The tests "
+                     f"below ignore them, but the motor reacts to every one - check the pot's wiring and connector "
+                     f"(the Diagnostics quick check counts them).")
         if do_friction:
             # 2. PWMmin: smallest drive that reliably moves the motor, per direction
             self.stage = "Finding the minimum drive (PWMmin)"
@@ -2482,9 +2518,10 @@ class Monitor:
         if len(win2) >= 150 and win2[-1][0] - win2[0][0] >= 1900 and not any(x[5] for x in win2):
             ts = [x[1] for x in win2]
             if max(ts) - min(ts) <= 1 and abs(win2[-1][2] - win2[-1][1]) < 2:
-                fs = [x[3] for x in win2]
+                raw = [x[3] for x in win2]
+                fs = _med3(raw)                                 # one glitchy reading is no swing (2.4.1)
                 mean = _mean(fs)
-                nz_here = rest_noise(fs) or 0.0
+                nz_here = rest_noise(raw) or 0.0
                 thr = max(3.0, dz + 1.5, 3.0 * nz_here)          # a noisy pot alone must not look like hunting
                 crossings, state = 0, 0
                 for v in fs:
@@ -2493,13 +2530,14 @@ class Monitor:
                         crossings += 1
                     if st_:
                         state = st_
-                if crossings >= 8:
+                # swinging AROUND its target - a motor stuck away from it (no motor power, say) isn't hunting (2.4.1)
+                if crossings >= 8 and abs(mean - win2[-1][1]) <= 2 * thr + 10:
                     self._note("hunting", m, s, f"Motor {n} kept swinging around its target at rest ({crossings} "
                                f"swings in 2 s, about ±{(max(fs) - min(fs)) / 2:.0f} counts) instead of holding.",
                                swings=crossings, amplitude=round((max(fs) - min(fs)) / 2, 1))
                 elif now - self.noise_t[m] > 2.0:
                     self.noise_t[m] = now
-                    nz = rest_noise(fs[-120:])
+                    nz = rest_noise(raw[-120:])
                     pn = robust_sigma([x[4] for x in win2[-120:]]) or 0.0
                     if nz is not None:
                         self.noise[m] = nz if self.noise[m] is None else 0.7 * self.noise[m] + 0.3 * nz
@@ -2700,6 +2738,15 @@ class CheckStop(Exception):
         self.code, self.unsafe, self.info = code, unsafe, info
 
 
+class WrongWay(Exception):
+    """The full check's direction probe saw the motor go the wrong way. Decided only after the other way has been
+    tried too (page 2.4.1): a motor wired backwards goes the wrong way both ways, a seat that sinks under its weight
+    while the drive is still weak goes the wrong way one way only."""
+    def __init__(self, f0, f):
+        super().__init__("wrong way")
+        self.f0, self.f = f0, f
+
+
 class MotionCheck:
     """Moves one motor a little, gently, and watches it: which way it goes, how much drive it needs each way,
     whether another channel moves instead (swapped wiring), and how it answers a small step with its own
@@ -2732,6 +2779,27 @@ class MotionCheck:
         self.hist = collections.deque(maxlen=200)
         self.runaway_limit = 300
         self.persist = collections.Counter()
+        # the last pot readings of every motor: each check below looks at a median (5 readings; crosstalk 11), so a
+        # pot whose wiper loses contact now and then (readings 20-40 counts off, sometimes a few in a row) can't fake
+        # a movement
+        self.fwin = [collections.deque(maxlen=11) for _ in range(3)]
+        self.seed_fwin()
+
+    def seed_fwin(self):
+        """Fill the reading windows with the board's latest readings, so the first checks see a full median too."""
+        with self.b.slock:
+            snap = list(self.b.samples)[-11:]
+        for k in range(3):
+            self.fwin[k].clear()
+            self.fwin[k].extend(x["m"][k]["f"] for x in snap)
+
+    def _n(self, key, cond, n):
+        """True when cond holds for n samples in a row."""
+        if cond:
+            self.persist[key] += 1
+            return self.persist[key] >= n
+        self.persist[key] = 0
+        return False
 
     def _two(self, key, cond):
         """True when cond holds for 2 samples in a row - a single glitchy pot reading can't trigger a stop."""
@@ -2813,7 +2881,10 @@ class MotionCheck:
         lo_ok, hi_ok = self.lo - 25, self.hi + 25
         for s in new:
             mm = s["m"][m]
-            f = mm["f"]
+            for k in range(3):
+                self.fwin[k].append(s["m"][k]["f"])
+            fm = lambda k, n=7: statistics.median(list(self.fwin[k])[-n:]) if len(self.fwin[k]) >= 3 else s["m"][k]["f"]
+            f = fm(m)
             if self.expect_on and s["dis"][m]:
                 raise CheckStop("cutoff", f"Motor {n} was switched off by its safety cutoff (pot {f:.0f}).", True,
                                 pot=round(f, 1))
@@ -2829,7 +2900,7 @@ class MotionCheck:
             for k, (f0, t0, tb, rate) in self.base_other.items():
                 if s["m"][k]["t"] != t0:
                     moved_other = True
-                d = s["m"][k]["f"] - f0
+                d = fm(k, 11) - f0          # crossed wiring moves the other motor and it STAYS moved: ~0.1 s median
                 # a switched-off motor that sinks under the seat's weight (a gearbox that can be driven backwards)
                 # drifts on its own: anything between where it was and where its drift would have taken it is that
                 # drift (it may also have stopped at an end) - only movement beyond it, or the other way, is crosstalk
@@ -2838,9 +2909,11 @@ class MotionCheck:
                     d = d - pred if d > pred else min(d, 0.0)
                 elif pred < 0:
                     d = d - pred if d < pred else max(d, 0.0)
-                if self._two(("x", k), abs(d) > self.cross_lim[k]):
+                if self._n(("x", k), abs(d) > self.cross_lim[k], 20):   # crossed wiring stays moved (~0.2 s)
                     raise CheckStop("crosstalk", f"While motor {n} was being driven, motor {k + 1}'s pot moved "
-                                    f"{d:+.0f} counts instead.", True, other=k + 1, delta=round(d, 1))
+                                    f"{d:+.0f} counts instead.", True, other=k + 1, delta=round(d, 1),
+                                    base=round(f0, 1), pot=round(fm(k, 11), 1), drift=round(rate, 1),
+                                    samples=len(self.fwin[k]))
             self.other_interf = self.other_interf + 1 if moved_other else 0
             if self.other_interf >= 6:
                 raise CheckStop("simhub", "Something else is moving the other motors (SimHub?). Stop SimHub's motion "
@@ -2848,10 +2921,7 @@ class MotionCheck:
             if self.watch is not None:
                 f0, d = self.watch
                 if self._two("rev", (f - f0) * d <= -max(8.0, 3.5 * self.nz)):
-                    raise CheckStop("reversed", f"Motor {n} moved the WRONG way: driven towards "
-                                    f"{'higher' if d > 0 else 'lower'} numbers, its pot went from {f0:.0f} to "
-                                    f"{f:.0f}.", True, start=round(f0, 1), now=round(f, 1),
-                                    driven="up" if d > 0 else "down")
+                    raise WrongWay(f0, f)
             if self.step_watch is not None:
                 tgt, size, t_start = self.step_watch
                 if self._two("unst", now - t_start > 0.3 and abs(f - tgt) > max(100.0, 2.5 * size)):
@@ -2873,6 +2943,8 @@ class MotionCheck:
                     sg = 1 if es[0] > 0 else -1
                     moved = (statistics.median(h[1] for h in win[-5:]) - statistics.median(h[1] for h in win[:5])) * sg
                     if len(win) >= 10 and all(h[3] * sg > 15 for h in win) and moved < -max(10.0, 3.0 * self.nz):
+                        if self.watch is not None:                  # the direction probe decides (both ways)
+                            raise WrongWay(self.watch[0], win[-1][1])
                         raise CheckStop("reversed", f"Motor {n} moves AWAY from where it is driven.", True)
 
     def ramp_to(self, x, speed=250.0):
@@ -2899,7 +2971,26 @@ class MotionCheck:
                 snap = list(self.b.samples)[-9:]
             return statistics.median(x["m"][k]["f"] for x in snap) if snap else 512.0
         ta, fa = time.time(), {k: med(k) for k in others}
-        time.sleep(1.0)
+        s0 = self.b.latest() or s
+        for k in others:                                 # so they are switched back on whatever happens next
+            self.base_other[k] = (fa[k], s0["m"][k]["t"], ta, 0.0)
+        # meanwhile the motor under test holds on its own settings: one that runs away from its target by itself is
+        # wired backwards (its own drive pushes it further off) - stop it at once, don't wait a second blind
+        f_self0, t_self = med(self.m), s0["m"][self.m]["t"]
+        while time.time() - ta < 1.0:
+            time.sleep(0.05)
+            fs = med(self.m)
+            st = self.b.latest() or s0
+            if st["m"][self.m]["t"] != t_self:
+                raise CheckStop("simhub", "Something else is sending positions (SimHub?). Stop SimHub's motion "
+                                "output and run the check again.")
+            if abs(fs - t_self) > abs(f_self0 - t_self) + 30:
+                self.b.cmd_text(f"di{self.n}")
+                self.b.last_dis_cmd[self.m] = time.time()
+                raise CheckStop("reversed", f"Motor {self.n} ran away from its target on its own settings before it "
+                                f"was even driven (pot {f_self0:.0f} -> {fs:.0f}, target {t_self}): the motor or its "
+                                f"pot is most likely wired backwards.", True, start=round(f_self0, 1),
+                                now=round(fs, 1), driven="none")
         tb, fb = time.time(), {k: med(k) for k in others}
         s2 = self.b.latest() or s
         for k in others:
@@ -2911,6 +3002,7 @@ class MotionCheck:
                          f"allowed for")
             self.base_other[k] = (fb[k], s2["m"][k]["t"], tb, rate)
             self.cross_lim[k] = max(12.0, 6 * nz)
+        self.seed_fwin()
 
     def others_back(self):
         self.base_other = {}
@@ -2971,11 +3063,16 @@ class MotionCheck:
                     return self._finish(r, ok=False)
             time.sleep(0.2)
             self.chk_seq = b.seq                         # judge only what happens from now on
+            self.seed_fwin()
             self.expect_on = True
             self.wait(0.4)
-            found = {}
-            for d in (1, -1):
-                for lvl in levels:
+            found, wrong = {}, {}
+            way = lambda d: "higher" if d > 0 else "lower"
+
+            def probe(d, lvls, keep_going=False):
+                """Raise the drive step by step until the motor moves towards `d`. A wrong-way move ends it, unless
+                keep_going (the other way is known to work: it's the load, so try more drive)."""
+                for lvl in lvls:
                     self.b.cmd_pair("PQR"[m], lvl, min(255, lvl + 30))
                     time.sleep(0.1)
                     fa = self.fb_med()
@@ -2987,16 +3084,64 @@ class MotionCheck:
                         fa = self.fb_med()
                     self.watch = (fa, d)
                     self.set_target(round(fa) + d * 25)
-                    self.wait(0.7)
+                    try:
+                        self.wait(0.7)
+                    except WrongWay as e:
+                        self.watch = None
+                        self.set_target(self.fb_med())        # stop pushing at once
+                        self.wait(0.3)
+                        wrong[d] = {"lvl": lvl, "from": round(e.f0, 1), "to": round(e.f, 1)}
+                        if keep_going:
+                            continue
+                        self.say(f"went the wrong way when driven towards {way(d)} numbers at drive {lvl} "
+                                 f"({e.f0:.0f} -> {e.f:.0f}) - trying the other way before deciding")
+                        return
                     moved = (self.fb_med() - fa) * d
                     self.watch = None
                     self.set_target(self.fb_med())
                     self.wait(0.2)
                     if moved >= max(6.0, 2.5 * self.nz):
                         found[d] = lvl
-                        self.say(f"moves {'up' if d > 0 else 'down'} (towards {'higher' if d > 0 else 'lower'} "
-                                 f"numbers) at drive {lvl}")
-                        break
+                        wrong.pop(d, None)
+                        self.say(f"moves {'up' if d > 0 else 'down'} (towards {way(d)} numbers) at drive {lvl}")
+                        return
+
+            def reversed_stop(both):
+                w1, w2 = wrong.get(1), wrong.get(-1)
+                if both:
+                    msg = (f"Motor {n} moved the WRONG way both ways: driven towards higher numbers its pot went from "
+                           f"{w1['from']:.0f} to {w1['to']:.0f}, towards lower numbers from {w2['from']:.0f} to "
+                           f"{w2['to']:.0f}.")
+                else:
+                    d = 1 if w1 else -1
+                    w = w1 or w2
+                    msg = (f"Motor {n} moved the WRONG way: driven towards {way(d)} numbers, its pot went from "
+                           f"{w['from']:.0f} to {w['to']:.0f}, and it didn't move the other way at all.")
+                w = w1 or w2
+                raise CheckStop("reversed", msg, True, start=w["from"], now=w["to"],
+                                driven="up" if w1 else "down", both=both)
+
+            probe(1, levels)
+            probe(-1, levels)
+            if 1 in wrong and -1 in wrong:
+                reversed_stop(True)
+            for d in (1, -1):
+                if d not in wrong:
+                    continue
+                if found.get(-d) is None:
+                    reversed_stop(False)
+                # it moves the right way the other way: going the wrong way was the load (it sinks while the drive is
+                # still weak) - try more drive that way
+                w = wrong.pop(d)
+                r["sinks_when_weak"] = {"driven": "up" if d > 0 else "down", "at_drive": w["lvl"], "from": w["from"],
+                                        "to": w["to"]}
+                self.say(f"it moves towards {way(-d)} numbers at drive {found[-d]}, so going the wrong way when driven "
+                         f"towards {way(d)} numbers at drive {w['lvl']} was the load pulling it (it sinks while the "
+                         f"drive is weak) - trying more drive")
+                probe(d, [l for l in levels if l > w["lvl"]], keep_going=True)
+                if d in wrong:
+                    w = wrong.pop(d)
+                    r["sinks_when_weak"]["still_at_drive"] = w["lvl"]
             r["drive_to_move_up"], r["drive_to_move_down"] = found.get(1), found.get(-1)
             if not found:
                 r.update(result="no_move", message=f"Didn't move either way even at drive {levels[-1]} "
@@ -3007,8 +3152,11 @@ class MotionCheck:
                 return self._finish(r, ok=False)
             if len(found) == 1:
                 d_ok = next(iter(found))
+                sw = r.get("sinks_when_weak")
                 r.update(result="one_way", message=f"Moves {'up' if d_ok > 0 else 'down'} but not "
-                         f"{'down' if d_ok > 0 else 'up'}, even at drive {levels[-1]}.")
+                         f"{'down' if d_ok > 0 else 'up'}, even at drive {levels[-1]}." +
+                         (f" Driven {sw['driven']} it sinks the other way instead: its load pulls it and the drive "
+                          f"is too weak to hold it." if sw else ""))
                 return self._finish(r, ok=False)
             # 2. a small step with its own settings
             self.say("small step with its own settings")
@@ -3882,16 +4030,23 @@ def analyze(rep):
                 f"longer).", n, "glitch")
         c = counts.get(f"wrong_direction m{n}", 0)
         if c:
-            add("fail", f"Motor {n} moved away from its target while driven ({c}x in 24 h)",
-                "The drive and the pot disagree about direction: the motor wires or the pot's outer wires are swapped "
-                "- or the pot slipped on its shaft.", f"Swap the two motor wires on its IBT-2 (M+ / M-). Then run the "
-                "full check.", n, "wrong_dir_seen")
+            ck_ok = (checks.get(n) or {}).get("result") == "ok"
+            add("warn" if ck_ok else "fail", f"Motor {n} moved away from its target while driven ({c}x in 24 h)",
+                ("The full check found it moves the right way both ways, so this is the load: the seat's weight moved "
+                 "it while the drive was too weak to hold it (or the motor power was off)." if ck_ok else
+                 "Either the drive and the pot disagree about direction (motor wires or the pot's outer wires swapped, "
+                 "or the pot slipped on its shaft), or the motor is too weak to hold the seat and it sinks while "
+                 "driven - most often when it happens now and then rather than every time."),
+                ("Raise its PWMmax a little, or look at what loads it." if ck_ok else
+                 "Run the full check first: it shows which way the motor really goes. Swap the two motor wires on its "
+                 "IBT-2 (M+ / M-) only if the check says it moves the WRONG way."), n, "wrong_dir_seen")
         c = counts.get(f"stall m{n}", 0)
         if c:
             add("warn", f"Motor {n} was pushed at full allowed power without moving ({c}x in 24 h)",
                 "It hit something, the load is more than PWMmax allows, or the pot isn't turning with the motor.",
                 "Look for a mechanical end stop or binding; raise PWMmax a little if it simply lacks power; check the "
-                "pot coupling.", n, "stall_seen")
+                "pot coupling. If every motor shows this at the same times, the motors' power supply was off (or its "
+                "fuse blew) while the board was on.", n, "stall_seen")
         c = counts.get(f"hunting m{n}", 0)
         if c:
             add("warn", f"Motor {n} kept swinging around its target at rest ({c}x in 24 h)",
@@ -4059,8 +4214,9 @@ def analyze(rep):
         if mnum and mnum < (0, 4, 0):
             add("warn", f"The board's WiFi module runs firmware {mod}",
                 "Updating the board from this page needs 0.4.0 or newer (0.5.0 or newer shows the progress).",
-                "Update the WiFi module once with the Arduino IDE: Tools, Firmware Updater (over USB).",
-                code="wifi_module_old")
+                "Update the WiFi module once over USB. " + WIFI_MODULE_STEPS + " If the IDE's updater fails, Arduino's "
+                "stand-alone updater does the same (unor4wifi-updater, from github.com/arduino/uno-r4-wifi-usb-bridge, "
+                "Releases).", code="wifi_module_old")
         elif mnum and mnum < (0, 5, 0):
             add("info", f"The board's WiFi module runs firmware {mod}",
                 "Updates from this page work, but without a progress bar (0.5.0 or newer shows it).",
@@ -4118,6 +4274,15 @@ def analyze(rep):
     for n, ck in checks.items():
         pin = pins[n]
         res, msg = ck.get("result"), ck.get("message", "")
+        sw = ck.get("sinks_when_weak")
+        if sw and res in ("ok", "one_way"):
+            add("warn", f"Motor {n} sinks under its load when the drive is weak",
+                f"Driven {sw['driven']} gently (drive {sw['at_drive']}) it went the other way ({sw['from']:.0f} -> "
+                f"{sw['to']:.0f}) - the seat's weight drove it backwards, so its gearbox can be driven backwards. Not a "
+                f"wiring fault: it moves the right way with more drive" + (" the other way." if res == "one_way" else "."),
+                "It needs enough drive to hold the seat: raise its PWMmin a little (auto-tune finds the value), and "
+                "keep PWMmax high enough. A seat that sinks while the motors are off is normal for such a gearbox; "
+                "the soft start brings it back at power-up.", n, "sinks")
         if res == "ok":
             up, dn = ck.get("drive_to_move_up"), ck.get("drive_to_move_down")
             stp = ck.get("step") or {}
@@ -5576,11 +5741,17 @@ def inspect_firmware(raw, name=""):
 
 OTA_STATES = {0: "idle", 1: "stopping the motors", 2: "starting", 3: "downloading", 4: "checking", 5: "installing",
               6: "failed"}
+# how to update the UNO R4 WiFi's WiFi module (ESP32-S3) - also what the diagnostics say (2.4.1)
+WIFI_MODULE_STEPS = ("Close SimHub completely (it keeps the board's USB port busy, so the updater can't reach it), and the "
+                     "Serial Monitor. Arduino IDE, Tools, Firmware Updater: UNO R4 WiFi, Check Updates, install the newest, "
+                     "and wait for 'Firmware successfully installed'. Unplug and replug the USB cable. That erases the sketch "
+                     "on the board, so upload SMC3_R4 again over USB (with your WiFi name and password in it). This card then "
+                     "shows the new version.")
 OTA_ERRORS = {
     -100: "SimHub (or SMC3Utils) is sending to the board over USB. The WiFi module programs the board over that same "
           "link, so pause SimHub's motion output (or close SimHub), wait a few seconds and try again.",
     -101: "The board's WiFi module runs firmware older than 0.4.0, which can't do this. Update the WiFi module once "
-          "with the Arduino IDE (Tools, Firmware Updater), then try again.",
+          "over USB: " + WIFI_MODULE_STEPS,
     -102: "The board didn't get the page's address - try again.",
     -103: "The download stopped moving. Can the board reach this page (same network, the page's port open on the NAS)?",
     -104: "The WiFi module could not start programming the board. The old firmware is still running - try again; if it "
@@ -5652,7 +5823,7 @@ class FirmwareUpdate:
             if mod and mod < 0x000400:
                 v["capable"] = False
                 v["problem"] = (f"The board's WiFi module runs firmware {w.get('module_fw')}; updating from the page needs "
-                                "0.4.0 or newer. Update it once with the Arduino IDE (Tools, Firmware Updater).")
+                                "0.4.0 or newer. Update it once over USB: " + WIFI_MODULE_STEPS)
         else:
             v["problem"] = ("The board runs firmware " + (v["fw"] or "older than 1.7") + ", which can't be updated from "
                             "the page. Flash SMC3_R4_v1.9.3.ino over USB with the Arduino IDE once - from then on "
@@ -5876,7 +6047,8 @@ MANUAL_SPEED_CENTRE = 120.0   # counts/s for Return to center
 MANUAL_ACCEL = 800.0          # counts/s^2: eases in and out instead of lurching
 MANUAL_HOLD = 30              # x 100 ms: the board ignores SimHub this long after each refresh (every second)
 MANUAL_BEHIND = 120           # counts a motor may fall behind where the page sends it (for 0.4 s) before it's switched off
-MANUAL_AWAY = 30              # counts off, and moving further away (> 60 counts/s for 0.1 s): switched off at once
+MANUAL_AWAY = 20              # counts off before "moving away" counts (2.4.1: judged on medians of 5 readings)
+MANUAL_AWAY_SPEED = 120.0     # counts/s the wrong way = running away (wired backwards) - slower is the load sinking it
 
 
 class ManualControl:
@@ -5889,9 +6061,9 @@ class ManualControl:
     drops (a restart gives SimHub the seat back), or until something else moves the motors (auto-tune, a test
     signal, Seat setup, the full check, a firmware update) - then it ends by itself.
 
-    A motor that moves away from where it is sent (wired backwards) is switched off within 0.1 s, one that falls more
-    than MANUAL_BEHIND counts behind for 0.4 s (blocked, too weak) too - the page keeps the seat, so the other motors
-    stay where they are."""
+    A motor that runs away from where it is sent (wired backwards) is switched off within ~0.1 s. One that sinks
+    away slowly or falls more than MANUAL_BEHIND counts behind for 0.4 s (blocked, too weak, no motor power) is
+    held where it is instead. Either way the page keeps the seat, so the other motors stay where they are."""
 
     def __init__(self, board, cfg, events):
         self.b, self.cfg, self.events = board, cfg, events
@@ -5910,7 +6082,9 @@ class ManualControl:
         self.conn = None
         self.started = 0.0
         self.behind = [None, None, None]     # since when each motor is too far behind
-        self.away = [None, None, None]       # since when each motor moves away from where it is sent
+        self.away = [None, None, None]       # since when each motor runs away from where it is sent
+        self.ref = [None, None, None]        # (pot, side) when each motor started to lag
+        self.fh = [collections.deque(maxlen=12) for _ in range(3)]   # (time, median pot) of the last passes
         self.msg = ""                        # why it last ended (shown once by the page)
         self.msg_id = 0
         threading.Thread(target=self._loop, daemon=True).start()
@@ -6064,40 +6238,63 @@ class ManualControl:
                 self.pos[m] = nxt
             if self.sent[m] is None or round(self.pos[m]) != self.sent[m] or now - self.last_send[m] > 0.5:
                 self._send(m, self.pos[m])                # a change, or a keep-alive: full power
-        # a motor that doesn't follow: switch it off (the firmware's cutoff is the last resort, not the first).
-        # Moving AWAY from where it is sent (wired backwards) trips within 0.1 s; just falling far behind (blocked, too
-        # weak) after 0.4 s.
+        # a motor that doesn't follow (2.4.1). Judged on the median of its last 5 readings, so a pot whose wiper loses
+        # contact now and then can't fake anything:
+        # - running AWAY from where it is sent, fast (wired backwards: the drive pushes it further off): switched off
+        # - sinking away slowly, stuck, or more than MANUAL_BEHIND behind (blocked, too weak, no motor power): the
+        #   page stops moving it and holds it where it is - switching it off would let a seat that sinks sink further
         with b.slock:
-            snap = list(b.samples)[-10:]
-        if len(snap) < 8:
+            snap = list(b.samples)[-5:]
+        if len(snap) < 5:
             return
         s = snap[-1]
-        dt_s = max(0.01, (snap[-1]["ms"] - snap[0]["ms"]) / 1000.0)
         for m in self.motors():
             if s["dis"][m] or self.pos[m] is None:
-                self.behind[m] = self.away[m] = None
+                self.behind[m] = self.away[m] = self.ref[m] = None
+                self.fh[m].clear()
                 continue
-            f_new = statistics.median(x["m"][m]["f"] for x in snap[-3:])
-            f_old = statistics.median(x["m"][m]["f"] for x in snap[:3])
-            v = (f_new - f_old) / dt_s
+            f = statistics.median(x["m"][m]["f"] for x in snap)
+            self.fh[m].append((now, f))
+            old = next((x for x in self.fh[m] if now - x[0] <= 0.12), self.fh[m][0])
+            v = (f - old[1]) / max(0.04, now - old[0])                  # counts/s over the last ~0.1 s
             g = s["m"][m]["g"]
-            gap = g - f_new
-            away = abs(gap) > MANUAL_AWAY and v * (1 if gap > 0 else -1) < -60.0
-            self.away[m] = (self.away[m] or now) if away else None
-            self.behind[m] = (self.behind[m] or now) if abs(gap) > MANUAL_BEHIND else None
-            why = None
-            if self.away[m] and now - self.away[m] >= 0.1:
-                why = (f"Motor {m + 1} moved AWAY from where the page sent it (pot {f_new:.0f}, sent to {g:.0f}), so it "
-                       f"was switched off. The motor or its pot is most likely wired backwards")
-            elif self.behind[m] and now - self.behind[m] >= 0.4:
-                why = (f"Motor {m + 1} fell {abs(gap):.0f} counts behind where the page sent it (pot {f_new:.0f}, sent "
-                       f"to {g:.0f}), so it was switched off. It may be blocked or too weak")
-            if why:
+            gap = g - f
+            sg = 1 if gap > 0 else -1
+            away_by = 0.0
+            if abs(gap) > MANUAL_AWAY:
+                if self.ref[m] is None or self.ref[m][1] != sg:
+                    self.ref[m] = (f, sg)                               # where it was when it started to lag
+                away_by = (self.ref[m][0] - f) * sg                     # > 0: it went the other way since
+            else:
+                self.ref[m] = None
+            fast = away_by > 10 and v * sg < -MANUAL_AWAY_SPEED
+            self.away[m] = (self.away[m] or now) if fast else None
+            slow = away_by > 15 or abs(gap) > MANUAL_BEHIND
+            self.behind[m] = (self.behind[m] or now) if slow else None
+            if self.away[m] and now - self.away[m] >= 0.06:
                 b.cmd_text(f"di{m + 1}")
-                self.goal[m], self.vel[m], self.behind[m], self.away[m] = None, 0.0, None, None
-                self.msg, self.msg_id = (why + " - check it (the Diagnostics full check helps), then Enable Motors. "
-                                         "The page still has the seat."), self.msg_id + 1
-                self.events.add("manual", self.msg, motor=m + 1)
+                self._stuck(m, None, f"Motor {m + 1} ran AWAY from where the page sent it (pot {f:.0f}, sent to "
+                            f"{g:.0f}, {abs(v):.0f} counts/s the wrong way), so it was switched off. The motor or its pot "
+                            f"is most likely wired backwards - run the Diagnostics full check, then Enable Motors.")
+            elif self.behind[m] and now - self.behind[m] >= 0.4:
+                what = (f"went {away_by:.0f} counts the other way (it sinks: too little drive to hold it?)"
+                        if away_by > 15 else f"is {abs(gap):.0f} counts behind")
+                self._stuck(m, f, f"Motor {m + 1} couldn't follow the page: it {what} - pot {f:.0f}, sent to "
+                            f"{g:.0f}. The page stopped moving it and holds it where it is. Blocked, too weak "
+                            f"(PWMmax), or no motor power?")
+
+    def _stuck(self, m, hold_at, msg):
+        """Stop moving motor m: switched off (hold_at None) or held where it is now."""
+        if hold_at is not None:
+            self.goal[m] = self.pos[m] = float(hold_at)
+            self._send(m, hold_at)
+        else:
+            self.goal[m] = None
+        self.vel[m] = 0.0
+        self.behind[m] = self.away[m] = self.ref[m] = None
+        self.fh[m].clear()
+        self.msg, self.msg_id = msg + " The page still has the seat.", self.msg_id + 1
+        self.events.add("manual", self.msg, motor=m + 1)
 
 
 # --------------------------------------------------------------------------------------------------------------
@@ -7072,11 +7269,11 @@ details.oks .flist{margin-top:6px}
     <h3>Profiles and recommendations</h3><p>Save the settings that suit a car or game under a name and load them later. The recommendations (circuit, rally, flight, space, trucks) adjust your own tuned settings for that kind of sim and list the SimHub settings that matter most for it. Loading applies live; save to EEPROM to make it the power-on default.</p>
     <h3>Backups</h3><p>Every Save to EEPROM, and every bigger change, keeps a copy on the NAS (EEPROM section). Switch back to any of them live, or switch and save in one go.</p></div>
    <div><h3>Motor names and the rig</h3><p>Settings, Motor names: call the motors Front left, Front right, Traction loss (or anything you like). The names appear everywhere in the page and in diagnostics files; the number stays alongside because the wiring, SimHub and the LED matrix use numbers. The same card says what <b>motor 3</b> does: on a <b>traction-loss</b> rig motors 1 and 2 lift the front corners and motor 3, mounted horizontally, swings the rear left and right about a pivot at the front; on a <b>three-lift</b> rig it lifts the rear. Seat setup, the full check, auto-tune and the 3D view follow that.</p>
-    <h3>Moving the motors from the page (firmware 1.9)</h3><p><b>Drag a motor card's knob</b> and that motor follows - up to 200 counts/s, easing in and out, never past its Clip window or travel limits (hatched on the track; a thin line marks where it is going). Arrow keys on a selected knob move it 5 counts, with Shift 25. <b>Quick Controls, Return to center</b> brings every motor back to its neutral position - SimHub's 0: the level seat with the rear centred, your Seat setup's level if you made one - gently. Either way the page takes the seat: the board ignores SimHub's position commands (SimHub keeps sending), and every motor runs at full power. <b>Resume SimHub</b> gives the seat back - it then goes straight to wherever the game puts it, so pause the game first if you sit in it. The page also lets go by itself when the board restarts, the page server stops (SimHub has the seat back within 3 s), or something else moves the motors. A motor that moves away from where it is sent (wired backwards) is switched off within a tenth of a second, and one that falls far behind (blocked, too weak) within half a second; the page keeps the seat.</p>
+    <h3>Moving the motors from the page (firmware 1.9)</h3><p><b>Drag a motor card's knob</b> and that motor follows - up to 200 counts/s, easing in and out, never past its Clip window or travel limits (hatched on the track; a thin line marks where it is going). Arrow keys on a selected knob move it 5 counts, with Shift 25. <b>Quick Controls, Return to center</b> brings every motor back to its neutral position - SimHub's 0: the level seat with the rear centred, your Seat setup's level if you made one - gently. Either way the page takes the seat: the board ignores SimHub's position commands (SimHub keeps sending), and every motor runs at full power. <b>Resume SimHub</b> gives the seat back - it then goes straight to wherever the game puts it, so pause the game first if you sit in it. The page also lets go by itself when the board restarts, the page server stops (SimHub has the seat back within 3 s), or something else moves the motors. A motor that runs away from where it is sent (wired backwards) is switched off within a tenth of a second; one that sinks, is stuck or falls far behind (too weak, blocked, no motor power) is held where it is. Either way the page keeps the seat.</p>
     <h3>Selected motor</h3><p>Click a motor card or chart, or choose a motor in Test Signal or Auto-Tune: the same motor is highlighted everywhere. While a test signal or auto-tune runs, its chart is marked and the others fade.</p>
     <h3>Diagnostics</h3><p>Settings section. <b>Quick check</b> reads the board and listens for a few seconds; <b>Full check</b> also moves each motor a little to see which way it goes, how much drive it needs, whether the wiring is swapped and how it answers a small step - and can ask you what you saw. Both make one file (saved on the NAS too) to download and give to whoever helps you. The page also watches while you drive and notes pot glitches, a motor moving the wrong way or stalling, hunting, cutoffs, the tilt limit and board restarts. It also keeps a <b>load map</b>: where each motor falls behind or runs at full power, each way across its travel - a quick check after a session names where the rig struggles (lifting a heavy driver, say). With the motion sensor, the full check also measures the seat itself: degrees per count, bounce and play in the linkage - for the traction-loss motor, how far the seat turns. For the rear slide it asks whether the rear went left or right.</p>
     <h3>Status bar</h3><p>LOW POWER means no position commands for 15 s, so the board runs at quarter drive until SimHub or this page sends targets again.</p>
-    <h3>Firmware update (firmware 1.9.2)</h3><p>Settings, Firmware update installs new firmware over WiFi - no USB cable, and SimHub can stay open (with its motion output paused). In the Arduino IDE open the new .ino and use <b>Sketch, Export Compiled Binary</b>; choose that .bin on the page and press Install. The page checks the file (an SMC3_R4 build for the UNO R4 WiFi, and which version), the board switches the motors off, its WiFi module downloads and checks the file and installs it, and the page confirms the new version once the board is back. The board remembers the WiFi name and password it last joined with, so a build with the placeholders still connects. Needs the WiFi module's own firmware 0.4.0 or newer (0.5.0+ shows progress). The first install of it (SMC3_R4_v1.9.3.ino - 1.9.2 didn't compile in the Arduino IDE) goes over USB.</p>
+    <h3>Firmware update (firmware 1.9.2)</h3><p>Settings, Firmware update installs new firmware over WiFi - no USB cable, and SimHub can stay open (with its motion output paused). In the Arduino IDE open the new .ino and use <b>Sketch, Export Compiled Binary</b>; choose that .bin on the page and press Install. The page checks the file (an SMC3_R4 build for the UNO R4 WiFi, and which version), the board switches the motors off, its WiFi module downloads and checks the file and installs it, and the page confirms the new version once the board is back. The board remembers the WiFi name and password it last joined with, so a build with the placeholders still connects. Needs the WiFi module's own firmware 0.4.0 or newer (0.5.0+ shows progress): Arduino IDE, Tools, Firmware Updater, with SimHub closed (it keeps the USB port busy) - and since that erases the sketch on the board, upload SMC3_R4 again over USB afterwards. The first install of it (SMC3_R4_v1.9.3.ino - 1.9.2 didn't compile in the Arduino IDE) goes over USB.</p>
     <h3>Soft start (firmware 1.9.1)</h3><p>After the rig has been off the seat may have ridden down a little. At power-up, and when you press Enable Motors, each motor creeps from wherever it is to its position (SimHub's centre at power-up) instead of jumping there - 60 counts/s by default, easing in and out. Once it has caught up everything runs normally. A seat that rode down past an end stop is allowed to come back (only going further out switches the motor off), the tilt limit waits, and the board keeps full power meanwhile. Settings, Loop, PWM &amp; smoothing: Soft start.</p></div>
    <div><h3>Seat setup (firmware 1.9)</h3><p>Levels the platform first and makes that SimHub's centre: the board adds a <b>level trim</b> to every position SimHub sends, so SimHub's middle (512) is the level seat - and the seat goes level at power-up. With the motion sensor it levels itself (each motor moves a little to learn how it tilts the seat, then the page moves them until the sensor reads level, choosing the level position nearest the middle of every motor); without it you nudge the motors with a spirit level on the seat. On a traction-loss rig only motors 1 and 2 level the seat; you <b>centre</b> motor 3, the rear slide, so the seat points straight ahead, and tell the page which way the rear went for +10.</p>
     <p>Then each motor moves slowly away from level, both ways, and stops at the tilt you allow, when it pushes against something, at the end of its Clip window, or when you press Stop (space bar). The rear slide stops at the <b>traction loss you allow</b> - how far the seat may turn each way, measured by the sensor. From what it found the page suggests <b>travel limits</b> (the board never sends a motor past them), <b>end stops</b> (a motor that gets past one anyway is switched off: E1-E3) and <b>tilt limits</b> for each direction (every motor stops: E4). While Seat setup is open the board ignores SimHub's positions; Cancel puts everything back. Auto-tune, the test signal and the full check stay inside the travel limits.</p>

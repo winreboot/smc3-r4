@@ -67,8 +67,9 @@ motor back to its neutral position (SimHub's 0: the level seat with the rear cen
 
 While the page moves the motors, it **has the seat**: the board ignores SimHub's position commands, and the status
 bar says so. **Resume SimHub** gives the seat back. The page also lets go when the board restarts, when the page
-server stops, or when auto-tune, a test signal, Seat setup or the full check starts. A motor that doesn't follow
-(wired backwards, blocked) is switched off at once.
+server stops, or when auto-tune, a test signal, Seat setup or the full check starts. A motor that runs away from
+where it is sent (wired backwards) is switched off at once; one that sinks, is stuck or falls behind is held where it
+is.
 
 ![Return to center: each motor heading for its neutral position, the page holding the seat](docs/img/manual-control.png)
 
@@ -476,7 +477,8 @@ noise. To see what the diagnostics find, add a fault:
 | `--flex` / `--slop 2:24` | a bouncy seat frame / 24 counts of play in motor 2's linkage |
 | `--heavy 1` | a heavy load on motor 1: lifting needs much more drive, worse near the top |
 | `--pot-noise 2:2.3` | motor 2's pot reads ±2.3 counts at rest, with the odd spike |
-| `--sag 2` | motor 2's gearbox can be driven backwards: the seat sinks while the drive is weak |
+| `--sag 2` (`--sag-pull 0.2`) | motor 2's gearbox can be driven backwards: the seat sinks while the drive is weak (harder) |
+| `--pot-glitches 2:80` | motor 2's pot wiper loses contact about 80 times a second (readings 16-40 counts off) |
 | `--imu-lost-at 30` | the sensor goes quiet after 30 s |
 | `--seat-tilt 1.6:-2.2` | the seat isn't level with every motor at 512 (for Seat setup) |
 | `--stops 3:180:860` | motor 3 hits a mechanical stop at pot 180 and 860 |
