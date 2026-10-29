@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-smc3_scope v2.3.1 - live scope, tuner and auto-tuner for the SMC3_R4 motion controller (Arduino UNO R4 WiFi).
+smc3_scope v2.4 - live scope, tuner and auto-tuner for the SMC3_R4 motion controller (Arduino UNO R4 WiFi).
 
 Connects to the board's TCP telemetry port, keeps a rolling buffer of samples and serves a web page with live
 charts, a parameter editor (sends ordinary SMC3 commands back to the board), test signals and a per-motor
@@ -12,6 +12,16 @@ Every option can also come from the environment (Docker): SMC3_HOST, SMC3_PORT, 
 SMC3_DATA_DIR.  Settings changed in the page (board address, theme, auto-find) are saved to
 <data dir>/config.json and survive restarts and upgrades.  Standard-library Python 3.8+ only.
 
+v2.4: move the motors from the page (firmware 1.9): drag a motor card's knob and the motor follows (up to 200
+      counts/s, easing in and out, inside its Clip window and travel limits); Quick Controls, Return to center
+      brings every motor back to its neutral position (SimHub's 0 - the level seat) and Resume SimHub gives the seat
+      back. Meanwhile the board ignores SimHub ([kH], as Seat setup does) and runs at full power. Auto-tune copes with
+      a noisy pot and a seat that sinks under its weight: movement is judged on the median of several readings
+      against limits above the pot's noise (2.3.1 compared two single readings with a 6-count limit, so a +-2-count
+      pot read as "moved the wrong way"), "wired backwards" needs the wrong way BOTH ways, and the "holds still" and
+      ringing limits grow with the noise. A safety stop now switches the motor off with its own settings back
+      (2.3.1 left it on with PWMmax 0). The page re-reads the PID table after any auto-tune ends. The full check
+      and the watcher use the same median-based wrong-way test.
 v2.3.1: ships with firmware 1.9.3 - 1.9.2 didn't compile in the Arduino IDE (the boards package's GCC 7). The page
       names SMC3_R4_v1.9.3.ino where it tells you what to flash; nothing else changed.
 v2.3: firmware update over WiFi (firmware 1.9.2): Settings, Firmware update - pick the .bin the Arduino IDE exports
@@ -55,7 +65,7 @@ v1.4: settings dialog (board address, port, find-board scan, auto-find), day/nig
       fixed a thread race that made the page flash "not reachable".
 """
 
-VERSION = "2.3.1"
+VERSION = "2.4"
 
 import argparse
 import base64
@@ -690,13 +700,23 @@ def _std(xs):
     return statistics.pstdev(xs) if len(xs) > 1 else 0.0
 
 
-def analyze_step(samples, m, t_old, pwmmin, pwmmax, window_ms):
-    """Step-response metrics for motor m from telemetry samples that contain a target change away from t_old."""
+def _med3(xs):
+    """3-reading running median: a single noisy pot reading can't cross a threshold on its own."""
+    if len(xs) < 3:
+        return list(xs)
+    return [xs[0]] + [sorted(xs[i - 1:i + 2])[1] for i in range(1, len(xs) - 1)] + [xs[-1]]
+
+
+def analyze_step(samples, m, t_old, pwmmin, pwmmax, window_ms, noise=0.0):
+    """Step-response metrics for motor m from telemetry samples that contain a target change away from t_old.
+    noise: the pot's noise at rest (1 sigma, counts) - tolerances grow with it, so a noisy pot doesn't read as
+    ringing, slow settling or a wrong-way start (page 2.4)."""
     idx = next((i for i, s in enumerate(samples) if s["m"][m]["t"] != t_old), None)
     if idx is None:
         return None
     t_new = samples[idx]["m"][m]["t"]
-    f0 = samples[idx - 1]["m"][m]["f"] if idx > 0 else samples[idx]["m"][m]["f"]
+    before = [s["m"][m]["f"] for s in samples[max(0, idx - 5):idx]] or [samples[idx]["m"][m]["f"]]
+    f0 = statistics.median(before)
     t0 = samples[idx]["ms"]
     post = [s for s in samples[idx:] if 0 <= s["ms"] - t0 <= window_ms and s["m"][m]["t"] == t_new]
     size = abs(t_new - f0)
@@ -708,18 +728,19 @@ def analyze_step(samples, m, t_old, pwmmin, pwmmax, window_ms):
                 "sse": abs(t_new - _mean(fb_tail)), "osc": 0, "fb_std": _std(fb_tail),
                 "pid_std": _std([s["m"][m]["p"] for s in post[-30:]]), "sat": 0.0, "wrong": False}
     sgn = 1 if t_new >= f0 else -1
-    ys = [((s["m"][m]["f"] - f0) * sgn / size, s["ms"] - t0, s) for s in post]
+    fs = _med3([s["m"][m]["f"] for s in post])
+    ys = [((f - f0) * sgn / size, s["ms"] - t0, s) for f, s in zip(fs, post)]
     t10 = next((t for y, t, _ in ys if y >= 0.1), None)
     t90 = next((t for y, t, _ in ys if y >= 0.9), None)          # 90% of the way to the TARGET
     span = ys[-1][1]
     tail = [s for y, t, s in ys if t >= span - 300]
     fb_tail = [s["m"][m]["f"] for s in tail]
-    final = _mean(fb_tail)
+    final = _mean([f for f, s in zip(fs, post) if s["ms"] - t0 >= span - 300])
     sse = (t_new - final) * sgn                                    # leftover error = Ki's job
     # Dynamics are judged against where the seat actually comes to rest, so a few counts of leftover
     # error (sag) don't masquerade as slow settling or overshoot.
     yf = (final - f0) * sgn / size
-    tol = max(3.0, 0.03 * size)
+    tol = max(3.0, 0.03 * size, 3.0 * noise)
     peak = max(y for y, _, _ in ys)
     os_pct = max(0.0, (peak - yf) * 100.0)
     last_out = None
@@ -740,8 +761,12 @@ def analyze_step(samples, m, t_old, pwmmin, pwmmax, window_ms):
         if state and st != state:
             crossings += 1
         state = st
+    # started the wrong way: 3 readings in a row clearly behind where it started (not one noisy reading)
     early = [s for y, t, s in ys if t <= 500]
-    wrong = any((s["m"][m]["f"] - f0) * sgn < -15 for s in early)
+    lim_w, run, wrong = max(15.0, 4.0 * noise), 0, False
+    for s in early:
+        run = run + 1 if (s["m"][m]["f"] - f0) * sgn < -lim_w else 0
+        wrong = wrong or run >= 3
     rising = [s for y, t, s in ys if t90 is None or t <= t90]
     sat = _mean([1.0 if abs(s["m"][m]["p"]) + pwmmin >= pwmmax else 0.0 for s in rising])
     return {
@@ -800,6 +825,7 @@ class Tuner:
         self.runaway_limit = 400
         self.lo, self.hi = 100, 923              # where targets may go: Clip window + travel limits (firmware 1.9)
         self.events = None
+        self.noise_sd = 0.5                      # the pot's noise at rest (1 sigma, counts), measured at the start
 
     # ---- public ----
     def running(self):
@@ -875,6 +901,18 @@ class Tuner:
         s = self.board.latest()
         return s["m"][self.motor]["f"] if s else 512.0
 
+    def _fb_med(self, n=9):
+        """Median of the last n pot readings (~90 ms): a noisy pot can't fake a movement with one reading."""
+        with self.board.slock:
+            snap = list(self.board.samples)[-n:]
+        fs = [x["m"][self.motor]["f"] for x in snap]
+        return statistics.median(fs) if fs else 512.0
+
+    def _calm(self, k, mult=1.5):
+        """'Holds still' limit for the pot's spread while holding: k counts for a quiet pot, mult x its noise for a
+        noisy one (a pot that reads +-2 counts at rest can't hold within +-2 on the graph either)."""
+        return max(k, mult * self.noise_sd)
+
     def _t(self):
         s = self.board.latest()
         return s["m"][self.motor]["t"] if s else self.cur
@@ -923,17 +961,18 @@ class Tuner:
             if mm["f"] < lo_ok or mm["f"] > hi_ok:
                 raise TuneAbort(f"Motor {n} went outside its allowed travel ({mm['f']:.0f}).")
             self.hist.append((s["ms"], mm["f"], mm["t"] - mm["f"], mm["p"]))
-        # wrong-direction watch: pushing towards the target for 250 ms but moving away from it
+        # wrong-direction watch: pushing towards the target for 250 ms but moving away from it (the median of the
+        # first and last few readings, and more than the pot's noise - one noisy reading can't trigger it)
         if len(self.hist) > 2:
             t_end = self.hist[-1][0]
             win = [h for h in self.hist if t_end - h[0] <= 300]
-            if win and t_end - win[0][0] >= 250:
+            if len(win) >= 10 and t_end - win[0][0] >= 250:
                 es = [h[2] for h in win]
                 if all(abs(e) > 30 for e in es) and (all(e > 0 for e in es) or all(e < 0 for e in es)):
                     sg = 1 if es[0] > 0 else -1
                     pushing = all(h[3] * sg > 15 for h in win)
-                    moved = (win[-1][1] - win[0][1]) * sg
-                    if pushing and moved < -10:
+                    moved = (statistics.median(h[1] for h in win[-5:]) - statistics.median(h[1] for h in win[:5])) * sg
+                    if pushing and moved < -max(10.0, 3.0 * self.noise_sd):
                         raise TuneAbort(f"Motor {n} moves AWAY from where it is driven. The motor or the pot is "
                                         f"wired backwards.", "unsafe")
 
@@ -946,11 +985,11 @@ class Tuner:
         self.set_target(x)
 
     def _settle(self, x, timeout, tol=None):
-        tol = tol if tol is not None else 4.0
+        tol = tol if tol is not None else max(4.0, 1.5 * self.noise_sd)
         end = time.time() + timeout
         while time.time() < end:
             self.wait(0.1)
-            if abs(self._fb() - x) <= tol:
+            if abs(self._fb_med(5) - x) <= tol:
                 self.wait(0.2)
                 return True
         return False
@@ -962,7 +1001,7 @@ class Tuner:
         self.wait(hold)
         self.wait(0.15)                       # let the last telemetry burst arrive
         got = despike(self.board.since(seq0), self.motor)
-        r = analyze_step(got, self.motor, t_old, p["pwmmin"], p["pwmmax"], hold * 1000 - 100)
+        r = analyze_step(got, self.motor, t_old, p["pwmmin"], p["pwmmax"], hold * 1000 - 100, self.noise_sd)
         if r is None:
             raise TuneAbort("Couldn't see the step in the telemetry (WiFi too slow?). Try again.")
         seat = seat_step(self.board.since(seq0 - 20), self.motor, t_old,      # motion sensor: what the seat did
@@ -993,6 +1032,16 @@ class Tuner:
     def _safe_stop(self):
         p = dict(self.original or {})
         n = self.motor + 1
+        if self.board.fwnum() >= 15:
+            # switched off (it brakes and shows Off) and its own settings back, so Enable Motors is all it takes
+            # once the cause is fixed - page 2.3.1 and older left it on with PWMmax 0, which looked "Online"
+            self.board.cmd_text(f"di{n}")
+            time.sleep(0.15)
+            if self.original:
+                self._apply(self.original)
+            self.say(f"SAFETY: motor {n} is switched off, with the settings it had before auto-tune. Fix the cause "
+                     f"first, then press Enable Motors.")
+            return
         self.board.cmd_pair("PQR"[self.motor], 0, 0)
         self.board.cmd_pair("VWX"[self.motor], p.get("dz", 0), 0)
         self.say(f"SAFETY: motor {n}'s drive is set to zero (PWMmax 0, PWMrev 0) so it can't run away. This is "
@@ -1006,6 +1055,77 @@ class Tuner:
             self.set_target(self._fb())
         except Exception:
             pass
+
+    def _pwmmin_search(self, p, sigma, n):
+        """Step 2: the smallest drive that reliably moves the motor, each way. Returns {1: pwm up, -1: pwm down}.
+        Starts with almost no drive, so the motor only creeps a few counts at a time. Movement is judged on the
+        median of several readings against limits above the pot's noise; a motor that goes the wrong way is only
+        called "wired backwards" when it does so BOTH ways - a seat that sinks under its own weight while the drive
+        is still too weak to lift it goes the wrong way one way only (page 2.4)."""
+        p.update(kp=20)
+        found = {1: None, -1: None}
+        wrong = {1: 0, -1: 0}                # times it went the wrong way when driven each way
+        went_right = {1: False, -1: False}   # it moved the right way at least once
+        sag_dir = None                       # the way the load pulls it, once that's clear
+        thr_move = max(5.0, 2.5 * sigma)
+        thr_wrong = max(6.0, 3.0 * sigma)
+        way = lambda d: "higher" if d > 0 else "lower"
+        cap = int(min(80, p["pwmmax"] - 5))
+        for pm in range(0, cap + 1, 2):
+            self.progress = 10 + int(20 * pm / max(1, cap))
+            p["pwmmin"] = pm
+            self._apply(p)
+            for d in (1, -1):
+                if found[d] is not None:
+                    continue
+                ok = 0
+                for _ in range(2):
+                    self.wait(0.12)
+                    f0 = self._fb_med()
+                    self.set_target(round(f0) + d * 12)
+                    self.wait(0.6)
+                    f1 = self._fb_med()
+                    moved = (f1 - f0) * d
+                    if moved <= -thr_wrong:
+                        wrong[d] += 1
+                        self.set_target(round(f1))          # stop pushing at once
+                        if sag_dir != d:
+                            self.say(f"Went {-moved:.0f} counts the wrong way when driven towards {way(d)} counts at "
+                                     f"PWM {pm} - checking the other way before deciding.")
+                        break
+                    if moved >= thr_move:
+                        ok += 1
+                        went_right[d] = True
+                    else:
+                        break
+                if ok == 2:
+                    found[d] = pm
+                    self.say(f"Moves reliably towards {way(d)} counts at PWM {pm}.")
+            # a motor wired backwards goes the wrong way BOTH ways
+            if wrong[1] and wrong[-1]:
+                raise TuneAbort(f"motor {n} moved the wrong way both ways (driven towards higher counts it went "
+                                f"lower, and the other way round). The motor or the pot is wired backwards.",
+                                "unsafe")
+            for d in (1, -1):
+                if wrong[d] and went_right[-d] and sag_dir is None:
+                    sag_dir = d
+                    self.say(f"It moves the right way towards {way(-d)} counts, so going {way(-d)} when driven "
+                             f"towards {way(d)} is the load pulling it (the seat's weight, or the gearbox can be "
+                             f"driven backwards) while the drive is still too weak - not a wiring fault. "
+                             f"Carrying on with more drive.")
+                if wrong[d] >= 3 and not went_right[-d]:
+                    raise TuneAbort(f"motor {n} went the wrong way {wrong[d]} times when driven towards {way(d)} "
+                                    f"counts and hasn't moved the right way yet. The motor or the pot may be wired "
+                                    f"backwards - run the Diagnostics full check to see.", "unsafe")
+            if found[1] is not None and found[-1] is not None:
+                break
+        if found[1] is None and found[-1] is None:
+            raise TuneAbort(f"motor {n} didn't move even with PWMmin {cap}. Check motor power and wiring.")
+        if found[1] is None or found[-1] is None:
+            good = 1 if found[1] is not None else -1
+            raise TuneAbort(f"motor {n} moves towards {way(good)} counts but not the other way even at PWM {cap}: "
+                            f"too weak for the load with PWMmax {p['pwmmax']}, or something binds.")
+        return found
 
     # ---- the procedure ----
     def _thread(self, *a):
@@ -1042,6 +1162,7 @@ class Tuner:
     def _run(self, m, amp, style, do_friction, do_ki, do_kd):
         b, n = self.board, m + 1
         os_target, margin, knee_tol = STYLES.get(style, STYLES["normal"])
+        self.noise_sd = 0.5
         self.say(f"Auto-tune motor {n}, style '{style}', travel ±{amp} counts.")
 
         self.stage, self.progress = "Reading settings", 2
@@ -1085,55 +1206,30 @@ class Tuner:
         if abs(self._fb() - c) > 40:
             raise TuneAbort(f"motor {n} didn't follow the target (feedback {self._fb():.0f}, wanted {c}). "
                             f"Is motor power on?")
+        # pot noise at rest - every limit below that judges "holding still" or "moved" scales with it
+        self.stage, self.progress = "Measuring pot noise", 8
+        self.wait(1.0)                           # let any ringing from the move die out first
+        seq = b.seq
+        self.wait(1.5)
+        fs = [x["m"][m]["f"] for x in b.since(seq)]
+        # noise = what's left after removing slow movement (5-sample moving average)
+        resid = [fs[i] - _mean(fs[i - 2:i + 3]) for i in range(2, len(fs) - 2)]
+        sigma = _std(resid) * 1.12
+        self.noise_sd = max(0.3, sigma)
         if do_friction:
-            self.stage, self.progress = "Measuring pot noise", 8
-            self.wait(1.0)                       # let any ringing from the move die out first
-            seq = b.seq
-            self.wait(1.5)
-            fs = [x["m"][m]["f"] for x in b.since(seq)]
-            # noise = what's left after removing slow movement (5-sample moving average)
-            resid = [fs[i] - _mean(fs[i - 2:i + 3]) for i in range(2, len(fs) - 2)]
-            sigma = _std(resid) * 1.12
             p["dz"] = int(min(4, max(1, math.ceil(3 * sigma) + 1)))
             self.say(f"Pot noise at rest ±{sigma:.2f} counts -> dead zone {p['dz']}.")
-
+        else:
+            self.say(f"Pot noise at rest ±{sigma:.2f} counts.")
+        if sigma > 1.5:
+            self.say(f"That's a noisy pot (usual is ±0.3-1): the tests below allow for it. A 100 nF capacitor from the "
+                     f"pot's wiper to GND at the Arduino, and pot wires kept away from the motor wires, usually fix it.")
+        if do_friction:
             # 2. PWMmin: smallest drive that reliably moves the motor, per direction
             self.stage = "Finding the minimum drive (PWMmin)"
-            p.update(kp=20)
-            found = {1: None, -1: None}
-            cap = int(min(80, p["pwmmax"] - 5))
-            for pm in range(0, cap + 1, 2):
-                self.progress = 10 + int(20 * pm / max(1, cap))
-                p["pwmmin"] = pm
-                self._apply(p)
-                for d in (1, -1):
-                    if found[d] is not None:
-                        continue
-                    ok = 0
-                    for _ in range(2):
-                        f0 = self._fb()
-                        self.set_target(round(f0) + d * 12)
-                        self.wait(0.6)
-                        moved = (self._fb() - f0) * d
-                        if moved <= -6:
-                            raise TuneAbort(f"motor {n} moved the wrong way. The motor or the pot is wired "
-                                            f"backwards.", "unsafe")
-                        if moved >= 5:
-                            ok += 1
-                        else:
-                            break
-                    if ok == 2:
-                        found[d] = pm
-                        self.say(f"Moves reliably towards {'higher' if d > 0 else 'lower'} counts at PWM {pm}.")
-                if found[1] is not None and found[-1] is not None:
-                    break
-            if found[1] is None and found[-1] is None:
-                raise TuneAbort(f"motor {n} didn't move even with PWMmin {cap}. Check motor power and wiring.")
-            if found[1] is None or found[-1] is None:
-                good = 1 if found[1] is not None else -1
-                raise TuneAbort(f"motor {n} moves towards {'higher' if good > 0 else 'lower'} counts but not the "
-                                f"other way even at PWM {cap}: too weak for the load with PWMmax {p['pwmmax']}, "
-                                f"or something binds.")
+            self.say("Finding the minimum drive: it starts with almost none, so the motor only creeps a few counts at a "
+                     "time.")
+            found = self._pwmmin_search(p, sigma, n)
             p["pwmmin"] = min(found[1], found[-1])
             gap = abs(found[1] - found[-1])
             self.say(f"PWMmin {p['pwmmin']} (the easier direction; the harder one needs {max(found.values())}).")
@@ -1167,7 +1263,7 @@ class Tuner:
             r = self._step_pair(hi, lo, p)
             results.append((p["kp"], r))
             self.say(f"Kp {p['kp']}: {fmt(r)}")
-            if r["os"] > OS_STOP or r["osc"] >= 4 or r["fb_std"] > 2.5:
+            if r["os"] > OS_STOP or r["osc"] >= 4 or r["fb_std"] > self._calm(2.5, 2.0):
                 self.say("Too lively - stopping the sweep here.")
                 break
             if r["pid_std"] > PID_NOISE_MAX:
@@ -1190,7 +1286,7 @@ class Tuner:
                     break
             kp *= KP_STEP
         good = [(k, r) for k, r in results if r["reached"] and r["os"] <= os_target and r["osc"] <= 2
-                and r["fb_std"] <= 2.0 and r["pid_std"] <= PID_NOISE_MAX]
+                and r["fb_std"] <= self._calm(2.0) and r["pid_std"] <= PID_NOISE_MAX]
         notes = []
         if good:
             # sweet spot = the lowest Kp that is (nearly) as good as the best one; higher only adds harshness
@@ -1237,7 +1333,7 @@ class Tuner:
             self._settle(c, 2.0)
             rs = self._step_pair(c + 15, c - 15, p, hold=1.5)
             self.say(f"Small ±15 steps at Kp {p['kp']}: {fmt(rs)}")
-            if (rs["osc"] >= 2 or rs["os"] > 35 or rs["fb_std"] > 1.5) and p["kp"] > KP_START:
+            if (rs["osc"] >= 2 or rs["os"] > 35 or rs["fb_std"] > self._calm(1.5)) and p["kp"] > KP_START:
                 p["kp"] = max(KP_START, int(p["kp"] * 0.8))
                 self._apply(p)
                 self.say(f"Small moves are too lively - Kp reduced to {p['kp']}.")
@@ -1304,7 +1400,7 @@ class Tuner:
                 self._apply(p)
                 r = self._step_pair(hi, lo, p)
                 self.say(f"Kd {kd} (Ks 4): {fmt(r)}")
-                if r["pid_std"] > r_base["pid_std"] * 1.5 + 3 or r["fb_std"] > 2.0 or r["osc"] >= 2:
+                if r["pid_std"] > r_base["pid_std"] * 1.5 + 3 or r["fb_std"] > self._calm(2.0) or r["osc"] >= 2:
                     self.say("Kd starts adding noise - stopping.")
                     break
                 if best is None or score(r) < score(best[1]):
@@ -2059,6 +2155,7 @@ class Monitor:
         self.board, self.gen, self.tuner, self.cfg, self.events = board, gen, tuner, cfg, events
         self.diag = None
         self.seat_setup = None               # SeatSetup (v2.0): its moves are the page's, not SimHub's
+        self.manual = None                   # ManualControl (v2.4): knobs dragged / Return to center - the page's too
         self.inc_dir = os.path.join(data_dir, "diagnostics", "incidents")
         self.lock = threading.Lock()
         self.incidents = []
@@ -2187,7 +2284,8 @@ class Monitor:
     def _busy(self, m, now):
         g, t, d = self.gen, self.tuner, self.diag
         if (g.mode != "off" and g.motor == m) or (t.running() and t.motor == m) or (d is not None and d.moving()) or \
-                (self.seat_setup is not None and self.seat_setup.state != "idle"):
+                (self.seat_setup is not None and self.seat_setup.state != "idle") or \
+                (self.manual is not None and self.manual.active):
             self.busy_until[m] = now + 3.0
         return now < self.busy_until[m]
 
@@ -2360,8 +2458,9 @@ class Monitor:
             es = [x[2] - x[3] for x in win]
             if all(abs(e) > 30 for e in es) and (all(e > 0 for e in es) or all(e < 0 for e in es)):
                 sg = 1 if es[0] > 0 else -1
-                moved = (win[-1][3] - win[0][3]) * sg
-                if all(x[4] * sg > 15 for x in win) and moved < -10 and all(inside(x[3]) for x in win):
+                moved = (statistics.median(x[3] for x in win[-5:]) - statistics.median(x[3] for x in win[:5])) * sg
+                if all(x[4] * sg > 15 for x in win) and moved < -max(10.0, 3.0 * (self.noise[m] or 0.0)) and \
+                        all(inside(x[3]) for x in win):
                     self._note("wrong_direction", m, s, f"Motor {n} moved AWAY from its target while it was being "
                                f"driven towards it ({-moved:.0f} counts in {win[-1][0] - win[0][0]} ms). The motor "
                                f"or its pot is wired backwards, or the pot slipped on its shaft.",
@@ -2617,6 +2716,8 @@ class MotionCheck:
         self.clip = self.orig["clip"]
         self.lo, self.hi = self.b.window(m)          # Clip window + travel limits (firmware 1.9)
         self.noise = noise
+        nz = noise[m] if noise and noise[m] is not None else None
+        self.nz = max(0.3, nz) if nz is not None else 0.5   # this motor's pot noise (1 sigma) - limits scale with it
         self.cur = None
         self.recent = collections.deque(maxlen=300)
         self.last_cmd = 0.0
@@ -2680,6 +2781,13 @@ class MotionCheck:
         s = self.b.latest()
         return s["m"][self.m]["f"] if s else 512.0
 
+    def fb_med(self, n=9):
+        """Median of the last n pot readings (~90 ms): a noisy pot can't fake a movement with one reading."""
+        with self.b.slock:
+            snap = list(self.b.samples)[-n:]
+        fs = [x["m"][self.m]["f"] for x in snap]
+        return statistics.median(fs) if fs else 512.0
+
     def wait(self, sec):
         end = time.time() + sec
         while True:
@@ -2718,10 +2826,18 @@ class MotionCheck:
                         raise CheckStop("simhub", "Something else is sending positions (SimHub?). Stop SimHub's motion "
                                         "output and run the check again.")
             moved_other = False
-            for k, (f0, t0) in self.base_other.items():
+            for k, (f0, t0, tb, rate) in self.base_other.items():
                 if s["m"][k]["t"] != t0:
                     moved_other = True
                 d = s["m"][k]["f"] - f0
+                # a switched-off motor that sinks under the seat's weight (a gearbox that can be driven backwards)
+                # drifts on its own: anything between where it was and where its drift would have taken it is that
+                # drift (it may also have stopped at an end) - only movement beyond it, or the other way, is crosstalk
+                pred = rate * (now - tb)
+                if pred > 0:
+                    d = d - pred if d > pred else min(d, 0.0)
+                elif pred < 0:
+                    d = d - pred if d < pred else max(d, 0.0)
                 if self._two(("x", k), abs(d) > self.cross_lim[k]):
                     raise CheckStop("crosstalk", f"While motor {n} was being driven, motor {k + 1}'s pot moved "
                                     f"{d:+.0f} counts instead.", True, other=k + 1, delta=round(d, 1))
@@ -2731,7 +2847,7 @@ class MotionCheck:
                                 "output and run the check again.")
             if self.watch is not None:
                 f0, d = self.watch
-                if self._two("rev", (f - f0) * d <= -8):
+                if self._two("rev", (f - f0) * d <= -max(8.0, 3.5 * self.nz)):
                     raise CheckStop("reversed", f"Motor {n} moved the WRONG way: driven towards "
                                     f"{'higher' if d > 0 else 'lower'} numbers, its pot went from {f0:.0f} to "
                                     f"{f:.0f}.", True, start=round(f0, 1), now=round(f, 1),
@@ -2755,7 +2871,8 @@ class MotionCheck:
                 es = [h[2] for h in win]
                 if all(abs(e) > 30 for e in es) and (all(e > 0 for e in es) or all(e < 0 for e in es)):
                     sg = 1 if es[0] > 0 else -1
-                    if all(h[3] * sg > 15 for h in win) and (win[-1][1] - win[0][1]) * sg < -10:
+                    moved = (statistics.median(h[1] for h in win[-5:]) - statistics.median(h[1] for h in win[:5])) * sg
+                    if len(win) >= 10 and all(h[3] * sg > 15 for h in win) and moved < -max(10.0, 3.0 * self.nz):
                         raise CheckStop("reversed", f"Motor {n} moves AWAY from where it is driven.", True)
 
     def ramp_to(self, x, speed=250.0):
@@ -2773,12 +2890,27 @@ class MotionCheck:
                 if k != self.m and not s["dis"][k]:
                     self.b.cmd_text(f"di{k + 1}")
             self.wait_states({k: True for k in range(3) if k != self.m})
+        # how fast each switched-off motor drifts on its own (page 2.4): one with a gearbox the seat's weight can drive
+        # backwards sinks slowly, which must not look like crossed wiring
+        others = [k for k in range(3) if k != self.m]
+
+        def med(k):
+            with self.b.slock:
+                snap = list(self.b.samples)[-9:]
+            return statistics.median(x["m"][k]["f"] for x in snap) if snap else 512.0
+        ta, fa = time.time(), {k: med(k) for k in others}
+        time.sleep(1.0)
+        tb, fb = time.time(), {k: med(k) for k in others}
         s2 = self.b.latest() or s
-        for k in range(3):
-            if k != self.m:
-                self.base_other[k] = (s2["m"][k]["f"], s2["m"][k]["t"])
-                nz = self.noise[k] if self.noise[k] is not None else 0.5
-                self.cross_lim[k] = max(12.0, 6 * nz)
+        for k in others:
+            nz = self.noise[k] if self.noise[k] is not None else 0.5
+            rate = (fb[k] - fa[k]) / max(0.1, tb - ta)
+            rate = rate if abs(rate) >= max(4.0, 2.0 * nz) else 0.0
+            if rate:
+                self.say(f"motor {k + 1}, switched off, drifts {rate:+.0f} counts/s on its own (the seat's weight?) - "
+                         f"allowed for")
+            self.base_other[k] = (fb[k], s2["m"][k]["t"], tb, rate)
+            self.cross_lim[k] = max(12.0, 6 * nz)
 
     def others_back(self):
         self.base_other = {}
@@ -2846,21 +2978,21 @@ class MotionCheck:
                 for lvl in levels:
                     self.b.cmd_pair("PQR"[m], lvl, min(255, lvl + 30))
                     time.sleep(0.1)
-                    fa = self.fb()
+                    fa = self.fb_med()
                     if not (self.lo + 30 <= fa + d * 25 <= self.hi - 30):
                         tgt = fa - d * 40                     # too close to the end: back off first
                         self.watch = None
                         self.set_target(tgt)
                         self.wait(0.8)
-                        fa = self.fb()
+                        fa = self.fb_med()
                     self.watch = (fa, d)
                     self.set_target(round(fa) + d * 25)
                     self.wait(0.7)
-                    moved = (self.fb() - fa) * d
+                    moved = (self.fb_med() - fa) * d
                     self.watch = None
-                    self.set_target(self.fb())
+                    self.set_target(self.fb_med())
                     self.wait(0.2)
-                    if moved >= 6:
+                    if moved >= max(6.0, 2.5 * self.nz):
                         found[d] = lvl
                         self.say(f"moves {'up' if d > 0 else 'down'} (towards {'higher' if d > 0 else 'lower'} "
                                  f"numbers) at drive {lvl}")
@@ -2900,7 +3032,7 @@ class MotionCheck:
                 self.step_watch = None
                 self.wait(0.15)
                 got = despike(b.since(seq0), m)
-                res = analyze_step(got, m, t_old, o["pwmmin"], o["pwmmax"], 1500)
+                res = analyze_step(got, m, t_old, o["pwmmin"], o["pwmmax"], 1500, self.nz)
                 tl = tl_motor(self.d.cfg)
                 around = b.since(seq0 - 20)                     # needs a few samples from before the step
                 seat = seat_step(around, m, t_old, yaw=(m == tl))
@@ -3616,9 +3748,11 @@ def analyze(rep):
         cut, clip, dz = ms["Max limit (cutoff)"], ms["Clip"], ms["Dead zone"]
         if pmax is not None and pmax < 30:
             add("fail", f"Motor {n} can't move: PWMmax is {pmax}",
-                "Auto-tune sets PWMmax 0 when it stops for safety (motor moving the wrong way or running away); it's "
-                "not saved, so a power cycle brings back the stored value.",
-                f"Fix what auto-tune complained about, then set PWMmax back (e.g. 100) in the PID table and Apply M{n}.",
+                "Auto-tune on page 2.3.1 and older set PWMmax 0 when it stopped for safety (motor moving the wrong way "
+                "or running away); it's not saved, so a power cycle brings back the stored value. (From page 2.4 "
+                "auto-tune switches the motor off instead, with its own settings back.)",
+                f"Fix what auto-tune complained about, then press Revert on the Auto-Tune page - or set PWMmax back "
+                f"(e.g. 100) in the PID table and Apply M{n}.",
                 n, "pwmmax0")
         elif pmin is not None and pmax is not None and pmin >= pmax:
             add("fail", f"Motor {n}: PWMmin ({pmin}) is not below PWMmax ({pmax})",
@@ -3973,9 +4107,10 @@ def analyze(rep):
                         "If nothing was wrong: run Seat setup again with a bigger End stop margin, or tune the motor so "
                         "it overshoots less. Then Enable Motors.", k + 1, "seat_endstop")
         if ss.get("page_holds"):
-            add("info", "This page is holding SimHub's position commands back (Seat setup is open)",
-                "SimHub can't move the seat until Seat setup is saved or cancelled.", "Finish or cancel Seat setup.",
-                code="seat_hold")
+            add("info", "This page is holding SimHub's position commands back",
+                "Seat setup is open, or the page is moving the motors itself (a motor's knob dragged, or Return to "
+                "center - page 2.4). SimHub can't move the seat meanwhile.",
+                "Finish or cancel Seat setup, or press Resume SimHub in Quick Controls.", code="seat_hold")
     # ---- full check ----
     if isinstance(rep.get("check"), dict) and rep["check"].get("skipped"):
         add("info", "Motors were not moved", "Reason: " + rep["check"]["skipped"] + ".", code="check_skipped")
@@ -5733,6 +5868,239 @@ class FirmwareUpdate:
 
 
 # --------------------------------------------------------------------------------------------------------------
+# Moving the motors by hand from the page (page 2.4)
+# --------------------------------------------------------------------------------------------------------------
+
+MANUAL_SPEED = 200.0          # counts/s while you drag a motor's knob
+MANUAL_SPEED_CENTRE = 120.0   # counts/s for Return to center
+MANUAL_ACCEL = 800.0          # counts/s^2: eases in and out instead of lurching
+MANUAL_HOLD = 30              # x 100 ms: the board ignores SimHub this long after each refresh (every second)
+MANUAL_BEHIND = 120           # counts a motor may fall behind where the page sends it (for 0.4 s) before it's switched off
+MANUAL_AWAY = 30              # counts off, and moving further away (> 60 counts/s for 0.1 s): switched off at once
+
+
+class ManualControl:
+    """Drag a motor card's knob, or press Return to center: the page moves the motors itself.
+
+    While it's on, the board holds SimHub's position commands back ([kH], firmware 1.9) - refreshed every second, so
+    SimHub gets the seat back within 3 s if this page server stops - and the page keeps sending positions, so the
+    board stays at full power. Positions move at no more than MANUAL_SPEED counts/s, easing in and out, and stay
+    inside each motor's Clip window and travel limits. It stays on until Resume SimHub, until the board's connection
+    drops (a restart gives SimHub the seat back), or until something else moves the motors (auto-tune, a test
+    signal, Seat setup, the full check, a firmware update) - then it ends by itself.
+
+    A motor that moves away from where it is sent (wired backwards) is switched off within 0.1 s, one that falls more
+    than MANUAL_BEHIND counts behind for 0.4 s (blocked, too weak) too - the page keeps the seat, so the other motors
+    stay where they are."""
+
+    def __init__(self, board, cfg, events):
+        self.b, self.cfg, self.events = board, cfg, events
+        self.lock = threading.Lock()
+        self.busy = lambda: None             # -> why the motors are taken (set by main), or None
+        self.seat_open = lambda: False       # Seat setup keeps its own hold - don't give the seat back under it
+        self.active = False
+        self.what = ""                       # "drag" | "centre" - what started it, for the event log
+        self.goal = [None, None, None]       # where each motor should end up (pot counts)
+        self.pos = [None, None, None]        # what is being sent now (pot counts, moving towards goal)
+        self.vel = [0.0, 0.0, 0.0]
+        self.speed = [MANUAL_SPEED] * 3
+        self.sent = [None, None, None]
+        self.last_send = [0.0, 0.0, 0.0]
+        self.last_hold = 0.0
+        self.conn = None
+        self.started = 0.0
+        self.behind = [None, None, None]     # since when each motor is too far behind
+        self.away = [None, None, None]       # since when each motor moves away from where it is sent
+        self.msg = ""                        # why it last ended (shown once by the page)
+        self.msg_id = 0
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    # ---- helpers ----
+    def motors(self):
+        return list(range(int(self.cfg.get("motors") or 3)))
+
+    def _rev(self, m):
+        return m == 0 and bool((self.b.fw_cache or [0, 0])[0] & 1)
+
+    def _send(self, m, v):
+        v = int(round(v))
+        self.b.cmd_word("ABC"[m], 1023 - v if self._rev(m) else v)   # pot position (the board adds the trim)
+        self.sent[m] = v
+        self.last_send[m] = time.time()
+
+    def can(self, m=None):
+        """Why the page can't move motor m (or the seat) now, or None."""
+        if not self.b.connected:
+            return "The board is not connected."
+        if self.b.fwnum() < 19:
+            return ("Moving the motors from the page needs firmware 1.9 or newer on the board (it holds SimHub back "
+                    "meanwhile).")
+        why = self.busy()
+        if why:
+            return why
+        if m is not None:
+            if m not in self.motors():
+                return f"Motor {m + 1} is not in use (Settings, motors in use)."
+            s = self.b.latest()
+            if s and s["dis"][m]:
+                return f"Motor {m + 1} is off - press Enable Motors first."
+        return None
+
+    def _begin(self, what):
+        """Take the seat: hold SimHub back, start from where every motor is heading now."""
+        s = self.b.latest()
+        for m in range(3):
+            self.pos[m] = float(s["m"][m]["t"]) if s else None
+            self.goal[m], self.vel[m], self.sent[m] = None, 0.0, None
+            self.speed[m] = MANUAL_SPEED
+        self.active, self.what, self.started = True, what, time.time()
+        self.conn = self.b.conn_id
+        self.b.seat_cmd(ord("H"), MANUAL_HOLD)
+        self.last_hold = time.time()
+        if self.b.seat is not None:
+            self.b.seat["page_holds"] = True
+        self.events.add("manual", "The page took the seat (" + ("Return to center" if what == "centre" else
+                        "a motor's knob dragged") + "): SimHub's motion is ignored until Resume SimHub.", quiet=True)
+
+    def _end(self, msg, give_back=True):
+        self.active = False
+        self.goal = [None, None, None]
+        if give_back and self.b.connected and not self.seat_open():
+            self.b.seat_cmd(ord("H"), 0)
+            if self.b.seat is not None:
+                self.b.seat["page_holds"] = False
+        self.msg, self.msg_id = msg, self.msg_id + 1
+        self.events.add("manual", msg, quiet=True)
+
+    # ---- what the page asks for ----
+    def move(self, m, pos):
+        why = self.can(m)
+        if why:
+            return {"ok": False, "error": why}
+        with self.lock:
+            if not self.active:
+                self._begin("drag")
+            lo, hi = self.b.window(m)
+            self.goal[m] = float(max(lo, min(hi, pos)))
+            self.speed[m] = MANUAL_SPEED
+            if self.pos[m] is None:
+                s = self.b.latest()
+                self.pos[m] = float(s["m"][m]["t"]) if s else self.goal[m]
+        return {"ok": True, "goal": self.goal[m]}
+
+    def centre(self):
+        why = self.can()
+        if why:
+            return {"ok": False, "error": why}
+        with self.lock:
+            if not self.active:
+                self._begin("centre")
+            for m in self.motors():
+                self.goal[m] = float(self.b.centre(m))
+                self.speed[m] = MANUAL_SPEED_CENTRE
+                if self.pos[m] is None:
+                    self.pos[m] = self.goal[m]
+        return {"ok": True}
+
+    def release(self):
+        with self.lock:
+            if not self.active:
+                return {"ok": True}
+            self._end("Resume SimHub pressed: SimHub drives the seat again.")
+        return {"ok": True}
+
+    def status(self):
+        on = self.motors()
+        return {"active": self.active, "what": self.what,
+                "goal": [None if g is None else round(g, 1) for g in self.goal],
+                "moving": [bool(self.active and self.goal[m] is not None and self.pos[m] is not None
+                                and abs(self.goal[m] - self.pos[m]) > 0.5) for m in range(3)],
+                "window": [list(self.b.window(m)) for m in range(3)], "centre": [self.b.centre(m) for m in range(3)],
+                "can": None if self.active else self.can(), "in_use": on, "msg": self.msg, "msg_id": self.msg_id}
+
+    # ---- the loop: 50 times a second while on ----
+    def _loop(self):
+        prev = time.time()
+        while True:
+            time.sleep(0.02)
+            now = time.time()
+            dt, prev = min(0.1, now - prev), now          # the real time since the last pass: exact speeds
+            if not self.active:
+                continue
+            try:
+                with self.lock:
+                    self._tick(dt)
+            except Exception as e:                       # never let the loop die with the seat held
+                log(f"[manual] {e!r}")
+
+    def _tick(self, dt):
+        if not self.active:
+            return
+        b, now = self.b, time.time()
+        if b.conn_id != self.conn or not b.connected:
+            # the board's hold runs out by itself; after a restart it heads for its centre with the soft start
+            self._end("The connection to the board dropped - SimHub drives the seat again.", give_back=False)
+            return
+        why = self.busy()
+        if why:
+            self._end("Something else moves the motors now, so the page let go: " + why)
+            return
+        if now - self.last_hold >= 1.0:
+            b.seat_cmd(ord("H"), MANUAL_HOLD)
+            self.last_hold = now
+        for m in self.motors():
+            if self.pos[m] is None:
+                continue
+            g = self.goal[m]
+            if g is not None:
+                d = g - self.pos[m]
+                vmax = min(self.speed[m], math.sqrt(2.0 * MANUAL_ACCEL * abs(d)))      # slow down in time
+                want = math.copysign(vmax, d) if abs(d) > 0.01 else 0.0
+                dv = max(-MANUAL_ACCEL * dt, min(MANUAL_ACCEL * dt, want - self.vel[m]))
+                self.vel[m] += dv
+                nxt = self.pos[m] + self.vel[m] * dt
+                if (g - nxt) * d <= 0 or (abs(d) < 0.6 and abs(self.vel[m]) < 40):   # there
+                    nxt, self.vel[m] = g, 0.0
+                self.pos[m] = nxt
+            if self.sent[m] is None or round(self.pos[m]) != self.sent[m] or now - self.last_send[m] > 0.5:
+                self._send(m, self.pos[m])                # a change, or a keep-alive: full power
+        # a motor that doesn't follow: switch it off (the firmware's cutoff is the last resort, not the first).
+        # Moving AWAY from where it is sent (wired backwards) trips within 0.1 s; just falling far behind (blocked, too
+        # weak) after 0.4 s.
+        with b.slock:
+            snap = list(b.samples)[-10:]
+        if len(snap) < 8:
+            return
+        s = snap[-1]
+        dt_s = max(0.01, (snap[-1]["ms"] - snap[0]["ms"]) / 1000.0)
+        for m in self.motors():
+            if s["dis"][m] or self.pos[m] is None:
+                self.behind[m] = self.away[m] = None
+                continue
+            f_new = statistics.median(x["m"][m]["f"] for x in snap[-3:])
+            f_old = statistics.median(x["m"][m]["f"] for x in snap[:3])
+            v = (f_new - f_old) / dt_s
+            g = s["m"][m]["g"]
+            gap = g - f_new
+            away = abs(gap) > MANUAL_AWAY and v * (1 if gap > 0 else -1) < -60.0
+            self.away[m] = (self.away[m] or now) if away else None
+            self.behind[m] = (self.behind[m] or now) if abs(gap) > MANUAL_BEHIND else None
+            why = None
+            if self.away[m] and now - self.away[m] >= 0.1:
+                why = (f"Motor {m + 1} moved AWAY from where the page sent it (pot {f_new:.0f}, sent to {g:.0f}), so it "
+                       f"was switched off. The motor or its pot is most likely wired backwards")
+            elif self.behind[m] and now - self.behind[m] >= 0.4:
+                why = (f"Motor {m + 1} fell {abs(gap):.0f} counts behind where the page sent it (pot {f_new:.0f}, sent "
+                       f"to {g:.0f}), so it was switched off. It may be blocked or too weak")
+            if why:
+                b.cmd_text(f"di{m + 1}")
+                self.goal[m], self.vel[m], self.behind[m], self.away[m] = None, 0.0, None, None
+                self.msg, self.msg_id = (why + " - check it (the Diagnostics full check helps), then Enable Motors. "
+                                         "The page still has the seat."), self.msg_id + 1
+                self.events.add("manual", self.msg, motor=m + 1)
+
+
+# --------------------------------------------------------------------------------------------------------------
 # Web page and artwork (seat logo, rig and motor pictures cropped from the dashboard design; Michroma font,
 # SIL Open Font License 1.1, Copyright 2011 The Michroma Project Authors)
 # --------------------------------------------------------------------------------------------------------------
@@ -5833,7 +6201,7 @@ svg.i{width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:1.8;stro
 .pill{flex:1;display:flex;align-items:center;min-width:280px;height:46px;padding:0 6px;border:1px solid var(--chrome-line);border-radius:10px;background:#0c141d;overflow:hidden}
 .pill>span{padding:0 13px;font-size:13.5px;color:var(--chrome-dim);white-space:nowrap;border-left:1px solid var(--chrome-line)}
 .pill>span:first-child{border-left:0;color:var(--chrome-text);font-weight:600;display:flex;align-items:center;gap:9px}
-.pill .bad{color:#ff5757}.pill .ok{color:#4ade6a}
+.pill .bad{color:#ff5757}.pill .ok{color:#4ade6a}.pill .mheld{color:#f8a646}
 .dot{width:13px;height:13px;border-radius:50%;background:#7b8796;display:inline-block;flex:none}
 .dot.on{background:#3ee35b;box-shadow:0 0 8px rgba(62,227,91,.55)}.dot.off{background:#ff4d4f}.dot.warn{background:#ffb020}
 .seg{display:flex;border:1px solid var(--chrome-line);border-radius:10px;overflow:hidden;background:#0c141d;height:46px}
@@ -5917,6 +6285,19 @@ html[data-theme=light] .mimg{background:#111a24}
 .track .fill{position:absolute;left:0;top:0;bottom:0;border-radius:6px;background:linear-gradient(90deg,#0b55d6,#1f8fff)}
 .track .fb{position:absolute;top:-4px;width:3px;height:16px;margin-left:-1.5px;background:var(--c-f);border-radius:2px}
 .track .knob{position:absolute;top:50%;width:16px;height:16px;margin:-8px 0 0 -8px;border-radius:50%;background:#e9f6ff;border:3px solid #2bb3ff;box-shadow:0 0 6px rgba(43,179,255,.7)}
+/* 2.4: drag the knob to move the motor */
+.track{touch-action:none}
+.track .knob{cursor:grab;outline:none;transition:box-shadow .15s,transform .1s;z-index:2}
+.track .knob::before{content:"";position:absolute;inset:-10px;border-radius:50%}
+.track .knob:hover,.track .knob:focus-visible{box-shadow:0 0 0 6px rgba(43,179,255,.28),0 0 6px rgba(43,179,255,.7)}
+.track.drag .knob{cursor:grabbing;transform:scale(1.2);box-shadow:0 0 0 7px rgba(43,179,255,.32),0 0 8px rgba(43,179,255,.8)}
+.track.nomove .knob{cursor:not-allowed}
+.track .zone{position:absolute;top:0;bottom:0;opacity:0;transition:opacity .2s;background:repeating-linear-gradient(135deg,var(--faint) 0 2px,transparent 2px 6px)}
+.track .zl{left:0;border-radius:6px 0 0 6px}.track .zr{right:0;border-radius:0 6px 6px 0}
+.track:hover .zone,.track.drag .zone,.track.mheld .zone{opacity:.55}
+.track .mgoal{position:absolute;top:-6px;bottom:-6px;width:2px;margin-left:-1px;background:var(--mc);border-radius:1px;display:none;z-index:1}
+.track .mgoal::after{content:"";position:absolute;top:-6px;left:-4px;border:5px solid transparent;border-top-color:var(--mc)}
+.track.mheld .mgoal{display:block}
 .scale{display:flex;justify-content:space-between;font-size:12.5px;color:var(--dim);margin-bottom:4px}
 .rows div{display:flex;justify-content:space-between;padding:5px 2px;border-top:1px solid var(--line);font-size:14px}
 .rows b{font-family:var(--mono);font-weight:600}
@@ -5928,6 +6309,8 @@ html[data-theme=light] .mimg{background:#111a24}
 .tile{height:72px;border-radius:7px;flex-direction:column;gap:6px;font-size:14px;white-space:normal;text-align:center;line-height:1.2;padding:0 8px}
 .tile svg{width:22px;height:22px}
 .qsub{font-size:15px;font-weight:600;margin:16px 0 9px}
+#resBtn.glow{animation:heldglow 1.6s ease-in-out infinite}
+@keyframes heldglow{0%,100%{box-shadow:0 0 0 0 rgba(75,201,91,.0)}50%{box-shadow:0 0 0 4px rgba(75,201,91,.35)}}
 
 /* graphs */
 .gh{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:4px}
@@ -6298,6 +6681,8 @@ details.oks .flist{margin-top:6px}
   <div class="qgrid">
    <button class="btn b-blue tile" data-k="ena" onclick="txt('ena')"><svg class="i" viewBox="0 0 24 24"><path d="M7 4l13 8-13 8z" fill="currentColor"/></svg>Enable Motors</button>
    <button class="btn b-red tile" id="disBtn" data-k="dis" onclick="disableAll()"><svg class="i" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor"/></svg>Disable Motors</button>
+   <button class="btn b-blue" id="cenBtn" data-k="mcenter" onclick="manCenter()">Return to center</button>
+   <button class="btn b-green" id="resBtn" data-k="mresume" onclick="manRelease()" disabled>Resume SimHub</button>
   </div>
   <div class="qsub">Board</div>
   <div class="qgrid">
@@ -6683,10 +7068,11 @@ details.oks .flist{margin-top:6px}
   <div class="cols">
    <div><h3>Every control explains itself</h3><p>Hold the mouse over any setting, button, legend entry or status item for a short note on what it does on the rig, what too low and too high feel like, and where to start.</p>
     <h3>Tuning by hand</h3><ol><li>Stop SimHub's motion output.</li><li>Set Ki 0, Kd 0, PWMmin 10-15, dead zone 2-4 and press Apply.</li><li>Run a Square test on one motor and raise Kp until the green line just stops overshooting the blue one.</li><li>Add a little Ki (5-20) only if the seat settles short of the target.</li><li>Save to EEPROM.</li></ol></div>
-   <div><h3>Auto-tune</h3><p>Measures friction (PWMmin) and pot noise (dead zone), raises Kp until it stops tracking any better, checks small road-sized moves, then adds Ki and Kd only if they help. With the motion sensor it also watches the seat, so a setting that makes the frame bounce doesn't count as calm. It stops by itself and restores the previous settings if SimHub moves the rig or anything looks wrong. Nothing is saved until you press Save to EEPROM.</p>
+   <div><h3>Auto-tune</h3><p>Measures friction (PWMmin) and pot noise (dead zone), raises Kp until it stops tracking any better, checks small road-sized moves, then adds Ki and Kd only if they help. With the motion sensor it also watches the seat, so a setting that makes the frame bounce doesn't count as calm. It stops by itself and restores the previous settings if SimHub moves the rig or anything looks wrong. Nothing is saved until you press Save to EEPROM. Every limit that judges "it moved" or "it holds still" allows for the pot's noise, and a motor is only called wired backwards when it goes the wrong way <b>both</b> ways - a seat that sinks under its weight while the drive is still too weak only goes the wrong way one way (page 2.4). If it does stop for safety, that motor is switched off with its previous settings back: fix the cause, then Enable Motors.</p>
     <h3>Profiles and recommendations</h3><p>Save the settings that suit a car or game under a name and load them later. The recommendations (circuit, rally, flight, space, trucks) adjust your own tuned settings for that kind of sim and list the SimHub settings that matter most for it. Loading applies live; save to EEPROM to make it the power-on default.</p>
     <h3>Backups</h3><p>Every Save to EEPROM, and every bigger change, keeps a copy on the NAS (EEPROM section). Switch back to any of them live, or switch and save in one go.</p></div>
    <div><h3>Motor names and the rig</h3><p>Settings, Motor names: call the motors Front left, Front right, Traction loss (or anything you like). The names appear everywhere in the page and in diagnostics files; the number stays alongside because the wiring, SimHub and the LED matrix use numbers. The same card says what <b>motor 3</b> does: on a <b>traction-loss</b> rig motors 1 and 2 lift the front corners and motor 3, mounted horizontally, swings the rear left and right about a pivot at the front; on a <b>three-lift</b> rig it lifts the rear. Seat setup, the full check, auto-tune and the 3D view follow that.</p>
+    <h3>Moving the motors from the page (firmware 1.9)</h3><p><b>Drag a motor card's knob</b> and that motor follows - up to 200 counts/s, easing in and out, never past its Clip window or travel limits (hatched on the track; a thin line marks where it is going). Arrow keys on a selected knob move it 5 counts, with Shift 25. <b>Quick Controls, Return to center</b> brings every motor back to its neutral position - SimHub's 0: the level seat with the rear centred, your Seat setup's level if you made one - gently. Either way the page takes the seat: the board ignores SimHub's position commands (SimHub keeps sending), and every motor runs at full power. <b>Resume SimHub</b> gives the seat back - it then goes straight to wherever the game puts it, so pause the game first if you sit in it. The page also lets go by itself when the board restarts, the page server stops (SimHub has the seat back within 3 s), or something else moves the motors. A motor that moves away from where it is sent (wired backwards) is switched off within a tenth of a second, and one that falls far behind (blocked, too weak) within half a second; the page keeps the seat.</p>
     <h3>Selected motor</h3><p>Click a motor card or chart, or choose a motor in Test Signal or Auto-Tune: the same motor is highlighted everywhere. While a test signal or auto-tune runs, its chart is marked and the others fade.</p>
     <h3>Diagnostics</h3><p>Settings section. <b>Quick check</b> reads the board and listens for a few seconds; <b>Full check</b> also moves each motor a little to see which way it goes, how much drive it needs, whether the wiring is swapped and how it answers a small step - and can ask you what you saw. Both make one file (saved on the NAS too) to download and give to whoever helps you. The page also watches while you drive and notes pot glitches, a motor moving the wrong way or stalling, hunting, cutoffs, the tilt limit and board restarts. It also keeps a <b>load map</b>: where each motor falls behind or runs at full power, each way across its travel - a quick check after a session names where the rig struggles (lifting a heavy driver, say). With the motion sensor, the full check also measures the seat itself: degrees per count, bounce and play in the linkage - for the traction-loss motor, how far the seat turns. For the rear slide it asks whether the rear went left or right.</p>
     <h3>Status bar</h3><p>LOW POWER means no position commands for 15 s, so the board runs at quarter drive until SimHub or this page sends targets again.</p>
@@ -6834,6 +7220,9 @@ const TIPS={
  lg_f:"<b>Feedback</b> - where the pot says the motor really is. Good tuning = green sits on blue.",
  lg_p:"<b>PID output</b> before PWMmin is added. Middle line = 0; top/bottom = full ±255. Pinned at the edge means the motor is giving everything it is allowed.",
  mpos:"<b>Position</b> - where the motor is being sent (the smoothed goal, 0-1023). The green tick on the bar is where it really is.",
+ knob:"<b>Drag to move this motor</b> (firmware 1.9). The page takes the seat from SimHub while you do: every motor holds where it is and SimHub's motion is ignored until you press <b>Resume SimHub</b> (Quick Controls). The motor follows at up to 200 counts/s, easing in and out, and stops at its Clip window and travel limits (hatched). The thin line marks where it is going.<br><br>Arrow keys move it 5 counts, with Shift 25. Keep clear of the seat while you move it.",
+ mcenter:"<b>Return to center</b> (firmware 1.9): every motor goes back to its neutral position - SimHub's 0, the level seat with the rear centred (your Seat setup's level, if you made one) - gently, at up to 120 counts/s. The page keeps the seat there: SimHub's motion is ignored until you press <b>Resume SimHub</b>.",
+ mresume:"<b>Give the seat back to SimHub.</b> Lit up while the page has the seat (after you dragged a knob or pressed Return to center; the status bar says so too) - SimHub keeps sending meanwhile, but the board ignores it. From the next position SimHub sends after this, the seat goes wherever the game puts it - straight away, so pause the game (or stop its motion output) first if you sit in the seat.",
  mstate:"<b>Online</b> = enabled and reporting. <b>Off</b> = stopped by its safety cutoff or Disable Motors - press Enable Motors.",
  pr_name:"Any name you like - a car, a game, a feel. Saving with an existing name replaces it.",
  pr_save:"Reads every setting running on the board now and stores it on the NAS under this name.",
@@ -6854,6 +7243,7 @@ const TIPS={
  st_fw:"Firmware version on the board. Auto-tune needs 1.4 or newer, Disable Motors 1.5.",
  st_isr:"Longest time the 4 kHz control interrupt took recently. Budget 250 µs; under ~200 is healthy.",
  st_div:"Control loop divider: PID runs at 4000 / this many times a second.",
+ st_held:"<b>The page has the seat</b> (page 2.4): you dragged a motor's knob or pressed Return to center. The board ignores SimHub's position commands meanwhile, and the page keeps every motor at full power. Quick Controls, <b>Resume SimHub</b> gives the seat back.",
  st_low:"No position commands for 15 s, so the board drops the drive to a quarter (like the original SMC3). Clears as soon as SimHub or this page sends targets.",
  st_full:"Position commands are arriving, so the motors run at full drive.",
  sy_board:"Live data from the board over WiFi.",sy_motors:"How many motors are enabled.",sy_pid:"The control loop is running and reporting.",
@@ -6927,9 +7317,9 @@ function buildMotorCards(){document.querySelectorAll('.motor').forEach(c=>{const
  c.innerHTML=`<div class="mh"><span class="badge">${m+1}</span><b class="mtitle" id="mn${m}">Motor ${m+1}</b><span class="state nodata" data-k="mstate" id="ms${m}"><i class="dot"></i><span>No data</span></span></div>
  <img class="mimg" src="/img/motor.png" alt="">
  <div class="mpos" data-k="mpos"><span>Position</span><b id="mp${m}">-</b></div>
- <div class="track"><div class="fill" id="mf${m}"></div><div class="fb" id="mt${m}"></div><div class="knob" id="mk${m}"></div></div>
+ <div class="track" id="tk${m}"><div class="zone zl" id="zl${m}"></div><div class="zone zr" id="zr${m}"></div><div class="fill" id="mf${m}"></div><div class="fb" id="mt${m}"></div><div class="mgoal" id="mg${m}"></div><div class="knob" id="mk${m}" data-k="knob" tabindex="0" role="slider" aria-label="Motor ${m+1} position" aria-valuemin="0" aria-valuemax="1023"></div></div>
  <div class="scale"><span>0</span><span>1023</span></div>
- <div class="rows"><div data-k="lg_f"><span>Feedback (fb)</span><b id="mfb${m}">-</b></div><div><span>Error (err)</span><b id="me${m}">-</b></div><div data-k="lg_p"><span>PID Out</span><b id="mo${m}">-</b></div></div>`;});}
+ <div class="rows"><div data-k="lg_f"><span>Feedback (fb)</span><b id="mfb${m}">-</b></div><div><span>Error (err)</span><b id="me${m}">-</b></div><div data-k="lg_p"><span>PID Out</span><b id="mo${m}">-</b></div></div>`;bindKnob(m);});}
 function buildCharts(){let h='';for(let m=0;m<3;m++)h+=`<div class="chart" data-m="${m}" data-k="chartsel" onclick="setSel(${m})"><span class="tab"><span id="ct${m}">Motor ${m+1}</span><em id="tag${m}"></em></span><canvas id="c${m}"></canvas><div class="ro"><span>goal</span><b id="rg${m}">-</b><span>fb</span><b id="rf${m}">-</b><span>err</span><b id="re${m}">-</b><span>pid</span><b id="rp${m}">-</b></div></div>`;
  h+=`<div class="chart seatc" id="seatc" data-k="seatchart" hidden><span class="tab"><svg id="hz" viewBox="0 0 34 18"><path id="hzg" fill="#8a5a24"/><line id="hzl" stroke="#fff" stroke-width="1.4"/><path d="M12 9h4M18 9h4" stroke="#ffd34d" stroke-width="1.6"/></svg><span>Seat angle</span></span><canvas id="c3"></canvas><div class="ro"><span>roll</span><b id="sr">-</b><span>pitch</span><b id="sp">-</b><span>range</span><b id="srng">-</b><span>speed</span><b id="sv">-</b></div></div>`;
  $('charts').innerHTML=h;}
@@ -6944,7 +7334,7 @@ function tipAttach(root){(root||document).querySelectorAll('[data-k]').forEach(e
 const tipEl=$('tip');
 function placeTip(e){const p=14;let x=e.clientX+p,y=e.clientY+p;const w=tipEl.offsetWidth,h=tipEl.offsetHeight;
  if(x+w>innerWidth-8)x=e.clientX-w-p;if(y+h>innerHeight-8)y=e.clientY-h-p;tipEl.style.left=Math.max(8,x)+'px';tipEl.style.top=Math.max(8,y)+'px';}
-document.addEventListener('mouseover',e=>{const el=e.target.closest('[data-tip]');if(!el){tipEl.style.display='none';return;}
+document.addEventListener('mouseover',e=>{const el=e.target.closest('[data-tip]');if(!el||(typeof drag!=='undefined'&&drag)){tipEl.style.display='none';return;}
  tipEl.innerHTML=el.dataset.tip;tipEl.style.display='block';placeTip(e);});
 document.addEventListener('mousemove',e=>{if(tipEl.style.display==='block')placeTip(e);});
 
@@ -7121,13 +7511,14 @@ async function poll(){
    if(j.diag.prompt&&curView!=='settings'&&Date.now()-waitToast>15000){waitToast=Date.now();toast('The diagnostics check is waiting for your answer - <a href="#settings">Settings</a>.');}
    if((j.diag.state==='running'||j.diag.state==='waiting')&&diagState!==j.diag.state&&curView!=='settings')diagPoll(true);}
   if(j.watch){watch=j.watch;showBadge();}
+  if(j.manual){man=j.manual;}
   if(typeof V3!=='undefined'&&V3)V3.imu=j.imu||null;
-  updateStatus(j); updateCards(); if(!paused)draw(); misses=0;
+  updateStatus(j); updateCards(); manUI(); if(!paused)draw(); misses=0;
   const ls=data[data.length-1];$('dg_live').innerHTML=diagMotor!=null&&ls?`<span class="mtag m${diagMotor+1}">${esc(mshort(diagMotor))}</span>pot ${ls.m[diagMotor].f.toFixed(1)}  target ${ls.m[diagMotor].t}  drive ${ls.m[diagMotor].p.toFixed(0)}`:'';
  }catch(e){if(++misses>=5){$('pill').innerHTML='<span><i class="dot off"></i>Page server not reachable</span>';}}
  setTimeout(poll,100);}
 function updateStatus(j){const s=data[data.length-1];const fresh_inc=watch.newest>seenInc();
- let h=connected?'<span data-k="st_conn"><i class="dot on"></i>Board Connected</span>':`<span data-k="st_conn"><i class="dot off"></i>Not connected <span class="muted" style="font-weight:400">(${esc(j.host||'no address set')})</span></span>`;
+ let h=connected?'<span data-k="st_conn"><i class="dot on"></i>Board Connected</span>'+(man.active?'<span class="mheld" data-k="st_held">Page has the seat</span>':''):`<span data-k="st_conn"><i class="dot off"></i>Not connected <span class="muted" style="font-weight:400">(${esc(j.host||'no address set')})</span></span>`;
  if(j.fw)h+=`<span data-k="st_fw">fw v${esc(j.fw)}</span>`;
  if(s&&connected){h+=`<span data-k="st_isr">ISR max ${s.isr} µs</span><span data-k="st_div">Fpid/${s.div}</span>`+(s.low?'<span class="bad" data-k="st_low">LOW POWER (no position commands)</span>':'<span class="ok" data-k="st_full">Full power</span>');
   if(s.roll!=null)h+=`<span data-k="seatchart">Seat ${s.roll.toFixed(1)}° / ${s.pitch.toFixed(1)}°</span>`;}
@@ -7155,8 +7546,10 @@ function updateCards(){const s=data[data.length-1];
  for(let m=0;m<3;m++){const st=$('ms'+m);
   if(!s||!connected){st.className='state nodata';st.lastElementChild.textContent='No data';continue;}
   const x=s.m[m];const off=s.dis[m];st.className='state'+(off?' off':'');st.lastElementChild.textContent=off?'Off':'Online';
-  $('mp'+m).textContent=Math.round(x.g);$('mfb'+m).textContent=x.f.toFixed(1);$('me'+m).textContent=(x.g-x.f).toFixed(1);$('mo'+m).textContent=x.p.toFixed(1);
-  const pc=v=>Math.max(0,Math.min(100,v/1023*100))+'%';$('mf'+m).style.width=pc(x.g);$('mk'+m).style.left=pc(x.g);$('mt'+m).style.left=pc(x.f);
+  const dragging=drag&&drag.m===m&&drag.v!=null;
+  if(!dragging)$('mp'+m).textContent=Math.round(x.g);$('mfb'+m).textContent=x.f.toFixed(1);$('me'+m).textContent=(x.g-x.f).toFixed(1);$('mo'+m).textContent=x.p.toFixed(1);
+  const pc=v=>Math.max(0,Math.min(100,v/1023*100))+'%';if(!dragging){$('mf'+m).style.width=pc(x.g);$('mk'+m).style.left=pc(x.g);}$('mt'+m).style.left=pc(x.f);
+  $('mk'+m).setAttribute('aria-valuenow',Math.round(x.g));
   $('rg'+m).textContent=x.g.toFixed(1);$('rf'+m).textContent=x.f.toFixed(1);$('re'+m).textContent=(x.g-x.f).toFixed(1);$('rp'+m).textContent=x.p.toFixed(1);}}
 function cssv(n){return getComputedStyle(document.documentElement).getPropertyValue(n).trim()}
 function draw(){
@@ -7224,6 +7617,55 @@ async function saveEeprom(){if(!confirm('Save all settings running on the board 
  const r=await post('/eeprom/save');if(r.ok){toast('Saved to EEPROM. A backup of these settings is kept in the EEPROM section.');if(curView==='eeprom')loadBackups();}else toast(esc(r.error),true);}
 function applyFilt(){post('/cmd',{pair:'f',a:+$('fsm').value,b:Math.round((+$('frate').value||0)/100)});toast('Smoothing and max speed sent to the board.');}
 function disableAll(){txt('dis');}
+
+// ---------- moving the motors from the page (2.4): drag a knob, Return to center, Resume SimHub ----------
+let man={active:false,goal:[null,null,null],moving:[false,false,false],window:[[0,1023],[0,1023],[0,1023]],centre:[512,512,512],can:null,msg:'',msg_id:null,in_use:[0,1,2]};
+let drag=null,manMsgSeen=null;
+function manBlock(m){                      // why motor m can't be moved from the page right now ('' = it can)
+ if(!connected)return 'The board is not connected.';
+ if(fwnum<19)return 'Moving the motors from the page needs firmware 1.9 or newer on the board.';
+ if(!man.active&&man.can)return man.can;
+ if(m!=null&&m>=NM)return mfull(m)+' is not in use.';
+ const s=data[data.length-1];if(m!=null&&s&&s.dis[m])return mfull(m)+' is off - press Enable Motors first.';
+ return '';}
+function knobPos(m,x){const r=$('tk'+m).getBoundingClientRect(),w=man.window[m]||[0,1023];
+ return Math.max(w[0],Math.min(w[1],Math.round((x-r.left)/Math.max(1,r.width)*1023)));}
+function showKnob(m,v){const pc=Math.max(0,Math.min(100,v/1023*100))+'%';$('mk'+m).style.left=pc;$('mf'+m).style.width=pc;$('mp'+m).textContent=Math.round(v);}
+function manTook(){if(!man.active)toast('The page has the seat now: SimHub\'s motion is ignored until you press <b>Resume SimHub</b> (Quick Controls).');}
+function manSend(force){if(!drag||drag.v==null)return;const now=Date.now(),wait=70-(now-drag.sentAt);
+ if(!force&&wait>0){if(!drag.timer)drag.timer=setTimeout(()=>{if(drag){drag.timer=null;manSend(true);}},wait);return;}
+ if(drag.timer){clearTimeout(drag.timer);drag.timer=null;}
+ drag.sentAt=now;const m=drag.m;
+ post('/manual/move',{motor:m,pos:drag.v}).then(r=>{if(r&&!r.ok){toast(esc(r.error),true);if(drag&&drag.m===m){$('tk'+m).classList.remove('drag');drag=null;}}}).catch(()=>{});}
+function bindKnob(m){const k=$('mk'+m),tk=$('tk'+m);
+ k.addEventListener('pointerdown',e=>{if(e.button!==0)return;tipEl.style.display='none';const why=manBlock(m);
+  if(why){toast(esc(why),true);return;}
+  e.preventDefault();e.stopPropagation();k.focus({preventScroll:true});try{k.setPointerCapture(e.pointerId);}catch(_){}
+  drag={m:m,v:null,x0:e.clientX,sentAt:0,timer:null,moved:false};tk.classList.add('drag');setSel(m);});
+ k.addEventListener('pointermove',e=>{if(!drag||drag.m!==m)return;
+  if(!drag.moved){if(Math.abs(e.clientX-drag.x0)<3)return;drag.moved=true;manTook();}
+  drag.v=knobPos(m,e.clientX);showKnob(m,drag.v);manSend(false);});
+ const end=()=>{if(!drag||drag.m!==m)return;if(drag.moved)manSend(true);tk.classList.remove('drag');drag=null;};
+ k.addEventListener('pointerup',end);k.addEventListener('pointercancel',end);k.addEventListener('lostpointercapture',end);
+ k.addEventListener('click',e=>e.stopPropagation());
+ k.addEventListener('keydown',e=>{const st={ArrowLeft:-1,ArrowDown:-1,ArrowRight:1,ArrowUp:1}[e.key];if(st==null)return;e.preventDefault();
+  const why=manBlock(m);if(why){toast(esc(why),true);return;}
+  const s=data[data.length-1],w=man.window[m]||[0,1023];const base=man.active&&man.goal[m]!=null?man.goal[m]:(s?s.m[m].t:512);
+  const v=Math.max(w[0],Math.min(w[1],Math.round(base+st*(e.shiftKey?25:5))));manTook();
+  man.goal[m]=v;post('/manual/move',{motor:m,pos:v}).then(r=>{if(r&&!r.ok)toast(esc(r.error),true);});});}
+async function manCenter(){const why=manBlock(null);if(why){toast(esc(why),true);return;}
+ const r=await post('/manual/center',{});
+ if(r.ok)toast('Returning to center. The page holds the seat there - SimHub\'s motion is ignored until you press <b>Resume SimHub</b>.');else toast(esc(r.error),true);}
+async function manRelease(){const r=await post('/manual/release',{});if(!r.ok)toast(esc(r.error||'No answer.'),true);}
+function manUI(){const held=man.active,why=manBlock(null);
+ $('resBtn').disabled=!held;$('resBtn').classList.toggle('glow',held);$('cenBtn').disabled=!!why&&!held;
+ $('cenBtn').dataset.tip=TIPS.mcenter+(why&&!held?'<br><br><b>Not now:</b> '+esc(why):'');
+ for(let m=0;m<3;m++){const tk=$('tk'+m);if(!tk)continue;const w=man.window[m]||[0,1023];
+  tk.classList.toggle('mheld',held&&man.goal[m]!=null);tk.classList.toggle('nomove',!!manBlock(m));
+  $('zl'+m).style.width=(w[0]/1023*100)+'%';$('zr'+m).style.width=((1023-w[1])/1023*100)+'%';
+  if(man.goal[m]!=null)$('mg'+m).style.left=(man.goal[m]/1023*100)+'%';}
+ if(man.msg_id!=null&&manMsgSeen!==null&&man.msg_id!==manMsgSeen&&man.msg)toast(esc(man.msg),!/Resume SimHub pressed/.test(man.msg));
+ if(man.msg_id!=null)manMsgSeen=man.msg_id;}
 
 // ---------- test signal ----------
 async function gen(mode){const body={motor:+$('gm').value,mode:mode||$('gmode').value,amp:+$('gamp').value,period:+$('gper').value,centre:+$('goff').value,value:+$('goff').value};
@@ -7311,7 +7753,7 @@ async function tunePoll(){
    for(const k of Object.keys(NAMES)){const a=r.before[k],b=r.after[k];h+=`<tr><td>${NAMES[k]}</td><td>${a}</td><td class="${a!==b?'chg':''}">${b}</td></tr>`;}h+='</table>';}
   if(s.can_revert)h+='<div style="display:flex;gap:10px"><button class="btn b-grey" data-k="trevert" onclick="tuneRevert()">Revert</button><button class="btn b-red" data-k="sav" onclick="saveEeprom()">Save to EEPROM</button></div>';
   if($('tresult').dataset.h!==h){$('tresult').innerHTML=h;$('tresult').dataset.h=h;tipAttach($('tresult'));}
-  if(s.state==='done'&&!tunePoll.reread){tunePoll.reread=true;readParams();}if(s.state==='running')tunePoll.reread=false;
+  if(s.state!=='running'&&s.state!=='idle'&&!tunePoll.reread){tunePoll.reread=true;readParams();}if(s.state==='running')tunePoll.reread=false;
  }catch(e){}
  setTimeout(tunePoll,700);}
 async function tuneRevert(){await post('/tune/revert');readParams();}
@@ -8019,7 +8461,8 @@ class Handler(BaseHTTPRequestHandler):
                                  "prompt": self.diag.prompt is not None},
                         "imu": imu if (imu and time.time() - imu["t"] < 1.0) else None,
                         "seat": {"open": self.seat.state != "idle", "action": self.seat.action,
-                                 "trim": [self.board.trim(m) for m in range(3)]}})
+                                 "trim": [self.board.trim(m) for m in range(3)]},
+                        "manual": self.manual.status()})
         elif u.path == "/config":
             self._json(self.cfg.public())
         elif u.path == "/fw/status":                     # 2.3: firmware update
@@ -8262,6 +8705,20 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"ok": False, "error": "Check the test-signal numbers."})
                 return
             self._json({"ok": True})
+        elif p == "/manual/move":                        # 2.4: a motor card's knob dragged
+            try:
+                m, pos = int(req.get("motor", -1)), float(req.get("pos"))
+            except (TypeError, ValueError):
+                self._json({"ok": False, "error": "No position given."})
+                return
+            if not 0 <= m <= 2 or not 0 <= pos <= 1023:
+                self._json({"ok": False, "error": "No such motor or position."})
+                return
+            self._json(self.manual.move(m, pos))
+        elif p == "/manual/center":                      # 2.4: Quick Controls, Return to center
+            self._json(self.manual.centre())
+        elif p == "/manual/release":                     # 2.4: Quick Controls, Resume SimHub
+            self._json(self.manual.release())
         elif p in ("/board/led", "/board/sensor", "/board/sensor/action", "/board/soft"):
             self._board_setting(p, req)
         elif p.startswith("/seat/"):
@@ -8569,6 +9026,11 @@ def main():
             return "A test signal is running - stop it first."
         return None
     Handler.fwup.busy_check = busy
+    Handler.manual = ManualControl(board, cfg, events)
+    Handler.manual.busy = lambda: busy() or ("A firmware update is running." if Handler.fwup.state == "running"
+                                             else None)
+    Handler.manual.seat_open = lambda: Handler.seat.state != "idle"
+    Handler.monitor.manual = Handler.manual
     Handler.diag.fwup = Handler.fwup
     events.add("scope", f"smc3_scope v{VERSION} started (board {cfg.get('host') or 'not set'}:{cfg.get('port')}, "
                f"{cfg.get('motors')} motors in use).", quiet=True)

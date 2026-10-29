@@ -17,6 +17,10 @@ Smoke test: start simulated rigs and the page, run diagnostics, check the result
 7. Firmware update over WiFi (firmware 1.9.2): a .bin that isn't SMC3_R4 is refused; an SMC3_R4 one is converted to
    the UNO R4 WiFi's .ota format, the simulated board fetches it from the page, checks it, "installs" it and comes
    back with the new version.
+8. Moving the motors from the page (page 2.4): with a fake SimHub sending, Return to center brings every motor to
+   its centre and keeps it there; Resume SimHub gives the seat back.
+9. Auto-tune on a noisy pot (page 2.4): a motor whose pot reads +-2.3 counts at rest gets through the minimum-drive
+   search instead of being called "wired backwards".
 """
 import json, os, subprocess, sys, tempfile, time, urllib.request as u
 
@@ -224,6 +228,39 @@ try:
     time.sleep(1.0)
     check(st["state"] == "done" and get(base7, "/data?since=0")["fw"] == "1.9.9",
           f"update: the board came back with 1.9.9 ({st['state']}: {st.get('msg')})")
+
+    # 8. moving the motors from the page while SimHub sends
+    sim8, scope8, base8 = start(4717, 8717, "--simhub", "--seat-setup")
+    procs += [sim8, scope8]
+    r = post(base8, "/manual/center")
+    check(r.get("ok"), f"Return to center ({r.get('error')})")
+    time.sleep(7)
+    d = get(base8, "/data?since=0")
+    t1 = [d["samples"][-1]["m"][k]["t"] for k in range(3)]
+    time.sleep(1)
+    t2 = [get(base8, "/data?since=0")["samples"][-1]["m"][k]["t"] for k in range(3)]
+    check(d["manual"]["active"] and t1 == d["manual"]["centre"] and t1 == t2,
+          f"every motor at its centre {d['manual']['centre']} and held there although SimHub sends ({t1}, {t2})")
+    post(base8, "/manual/release")
+    time.sleep(1)
+    t3 = get(base8, "/data?since=0")["samples"][-1]["m"][1]["t"]
+    time.sleep(0.7)
+    t4 = get(base8, "/data?since=0")["samples"][-1]["m"][1]["t"]
+    check(not get(base8, "/data?since=0")["manual"]["active"] and t3 != t4, "Resume SimHub: SimHub moves the seat again")
+
+    # 9. auto-tune on a noisy pot gets through the minimum-drive search
+    sim9, scope9, base9 = start(4718, 8718, "--pot-noise", "2:2.34")
+    procs += [sim9, scope9]
+    r = post(base9, "/tune/start", {"motor": 1, "amp": 100, "style": "gentle", "friction": True, "ki": True, "kd": True})
+    t0 = time.time()
+    st = get(base9, "/tune/status")
+    while time.time() - t0 < 120 and st["state"] == "running" and st["progress"] < 31:
+        time.sleep(0.5)
+        st = get(base9, "/tune/status")
+    post(base9, "/tune/abort")
+    check(st["progress"] >= 31 and not any("wrong way" in l for l in st["log"]),
+          f"noisy pot: auto-tune got past the minimum drive ({st['state']}, {st['progress']}%"
+          f"{', ' + st['log'][-1][9:90] if st['log'] else ''})")
 finally:
     for p in procs:
         p.terminate()

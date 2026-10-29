@@ -2,7 +2,7 @@
 
 `smc3_scope.py` is a single file that uses only the Python standard library (3.8 or newer). It connects to the
 board's telemetry port over WiFi, keeps the last two minutes of data, and serves the page. It also runs the test
-signals, auto-tune, Seat setup, the watcher and the diagnostics. SimHub keeps the USB port; the page never needs it.
+signals, auto-tune, Seat setup, moving the motors from the page (2.4), the watcher and the diagnostics. SimHub keeps the USB port; the page never needs it.
 
 The 3D view's engine, three.js r160 (MIT licence, served at `/vendor/three/LICENSE.txt`), is built into the file,
 so the page works on a network without internet access.
@@ -52,6 +52,14 @@ limits, end stops, tilt limits) are not in the data folder: they live on the boa
 Settings, Firmware update (firmware 1.9.2 on the board) keeps the chosen file in memory only. While an update runs
 the board fetches it from `http://<this machine>:<web port>/ota/<number>.ota`; that address answers only during an
 update and only for its number.
+
+## Moving the motors from the page
+
+Dragging a motor card's knob, or Return to center (2.4, firmware 1.9 on the board), makes this server move the
+motors itself: 50 times a second it sends each motor's position, eased in and out and never faster than
+200 counts/s (120 for Return to center), and every second it renews the board's hold on SimHub's position
+commands (`[kH 30]`: 3 s). So if this server stops, SimHub has the seat back within 3 s; Resume SimHub gives it back
+at once (`[kH 0]`). A dropped connection to the board, or anything else that moves the motors, ends it too.
 
 ## Security
 

@@ -3,6 +3,43 @@
 `smc3_scope` (the page) and `SMC3_R4` (the firmware) are versioned separately. The page works with older
 firmware too; the notes say which firmware a feature needs.
 
+## Page 2.4 (firmware 1.9.3, unchanged)
+
+- **Move the motors from the page** (firmware 1.9). Drag a motor card's knob and that motor follows: up to
+  200 counts/s, easing in and out, never past its Clip window or travel limits (hatched on the track while you
+  drag; a thin line marks where it is going). Arrow keys on a selected knob move it 5 counts, with Shift 25.
+- **Quick Controls, Return to center**: every motor goes back to its neutral position - SimHub's 0, the level seat
+  with the rear centred (Seat setup's level, if you made one) - gently, at up to 120 counts/s.
+- While the page moves the motors it **has the seat**: the board ignores SimHub's position commands (`[kH]`, as Seat
+  setup does; SimHub keeps sending) and every motor runs at full power. The status bar says so and **Resume
+  SimHub** lights up; it gives the seat back. The page also lets go by itself when the board restarts, when the
+  page server stops (SimHub has the seat back within 3 s), or when something else moves the motors (auto-tune, a
+  test signal, Seat setup, the full check, a firmware update).
+- A motor that doesn't follow the page is switched off before the firmware's cutoff would trip: within 0.1 s if it
+  moves away from where it is sent (wired backwards), within 0.4 s if it falls more than 120 counts behind (blocked,
+  too weak). The page keeps the seat.
+- **Auto-tune works with a noisy pot, and with a seat that sinks under its weight.** 2.3.1 could stop at once with
+  "moved the wrong way - the motor or the pot is wired backwards" although nothing was wrong:
+  - The minimum-drive search compared two single pot readings against 6 counts. A pot that reads ±2 counts at
+    rest crosses that by noise alone - on the simulator, 5 runs in 6 stopped there. Movement is now judged on the
+    median of nine readings against limits that grow with the pot's noise (measured first, every run).
+  - A motor is only called wired backwards when it goes the wrong way **both** ways. A seat that sinks while the
+    drive is still too weak to lift it goes the wrong way one way only: that is now explained in the log and the
+    search carries on with more drive.
+  - The step analysis, the "holds still" limits and the ringing count allow for the pot's noise too, so a noisy pot
+    no longer reads as a lively motor (2.3.1 stopped the Kp sweep at the first step).
+  - It says when the pot is noisy, and what usually fixes it (a 100 nF capacitor from the wiper to GND, pot wires
+    away from the motor wires).
+  - A safety stop now **switches the motor off with its own settings back** (firmware 1.5+), so it shows Off and
+    Enable Motors is all it takes once the cause is fixed. 2.3.1 left it on with PWMmax 0, which looked Online but
+    couldn't move.
+  - The page re-reads the PID table after any end of auto-tune, not just a finished one.
+- The full check and the watcher use the same median-based wrong-way test.
+- Full check: a switched-off motor that drifts on its own (a gearbox the seat's weight can drive backwards) no
+  longer reads as crossed wiring. Its drift is measured first and allowed for.
+- Simulator: `--pot-noise M:SIGMA` (a noisy pot with the odd spike), `--sag M` (a gearbox the seat's weight can
+  drive backwards).
+
 ## Page 2.3.1 + firmware 1.9.3
 
 - **Firmware 1.9.3 compiles in the Arduino IDE.** 1.9.2 stopped with "sorry, unimplemented: string literal in

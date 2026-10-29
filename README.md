@@ -14,6 +14,7 @@ The page lets you:
 - see the seat's real angles with an optional motion sensor, and the seat itself moving in a **3D view**;
 - **level the platform** and make that SimHub's centre, then let each motor find how far it may go and save
   **travel limits, end stops and tilt limits** on the board;
+- **move each motor by dragging its slider**, or send the whole seat back to center with one button;
 - find out why when something goes wrong, and where the rig struggles under load;
 - **update the firmware over WiFi**: pick the `.bin` from the Arduino IDE and press Install.
 
@@ -58,6 +59,18 @@ error and its PID output. The live graphs show, per motor:
 
 Good tuning means the green line sits on the blue one. Click a motor, or choose one in a menu, and it is
 highlighted everywhere: card, graph, PID column, test signal and auto-tune.
+
+**Move a motor by hand (firmware 1.9): drag its knob.** The motor follows at up to 200 counts/s, easing in and out,
+and never goes past its Clip window or travel limits (hatched on the track). A thin line marks where it is going.
+Arrow keys on a selected knob move it 5 counts, with Shift 25. **Quick Controls, Return to center** sends every
+motor back to its neutral position (SimHub's 0: the level seat with the rear centred), gently.
+
+While the page moves the motors, it **has the seat**: the board ignores SimHub's position commands, and the status
+bar says so. **Resume SimHub** gives the seat back. The page also lets go when the board restarts, when the page
+server stops, or when auto-tune, a test signal, Seat setup or the full check starts. A motor that doesn't follow
+(wired backwards, blocked) is switched off at once.
+
+![Return to center: each motor heading for its neutral position, the page holding the seat](docs/img/manual-control.png)
 
 **Day, Dark and Auto** (which follows your computer):
 
@@ -163,6 +176,11 @@ won't pick a Kp that keeps the motor calm but makes a flexing frame bounce.
 There are three styles: **Gentle**, **Normal** and **Firm**. It stops by itself if SimHub moves the rig or
 anything looks wrong, such as the motor moving the wrong way or running away. Nothing is saved until you press
 Save to EEPROM, and **Revert** undoes it.
+
+It measures the pot's noise first, and every limit that judges "it moved" or "it holds still" allows for it, so a
+noisy pot doesn't look like a motor going the wrong way or ringing. A motor is only called wired backwards when it
+goes the wrong way **both** ways: a seat that sinks under its weight while the drive is still too weak goes the
+wrong way one way only. If it does stop for safety, that motor is switched off with its previous settings back.
 
 | Checklist first | Running | Result |
 |---|---|---|
@@ -457,6 +475,8 @@ noise. To see what the diagnostics find, add a fault:
 | `--imu 100` (or `10`) | a WT901C on the seat, sending 100 (or the factory 10) angles per second; `--sensor-on` switches it on |
 | `--flex` / `--slop 2:24` | a bouncy seat frame / 24 counts of play in motor 2's linkage |
 | `--heavy 1` | a heavy load on motor 1: lifting needs much more drive, worse near the top |
+| `--pot-noise 2:2.3` | motor 2's pot reads ±2.3 counts at rest, with the odd spike |
+| `--sag 2` | motor 2's gearbox can be driven backwards: the seat sinks while the drive is weak |
 | `--imu-lost-at 30` | the sensor goes quiet after 30 s |
 | `--seat-tilt 1.6:-2.2` | the seat isn't level with every motor at 512 (for Seat setup) |
 | `--stops 3:180:860` | motor 3 hits a mechanical stop at pot 180 and 860 |
@@ -473,7 +493,7 @@ noise. To see what the diagnostics find, add a fault:
   - 1.7: full diagnostics;
   - 1.8: the LED matrix in words, and the motion sensor;
   - 1.9: Seat setup (level trim, travel limits, end stops, tilt limits for each direction), gyro and acceleration
-    for the 3D view;
+    for the 3D view, moving the motors from the page (page 2.4);
   - 1.9.1: soft start;
   - 1.9.2: firmware updates from the page, and the board remembers its WiFi;
   - 1.9.3: the same, and it compiles in the Arduino IDE (1.9.2 didn't).
