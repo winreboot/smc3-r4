@@ -105,12 +105,16 @@ ap.add_argument("--fw191", action="store_true")
 ap.add_argument("--wifi-fw", default="0.5.2")
 ap.add_argument("--ota-fail", choices=["crc", "flash"], default=None)
 ap.add_argument("--tl-left", action="store_true")
+ap.add_argument("--load", type=float, default=0.0,
+                help="a rider of this many kg: the lifts need more drive going up and less going down, every motor "
+                     "carries more weight (slower to start and stop), the rear slide more friction")
+ap.add_argument("--vmax", type=float, default=2200.0, help="counts/s at full drive (default 2200; ~1000 is a slow rig)")
 ap.add_argument("--tuned", action="store_true", help="start with sane settings (Kp 250, Ki 0, Kd 0, PWMmin 30, dead zone 2)")
 args = ap.parse_args()
 
 PID_HZ, SUB = 4000, 40
 DT = 1.0 / PID_HZ
-VMAX, TAU, TLAG = 2200.0, 0.09, 0.006
+VMAX, TAU, TLAG = args.vmax, 0.09, 0.006
 FRIC_UP, FRIC_DN = 0.13, 0.05
 FULL = 4080
 drvmap, potmap = [0, 1, 2], [0, 1, 2]
@@ -562,28 +566,39 @@ def chan_tick(c):
     return 0.0, True
 
 
+def _lifts(i):
+    return args.layout == "lifts" or i != 2
+
+
 def phys_tick(p, d, brake):
+    kg = args.load
+    tau = TAU * (1.0 + kg / 100.0)            # --load: the rider's weight is slower to get going and to stop
     if args.reverse == p.i + 1: d = -d
     if args.dead == p.i + 1: d, brake = 0.0, True
     if args.oneway == p.i + 1 and d < 0: d = 0.0
     p.dl += (d - p.dl) * DT / (0.035 if args.hunt == p.i + 1 else TLAG)   # --hunt: sluggish drive -> limit cycle
     if args.sag == p.i + 1:                   # --sag: back-drivable; the weight pulls towards lower numbers
-        net = (0.0 if brake else p.dl) - SAG_PULL
+        net = (0.0 if brake else p.dl) - SAG_PULL - (0.0012 * kg if _lifts(p.i) else 0.0)
         fr = FRIC_UP if net > 0 else FRIC_DN
         deff = math.copysign(max(0.0, abs(net) - fr), net) if net != 0 else 0.0
         if brake:                             # the bridge brakes: it sinks slowly
             p.v += (deff * VMAX * 0.15 - p.v) * DT / 0.012
         else:
-            p.v += (deff * VMAX - p.v) * DT / TAU
+            p.v += (deff * VMAX - p.v) * DT / tau
     else:
         fr = FRIC_UP if p.dl > 0 else FRIC_DN
         if args.heavy == p.i + 1 and p.dl > 0:   # --heavy: lifting this corner needs a lot more, worse near the top
             fr = 0.22 + 0.30 * max(0.0, (p.x - 560) / 300.0)
+        if kg:                                # --load: a worm gear lifting the rider / sliding the rider
+            if _lifts(p.i):
+                fr = fr + 0.0012 * kg if p.dl > 0 else max(0.01, fr - 0.0004 * kg)
+            else:
+                fr += 0.0006 * kg
         deff = math.copysign(max(0.0, abs(p.dl) - fr), p.dl) if p.dl != 0 else 0.0
         if brake or deff == 0.0:
-            p.v += -p.v * DT / 0.012
+            p.v += -p.v * DT / (0.012 * (1.0 + kg / 100.0))
         else:
-            p.v += (deff * VMAX - p.v) * DT / TAU
+            p.v += (deff * VMAX - p.v) * DT / tau
     p.x += p.v * DT
     lo_, hi_ = STOPS[p.i]                     # mechanical ends (--stops)
     if p.x < lo_: p.x, p.v = lo_, 0.0

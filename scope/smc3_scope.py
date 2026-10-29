@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-smc3_scope v2.4.1 - live scope, tuner and auto-tuner for the SMC3_R4 motion controller (Arduino UNO R4 WiFi).
+smc3_scope v2.5 - live scope, tuner and auto-tuner for the SMC3_R4 motion controller (Arduino UNO R4 WiFi).
 
 Connects to the board's TCP telemetry port, keeps a rolling buffer of samples and serves a web page with live
 charts, a parameter editor (sends ordinary SMC3 commands back to the board), test signals and a per-motor
@@ -12,6 +12,21 @@ Every option can also come from the environment (Docker): SMC3_HOST, SMC3_PORT, 
 SMC3_DATA_DIR.  Settings changed in the page (board address, theme, auto-find) are saved to
 <data dir>/config.json and survive restarts and upgrades.  Standard-library Python 3.8+ only.
 
+v2.5: auto-tune tests each direction on its own (up and down for a lift, left and right for the rear slide) and
+      reports both; after measuring the motor's top speed each way (one quick move), every test is a gradual move at
+      60% of the slower way's top speed, so the motor can follow it and Kp is judged on how closely it follows (2.4.1
+      jumped the target, so every test ran the motor flat out). "Who's in the seat": nobody, with the rider's weight
+      allowed for (stricter overshoot, a stiffer Kp, slower tests, a little Ki), or you, after a 15 s countdown.
+      Check tests the current values (typically with you in the seat) and says what to change. A stop holds the
+      motor where it is (the median of its last readings), a refusal sends nothing, and the wrong-way watch rests
+      while you get in. Small test steps are
+      30 counts each way (were 15 up, 30 down). A glitchy pot can't spoil a tune: pot readings are cleaned of glitches
+      (each compared with the median of the 11 around it) before overshoot, settling, ringing, a wrong-way start or
+      running away are judged, the Kp sweep stops on overshoot only twice in a row, and a Kp spoiled right after a
+      calm one is tested again. Auto-tune live: gauges for each test (both directions as needles),
+      the minimum drive, top speed, and the Kp sweep as two small charts. Copy puts the log on the clipboard (also on
+      plain http). Space or Esc stops auto-tune. The full check remembers which way each lift goes, so auto-tune can
+      say up and down. Simulator: --load KG (a rider), --vmax.
 v2.4.1: a pot whose wiper loses contact now and then (readings 20-40 counts off, sometimes a few in a row) no longer
       fakes a fault: the full check's crosstalk test ("motors mixed up") looks at an 11-reading median and its own
       checks at 7, from the first reading on; moving a motor from the page judges it on 5-reading medians; the
@@ -76,7 +91,7 @@ v1.4: settings dialog (board address, port, find-board scan, auto-find), day/nig
       fixed a thread race that made the page flash "not reachable".
 """
 
-VERSION = "2.4.1"
+VERSION = "2.5"
 
 import argparse
 import base64
@@ -139,10 +154,14 @@ def lift_motors(cfg):
 class Config:
     DEFAULTS = {"host": "", "port": 4210, "theme": "dark", "auto_find": True, "scan_subnet": "",
                 "motors": 3, "disable_unused": True, "motor_names": ["", "", ""],
-                "layout": "tl", "tl_dir": 1}
+                "layout": "tl", "tl_dir": 1, "lift_dir": {}, "rider_mode": "empty", "rider_kg": 0, "rider_unit": "lb",
+                "tune_speed": {}}
     # layout: "tl" = motors 1 and 2 lift the front corners, motor 3 slides the rear left / right (traction loss,
     #         the seat turning about a pivot at the front); "lifts" = all three motors lift the seat.
     # tl_dir: +1 = higher numbers move the rear to the right, -1 = to the left (Seat setup or the full check asks).
+    # lift_dir: {"1": +1 | -1} which way a lift goes for higher numbers, from the full check's question (page 2.5).
+    # rider_*: auto-tune's "who's in the seat" and the rider's weight (kg; shown in rider_unit). tune_speed: per motor,
+    #          the test-move speed and top speeds auto-tune measured, so Check runs the same moves.
 
     def __init__(self, data_dir, env_host, env_port):
         self.lock = threading.Lock()
@@ -693,14 +712,25 @@ class TuneAbort(Exception):
         self.kind = kind
 
 
-# style -> (overshoot allowed %, cap as share of the highest stable Kp, how close to the best settle time is "enough")
-STYLES = {"gentle": (5.0, 0.85, 1.30), "normal": (10.0, 0.90, 1.15), "firm": (15.0, 0.95, 1.05)}
+# style -> (overshoot allowed %, cap as share of the highest stable Kp, how close to the best is "enough",
+#           how far behind a test move the motor may follow, ms - page 2.5)
+STYLES = {"gentle": (5.0, 0.85, 1.30, 120.0), "normal": (10.0, 0.90, 1.15, 80.0), "firm": (15.0, 0.95, 1.05, 50.0)}
 SSE_FLOOR = 12.0             # never pick a Kp that leaves more than this many counts of error on big moves
 PID_NOISE_MAX = 6.0          # PWM std of the PID output while holding - above this it buzzes
 KP_START, KP_STEP, KP_MAX = 40, 1.3, 2000
 OS_STOP = 30.0
 KI_STEPS = [5, 10, 20, 40, 70]
 KD_STEPS = [5, 10, 20, 40]
+SPEED_KP = (120, 200)        # Kp range for the one quick move each way that measures the top speed (page 2.5)
+RAMP_SHARE = 0.6             # test moves run at this share of the slower direction's top speed, so the motor can follow
+RIDER_REF_KG = 80.0          # a rider this heavy (176 lb) gets the full allowance when the seat is tuned empty
+COUNTDOWN_S = 15             # "I'm in the seat": time to get in before anything moves
+SETTLE_OK_MS = 500           # gauges: settling within this is good, within twice this is fair
+PHASES = [("countdown", "Get in"), ("prep", "Prepare"), ("noise", "Pot noise"), ("pwmmin", "Min drive"),
+          ("speed", "Top speed"), ("kp", "Kp sweep"), ("small", "Small moves"), ("ki", "Ki"), ("kd", "Kd"),
+          ("final", "Final check")]
+CHECK_PHASES = [("countdown", "Get in"), ("prep", "Prepare"), ("noise", "Pot noise"), ("speed", "Top speed"),
+                ("big", "Test moves"), ("small", "Small moves")]
 
 
 def _mean(xs):
@@ -734,51 +764,79 @@ def _med5(xs):
     return xs[:2] + [sorted(xs[i - 2:i + 3])[2] for i in range(2, len(xs) - 2)] + xs[-2:]
 
 
-def analyze_step(samples, m, t_old, pwmmin, pwmmax, window_ms, noise=0.0):
-    """Step-response metrics for motor m from telemetry samples that contain a target change away from t_old.
-    noise: the pot's noise at rest (1 sigma, counts) - tolerances grow with it, so a noisy pot doesn't read as
-    ringing, slow settling or a wrong-way start (page 2.4)."""
-    idx = next((i for i, s in enumerate(samples) if s["m"][m]["t"] != t_old), None)
-    if idx is None:
+def _med7(xs):
+    """7-reading running median (page 2.5): a glitchy pot's bursts - up to three bad readings in a row - can't make a
+    peak, a late excursion or a swing; a motor's real overshoot lasts longer than 70 ms. Only where the full window
+    fits: the first and last three readings are left out (a burst there would pass through)."""
+    n = len(xs)
+    if n < 10:
+        return list(xs)
+    return [sorted(xs[i - 3:i + 4])[3] for i in range(3, n - 3)]
+
+
+def _hampel(xs, k=5, floor=10.0):
+    """Pot readings with glitches replaced (page 2.5): a reading more than max(floor, 4.5 sigma) away from the median
+    of the 2k+1 readings around it becomes that median. A glitchy pot's bad readings come in clusters - on the
+    owner's rig about 80 a second - so a 3- or 7-reading median isn't enough; real movement passes untouched (on a
+    steady move the median of the window is the reading in its middle)."""
+    n = len(xs)
+    out = list(xs)
+    for i in range(n):
+        w = xs[max(0, i - k):min(n, i + k + 1)]
+        med = statistics.median(w)
+        mad = statistics.median(abs(x - med) for x in w)
+        if abs(xs[i] - med) > max(floor, 4.5 * 1.4826 * mad):
+            out[i] = med
+    return out
+
+
+def _top_speed(post, fs, sgn):
+    """Fastest the pot moved during a move (counts/s): its speed over 100 ms windows, taken over the part of the window
+    where it really moved (above 30% of the 95th percentile), and the 75th percentile of that - so neither the rest
+    before and after nor one glitchy reading decides it."""
+    vs = []
+    for i in range(5, len(post) - 5):
+        dt = post[i + 5]["ms"] - post[i - 5]["ms"]
+        if dt > 0:
+            vs.append((fs[i + 5] - fs[i - 5]) * sgn / dt * 1000.0)
+    if len(vs) < 5:
         return None
-    t_new = samples[idx]["m"][m]["t"]
-    before = [s["m"][m]["f"] for s in samples[max(0, idx - 5):idx]] or [samples[idx]["m"][m]["f"]]
-    f0 = statistics.median(before)
-    t0 = samples[idx]["ms"]
-    post = [s for s in samples[idx:] if 0 <= s["ms"] - t0 <= window_ms and s["m"][m]["t"] == t_new]
-    size = abs(t_new - f0)
-    if len(post) < 10:
-        return None
-    if size < 8:     # the seat was already (nearly) there - nothing to measure except where it rests
-        fb_tail = [s["m"][m]["f"] for s in post[-30:]]
-        return {"size": size, "rise": 0.0, "reached": True, "os": 0.0, "settle": 0.0, "settled": True,
-                "sse": abs(t_new - _mean(fb_tail)), "osc": 0, "fb_std": _rstd(fb_tail),
-                "pid_std": _rstd([s["m"][m]["p"] for s in post[-30:]]), "sat": 0.0, "wrong": False}
-    sgn = 1 if t_new >= f0 else -1
-    fs = _med3([s["m"][m]["f"] for s in post])
-    ys = [((f - f0) * sgn / size, s["ms"] - t0, s) for f, s in zip(fs, post)]
-    t10 = next((t for y, t, _ in ys if y >= 0.1), None)
-    t90 = next((t for y, t, _ in ys if y >= 0.9), None)          # 90% of the way to the TARGET
+    vs.sort()
+    ref = vs[int(0.95 * (len(vs) - 1))]
+    if ref <= 0:
+        return 0.0
+    moving = [x for x in vs if x > 0.3 * ref]
+    return moving[int(0.75 * (len(moving) - 1))]
+
+
+def _settle_metrics(ys, fs, post, f0, t_new, size, sgn, noise, m, t_from):
+    """What happens once the target stops: overshoot, settling, leftover error, ringing (shared by steps and ramps).
+    Judged on a 7-reading running median (page 2.5): a glitchy pot's bursts of two or three bad readings in a row got
+    past the 3-reading median and counted as ringing or slow settling; a motor's real swings last longer than 70 ms."""
     span = ys[-1][1]
     tail = [s for y, t, s in ys if t >= span - 300]
     fb_tail = [s["m"][m]["f"] for s in tail]
-    final = _mean([f for f, s in zip(fs, post) if s["ms"] - t0 >= span - 300])
+    final = statistics.median([f for f, s in zip(fs, post) if s["ms"] - t_from >= span - 300])
     sse = (t_new - final) * sgn                                    # leftover error = Ki's job
     # Dynamics are judged against where the seat actually comes to rest, so a few counts of leftover
     # error (sag) don't masquerade as slow settling or overshoot.
     yf = (final - f0) * sgn / size
     tol = max(3.0, 0.03 * size, 3.0 * noise)
-    peak = max(_med5([y for y, _, _ in ys]))
+    y5 = _med7([y for y, _, _ in ys])
+    ts = [t for _, t, _ in ys]
+    if len(y5) < len(ts):                    # the 7-reading median leaves out the first and last three readings
+        ts = ts[3:-3]
+    peak = max(y5)
     os_pct = max(0.0, (peak - yf) * 100.0)
     last_out = None
-    for y, t, _ in ys:
+    for y, t in zip(y5, ts):
         if abs(y - yf) * size > tol:
             last_out = t
     settle = last_out or 0
     settled = (span - settle) >= 200
-    t_near = next((t for y, t, _ in ys if y >= 0.9 * yf), None) if yf > 0.2 else None
+    t_near = next((t for y, t in zip(y5, ts) if y >= 0.9 * yf), None) if yf > 0.2 else None
     crossings, state = 0, 0
-    for y, t, _ in ys:
+    for y, t in zip(y5, ts):
         if t_near is None or t < t_near:
             continue
         e = (yf - y) * size
@@ -788,57 +846,228 @@ def analyze_step(samples, m, t_old, pwmmin, pwmmax, window_ms, noise=0.0):
         if state and st != state:
             crossings += 1
         state = st
-    # started the wrong way: 3 readings in a row clearly behind where it started (not one noisy reading)
-    early = [s for y, t, s in ys if t <= 500]
+    return {"os": os_pct, "settle": settle, "settled": settled, "sse": abs(sse), "osc": crossings,
+            "fb_std": _rstd(fb_tail), "pid_std": _rstd([s["m"][m]["p"] for s in tail])}
+
+
+def _wrong_start(early, m, f0, sgn, noise):
+    """Started the wrong way: 3 readings in a row clearly behind where it started - on the 7-reading median (page
+    2.5), so a glitchy pot's burst of three bad readings can't fake it; a motor really going the wrong way keeps
+    going for far longer."""
     lim_w, run, wrong = max(15.0, 4.0 * noise), 0, False
-    for s in early:
-        run = run + 1 if (s["m"][m]["f"] - f0) * sgn < -lim_w else 0
+    fs = _med7(_hampel([s["m"][m]["f"] for s in early]))
+    for f in fs:
+        run = run + 1 if (f - f0) * sgn < -lim_w else 0
         wrong = wrong or run >= 3
+    if wrong:
+        log(f"[tune] wrong-way start: from {f0:.1f} ({'up' if sgn > 0 else 'down'}), readings "
+            f"{[round(s['m'][m]['f']) for s in early[:40]]}")
+    return wrong
+
+
+def _small_move(post, m, t_new, size):
+    fb_tail = [s["m"][m]["f"] for s in post[-30:]]
+    return {"size": size, "rise": 0.0, "reached": True, "os": 0.0, "settle": 0.0, "settled": True,
+            "sse": abs(t_new - _mean(fb_tail)), "osc": 0, "fb_std": _rstd(fb_tail),
+            "pid_std": _rstd([s["m"][m]["p"] for s in post[-30:]]), "sat": 0.0, "wrong": False,
+            "lag": None, "lag_ms": None, "lag_end": None, "drive": None, "behind": False, "vtop": None}
+
+
+def _before(samples, idx, m, t_old):
+    """Where the motor was before a move: the median of up to 15 readings at rest at the old target."""
+    pre = [s["m"][m]["f"] for s in samples[max(0, idx - 15):idx] if s["m"][m]["t"] == t_old]
+    return statistics.median(pre or [s["m"][m]["f"] for s in samples[max(0, idx - 15):idx]] or [samples[idx]["m"][m]["f"]])
+
+
+def analyze_step(samples, m, t_old, pwmmin, pwmmax, window_ms, noise=0.0, after_seq=None):
+    """Step-response metrics for motor m from telemetry samples that contain a target change away from t_old.
+    noise: the pot's noise at rest (1 sigma, counts) - tolerances grow with it, so a noisy pot doesn't read as
+    ringing, slow settling or a wrong-way start (page 2.4)."""
+    idx = next((i for i, s in enumerate(samples) if s["m"][m]["t"] != t_old
+                and (after_seq is None or s["seq"] > after_seq)), None)
+    if idx is None:
+        return None
+    t_new = samples[idx]["m"][m]["t"]
+    f0 = _before(samples, idx, m, t_old)
+    t0 = samples[idx]["ms"]
+    post = [s for s in samples[idx:] if 0 <= s["ms"] - t0 <= window_ms and s["m"][m]["t"] == t_new]
+    size = abs(t_new - f0)
+    if len(post) < 10:
+        return None
+    if size < 8:     # the seat was already (nearly) there - nothing to measure except where it rests
+        return dict(_small_move(post, m, t_new, size), kind="step")
+    sgn = 1 if t_new >= f0 else -1
+    fs = _med3(_hampel([s["m"][m]["f"] for s in post]))
+    ys = [((f - f0) * sgn / size, s["ms"] - t0, s) for f, s in zip(fs, post)]
+    t10 = next((t for y, t, _ in ys if y >= 0.1), None)
+    # 90% of the way to the TARGET - on a small step, within the tolerance of it (a 30-count step can't be asked to
+    # get within 3 counts when the dead zone is 3)
+    thr = min(0.9, 1.0 - (max(3.0, 0.03 * size, 3.0 * noise) + 1.0) / size)
+    t90 = next((t for y, t, _ in ys if y >= thr), None)
+    out = _settle_metrics(ys, fs, post, f0, t_new, size, sgn, noise, m, t0)
     rising = [s for y, t, s in ys if t90 is None or t <= t90]
     sat = _mean([1.0 if abs(s["m"][m]["p"]) + pwmmin >= pwmmax else 0.0 for s in rising])
-    return {
-        "size": size, "rise": (t90 - t10) if (t10 is not None and t90 is not None) else None,
-        "reached": t90 is not None, "os": os_pct, "settle": settle, "settled": settled,
-        "sse": abs(sse), "osc": crossings, "fb_std": _rstd(fb_tail),
-        "pid_std": _rstd([s["m"][m]["p"] for s in tail]), "sat": sat, "wrong": wrong,
-    }
+    out.update({
+        "kind": "step", "size": size, "rise": (t90 - t10) if (t10 is not None and t90 is not None) else None,
+        "reached": t90 is not None, "sat": sat, "wrong": _wrong_start([s for y, t, s in ys if t <= 500], m, f0, sgn, noise),
+        "lag": None, "lag_ms": None, "lag_end": None, "drive": None, "behind": False,
+        "vtop": _top_speed(post, fs, sgn),
+    })
+    return out
+
+
+def analyze_move(samples, m, t_old, pwmmin, pwmmax, window_ms, noise=0.0, after_seq=None):
+    """Metrics for one test move of motor m away from t_old (page 2.5). If the target jumped, it's a step (see
+    analyze_step). If it moved there along a ramp: how far the motor trails the board's goal while it follows
+    (counts, and ms at the ramp's speed), whether it falls further and further behind, how much of PWMmax that
+    takes - then, once the target stops, overshoot, settling, leftover error and ringing as for a step."""
+    idx = next((i for i, s in enumerate(samples) if s["m"][m]["t"] != t_old
+                and (after_seq is None or s["seq"] > after_seq)), None)
+    if idx is None:
+        return None
+    t_new = samples[-1]["m"][m]["t"]
+    end = next((i for i in range(idx, len(samples)) if samples[i]["m"][m]["t"] == t_new), None)
+    if end is None:
+        return None
+    if samples[end]["ms"] - samples[idx]["ms"] < 60:               # the target jumped: a step
+        return analyze_step(samples, m, t_old, pwmmin, pwmmax, window_ms, noise, after_seq)
+    f0 = _before(samples, idx, m, t_old)
+    t0, te = samples[idx]["ms"], samples[end]["ms"]
+    dur = te - t0
+    post = [s for s in samples[end:] if 0 <= s["ms"] - te <= window_ms and s["m"][m]["t"] == t_new]
+    size = abs(t_new - f0)
+    if len(post) < 10:
+        return None
+    if size < 8:
+        return dict(_small_move(post, m, t_new, size), kind="ramp")
+    sgn = 1 if t_new >= f0 else -1
+    ramp = samples[idx:end]
+    fr = _med3(_hampel([s["m"][m]["f"] for s in ramp]))
+    # the motor didn't get to the last target before this move began (a far too soft Kp): the goal passes it on the
+    # way, so "how far behind" means nothing for this move
+    started_off = abs(f0 - t_old) > max(10.0, 0.25 * size)
+    cruise = [(s, f) for s, f in zip(ramp, fr) if s["ms"] - t0 >= 0.35 * dur]
+    lags = [(s["m"][m]["g"] - f) * sgn for s, f in cruise]        # how far the motor trails the board's goal
+    lag = statistics.median(lags) if lags else None
+    lag_end = statistics.median(lags[-5:]) if len(lags) >= 5 else lag
+    v = None
+    if len(cruise) >= 5:
+        dt = cruise[-1][0]["ms"] - cruise[0][0]["ms"]
+        if dt > 0:
+            v = (cruise[-1][0]["m"][m]["g"] - cruise[0][0]["m"][m]["g"]) * sgn / dt * 1000.0
+    if not v or v < 5:
+        v = abs(t_new - t_old) / max(1.0, dur) * 1000.0
+    drives = [min(pwmmax, abs(s["m"][m]["p"]) + pwmmin) for s, _ in cruise]
+    # falls behind: towards the end of the ramp the motor moves clearly slower than the goal (out of drive, or far
+    # too soft), so the gap keeps growing - judged on the medians of the first and last few readings of the last
+    # quarter, so pot noise can't fake it
+    behind = False
+    late = [(s["ms"], f) for s, f in zip(ramp, fr) if s["ms"] - t0 >= 0.75 * dur]
+    if len(late) >= 6 and lag_end is not None and v:
+        k = max(3, len(late) // 3)
+        dt = (statistics.median(x[0] for x in late[-k:]) - statistics.median(x[0] for x in late[:k])) / 1000.0
+        if dt > 0:
+            v_end = (statistics.median(x[1] for x in late[-k:]) - statistics.median(x[1] for x in late[:k])) * sgn / dt
+            behind = v_end < 0.85 * v and lag_end > max(6.0, 3.0 * noise, 0.05 * size)
+    if started_off:
+        lag = lag_end = None
+        behind = False
+    fs = _med3(_hampel([s["m"][m]["f"] for s in post]))
+    ys = [((f - f0) * sgn / size, s["ms"] - te, s) for f, s in zip(fs, post)]
+    out = _settle_metrics(ys, fs, post, f0, t_new, size, sgn, noise, m, te)
+    early = [s for s in samples[idx:] if s["ms"] - t0 <= 500]
+    out.update({
+        "kind": "ramp", "size": size, "rise": None,
+        "reached": any(y >= 0.9 for y, _, _ in ys), "wrong": _wrong_start(early, m, f0, sgn, noise),
+        "sat": _mean([1.0 if abs(s["m"][m]["p"]) + pwmmin >= pwmmax else 0.0 for s, _ in cruise]),
+        "lag": lag, "lag_end": lag_end, "lag_ms": (max(0.0, lag) / v * 1000.0) if (lag is not None and v > 0) else None,
+        "v": v, "drive": statistics.median(drives) if drives else None, "behind": behind, "vtop": None,
+    })
+    return out
+
+
+def _mx(a, b, k, f=max):
+    xs = [x[k] for x in (a, b) if x.get(k) is not None]
+    return f(xs) if xs else None
 
 
 def worst(a, b):
     return {
-        "size": min(a["size"], b["size"]),
+        "kind": a.get("kind", "step"), "size": min(a["size"], b["size"]),
         "rise": None if (a["rise"] is None or b["rise"] is None) else max(a["rise"], b["rise"]),
         "reached": a["reached"] and b["reached"], "os": max(a["os"], b["os"]),
         "settle": max(a["settle"], b["settle"]), "settled": a["settled"] and b["settled"],
         "sse": max(a["sse"], b["sse"]), "osc": max(a["osc"], b["osc"]),
         "fb_std": max(a["fb_std"], b["fb_std"]), "pid_std": max(a["pid_std"], b["pid_std"]),
         "sat": max(a["sat"], b["sat"]), "wrong": a["wrong"] or b["wrong"],
+        "lag": _mx(a, b, "lag"), "lag_ms": _mx(a, b, "lag_ms"), "lag_end": _mx(a, b, "lag_end"),
+        "drive": _mx(a, b, "drive"), "behind": bool(a.get("behind") or b.get("behind")),
+        "vtop": _mx(a, b, "vtop", min),
     }
 
 
-def fmt(r):
-    rise = f"{r['rise']:.0f} ms" if r["rise"] is not None else "never got to 90%"
-    seat = ""
+def fmt1(r):
+    """One move, one direction."""
+    if r.get("kind") == "ramp":
+        head = (f"lag {r['lag_ms']:.0f} ms ({max(0.0, r['lag']):.1f} counts)" if r.get("lag_ms") is not None
+                else "lag -")
+        if r.get("behind"):
+            head += ", falls behind"
+    else:
+        head = f"rise {r['rise']:.0f} ms" if r["rise"] is not None else "never got to 90%"
+    return (f"{head}, overshoot {r['os']:.0f}%, settle {r['settle']:.0f} ms, off by {r['sse']:.1f}, "
+            f"ringing {r['osc']}")
+
+
+def dir_order(names):
+    """Directions in reading order: up before down, left before right, higher before lower."""
+    return [-1, 1] if names.get(-1) in ("up", "left") else [1, -1]
+
+
+def fmt(r, names=None):
+    """A test: both ways when it has them (page 2.5: each direction on its own), then the shared figures."""
+    if names and r.get("dp") and r.get("dm"):
+        by = {1: r["dp"], -1: r["dm"]}
+        s = " | ".join(f"{names[d]}: {fmt1(by[d])}" for d in dir_order(names))
+    else:
+        s = fmt1(r)
+    s += f" | hold noise {r['fb_std']:.2f}, pid noise {r['pid_std']:.1f}"
     if r.get("seat_os") is not None:
-        seat = f" | seat {r['seat_deg']:.2f}°, overshoot {r['seat_os']:.0f}%, ringing {r['seat_osc']}"
-    return (f"rise {rise}, overshoot {r.get('motor_os', r['os']):.0f}%, settle {r['settle']:.0f} ms, "
-            f"off by {r['sse']:.1f}, ringing {r.get('motor_osc', r['osc'])}, hold noise {r['fb_std']:.2f}, "
-            f"pid noise {r['pid_std']:.1f}{seat}")
+        s += f" | seat {r['seat_deg']:.2f}°, overshoot {r['seat_os']:.0f}%, ringing {r['seat_osc']}"
+    return s
+
+
+def _slim(r):
+    """A move's figures for the page's gauges and chart."""
+    if not r:
+        return None
+    out = {}
+    for k in ("kind", "lag_ms", "lag", "rise", "os", "settle", "settled", "sse", "osc", "drive", "sat", "behind",
+              "reached", "fb_std", "pid_std", "v"):
+        v = r.get(k)
+        out[k] = round(v, 2) if isinstance(v, float) else v
+    return out
 
 
 SEAT_OS_SLACK = 10      # % the seat may overshoot beyond the motor before it counts against a setting
+
+
+def kg_text(kg, unit):
+    return f"{kg / 0.45359237:.0f} lb" if unit == "lb" else f"{kg:.0f} kg"
 
 
 class Tuner:
     def __init__(self, board, gen):
         self.board, self.gen = board, gen
         self.state = "idle"            # idle | running | done | aborted | error
+        self.mode = "tune"             # tune | check (page 2.5: test the current values, change nothing)
         self.stage = ""
         self.progress = 0
         self.lines = []
         self.result = None
         self.motor = None
-        self.original = None
+        self.original = None           # the settings before the last auto-tune (Revert), and its motor
+        self.orig_motor = None
         self.abort_flag = False
         self.applied = False
         self.recent = collections.deque(maxlen=400)
@@ -854,26 +1083,45 @@ class Tuner:
         self.events = None
         self.noise_sd = 0.5                      # the pot's noise at rest (1 sigma, counts), measured at the start
         self.fwin = collections.deque(maxlen=5)  # the last 5 pot readings: per-reading checks use their median (2.4.1)
+        self.ramp_v = None                       # test moves follow a ramp at this speed (counts/s, page 2.5)
+        self.dn = {1: "higher", -1: "lower"}     # what each direction is called on this rig
+        self.live = {}                           # what the page's gauges show
+        self.countdown = None
+        self.rider_f = 0.0
+        self.pr = {}
+        self.slock = threading.Lock()            # two quick Starts can't both get through
+        self.moved = False                       # this run has sent a target that differs from where it began
+        self.start_t = None                      # the target when the run began
+        self.quiet_until = 0.0                   # the wrong-way watch rests until then (getting into the seat)
+        self.cur_p = None                        # the motor's values (check mode: what to keep)
 
     # ---- public ----
     def running(self):
         return self.state == "running"
 
     def status(self):
-        return {"state": self.state, "motor": None if self.motor is None else self.motor + 1,
+        return {"state": self.state, "mode": self.mode, "motor": None if self.motor is None else self.motor + 1,
                 "stage": self.stage, "progress": self.progress, "log": self.lines[-300:],
-                "result": self.result, "can_revert": bool(self.original) and not self.running()}
+                "result": self.result, "can_revert": bool(self.original) and not self.running(),
+                "revert_motor": None if self.orig_motor is None else self.orig_motor + 1,
+                "live": self.live, "countdown": self.countdown}
 
-    def start(self, motor, amp, style, do_friction, do_ki, do_kd):
-        if self.running():
-            return False, "An auto-tune is already running."
-        if not self.board.connected:
-            return False, "The board is not connected."
-        self.motor = motor
-        self.state, self.stage, self.progress = "running", "Starting", 0
-        self.lines, self.result, self.original, self.abort_flag = [], None, None, False
-        self.applied = False
-        threading.Thread(target=self._thread, args=(motor, amp, style, do_friction, do_ki, do_kd),
+    def start(self, motor, amp, style, do_friction, do_ki, do_kd, rider="empty", rider_kg=0.0, unit="lb",
+              mode="tune"):
+        with self.slock:
+            if self.running():
+                return False, "An auto-tune is already running."
+            if not self.board.connected:
+                return False, "The board is not connected."
+            self.motor, self.mode = motor, ("check" if mode == "check" else "tune")
+            self.state, self.stage, self.progress = "running", "Starting", 0
+            self.lines, self.result, self.abort_flag = [], None, False
+            self.applied, self.countdown, self.live, self.ramp_v = False, None, {}, None
+            self.moved, self.start_t, self.quiet_until, self.cur_p = False, None, 0.0, None
+            if self.mode == "tune":
+                self.original, self.orig_motor = None, None
+        threading.Thread(target=self._thread,
+                         args=(motor, amp, style, do_friction, do_ki, do_kd, rider, rider_kg, unit),
                          daemon=True).start()
         return True, "started"
 
@@ -883,8 +1131,8 @@ class Tuner:
     def revert(self):
         if self.running() or not self.original:
             return False
-        self._apply(self.original)
-        self.say(f"Reverted motor {self.motor + 1} to the settings it had before auto-tune.")
+        self._apply(self.original, self.orig_motor)
+        self.say(f"Reverted motor {self.orig_motor + 1} to the settings it had before auto-tune.")
         return True
 
     # ---- helpers ----
@@ -892,15 +1140,18 @@ class Tuner:
         self.lines.append(time.strftime("%H:%M:%S ") + msg)
         log(f"[tune M{(self.motor or 0) + 1}] {msg}")
 
-    def _apply(self, p):
-        b, m = self.board, self.motor
+    def _apply(self, p, m=None):
+        b = self.board
+        m = self.motor if m is None else m
         b.cmd_word("DEF"[m], p["kp"])
         b.cmd_word("GHI"[m], p["ki"])
         b.cmd_word("JKL"[m], p["kd"])
         b.cmd_word("MNO"[m], max(1, p["ks"]))
         b.cmd_pair("PQR"[m], p["pwmmin"], p["pwmmax"])
         b.cmd_pair("VWX"[m], p["dz"], p["pwmrev"])
-        self.applied = True
+        if m == self.motor:
+            self.applied = True
+            self._now(p)
         time.sleep(0.25)
 
     def _get_params(self):
@@ -909,18 +1160,66 @@ class Tuner:
         need = [f"Kp{n}", f"Ki{n}", f"Kd{n}", f"Ks{n}", f"PWM{n}", f"DZ{n}", f"LIM{n}"]
         if any(k not in pr for k in need):
             raise TuneAbort(f"Couldn't read motor {n}'s settings from the board. Try again.", "refuse")
+        self.pr = pr
         p = {"kp": pr[f"Kp{n}"], "ki": pr[f"Ki{n}"], "kd": pr[f"Kd{n}"], "ks": pr[f"Ks{n}"],
              "pwmmin": pr[f"PWM{n}"][0], "pwmmax": pr[f"PWM{n}"][1],
              "dz": pr[f"DZ{n}"][0], "pwmrev": pr[f"DZ{n}"][1],
              "lim": pr[f"LIM{n}"][0], "clip": pr[f"LIM{n}"][1]}
         return p, pr.get("FW")
 
+    # ---- what the page's gauges show (page 2.5) ----
+    def _lv(self, **kw):
+        """Update the gauges' data. The page reads it from another thread, so it is never changed in place: each
+        update is a new dict, swapped in at once."""
+        self.live = dict(self.live, **kw)
+
+    def _phase(self, key, stage=None, progress=None):
+        self._lv(phase=key)
+        if stage is not None:
+            self.stage = stage
+        if progress is not None:
+            self.progress = progress
+
+    def _now(self, p):
+        self._lv(now={k: p.get(k) for k in ("kp", "ki", "kd", "ks", "pwmmin", "pwmmax", "dz")})
+
+    def _show(self, label, r, kind="big"):
+        """The latest test, each way, for the gauges."""
+        self._lv(last={"label": label, "kind": kind, "move": r.get("kind"),
+                       "p": _slim(r.get("dp") or r), "m": _slim(r.get("dm") or r),
+                       "fb_std": round(r["fb_std"], 2), "pid_std": round(r["pid_std"], 2),
+                       "seat_os": r.get("seat_os")}, n=self.live.get("n", 0) + 1)
+
+    def _directions(self, m):
+        """What 'towards higher counts' means on this rig: up/down for a lift (higher numbers lift the seat unless
+        the full check saw otherwise; mirrored with REVERSE_MOTOR1), right/left for the rear slide."""
+        cfg = self.board.cfg
+        if m == tl_motor(cfg):
+            d = 1 if int(cfg.get("tl_dir") or 1) > 0 else -1
+            names = {d: "right", -d: "left"}
+            sym = {d: "▶", -d: "◀"}
+            kind = "slide"
+        else:
+            seen = (cfg.get("lift_dir") or {}).get(str(m + 1))
+            d = (1 if int(seen) > 0 else -1) if seen in (1, -1, "1", "-1") else (-1 if self.rev else 1)
+            names = {d: "up", -d: "down"}
+            sym = {d: "▲", -d: "▼"}
+            kind = "lift"
+        self.dn = names
+        self._lv(dirs={"kind": kind, "p": {"name": names[1], "sym": sym[1]},
+                       "m": {"name": names[-1], "sym": sym[-1]},
+                       "order": ["p" if d == 1 else "m" for d in dir_order(names)]})
+        return names
+
+    # ---- moving ----
     def _cmd_value(self, v_int):
         return 1023 - v_int if self.rev else v_int
 
     def set_target(self, v_int):
         v_int = int(max(self.lo, min(self.hi, round(v_int))))
         self.board.cmd_word("ABC"[self.motor], self._cmd_value(v_int))
+        if self.start_t is not None and v_int != self.start_t:
+            self.moved = True
         self.cur = v_int
         self.last_cmd = time.time()
         self.recent.append((self.last_cmd, v_int))
@@ -992,8 +1291,11 @@ class Tuner:
                 raise TuneAbort(f"Motor {n} went outside its allowed travel ({fmed:.0f}).")
             self.hist.append((s["ms"], mm["f"], mm["t"] - mm["f"], mm["p"]))
         # wrong-direction watch: pushing towards the target for 250 ms but moving away from it (the median of the
-        # first and last few readings, and more than the pot's noise - one noisy reading can't trigger it)
-        if len(self.hist) > 2:
+        # first and last few readings, and more than the pot's noise - one noisy reading can't trigger it). It rests
+        # while someone gets into the seat: their weight can push a lift away from where it holds (page 2.5).
+        if now < self.quiet_until:
+            self.hist.clear()
+        elif len(self.hist) > 2:
             t_end = self.hist[-1][0]
             win = [h for h in self.hist if t_end - h[0] <= 300]
             if len(win) >= 10 and t_end - win[0][0] >= 250:
@@ -1001,18 +1303,49 @@ class Tuner:
                 if all(abs(e) > 30 for e in es) and (all(e > 0 for e in es) or all(e < 0 for e in es)):
                     sg = 1 if es[0] > 0 else -1
                     pushing = all(h[3] * sg > 15 for h in win)
-                    moved = (statistics.median(h[1] for h in win[-5:]) - statistics.median(h[1] for h in win[:5])) * sg
+                    fw = _hampel([h[1] for h in win])        # 2.5: a cluster of glitchy readings can't fake it
+                    moved = (statistics.median(fw[-7:]) - statistics.median(fw[:7])) * sg
                     if pushing and moved < -max(10.0, 3.0 * self.noise_sd):
                         raise TuneAbort(f"Motor {n} moves AWAY from where it is driven. The motor or the pot is "
                                         f"wired backwards.", "unsafe")
 
-    def _ramp_to(self, x, speed=400.0):
-        start = self.cur
-        steps = max(1, int(abs(x - start) / (speed * 0.02)))
-        for i in range(1, steps + 1):
-            self.set_target(start + (x - start) * i / steps)
-            self.wait(0.02)
+    def _ramp_move(self, x, v):
+        """Move the target to x at v counts/s, easing in and out over ~0.12 s: a test move the motor can follow, like
+        a game's (page 2.5 - 2.4.1 and older jumped the target, so every test ran the motor flat out). The target is
+        updated 50 times a second from the clock."""
+        x = int(max(self.lo, min(self.hi, round(x))))
+        x0 = float(self.cur)
+        d = x - x0
+        if abs(d) < 1.0 or v <= 0:
+            self.set_target(x)
+            return
+        a = v / 0.12
+        ta = v / a
+        if a * ta * ta >= abs(d):                         # too short to reach full speed: accelerate, then brake
+            ta, tc, vp = math.sqrt(abs(d) / a), 0.0, None
+            vp = a * ta
+        else:
+            tc, vp = (abs(d) - a * ta * ta) / v, v
+        total = 2 * ta + tc
+        t_start = time.time()
+        while True:
+            t = time.time() - t_start
+            if t >= total:
+                break
+            if t < ta:
+                s = 0.5 * a * t * t
+            elif t < ta + tc:
+                s = 0.5 * a * ta * ta + vp * (t - ta)
+            else:
+                td = total - t
+                s = abs(d) - 0.5 * a * td * td
+            self.set_target(x0 + math.copysign(s, d))
+            self._check()
+            time.sleep(0.02)
         self.set_target(x)
+
+    def _ramp_to(self, x, speed=160.0):
+        self._ramp_move(x, speed)
 
     def _settle(self, x, timeout, tol=None):
         tol = tol if tol is not None else max(4.0, 1.5 * self.noise_sd)
@@ -1024,18 +1357,26 @@ class Tuner:
                 return True
         return False
 
-    def _step(self, x, hold, p):
+    def _move(self, x, hold, p, ramp=True):
+        """One test move to x: along a ramp at the measured test speed (ramp=True), or a jump of the target (small
+        road-sized moves, and the top-speed check)."""
         t_old = self._t()
         seq0 = self.board.seq
-        self.set_target(x)
+        if ramp and self.ramp_v:
+            self._ramp_move(x, self.ramp_v)
+        else:
+            self.set_target(x)
         self.wait(hold)
         self.wait(0.15)                       # let the last telemetry burst arrive
-        got = despike(self.board.since(seq0), self.motor)
-        r = analyze_step(got, self.motor, t_old, p["pwmmin"], p["pwmmax"], hold * 1000 - 100, self.noise_sd)
+        # from 30 readings before the move on: where it starts is the median of 15 readings at rest (2.4.1 had only
+        # the 2-4 that arrived before the target first changed, and a cluster of glitches could be most of them)
+        got = despike(self.board.since(seq0 - 30), self.motor)
+        r = analyze_move(got, self.motor, t_old, p["pwmmin"], p["pwmmax"], hold * 1000 - 100, self.noise_sd, seq0)
         if r is None:
-            raise TuneAbort("Couldn't see the step in the telemetry (WiFi too slow?). Try again.")
+            raise TuneAbort("Couldn't see the move in the telemetry (WiFi too slow?). Try again.")
         seat = seat_step(self.board.since(seq0 - 20), self.motor, t_old,      # motion sensor: what the seat did
-                         yaw=self.motor == tl_motor(self.board.cfg))         # (traction loss: how it turned)
+                         yaw=self.motor == tl_motor(self.board.cfg),         # (traction loss: how it turned)
+                         whole=bool(ramp and self.ramp_v))                   # a gradual move: all of it
         if seat and not seat.get("small") and seat.get("overshoot") is not None:
             r.update(seat_os=seat["overshoot"], seat_osc=seat["ringing"], seat_deg=seat["deg"],
                      seat_dpc=seat.get("deg_per_count"))
@@ -1044,10 +1385,13 @@ class Tuner:
                             f"backwards.", "unsafe")
         return r
 
-    def _step_pair(self, hi, lo, p, hold=2.0):
-        a = self._step(hi, hold, p)
-        b = self._step(lo, hold, p)
+    def _step_pair(self, hi, lo, p, hold=2.0, ramp=True):
+        """A move to hi, then to lo: one each way. The result is the worse of the two (that's what the choices go
+        by), with each direction's own figures under 'dp' (towards higher counts) and 'dm' (lower)."""
+        a = self._move(hi, hold, p, ramp)
+        b = self._move(lo, hold, p, ramp)
         r = worst(a, b)
+        r["dp"], r["dm"] = (a, b) if hi > lo else (b, a)
         seats = [x for x in (a, b) if x.get("seat_os") is not None]
         if seats:
             # with the motion sensor, the seat's own overshoot and ringing count too: a setting that keeps the motor
@@ -1067,24 +1411,55 @@ class Tuner:
             # once the cause is fixed - page 2.3.1 and older left it on with PWMmax 0, which looked "Online"
             self.board.cmd_text(f"di{n}")
             time.sleep(0.15)
-            if self.original:
+            self._hold_here()                            # Enable Motors then holds it where it stopped
+            if self.mode == "check":                     # the check changed nothing: its values are as they were
+                self.say(f"SAFETY: motor {n} is switched off; its values are unchanged. Fix the cause first, then "
+                         f"press Enable Motors.")
+                return
+            if self.original and self.orig_motor == self.motor:
                 self._apply(self.original)
             self.say(f"SAFETY: motor {n} is switched off, with the settings it had before auto-tune. Fix the cause "
                      f"first, then press Enable Motors.")
             return
+        if self.mode == "check" or self.orig_motor != self.motor:
+            p = dict(self.cur_p or {})
         self.board.cmd_pair("PQR"[self.motor], 0, 0)
         self.board.cmd_pair("VWX"[self.motor], p.get("dz", 0), 0)
         self.say(f"SAFETY: motor {n}'s drive is set to zero (PWMmax 0, PWMrev 0) so it can't run away. This is "
                  f"NOT saved - power-cycling the board brings back the stored settings. Fix the cause first, "
-                 f"then press Revert (or Enable motors if the cutoff tripped).")
+                 f"then " + ("power-cycle the board." if self.mode == "check" else
+                             "press Revert (or Enable motors if the cutoff tripped)."))
 
-    def _restore_and_hold(self):
-        if self.original:
-            self._apply(self.original)
+    def _hold_here(self):
+        """Stop moving: the target becomes where the motor is - the median of its last readings (one glitchy
+        reading must not become a target), and only if this run moved it at all."""
         try:
-            self.set_target(self._fb())
+            if self.moved:
+                self.set_target(self._fb_med(9))
         except Exception:
             pass
+
+    def _restore_and_hold(self):
+        self._hold_here()                                # first stop the move, then put the settings back
+        if self.mode == "tune" and self.original and self.orig_motor == self.motor:
+            self._apply(self.original)
+
+    def _countdown(self, secs):
+        """'I'm in the seat': nothing moves until the countdown ends (Stop works all along)."""
+        self._phase("countdown", "Get in the seat")
+        self.say(f"Get in the seat now: the test starts in {secs} s. Stop (or Space / Esc on the page) ends it at "
+                 f"any time.")
+        end = time.time() + secs
+        self.quiet_until = end + 2.0
+        try:
+            while True:
+                left = end - time.time()
+                if left <= 0:
+                    break
+                self.countdown = int(math.ceil(left))
+                self.wait(min(0.25, left))
+        finally:
+            self.countdown = None
 
     def _pwmmin_search(self, p, sigma, n):
         """Step 2: the smallest drive that reliably moves the motor, each way. Returns {1: pwm up, -1: pwm down}.
@@ -1100,10 +1475,14 @@ class Tuner:
         thr_move = max(5.0, 2.5 * sigma)
         thr_wrong = max(6.0, 3.0 * sigma)
         step = int(max(12, round(2.0 * thr_move)))       # far enough that a move can show above the noise
-        way = lambda d: "higher" if d > 0 else "lower"
+        way = lambda d: f"{self.dn[d]} ({'higher' if d > 0 else 'lower'} counts)" if self.dn[d] not in (
+            "higher", "lower") else f"{self.dn[d]} counts"
         cap = int(min(80, p["pwmmax"] - 5))
+        pw = {"cap": cap, "trying": 0, "p": None, "m": None}
         for pm in range(0, cap + 1, 2):
             self.progress = 10 + int(20 * pm / max(1, cap))
+            pw = dict(pw, trying=pm)
+            self._lv(pwmmin=pw)
             p["pwmmin"] = pm
             self._apply(p)
             for d in (1, -1):
@@ -1121,8 +1500,8 @@ class Tuner:
                         wrong[d] += 1
                         self.set_target(round(f1))          # stop pushing at once
                         if sag_dir != d:
-                            self.say(f"Went {-moved:.0f} counts the wrong way when driven towards {way(d)} counts at "
-                                     f"PWM {pm} - checking the other way before deciding.")
+                            self.say(f"Went {-moved:.0f} counts the wrong way when driven {way(d)} at PWM {pm} - "
+                                     f"checking the other way before deciding.")
                         break
                     if moved >= thr_move:
                         ok += 1
@@ -1131,7 +1510,9 @@ class Tuner:
                         break
                 if ok == 2:
                     found[d] = pm
-                    self.say(f"Moves reliably towards {way(d)} counts at PWM {pm}.")
+                    pw = dict(pw, **{"p" if d > 0 else "m": pm})
+                    self._lv(pwmmin=pw)
+                    self.say(f"Moves reliably {way(d)} at PWM {pm}.")
             # a motor wired backwards goes the wrong way BOTH ways
             if wrong[1] and wrong[-1]:
                 raise TuneAbort(f"motor {n} moved the wrong way both ways (driven towards higher counts it went "
@@ -1140,69 +1521,132 @@ class Tuner:
             for d in (1, -1):
                 if wrong[d] and went_right[-d] and sag_dir is None:
                     sag_dir = d
-                    self.say(f"It moves the right way towards {way(-d)} counts, so going {way(-d)} when driven "
-                             f"towards {way(d)} is the load pulling it (the seat's weight, or the gearbox can be "
-                             f"driven backwards) while the drive is still too weak - not a wiring fault. "
-                             f"Carrying on with more drive.")
+                    self.say(f"It moves the right way {way(-d)}, so going the other way when driven {way(d)} is the "
+                             f"load pulling it (the seat's weight, or the gearbox can be driven backwards) while the "
+                             f"drive is still too weak - not a wiring fault. Carrying on with more drive.")
                 if wrong[d] >= 3 and not went_right[-d]:
-                    raise TuneAbort(f"motor {n} went the wrong way {wrong[d]} times when driven towards {way(d)} "
-                                    f"counts and hasn't moved the right way yet. The motor or the pot may be wired "
-                                    f"backwards - run the Diagnostics full check to see.", "unsafe")
+                    raise TuneAbort(f"motor {n} went the wrong way {wrong[d]} times when driven {way(d)} and hasn't "
+                                    f"moved the right way yet. The motor or the pot may be wired backwards - run the "
+                                    f"Diagnostics full check to see.", "unsafe")
             if found[1] is not None and found[-1] is not None:
                 break
         if found[1] is None and found[-1] is None:
             raise TuneAbort(f"motor {n} didn't move even with PWMmin {cap}. Check motor power and wiring.")
         if found[1] is None or found[-1] is None:
             good = 1 if found[1] is not None else -1
-            raise TuneAbort(f"motor {n} moves towards {way(good)} counts but not the other way even at PWM {cap}: "
-                            f"too weak for the load with PWMmax {p['pwmmax']}, or something binds.")
+            raise TuneAbort(f"motor {n} moves {way(good)} but not the other way even at PWM {cap}: too weak for "
+                            f"the load with PWMmax {p['pwmmax']}, or something binds.")
         return found
+
+    def _measure_speed(self, p, lo, hi, share, change=True):
+        """Top speed each way from one quick move each way (the target jumps; Kp 120-200 so the drive is at or near
+        PWMmax for most of it). The test moves then run at `share` of the slower way."""
+        n = self.motor + 1
+        q = dict(p)
+        if change:              # the Kp the motor had before (the PWMmin search leaves a low one), within 120-200
+            ref = (self.original or p)["kp"]
+            q.update(kp=int(min(SPEED_KP[1], max(SPEED_KP[0], ref))), ki=0, kd=0, ks=1)
+            self._apply(q)
+        self._ramp_to(lo)
+        self._settle(lo, 3.0)
+        r = self._step_pair(hi, lo, q, hold=1.6, ramp=False)
+        v = {1: r["dp"].get("vtop") or 0.0, -1: r["dm"].get("vtop") or 0.0}
+        if min(v.values()) < 15:
+            slow = 1 if v[1] < v[-1] else -1
+            raise TuneAbort(f"motor {n} hardly moves {self.dn[slow]} on a full move ({v[slow]:.0f} counts/s with "
+                            f"PWMmax {p['pwmmax']}). Is motor power on, or is PWMmax far too low for the load?")
+        vslow = min(v.values())
+        ramp = int(round(share * vslow / 10.0)) * 10
+        filt = self.pr.get("FILT")
+        if isinstance(filt, list) and len(filt) > 1 and filt[1]:
+            cap = int(0.9 * filt[1] * 100)               # the board's own max speed would slow the goal down
+            if 0 < cap < ramp:
+                ramp = cap
+                self.say(f"The board's Max speed setting ({filt[1] * 100} counts/s) limits the test moves to "
+                         f"{cap} counts/s.")
+        self.ramp_v = int(max(30, min(1200, ramp)))
+        self._lv(speed={"p": round(v[1]), "m": round(v[-1]), "ramp": self.ramp_v,
+                        "share": round(share * 100), "pwmmax": p["pwmmax"]})
+        o = dir_order(self.dn)
+        self.say(f"Top speed{' (one quick move each way at Kp ' + str(q['kp']) + ')' if change else ''}: "
+                 + ", ".join(f"{self.dn[d]} {v[d]:.0f}" for d in o)
+                 + f" counts/s with PWMmax {p['pwmmax']}. The test moves run at {self.ramp_v} counts/s "
+                   f"({share * 100:.0f}% of the slower way), so the motor can follow them.")
+        if max(v.values()) > 1.6 * vslow:
+            self.say(f"Much slower {self.dn[1 if v[1] < v[-1] else -1]} than {self.dn[-1 if v[1] < v[-1] else 1]} - "
+                     f"the load works against it that way.")
+        return v
 
     # ---- the procedure ----
     def _thread(self, *a):
-        self.gen.set(mode="off")
+        final = "error"
         try:
-            self._run(*a)
-            self.state = "done"
+            self.gen.set(mode="off")
+            if self.mode == "check":
+                self._run_check(*a)
+            else:
+                self._run(*a)
+            final = "done"
         except TuneAbort as e:
+            final = "aborted"
             self.say(("Cannot start: " if e.kind == "refuse" else "Stopped: ") + str(e))
-            if e.kind == "unsafe":
-                self._safe_stop()
-            elif self.original and self.applied:
-                self._restore_and_hold()
-                self.say("Previous settings restored; the motor holds where it is.")
-            self.state = "aborted"
+            try:
+                if e.kind == "unsafe":
+                    self._safe_stop()
+                elif e.kind == "refuse":
+                    pass                                 # nothing was moved or changed: leave it all alone
+                elif self.mode == "tune" and self.original and self.applied:
+                    self._restore_and_hold()
+                    self.say("Previous settings restored; the motor holds where it is.")
+                else:
+                    self._hold_here()
+            except Exception as e2:
+                self.say(f"Couldn't put everything back ({e2!r}) - press Revert, or power-cycle the board.")
         except Exception as e:                                  # a bug - leave the rig as it was
             self.say(f"Internal error: {e!r}")
-            if self.original:
-                self._restore_and_hold()
-            self.state = "error"
-        self.stage = ""
-        if self.events:
-            n = (self.motor or 0) + 1
-            if self.state == "done" and self.result:
-                a, b = self.result["before"], self.result["after"]
-                self.events.add("tune", f"Auto-tune of motor {n} finished: " + ", ".join(
-                    f"{k} {a[k]}->{b[k]}" for k in a if a[k] != b[k]) + " (not saved yet).", motor=n,
-                    before=a, after=b)
-            else:
-                last = next((l[9:] for l in reversed(self.lines) if "Stopped" in l or "Cannot" in l or "error" in l),
-                            self.state)
-                self.events.add("tune", f"Auto-tune of motor {n} {self.state}: {last}", motor=n)
+            try:
+                if self.mode == "tune" and self.original:
+                    self._restore_and_hold()
+                else:
+                    self._hold_here()
+            except Exception:
+                pass
+        finally:
+            self.stage, self.countdown = "", None
+            try:
+                self._log_end(final)
+            except Exception:
+                pass
+            self.state = final                           # last: a new run can't start before this one is logged
 
-    def _run(self, m, amp, style, do_friction, do_ki, do_kd):
+    def _log_end(self, state):
+        if not self.events:
+            return
+        n = (self.motor or 0) + 1
+        what = "Check of motor %d's values" % n if self.mode == "check" else f"Auto-tune of motor {n}"
+        if state == "done" and self.result and self.mode == "tune":
+            a, b = self.result["before"], self.result["after"]
+            self.events.add("tune", f"Auto-tune of motor {n} finished: " + ", ".join(
+                f"{k} {a[k]}->{b[k]}" for k in a if a[k] != b[k]) + " (not saved yet).", motor=n,
+                before=a, after=b)
+        elif state == "done" and self.result:
+            self.events.add("tune", f"{what}: " + ("fine." if self.result.get("ok") else
+                                                   "; ".join(self.result.get("issues") or [])), motor=n)
+        else:
+            last = next((l[9:] for l in reversed(self.lines) if "Stopped" in l or "Cannot" in l or "error" in l),
+                        state)
+            self.events.add("tune", f"{what} {state}: {last}", motor=n)
+
+    def _prepare(self, m, amp, check=False):
+        """Reads the motor's settings and works out where it may move. Returns (orig, c, lo, hi, A)."""
         b, n = self.board, m + 1
-        os_target, margin, knee_tol = STYLES.get(style, STYLES["normal"])
-        self.noise_sd = 0.5
-        self.say(f"Auto-tune motor {n}, style '{style}', travel ±{amp} counts.")
-
-        self.stage, self.progress = "Reading settings", 2
+        self._phase("prep", "Reading settings", 2)
         orig, fw = self._get_params()
-        self.original = dict(orig)
         if not fw or fw[1] < 14:
             raise TuneAbort("auto-tune needs firmware 1.4 or newer on the board (flash the newest SMC3_R4.ino).",
                             "refuse")
         self.rev = (m == 0 and bool(fw[0] & 1))
+        self._directions(m)
         s = b.latest()
         if not s:
             raise TuneAbort("No telemetry from the board yet.", "refuse")
@@ -1218,27 +1662,28 @@ class Tuner:
         A = int(max(40, min(amp, room)))
         if A < amp:
             self.say(f"Travel limited to ±{A} by the allowed travel.")
-        lo, hi = c - A, c + A
         self.runaway_limit = 2 * A + 80
-
         self.cur = s["m"][m]["t"]
+        self.start_t, self.moved, self.cur_p = self.cur, False, dict(orig)
         self.recent.clear(); self.hist.clear()
         self.recent.append((time.time(), self.cur))
         self.chk_seq, self.interf, self.t_start = b.seq, 0, time.time()
+        self._now(orig)
+        if self.dn[1] in ("up", "down"):
+            self.say(f"Directions: {self.dn[1]} = higher counts" +
+                     (" (motor 1 is mirrored in the firmware)" if self.rev else "") +
+                     ("" if (b.cfg.get("lift_dir") or {}).get(str(n)) else
+                      " - assumed, as SimHub expects; the Diagnostics full check asks which way the seat really goes")
+                     + ".")
+        elif self.dn[1] in ("right", "left"):
+            self.say(f"Directions: higher counts move the rear to the {self.dn[1]}.")
+        self._lv(travel=A)
+        return orig, c, c - A, c + A, A
 
-        p = dict(orig)
-        p.update(kp=80, ki=0, kd=0, ks=1, dz=max(1, orig["dz"]))
-        self._apply(p)
-
-        # 1. centre and noise
-        self.stage, self.progress = "Moving to centre", 5
-        self._ramp_to(c)
-        self._settle(c, 4.0, tol=max(4.0, p["dz"] + 2))
-        if abs(self._fb() - c) > 40:
-            raise TuneAbort(f"motor {n} didn't follow the target (feedback {self._fb():.0f}, wanted {c}). "
-                            f"Is motor power on?")
-        # pot noise at rest - every limit below that judges "holding still" or "moved" scales with it
-        self.stage, self.progress = "Measuring pot noise", 8
+    def _noise(self, m, do_friction, p):
+        """Pot noise at rest - every limit below that judges "holding still" or "moved" scales with it."""
+        b = self.board
+        self._phase("noise", "Measuring pot noise", 8)
         self.wait(1.0)                           # let any ringing from the move die out first
         seq = b.seq
         self.wait(1.5)
@@ -1248,6 +1693,7 @@ class Tuner:
         sigma = _rstd(resid) * 1.12                      # 2.4.1: glitchy readings don't count as noise
         plain = _std(resid) * 1.12
         self.noise_sd = max(0.3, sigma)
+        self._lv(noise={"sd": round(sigma, 2), "glitchy": plain > max(2.0, 2.0 * sigma)})
         if do_friction:
             p["dz"] = int(min(4, max(1, math.ceil(3 * sigma) + 1)))
             self.say(f"Pot noise at rest ±{sigma:.2f} counts -> dead zone {p['dz']}.")
@@ -1260,147 +1706,278 @@ class Tuner:
             self.say(f"The pot also glitches: now and then a reading far off (spread ±{plain:.1f} with them). The tests "
                      f"below ignore them, but the motor reacts to every one - check the pot's wiring and connector "
                      f"(the Diagnostics quick check counts them).")
+        return sigma
+
+    def _run(self, m, amp, style, do_friction, do_ki, do_kd, rider="empty", rider_kg=0.0, unit="lb"):
+        b, n = self.board, m + 1
+        os_t, margin, knee_tol, lag_t = STYLES.get(style, STYLES["normal"])
+        os_0, lag_0 = os_t, lag_t
+        self.noise_sd = 0.5
+        seated = rider == "seated"
+        fr = 0.0 if seated else max(0.0, min(1.5, float(rider_kg or 0) / RIDER_REF_KG))
+        self.rider_f = fr
+        share = RAMP_SHARE - 0.1 * min(1.0, fr)
+        keys = [k for k, _ in PHASES if (k != "countdown" or seated) and (k != "pwmmin" or do_friction)
+                and (k != "ki" or do_ki) and (k != "kd" or do_kd)]
+        self._lv(phases=[[k, l] for k, l in PHASES if k in keys], style=style,
+                 rider={"mode": "seated" if seated else "empty", "kg": rider_kg, "unit": unit})
+        who = (" - you in the seat" if seated else
+               (f" - seat empty, allowing for a rider of {kg_text(rider_kg, unit)}" if fr > 0 else " - seat empty"))
+        self.say(f"Auto-tune motor {n}, style '{style}', travel ±{amp} counts{who}.")
+        if fr > 0:
+            f1 = min(1.0, fr)
+            os_t, lag_t = os_t * (1 - 0.35 * f1), lag_t * (1 - 0.25 * f1)
+            self.say(f"Allowing for the rider's weight: overshoot limit {os_t:.1f}% instead of {os_0:.0f}% (the extra "
+                     f"weight carries further), follow within {lag_t:.0f} ms instead of {lag_0:.0f} (it is slower "
+                     f"with you in it), test moves at {share * 100:.0f}% of top speed instead of {RAMP_SHARE * 100:.0f}%"
+                     + (", and a little Ki is kept for the weight" if do_ki else "") +
+                     f". These are estimates - run Check with you in the seat afterwards.")
+        sse_ok0 = None
+        self._lv(targets={"lag_ms": round(lag_t), "os": round(os_t, 1), "settle": SETTLE_OK_MS, "sse": None,
+                          "pid": PID_NOISE_MAX})
+
+        orig, c, lo, hi, A = self._prepare(m, amp)
+        self.original, self.orig_motor = dict(orig), m
+        if seated:
+            self._countdown(COUNTDOWN_S)
+
+        p = dict(orig)
+        p.update(kp=80, ki=0, kd=0, ks=1, dz=max(1, orig["dz"]))
+        self._apply(p)
+
+        # 1. centre and noise
+        self._phase("prep", "Moving to centre", 5)
+        self._ramp_to(c)
+        self._settle(c, 4.0, tol=max(4.0, p["dz"] + 2))
+        if abs(self._fb_med() - c) > 40:
+            raise TuneAbort(f"motor {n} didn't follow the target (feedback {self._fb_med():.0f}, wanted {c}). "
+                            f"Is motor power on?")
+        sigma = self._noise(m, do_friction, p)
+        self._now(p)
+        sse_ok0 = p["dz"] + 3.0
+        self._lv(targets=dict(self.live["targets"], sse=sse_ok0))
         if do_friction:
             # 2. PWMmin: smallest drive that reliably moves the motor, per direction
-            self.stage = "Finding the minimum drive (PWMmin)"
+            self._phase("pwmmin", "Finding the minimum drive (PWMmin)", 10)
             self.say("Finding the minimum drive: it starts with almost none, so the motor only creeps a few counts at a "
                      "time.")
             found = self._pwmmin_search(p, sigma, n)
             p["pwmmin"] = min(found[1], found[-1])
             gap = abs(found[1] - found[-1])
-            self.say(f"PWMmin {p['pwmmin']} (the easier direction; the harder one needs {max(found.values())}).")
+            easy = 1 if found[1] <= found[-1] else -1
+            self.say(f"PWMmin {p['pwmmin']} (the easier way, {self.dn[easy]}; {self.dn[-easy]} needs "
+                     f"{max(found.values())}).")
             if gap > 15 and not do_ki:
                 do_ki = True
                 self.say(("Large difference between directions (friction or binding in the rear slide, or the "
                           "seat pulling to one side) - " if self.motor == tl_motor(self.board.cfg) else
                           "Large difference between directions (typical with a worm gear lifting your weight) - ")
                          + "the Ki step will run to make up for it.")
+            self._apply(p)
             self._ramp_to(c)
             self._settle(c, 3.0)
 
-        # 3. Kp sweep
+        # 3. top speed each way -> how fast the test moves go
         s_now = self.board.latest()
         if s_now and s_now.get("roll") is not None:
             self.say("Motion sensor is sending: the seat's own overshoot and ringing count too" +
                      (" (how the seat turns, for the traction-loss motor)." if self.motor == tl_motor(self.board.cfg)
                       else "."))
-        self.stage, self.progress = "Sweeping Kp", 30
+        self._phase("speed", "Measuring top speed", 30)
+        vtop = self._measure_speed(p, lo, hi, share)
+        try:
+            ts = dict(b.cfg.get("tune_speed") or {})
+            ts[str(n)] = {"ramp": self.ramp_v, "top": [round(vtop[1]), round(vtop[-1])], "pwmmax": p["pwmmax"],
+                          "share": round(share, 2)}
+            b.cfg.update(tune_speed=ts)
+        except Exception:
+            pass
+
+        # 4. Kp sweep: test moves both ways along ramps the motor can follow
+        self._phase("kp", "Sweeping Kp", 33)
         p.update(ki=0, kd=0, ks=1, kp=KP_START)
         self._apply(p)
         self._ramp_to(lo)
         self._settle(lo, 3.0)
+        calm2 = self._calm(2.0)
+
+        def good(r):
+            return (r["reached"] and r["os"] <= os_t and r["osc"] <= 2 and r["fb_std"] <= calm2
+                    and r["pid_std"] <= PID_NOISE_MAX and not r.get("behind"))
+
+        def lag_ok(r):                     # both ways measured, and both within the target
+            ls = [x.get("lag_ms") for x in (r.get("dp") or {}, r.get("dm") or {})]
+            return None not in ls and max(ls) <= lag_t
+
         results, over, kp = [], 0, float(KP_START)
-        best_settle, best_sse, no_gain = float("inf"), float("inf"), 0
+        best_lag, best_settle, no_gain, met, why = float("inf"), float("inf"), 0, 0, "max"
+        sweep = []
         while kp <= KP_MAX:
-            self.progress = 30 + int(40 * math.log(kp / KP_START) / math.log(KP_MAX / KP_START))
+            self.progress = 33 + int(37 * math.log(kp / KP_START) / math.log(KP_MAX / KP_START))
             p["kp"] = int(round(kp))
             self._apply(p)
             self._settle(lo, 1.0)
             r = self._step_pair(hi, lo, p)
+            if (not good(r) and results and good(results[-1][1]) and r["reached"] and not r.get("behind")
+                    and r["os"] <= OS_STOP and r["osc"] < 4 and r["pid_std"] <= PID_NOISE_MAX):
+                # one bad test right after a calm one: a glitchy pot can kick the motor (a burst of bad readings
+                # makes the PID push hard for a moment) - test this Kp once more before believing it (page 2.5)
+                self.say(f"Kp {p['kp']}: {fmt(r, self.dn)} - testing it once more, to be sure.")
+                self._settle(lo, 1.0)
+                r = self._step_pair(hi, lo, p)
             results.append((p["kp"], r))
-            self.say(f"Kp {p['kp']}: {fmt(r)}")
+            sweep = sweep + [{"kp": p["kp"], "p": _slim(r["dp"]), "m": _slim(r["dm"]), "good": good(r)}]
+            self._lv(sweep=sweep)
+            self._show(f"Kp {p['kp']}", r)
+            self.say(f"Kp {p['kp']}: {fmt(r, self.dn)}")
             if r["os"] > OS_STOP or r["osc"] >= 4 or r["fb_std"] > self._calm(2.5, 2.0):
                 self.say("Too lively - stopping the sweep here.")
+                why = "edge"
                 break
             if r["pid_std"] > PID_NOISE_MAX:
                 self.say("Holding gets twitchy (the pot noise is being amplified) - stopping the sweep here.")
+                why = "edge"
                 break
-            if r["os"] > os_target:
+            if r["os"] > os_t:              # two in a row (2.4.1 counted any two, so two glitch kicks ended it)
                 over += 1
                 if over >= 2:
+                    why = "edge"
                     break
-            if r["reached"] and r["settled"]:
-                # leftover error below dead zone + 3 counts can't be felt (and Ki handles it) - don't chase it
-                sse_ok = p["dz"] + 3.0
-                if r["settle"] < best_settle * 0.95 or (r["sse"] > sse_ok and r["sse"] < best_sse * 0.85):
+            else:
+                over = 0
+            if good(r) and lag_ok(r):
+                met += 1
+                if met >= 2:
+                    why = "enough"
+                    self.say(f"Follows within {lag_t:.0f} ms both ways - no need to go stiffer.")
+                    break
+            else:
+                met = 0
+            if good(r) and r["settled"]:          # "no better" only counts among calm tests
+                lm = r["lag_ms"] if r.get("lag_ms") is not None else float("inf")
+                if lm < best_lag * 0.9 or r["settle"] < best_settle * 0.95:
                     no_gain = 0
                 else:
                     no_gain += 1
-                best_settle, best_sse = min(best_settle, r["settle"]), min(best_sse, r["sse"])
+                best_lag, best_settle = min(best_lag, lm), min(best_settle, r["settle"])
                 if no_gain >= 3:
+                    why = "nogain"
                     self.say("Higher Kp isn't improving anything any more - stopping the sweep.")
                     break
             kp *= KP_STEP
-        good = [(k, r) for k, r in results if r["reached"] and r["os"] <= os_target and r["osc"] <= 2
-                and r["fb_std"] <= self._calm(2.0) and r["pid_std"] <= PID_NOISE_MAX]
+        goods = [(k, r) for k, r in results if good(r)]
         notes = []
-        if good:
-            # sweet spot = the lowest Kp that is (nearly) as good as the best one; higher only adds harshness
-            fast = min(r["settle"] for k, r in good if r["settled"]) if any(r["settled"] for k, r in good) else None
-            tight = min(r["sse"] for k, r in good)
-            knee = None
-            if fast is not None:
-                knee = next(((k, r) for k, r in good if r["settled"] and r["settle"] <= fast * knee_tol + 20
-                             and r["sse"] <= max(tight * 1.5, p["dz"] + 3.0)), None)
-            cap = max(KP_START, int(round(good[-1][0] * margin)))
-            if knee and knee[0] <= cap:
-                kp_best, r_best = knee
-                self.say(f"Sweet spot: Kp {kp_best} - higher values didn't track noticeably better.")
+        if goods:
+            tight = min(r["sse"] for k, r in goods)
+            sse_ok = max(tight * 1.5, p["dz"] + 3.0)
+            cap = max(KP_START, int(round(goods[-1][0] * margin)))
+            meet = next(((k, r) for k, r in goods if lag_ok(r) and r["settled"] and r["sse"] <= sse_ok), None)
+            if meet and (why != "edge" or meet[0] <= cap):
+                kp_best, r_best = meet
+                self.say(f"Kp {kp_best} follows the test moves within {r_best['lag_ms']:.0f} ms both ways "
+                         f"(target {lag_t:.0f}) - higher only adds harshness.")
+            elif meet or why == "edge":
+                kp_best, r_best = goods[-1][0] * margin, goods[-1][1]
+                self.say(f"Highest calm Kp {goods[-1][0]} -> using {int(margin * 100)}% of it for a safety margin"
+                         + (f" (it follows {r_best['lag_ms']:.0f} ms behind; the target was {lag_t:.0f})."
+                            if r_best.get("lag_ms") is not None and not lag_ok(r_best) else "."))
             else:
-                kp_best, r_best = good[-1][0] * margin, good[-1][1]
-                self.say(f"Highest stable Kp {good[-1][0]} -> using {int(margin * 100)}% of it for a safety margin.")
+                best_l = min((r["lag_ms"] for k, r in goods if r.get("lag_ms") is not None), default=None)
+                knee = None
+                if best_l is not None:
+                    knee = next(((k, r) for k, r in goods if r.get("lag_ms") is not None and r["settled"]
+                                 and r["lag_ms"] <= best_l * knee_tol + 5 and r["sse"] <= sse_ok), None)
+                if knee:
+                    kp_best, r_best = knee
+                    self.say(f"Sweet spot: Kp {kp_best} - higher values didn't follow noticeably better.")
+                else:
+                    kp_best, r_best = goods[-1][0] * margin, goods[-1][1]
+                    self.say(f"Highest calm Kp {goods[-1][0]} -> using {int(margin * 100)}% of it for a safety "
+                             f"margin.")
         else:
             reached = [(k, r) for k, r in results if r["reached"]]
+            if not reached and why == "edge":
+                k, r = results[-1]
+                raise TuneAbort(f"motor {n} is too lively even at Kp {k} (overshoot {r['os']:.0f}%, ringing "
+                                f"{r['osc']}) before it even gets there. Check for slack between motor and pot, and for "
+                                f"a glitchy pot (the Diagnostics quick check counts glitches).")
             if not reached:
                 raise TuneAbort(f"motor {n} never reached the target within 2 s, even at Kp {results[-1][0]}. "
                                 f"PWMmax {p['pwmmax']} is probably too low for this load.")
             kp_best, r_best = reached[0]
-            notes.append(f"Even the gentlest Kp that reaches the target overshoots {r_best['os']:.0f}% - "
-                         f"check for slack in the linkage between motor and pot.")
-        if r_best["sat"] > 0.5:
-            notes.append(f"Big moves run into PWMmax ({p['pwmmax']}) - if large movements feel slow, raise PWMmax "
-                         f"by 10-20 and run auto-tune again.")
-        if not good:
-            kp_best = kp_best * margin
+            why_not = []
+            if r_best["os"] > os_t:
+                why_not.append(f"overshoots {r_best['os']:.0f}% (check for slack between motor and pot)")
+            if r_best["osc"] > 2:
+                why_not.append(f"swings {r_best['osc']}x before it settles")
+            if r_best.get("behind"):
+                why_not.append("can't keep up with the test moves (PWMmax too low for the load?)")
+            if r_best["fb_std"] > calm2:
+                why_not.append(f"doesn't hold still (±{r_best['fb_std']:.1f} counts - a noisy or glitchy pot?)")
+            if r_best["pid_std"] > PID_NOISE_MAX:
+                why_not.append("buzzes while holding (pot noise amplified)")
+            notes.append(f"No Kp was calm: even the gentlest one that gets there (Kp {kp_best}) "
+                         + ("; ".join(why_not) or "falls outside the limits") + ". It is used as it is.")
         # floor: whatever the style, don't settle on a Kp that leaves the seat far from where it is sent
-        floor = next((k for k, r in results if r["reached"] and r["sse"] <= SSE_FLOOR), None)
+        calm_enough = [(k, r) for k, r in results if r["reached"] and r["os"] <= max(os_t, 15.0) and r["osc"] <= 2
+                       and r["pid_std"] <= PID_NOISE_MAX and r["fb_std"] <= calm2 and not r.get("behind")]
+        limit = (goods[-1][0] * margin) if (goods and why == "edge") else float("inf")
+        floor = next((k for k, r in calm_enough if r["sse"] <= SSE_FLOOR and k <= limit), None)
         if floor is not None and kp_best < floor:
             self.say(f"Kp {int(kp_best)} would leave the seat more than {SSE_FLOOR:.0f} counts short - using Kp "
                      f"{floor}, the lowest that gets there.")
             kp_best = floor
         p["kp"] = max(KP_START, int(round(kp_best)))
+        self._lv(chosen=p["kp"])
         self.say(f"Kp {p['kp']}.")
-
-        # 4. small movements (road-texture sized) must not ring
-        self.stage, self.progress = "Checking small movements", 72
+        # 5. small movements (road-texture sized, sharp like a kerb) must not ring
+        self._phase("small", "Checking small movements", 72)
         self._apply(p)
         for _ in range(3):
-            self._ramp_to(c)
-            self._settle(c, 2.0)
-            rs = self._step_pair(c + 15, c - 15, p, hold=1.5)
-            self.say(f"Small ±15 steps at Kp {p['kp']}: {fmt(rs)}")
+            self._ramp_to(c - 15)               # from one side, so both steps are 30 counts (2.4.1: 15 up, 30 down)
+            self._settle(c - 15, 2.0)
+            rs = self._step_pair(c + 15, c - 15, p, hold=1.5, ramp=False)
+            self._show(f"Small ±15 steps, Kp {p['kp']}", rs, "small")
+            self.say(f"Small ±15 steps at Kp {p['kp']}: {fmt(rs, self.dn)}")
             if (rs["osc"] >= 2 or rs["os"] > 35 or rs["fb_std"] > self._calm(1.5)) and p["kp"] > KP_START:
                 p["kp"] = max(KP_START, int(p["kp"] * 0.8))
                 self._apply(p)
+                self._lv(chosen=p["kp"])
                 self.say(f"Small moves are too lively - Kp reduced to {p['kp']}.")
             else:
                 break
 
-        # 5. Ki, only if the motor settles short of the target (big or small moves)
-        self.stage, self.progress = "Checking steady-state error (Ki)", 76
+        # 6. Ki, if the motor settles short of the target (big or small moves) - or, allowing for a rider, a little
+        #    anyway: the rider's weight leaves the lifts short going up
+        self._phase("ki", "Checking steady-state error (Ki)", 76)
 
-        def measure():
+        def measure(label):
             self._ramp_to(lo)
             self._settle(lo, 2.0)
             big = self._step_pair(hi, lo, p, hold=2.5)
-            self._ramp_to(c)
-            self._settle(c, 2.0)
-            small = self._step_pair(c + 15, c - 15, p, hold=1.5)
+            self._show(label + ", test moves", big)
+            self._ramp_to(c - 15)
+            self._settle(c - 15, 2.0)
+            small = self._step_pair(c + 15, c - 15, p, hold=1.5, ramp=False)
+            self._show(label + ", small steps", small, "small")
             return big, small
 
-        r_base, r_small = measure()
-        self.say(f"Kp {p['kp']}, big moves: {fmt(r_base)}")
-        self.say(f"Kp {p['kp']}, small moves: {fmt(r_small)}")
+        r_base, r_small = measure(f"Kp {p['kp']}")
+        self.say(f"Kp {p['kp']}, test moves: {fmt(r_base, self.dn)}")
+        self.say(f"Kp {p['kp']}, small steps: {fmt(r_small, self.dn)}")
         tol = p["dz"] + 1.5
         sse0 = max(r_base["sse"], r_small["sse"])
-        if do_ki and sse0 > tol:
+        need = sse0 > tol
+        for_rider = fr > 0 and not need
+        if do_ki and (need or for_rider):
             best = None
-            for i, ki in enumerate(KI_STEPS):
+            steps = KI_STEPS if need else KI_STEPS[:2]
+            for i, ki in enumerate(steps):
                 self.progress = 77 + 2 * i
                 p["ki"] = ki
                 self._apply(p)
-                big, small = measure()
-                self.say(f"Ki {ki}: big {big['os']:.0f}% over / off by {big['sse']:.1f}, "
+                big, small = measure(f"Ki {ki}")
+                self.say(f"Ki {ki}: test moves {big['os']:.0f}% over / off by {big['sse']:.1f}, "
                          f"small {small['os']:.0f}% over / off by {small['sse']:.1f}")
                 # judged against what was already there, so a springy linkage's normal ringing doesn't veto it;
                 # ringing on the motor only - holding position (Ki) isn't what makes a flexing frame ring
@@ -1410,20 +1987,24 @@ class Tuner:
                     self.say("Ki starts causing overshoot - stopping.")
                     break
                 best = (ki, big, small)
-                if max(big["sse"], small["sse"]) <= tol:
+                if need and max(big["sse"], small["sse"]) <= tol:
                     break
-            if best and max(best[1]["sse"], best[2]["sse"]) < sse0 * 0.7:
+            if need and best and max(best[1]["sse"], best[2]["sse"]) < sse0 * 0.7:
                 p["ki"], r_base, r_small = best
+            elif for_rider and best:
+                p["ki"], r_base, r_small = best
+                self.say(f"Ki {p['ki']} kept for the rider: the empty seat settles within {sse0:.1f} counts, but your "
+                         f"weight leaves the motor short (most going up) and Ki makes that up.")
             else:
                 p["ki"] = 0
             self.say(f"Ki {p['ki']}.")
         elif do_ki:
             p["ki"] = 0
-            self.say(f"Settles within {sse0:.1f} counts on big and small moves - Ki not needed (0).")
+            self.say(f"Settles within {sse0:.1f} counts on test moves and small steps - Ki not needed (0).")
         self._apply(p)
 
-        # 6. Kd, only if there is overshoot to damp and it helps without adding noise
-        self.stage, self.progress = "Trying damping (Kd)", 88
+        # 7. Kd, only if there is overshoot to damp and it helps without adding noise
+        self._phase("kd", "Trying damping (Kd)", 88)
         if do_kd and r_base["os"] > 2:
             def score(r):
                 return r["os"] + r["settle"] / 40.0
@@ -1435,7 +2016,8 @@ class Tuner:
                 p.update(ks=4, kd=kd)
                 self._apply(p)
                 r = self._step_pair(hi, lo, p)
-                self.say(f"Kd {kd} (Ks 4): {fmt(r)}")
+                self._show(f"Kd {kd}", r)
+                self.say(f"Kd {kd} (Ks 4): {fmt(r, self.dn)}")
                 if r["pid_std"] > r_base["pid_std"] * 1.5 + 3 or r["fb_std"] > self._calm(2.0) or r["osc"] >= 2:
                     self.say("Kd starts adding noise - stopping.")
                     break
@@ -1453,11 +2035,12 @@ class Tuner:
             self._apply(p)
             self.say("Hardly any overshoot - Kd not needed (0).")
 
-        # 7. verify and finish at centre
-        self.stage, self.progress = "Verifying", 97
-        r_final, r_fsmall = measure()
-        self.say(f"Final, big moves: {fmt(r_final)}")
-        self.say(f"Final, small moves: {fmt(r_fsmall)}")
+        # 8. verify and finish at centre
+        self._phase("final", "Verifying", 97)
+        r_final, r_fsmall = measure("Final")
+        self.say(f"Final, test moves: {fmt(r_final, self.dn)}")
+        self.say(f"Final, small steps: {fmt(r_fsmall, self.dn)}")
+        self._show("Final, test moves", r_final)
         self._ramp_to(c)
         self._settle(c, 3.0)
         keys = ["kp", "ki", "kd", "ks", "pwmmin", "dz"]
@@ -1466,12 +2049,143 @@ class Tuner:
                 notes.append(f"The seat itself still bounces ({r_final['seat_os']:.0f}% overshoot) after the motor "
                              f"stops - the frame, seat mounts or linkage flex. More target smoothing softens it; "
                              f"stiffening the frame fixes it.")
+        # drive headroom: what following the test moves takes, each way, with the final values
+        drv = {d: (r_final["dp"] if d > 0 else r_final["dm"]).get("drive") for d in (1, -1)}
+        hard = max((d for d in (1, -1) if drv[d] is not None), key=lambda d: drv[d], default=None)
+        if hard is not None:
+            pct = 100.0 * drv[hard] / max(1, p["pwmmax"])
+            sat = (r_final["dp"] if hard > 0 else r_final["dm"]).get("sat") or 0.0
+            if r_final.get("behind") or pct >= 92 or sat > 0.3:
+                notes.append(f"Following the test moves ({self.ramp_v} counts/s) takes all of PWMmax "
+                             f"({p['pwmmax']}) going {self.dn[hard]} - big fast moves will lag that way. Raise PWMmax "
+                             f"by 10-20 and run auto-tune again.")
+            elif fr > 0 and pct > 70:
+                sug = int(min(255, max(p["pwmmax"] + 10, math.ceil(drv[hard] / 0.6 / 5.0) * 5)))
+                notes.append(f"With the seat empty, following the test moves already takes {pct:.0f}% of PWMmax "
+                             f"going {self.dn[hard]}. With {kg_text(rider_kg, unit)} in it that way needs more - "
+                             f"consider PWMmax {sug} (now {p['pwmmax']}), then run Check with you in the seat.")
+        if fr > 0:
+            notes.append(f"Tuned with the seat empty, allowing for {kg_text(rider_kg, unit)}. Sit in it and press "
+                         f"Check: it tests these values with you in the seat (about 30 s) and says what to change.")
         self.result = {"motor": n, "before": {k: orig[k] for k in keys}, "after": {k: p[k] for k in keys},
-                       "final": r_final, "notes": notes}
+                       "final": _slim(r_final), "dirs": {"p": _slim(r_final["dp"]), "m": _slim(r_final["dm"])},
+                       "small": {"p": _slim(r_fsmall["dp"]), "m": _slim(r_fsmall["dm"])},
+                       "names": {"p": self.dn[1], "m": self.dn[-1]}, "ramp_v": self.ramp_v, "pwmmax": p["pwmmax"],
+                       "notes": notes}
         for note in notes:
             self.say("Note: " + note)
         self.say("Done. The new values are running now but NOT saved - try them in a game, then press "
                  "'Save to EEPROM' to keep them or 'Revert' to go back.")
+        self.progress = 100
+
+    def _run_check(self, m, amp, style, do_friction, do_ki, do_kd, rider="empty", rider_kg=0.0, unit="lb"):
+        """Check (page 2.5): the motor's CURRENT values on test moves both ways and small steps - typically with you
+        in the seat after tuning it empty. Changes nothing; says what to change."""
+        b, n = self.board, m + 1
+        os_t, _, _, lag_t = STYLES.get(style, STYLES["normal"])
+        seated = rider == "seated"
+        self._lv(phases=[[k, l] for k, l in CHECK_PHASES if k != "countdown" or seated], style=style,
+                 rider={"mode": "seated" if seated else "empty", "kg": rider_kg, "unit": unit}, check=True)
+        self.say(f"Check of motor {n}'s current values, style '{style}', travel ±{amp} counts"
+                 + (" - you in the seat." if seated else " - seat empty."))
+        p, c, lo, hi, A = self._prepare(m, amp, check=True)
+        self.say(f"Values: Kp {p['kp']}, Ki {p['ki']}, Kd {p['kd']} (Ks {p['ks']}), PWMmin {p['pwmmin']}, PWMmax "
+                 f"{p['pwmmax']}, dead zone {p['dz']}. Nothing is changed.")
+        tol = p["dz"] + 3.0
+        self._lv(targets={"lag_ms": round(lag_t), "os": round(os_t, 1), "settle": SETTLE_OK_MS, "sse": tol,
+                          "pid": PID_NOISE_MAX})
+        if seated:
+            self._countdown(COUNTDOWN_S)
+        self._phase("prep", "Moving to centre", 5)
+        self._ramp_to(c)
+        self._settle(c, 4.0, tol=max(4.0, p["dz"] + 2))
+        if abs(self._fb_med() - c) > 40:
+            raise TuneAbort(f"motor {n} didn't follow the target (feedback {self._fb_med():.0f}, wanted {c}). "
+                            f"Is motor power on?")
+        self._noise(m, False, p)
+        self._phase("speed", "Test speed", 15)
+        ts = (b.cfg.get("tune_speed") or {}).get(str(n)) or {}
+        if ts.get("ramp") and ts.get("pwmmax") == p["pwmmax"]:
+            self.ramp_v = int(ts["ramp"])
+            self._lv(speed={"p": (ts.get("top") or [None, None])[0], "m": (ts.get("top") or [None, None])[1],
+                            "ramp": self.ramp_v, "share": round(100 * (ts.get("share") or RAMP_SHARE)),
+                            "pwmmax": p["pwmmax"]})
+            self.say(f"Test moves at {self.ramp_v} counts/s, as in the last auto-tune of this motor.")
+        else:
+            self._measure_speed(p, lo, hi, RAMP_SHARE, change=False)
+        self._phase("big", "Test moves", 40)
+        self._ramp_to(lo)
+        self._settle(lo, 3.0)
+        big = self._step_pair(hi, lo, p, hold=2.5)
+        self._show("Test moves", big)
+        self.say(f"Test moves: {fmt(big, self.dn)}")
+        self._phase("small", "Small steps", 75)
+        self._ramp_to(c - 15)
+        self._settle(c - 15, 2.0)
+        small = self._step_pair(c + 15, c - 15, p, hold=1.5, ramp=False)
+        self._show("Small ±15 steps", small, "small")
+        self.say(f"Small ±15 steps: {fmt(small, self.dn)}")
+        self._ramp_to(c)
+        self._settle(c, 2.0)
+        # verdict, each way
+        issues, suggest = [], []
+        by = {1: big["dp"], -1: big["dm"]}
+        sm = {1: small["dp"], -1: small["dm"]}
+        slow = [d for d in (1, -1) if by[d].get("lag_ms") is not None and by[d]["lag_ms"] > 1.1 * lag_t]
+        over = [d for d in (1, -1) if by[d]["os"] > os_t or sm[d]["os"] > 35]
+        ring = [d for d in (1, -1) if by[d]["osc"] > 2 or sm[d]["osc"] >= 2]      # as auto-tune judges them
+        miss = [d for d in (1, -1) if not by[d]["reached"]]
+        short = [d for d in (1, -1) if max(by[d]["sse"], sm[d]["sse"]) > tol]
+        flat = [d for d in (1, -1) if by[d].get("behind") or (by[d].get("drive") or 0) >= 0.92 * p["pwmmax"]
+                or (by[d].get("sat") or 0) > 0.3]
+        names = lambda ds: " and ".join(self.dn[d] for d in ds)
+        if slow:
+            w = max(by[d]["lag_ms"] for d in slow)
+            issues.append(f"follows {w:.0f} ms behind going {names(slow)} (target {lag_t:.0f})")
+            if not over and not ring:
+                sug = int(round(min(p["kp"] * 1.6, max(p["kp"] * 1.15, p["kp"] * w / lag_t)) / 5.0) * 5)
+                suggest.append(f"Raise Kp to about {sug} (now {p['kp']}) - or run auto-tune with you in the seat.")
+        if over:
+            w = max(max(by[d]["os"], sm[d]["os"]) for d in over)
+            issues.append(f"overshoots {w:.0f}% going {names(over)} (limit {os_t:.0f}%)")
+            suggest.append("Lower Kp by about 20%, or let auto-tune try Kd (damping) with you in the seat.")
+        if ring:
+            issues.append(f"rings going {names(ring)}")
+            if not over:
+                suggest.append("Lower Kp by about 20% - it swings around the target.")
+        if short:
+            w = max(max(by[d]["sse"], sm[d]["sse"]) for d in short)
+            issues.append(f"stops {w:.1f} counts short going {names(short)}")
+            suggest.append(f"Raise Ki to {max(10, p['ki'] * 2)} (now {p['ki']}): it makes up what the weight leaves short.")
+        if flat:
+            issues.append(f"runs out of drive going {names(flat)}")
+            suggest.append(f"Raise PWMmax by 10-20 (now {p['pwmmax']}).")
+        if miss:
+            issues.append(f"doesn't get there going {names(miss)}")
+            if not flat:
+                suggest.append("Raise Kp (or PWMmin) - it stops well short of where it is sent.")
+        hold = max(big["fb_std"], small["fb_std"])
+        if hold > self._calm(2.0):
+            issues.append(f"doesn't hold still (±{hold:.1f} counts)")
+            suggest.append("Lower Kp a little, or raise the dead zone by 1 - and check the pot wiring if it glitches.")
+        if max(big["pid_std"], small["pid_std"]) > PID_NOISE_MAX:
+            issues.append("buzzes while holding")
+            suggest.append("Lower Kp or Kd: the pot's noise is being amplified.")
+        if big.get("seat_os") is not None and big["seat_os"] >= 25 and big["seat_os"] >= big.get("motor_os", 0) + 20:
+            issues.append(f"the seat itself bounces ({big['seat_os']:.0f}% overshoot)")
+            suggest.append("More target smoothing softens it; stiffening the frame or seat mounts fixes it.")
+        ok = not issues
+        if ok:
+            self.say("Verdict: these values work " + ("with you in the seat." if seated else "with the seat as it is."))
+        else:
+            self.say("Verdict: " + "; ".join(issues) + ".")
+            for sgg in suggest:
+                self.say("Suggestion: " + sgg)
+        self.result = {"check": True, "motor": n, "ok": ok, "issues": issues, "suggest": suggest,
+                       "values": {k: p[k] for k in ("kp", "ki", "kd", "ks", "pwmmin", "pwmmax", "dz")},
+                       "dirs": {"p": _slim(big["dp"]), "m": _slim(big["dm"])},
+                       "small": {"p": _slim(small["dp"]), "m": _slim(small["dm"])},
+                       "names": {"p": self.dn[1], "m": self.dn[-1]}, "ramp_v": self.ramp_v, "seated": seated}
         self.progress = 100
 
 
@@ -2045,7 +2759,7 @@ def _wrap180(d):
     return (d + 540.0) % 360.0 - 180.0
 
 
-def seat_step(samples, m, t_old, yaw=False):
+def seat_step(samples, m, t_old, yaw=False, whole=False):
     """What the SEAT did (motion sensor) when motor m stepped away from t_old: how far it tilted (or, yaw=True, for
     the traction-loss motor: how far it turned), which way, its own overshoot and ringing next to the motor's, how
     long it lagged, and how far the motor turned before the seat started to follow (play in the linkage). None
@@ -2056,7 +2770,8 @@ def seat_step(samples, m, t_old, yaw=False):
     t_new, t0 = samples[idx]["m"][m]["t"], samples[idx]["ms"]
     key = "yaw" if yaw else "roll"
     pre = [x for x in samples[max(0, idx - 15):idx] if x.get(key) is not None]
-    post = [x for x in samples[idx:] if x.get(key) is not None and x["m"][m]["t"] == t_new]
+    # whole=True: a gradual move (auto-tune 2.5) - everything from its start, not only the readings at its first step
+    post = [x for x in samples[idx:] if x.get(key) is not None and (whole or x["m"][m]["t"] == t_new)]
     if len(pre) < 3 or len(post) < 25:
         return None
     if yaw:                                          # the seat's turn relative to before the step, as (yaw, 0)
@@ -3279,6 +3994,12 @@ class MotionCheck:
                               ["unsure", "Not sure"], ["again", "Show me again"]], where=True)
             if ans["answer"] != "again":
                 break
+        if ans and ans.get("answer") in ("up", "down"):        # auto-tune names its directions by it (page 2.5)
+            ld = dict(self.d.cfg.get("lift_dir") or {})
+            want = 1 if ans["answer"] == "up" else -1
+            if ld.get(str(n)) != want:
+                ld[str(n)] = want
+                self.d.cfg.update(lift_dir=ld)
         return ans
 
     def ask_show_slide(self, base):
@@ -6370,17 +7091,21 @@ PAGE = r"""<!doctype html>
  --green:#2bd44f; --green-1:#2fae3e; --green-2:#17762a; --red:#e03b3b; --red-1:#d8383b; --red-2:#a3232a; --amber:#f5b301;
  --mono:ui-monospace,"Cascadia Mono",Consolas,"SFMono-Regular",Menlo,monospace;
  --sans:"Segoe UI",system-ui,-apple-system,Roboto,"Helvetica Neue",Arial,sans-serif;
+ /* 2.5: status colours for the auto-tune gauges (never used for a series; always with an icon and a word) */
+ --st-good:#0ca30c; --st-warn:#fab219; --st-bad:#d03b3b;
 }
 html[data-theme=dark]{color-scheme:dark;
  --bg:#070c13; --card:#111a24; --card-2:#0d151e; --line:#223041; --line-2:#2c3b4f; --text:#e7edf5; --dim:#8a98aa; --faint:#5f6d80;
  --input:#060c12; --input-line:#283648; --chart:#03080e; --grid:#142030; --axis:#6f7d90;
  --c-t:#7f8da3; --c-g:#3d8bff; --c-f:#3ddc5a; --c-p:#ff8a1f; --tip:#0d1724; --tip-line:#2c3b4f; --tip-text:#e7edf5;
- --c-roll:#b98bff; --c-pitch:#2fd0e0; --seat:#8f6bff}
+ --c-roll:#b98bff; --c-pitch:#2fd0e0; --seat:#8f6bff;
+ --dir-a:#9085e9; --dir-b:#199e70}
 html[data-theme=light]{color-scheme:light;
  --bg:#eef2f7; --card:#ffffff; --card-2:#f5f8fb; --line:#d9e1ea; --line-2:#c7d2df; --text:#0f1b2d; --dim:#56677d; --faint:#8a99ab;
  --input:#f7f9fc; --input-line:#c9d4e1; --chart:#fbfcfe; --grid:#e6ebf1; --axis:#7c8a9c;
  --c-t:#9aa6b6; --c-g:#1f6fe5; --c-f:#14a046; --c-p:#e8780e; --tip:#ffffff; --tip-line:#c7d2df; --tip-text:#0f1b2d;
- --c-roll:#7646d8; --c-pitch:#0a8f9e; --seat:#7a52e8}
+ --c-roll:#7646d8; --c-pitch:#0a8f9e; --seat:#7a52e8;
+ --dir-a:#6250d6; --dir-b:#1baf7a}
 *{box-sizing:border-box}
 html,body{margin:0;background:var(--bg);color:var(--text);font:14px/1.4 var(--sans)}
 button,input,select{font:inherit;color:inherit}
@@ -6430,7 +7155,7 @@ main[data-view=motors]{grid-template-columns:minmax(0,3fr) minmax(0,.78fr);grid-
 main[data-view=graphs]{grid-template-columns:1fr;grid-template-areas:"graphs"}
 main[data-view=tools]{grid-template-columns:minmax(0,1.75fr) minmax(0,1fr);grid-template-areas:"test presets" "graphs graphs"}
 main[data-view=profiles]{grid-template-columns:minmax(0,1fr) minmax(360px,430px);grid-template-areas:"genres pid" "profiles pid"}
-main[data-view=autotune]{grid-template-columns:minmax(360px,430px) minmax(0,1fr);grid-template-areas:"tune tunelog" "graphs graphs"}
+main[data-view=autotune]{grid-template-columns:minmax(360px,430px) minmax(0,1fr);grid-template-areas:"tune tunelive" "tuneres tunelive" "tunelog tunelog" "graphs graphs"}
 main[data-view=eeprom]{grid-template-columns:minmax(0,1fr) minmax(360px,430px);grid-template-areas:"eeprom pid" "backups pid"}
 main[data-view=settings]{grid-template-columns:repeat(2,minmax(0,1fr));grid-template-areas:"settings global" "settings mnames" "led sensor" "fwupd fwupd" "diag diag"}
 main[data-view=help]{grid-template-columns:1fr;grid-template-areas:"help"}
@@ -6585,6 +7310,56 @@ html[data-theme=light] .pid th.h0{color:#0b5fd6}html[data-theme=light] .pid th.h
 .bar div{height:100%;width:0;background:linear-gradient(90deg,#0b55d6,#1f8fff);transition:width .4s}
 @media (prefers-reduced-motion:reduce){.bar div{transition:none}}
 pre.log{background:var(--chart);border:1px solid var(--line);border-radius:7px;height:260px;overflow:auto;font:12px/1.45 var(--mono);padding:8px 10px;margin:10px 0;white-space:pre-wrap}
+/* 2.5: who's in the seat, the check, live gauges, copy */
+.tune .frow.trow{grid-template-columns:minmax(0,1fr) minmax(0,1fr);margin-top:8px}
+.wrow{display:flex;gap:6px}.wrow input{flex:1;height:33px}.wrow select{width:60px;flex:none}
+.tune .acts .b-blue{height:37px;padding:0 13px}
+.tune .acts{flex-wrap:wrap}
+.ccount{display:flex;align-items:center;gap:14px;border:2px solid var(--amber);border-radius:10px;padding:10px 14px;margin:10px 0 4px;background:color-mix(in srgb,var(--amber) 9%,var(--card))}
+.ccount b{font-size:36px;font-family:var(--mono);line-height:1;color:var(--amber);min-width:50px;text-align:center}
+.ccount span{font-size:13.5px}
+.tlive .ct{margin-bottom:9px}
+.tlive .steps{margin:0 0 10px;gap:5px}
+.tlive .steps span{padding:3px 10px 3px 3px;font-size:12.5px;gap:6px}
+.tlive .steps span::before{width:19px;height:19px;font-size:11px}
+.tnow{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 10px}
+.tnow span{font:12.5px var(--mono);padding:3px 9px;border:1px solid var(--line-2);border-radius:14px;background:var(--card-2);color:var(--dim)}
+.tnow span b{color:var(--text);font-weight:600}
+.tnow span.on{border-color:var(--blue);box-shadow:inset 0 0 0 1px var(--blue)}.tnow span.on b{color:var(--blue)}
+.thead{display:flex;align-items:baseline;gap:6px 14px;flex-wrap:wrap;margin:2px 0 7px}
+.thead b{font-size:14.5px}
+.thead .muted{font-size:12.5px}
+.dleg{display:flex;gap:12px;font-size:12.5px;color:var(--dim);margin-left:auto}
+.dleg span{display:inline-flex;align-items:center;gap:5px}
+.da{color:var(--dir-a)}.db{color:var(--dir-b)}
+.gauges{display:grid;grid-template-columns:repeat(auto-fit,minmax(122px,1fr));gap:8px}
+.gauge{background:var(--card-2);border:1px solid var(--line);border-radius:8px;padding:7px 6px 7px;text-align:center;min-width:0}
+.gauge h5{margin:0;font-size:12.5px;font-weight:600;color:var(--dim)}
+.gauge svg{width:100%;max-width:150px;height:auto;display:block;margin:2px auto 0;overflow:visible}
+.gauge .gv{font-size:19px;font-weight:600;line-height:1.15;margin-top:-2px}.gauge .gv small{font-size:12px;color:var(--dim);font-weight:400}
+.gauge .gs{font-size:12px;margin-top:1px;font-weight:600}.gs.good{color:var(--st-good)}.gs.warn{color:var(--st-warn)}.gs.bad{color:var(--st-bad)}.gs.none{color:var(--faint);font-weight:400}
+.gauge .gd{display:flex;justify-content:center;flex-wrap:wrap;gap:2px 10px;font:12px var(--mono);color:var(--dim);margin-top:3px}
+.tfacts{display:grid;grid-template-columns:repeat(auto-fit,minmax(165px,1fr));gap:8px;margin-top:10px}
+.tfact{border:1px solid var(--line);border-radius:8px;padding:6px 10px;background:var(--card-2);font-size:12.5px;color:var(--dim);min-width:0}
+.tfact b{display:block;color:var(--text);font-size:14px;font-weight:600;margin-top:1px}
+.tfact .mm{position:relative;height:6px;border-radius:4px;background:var(--input);border:1px solid var(--input-line);margin:6px 0 2px}
+.tfact .mm i{position:absolute;top:-4px;width:2px;height:12px;margin-left:-1px;background:var(--text);border-radius:1px}
+.tfact .mm em{position:absolute;top:-9px;font-style:normal;font-size:10px;line-height:1;margin-left:-4px}
+.tcharts{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:10px;margin-top:10px}
+.tchart{border:1px solid var(--line);border-radius:8px;background:var(--chart);padding:7px 10px 4px;position:relative;min-width:0}
+.tchart h5{margin:0 0 2px;font-size:12.5px;font-weight:600;color:var(--dim)}
+.tchart svg{width:100%;height:160px;display:block}
+.ttip{position:absolute;pointer-events:none;background:var(--tip);border:1px solid var(--tip-line);color:var(--tip-text);border-radius:6px;padding:6px 9px;font:12px/1.45 var(--mono);white-space:nowrap;z-index:5;box-shadow:0 4px 14px rgba(0,0,0,.35)}
+.tempty{color:var(--dim);font-size:13px;padding:16px 4px;text-align:center}
+main[data-view=autotune] .tune .tcd{display:none!important}
+.tcopy{height:31px;padding:0 12px;margin-left:auto;font-size:13px}
+.tcopy.okc{border-color:var(--st-good)}
+.tdirs{border-collapse:collapse;margin:4px 0 10px;font-size:13px;width:100%}
+.tdirs th,.tdirs td{padding:3px 8px 3px 0;text-align:left;white-space:nowrap}.tdirs td{font-family:var(--mono)}
+.tdirs th{color:var(--dim);font-weight:500}
+.tverd{margin:6px 0 10px;padding:8px 10px;border-radius:8px;border:1px solid var(--line-2);background:var(--card-2)}
+.tverd.ok{border-color:var(--st-good)}.tverd.bad{border-color:var(--st-warn)}
+.tverd ul{margin:6px 0 0;padding-left:18px}
 table.res{border-collapse:collapse;margin:6px 0 10px}table.res td,table.res th{padding:4px 14px 4px 0;text-align:left}
 td.chg{color:var(--blue);font-weight:700}
 
@@ -6790,6 +7565,7 @@ details.oks .flist{margin-top:6px}
  main[data-view] > [data-views]{grid-area:auto!important}
  main[data-view] > .wide{grid-column:1/-1}
  #sscard,.sslive{order:-1}
+ main[data-view=autotune]{grid-auto-flow:dense}
  .genres{grid-template-columns:repeat(3,minmax(0,1fr))}
  .brand{width:auto}
 }
@@ -6970,6 +7746,10 @@ details.oks .flist{margin-top:6px}
    <div><span class="lbl" data-k="tamp">Travel ±</span><select id="tamp"><option>60</option><option>80</option><option selected>100</option><option>150</option><option>200</option></select></div>
    <div><span class="lbl" data-k="tstyle">Style</span><select id="tstyle"><option value="gentle">Gentle</option><option value="normal" selected>Normal</option><option value="firm">Firm</option></select></div>
   </div>
+  <div class="frow trow">
+   <div><span class="lbl" data-k="trider">In the seat while testing</span><select id="trider" onchange="riderUI()"><option value="empty">Nobody - I ride later</option><option value="seated">Me (15 s to get in)</option></select></div>
+   <div><span class="lbl" data-k="tkg">Rider's weight</span><div class="wrow"><input type="number" id="tkg" min="0" max="550" step="1" placeholder="e.g. 180" onchange="riderUI()"><select id="tunit" onchange="riderUnit()"><option>lb</option><option>kg</option></select></div></div>
+  </div>
   <div class="chks">
    <label class="chk" data-k="tfr"><input type="checkbox" id="tfr" checked><span>PWMmin + dead zone</span></label>
    <label class="chk" data-k="tki"><input type="checkbox" id="tki" checked><span>Ki if needed</span></label>
@@ -6977,18 +7757,31 @@ details.oks .flist{margin-top:6px}
   </div>
   <div class="acts">
    <button class="btn b-green" id="tstart" data-k="tstart" onclick="tuneConfirm()">Start Auto-Tune</button>
+   <button class="btn b-blue" id="tcheck" data-k="tcheck" onclick="tuneConfirm('check')">Check</button>
    <button class="btn b-grey" id="tstop" data-k="tstop" onclick="post('/tune/abort')" disabled>Stop</button>
    <a class="btn b-grey ibtn" href="#autotune" data-k="tgear"><svg class="i" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M4.9 19.1L7 17M17 7l2.1-2.1"/></svg></a>
   </div>
+  <div class="tcd" hidden></div>
   <div id="tmini" hidden><div class="bar"><div class="tbar"></div></div><div class="muted tstage"></div></div>
  </section>
 
- <section class="card" style="grid-area:tunelog" data-views="autotune">
-  <div class="ct">Auto-tune progress</div>
+ <!-- 2.5: what auto-tune is doing, as gauges -->
+ <section class="card tlive wide" style="grid-area:tunelive" data-views="autotune">
+  <div class="ct"><svg class="i" viewBox="0 0 24 24"><path d="M3 16a9 9 0 0 1 18 0"/><path d="M12 16l4.5-5"/><circle cx="12" cy="16" r="1.3"/></svg>Auto-tune live <small id="tl_sub">idle</small></div>
+  <div class="steps" id="tl_steps"></div>
+  <div class="tcd" hidden></div>
+  <div id="tl_body"><div class="tempty">Gauges show each test while auto-tune or Check runs: how far the motor trails the test move, overshoot, settling, how far short it stops, ringing and how much drive it takes - each direction on its own.</div></div>
+ </section>
+ <section class="card" style="grid-area:tuneres" data-views="autotune">
+  <div class="ct">Result</div>
+  <div id="tresult"><div class="muted">The values auto-tune found, or what Check says, appear here.</div></div>
+ </section>
+
+ <section class="card wide" style="grid-area:tunelog" data-views="autotune">
+  <div class="ct">Auto-tune progress<button class="btn b-grey tcopy" id="tcopy" data-k="tcopy" onclick="copyLog()"><svg class="i" viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg>Copy</button></div>
   <div class="bar"><div class="tbar"></div></div>
   <div class="muted tstage">Idle - choose a motor and press Start Auto-Tune.</div>
   <pre class="log" id="tlog"></pre>
-  <div id="tresult"></div>
  </section>
 
  <!-- seat setup (v2.0, firmware 1.9) -->
@@ -7265,7 +8058,7 @@ details.oks .flist{margin-top:6px}
   <div class="cols">
    <div><h3>Every control explains itself</h3><p>Hold the mouse over any setting, button, legend entry or status item for a short note on what it does on the rig, what too low and too high feel like, and where to start.</p>
     <h3>Tuning by hand</h3><ol><li>Stop SimHub's motion output.</li><li>Set Ki 0, Kd 0, PWMmin 10-15, dead zone 2-4 and press Apply.</li><li>Run a Square test on one motor and raise Kp until the green line just stops overshooting the blue one.</li><li>Add a little Ki (5-20) only if the seat settles short of the target.</li><li>Save to EEPROM.</li></ol></div>
-   <div><h3>Auto-tune</h3><p>Measures friction (PWMmin) and pot noise (dead zone), raises Kp until it stops tracking any better, checks small road-sized moves, then adds Ki and Kd only if they help. With the motion sensor it also watches the seat, so a setting that makes the frame bounce doesn't count as calm. It stops by itself and restores the previous settings if SimHub moves the rig or anything looks wrong. Nothing is saved until you press Save to EEPROM. Every limit that judges "it moved" or "it holds still" allows for the pot's noise, and a motor is only called wired backwards when it goes the wrong way <b>both</b> ways - a seat that sinks under its weight while the drive is still too weak only goes the wrong way one way (page 2.4). If it does stop for safety, that motor is switched off with its previous settings back: fix the cause, then Enable Motors.</p>
+   <div><h3>Auto-tune</h3><p>Measures pot noise (dead zone) and friction (PWMmin), then the motor's top speed each way with one quick move. Every test after that is a <b>gradual move</b> at 60% of the slower way's top speed - a move the motor can follow, like a game's - in <b>both directions</b> (up and down for a lift, left and right for the rear slide), and each direction is judged on its own: how far the motor trails the move (lag), overshoot, settling, how far short it stops, ringing and how much of PWMmax it takes. Kp rises until the motor follows within the style's lag target both ways, or until it starts to overshoot; small sharp steps (kerb-sized) check it stays calm; Ki and Kd are added only if they help. The board has one set of values per motor, so the worse direction decides. The <b>Auto-tune live</b> gauges show each test: the needles are the two directions, the coloured band says what's good. With the seat empty and your weight entered, it allows for you (stricter overshoot, stiffer, a little Ki); <b>Check</b> with you in the seat then tests the values with your weight. With the motion sensor it also watches the seat. It stops by itself and restores the previous settings if SimHub moves the rig or anything looks wrong; Stop, Space or Esc stops it at once. Nothing is saved until you press Save to EEPROM. Every limit allows for the pot's noise, and a motor is only called wired backwards when it goes the wrong way <b>both</b> ways. If it does stop for safety, that motor is switched off with its previous settings back: fix the cause, then Enable Motors.</p>
     <h3>Profiles and recommendations</h3><p>Save the settings that suit a car or game under a name and load them later. The recommendations (circuit, rally, flight, space, trucks) adjust your own tuned settings for that kind of sim and list the SimHub settings that matter most for it. Loading applies live; save to EEPROM to make it the power-on default.</p>
     <h3>Backups</h3><p>Every Save to EEPROM, and every bigger change, keeps a copy on the NAS (EEPROM section). Switch back to any of them live, or switch and save in one go.</p></div>
    <div><h3>Motor names and the rig</h3><p>Settings, Motor names: call the motors Front left, Front right, Traction loss (or anything you like). The names appear everywhere in the page and in diagnostics files; the number stays alongside because the wiring, SimHub and the LED matrix use numbers. The same card says what <b>motor 3</b> does: on a <b>traction-loss</b> rig motors 1 and 2 lift the front corners and motor 3, mounted horizontally, swings the rear left and right about a pivot at the front; on a <b>three-lift</b> rig it lifts the rear. Seat setup, the full check, auto-tune and the 3D view follow that.</p>
@@ -7296,15 +8089,15 @@ details.oks .flist{margin-top:6px}
 </div>
 
 <div class="modal" id="mTune"><div class="box">
- <h2>Before auto-tune on <span id="mt_n"></span></h2>
+ <h2><span id="mt_what">Before auto-tune on</span> <span id="mt_n"></span></h2>
  <ul>
-  <li>SimHub's motion output is <b>stopped</b> (or the game is closed). If SimHub moves the rig, the tune stops.</li>
-  <li>The rig is clear of hands, feet, cables and pets. The motor makes repeated moves of ±<span id="mt_a"></span> counts.</li>
-  <li>Your hand is near the <b>motor power switch</b>.</li>
-  <li>For final values, <b>sit in the seat</b> in your normal position - your weight changes how the motors behave. A first run with the seat empty is a good idea.</li>
-  <li>Takes about 2-3 minutes. Nothing is saved until you press <b>Save to EEPROM</b>; <b>Revert</b> undoes it.</li>
+  <li>SimHub's motion output is <b>stopped</b> (or the game is closed). If SimHub moves the rig, the test stops.</li>
+  <li>The rig is clear of hands, feet, cables and pets. The motor makes repeated moves of ±<span id="mt_a"></span> counts, each way.</li>
+  <li id="mt_seat">Your hand is near the <b>motor power switch</b>.</li>
+  <li id="mt_rider"></li>
+  <li id="mt_time">Takes about 2-3 minutes. Nothing is saved until you press <b>Save to EEPROM</b>; <b>Revert</b> undoes it.</li>
  </ul>
- <div style="display:flex;gap:10px;margin-top:12px"><button class="btn b-green" onclick="tuneStart()">Start auto-tune</button><button class="btn b-grey" onclick="closeModal('mTune')">Cancel</button></div>
+ <div style="display:flex;gap:10px;margin-top:12px"><button class="btn b-green" id="mt_go" onclick="tuneStart()">Start auto-tune</button><button class="btn b-grey" onclick="closeModal('mTune')">Cancel</button></div>
 </div></div>
 
 <div class="modal" id="mFw"><div class="box">
@@ -7362,15 +8155,19 @@ const TIPS={
  p_tri:"Triangle, ±150, 3 s cycle - constant speed, shows PWMmin flat spots when direction changes.",
  p_step:"One step: moves to Offset + Amplitude and holds there.",
  p_manual:"Moves to the Offset and holds there.",
- tune:"<b>Auto-tune</b> finds settings for one motor by testing it: friction (PWMmin), pot noise (dead zone), then Kp from low to high until it stops tracking better, then Ki and Kd only if they help. Applied live; nothing is saved until you press Save to EEPROM. Needs firmware 1.4 or newer.",
+ tune:"<b>Auto-tune</b> finds settings for one motor by testing it both ways (up and down, or left and right): friction (PWMmin), pot noise (dead zone), its top speed, then Kp from low to high on gradual test moves the motor can follow, until it follows closely or starts to overshoot, then Ki and Kd only if they help. Applied live; nothing is saved until you press Save to EEPROM. Needs firmware 1.4 or newer.",
  tmotor:"Motor to tune. Tune them one at a time.",
- tamp:"Size of the test moves, in counts either side of centre. Bigger moves give a more realistic tune but move you more. 80-150 is sensible; it is reduced automatically if the Clip window is narrow.",
+ tamp:"Size of the test moves, in counts either side of centre - each way. Bigger moves give a more realistic tune but move you more. 80-150 is sensible; it is reduced automatically if the Clip window is narrow.",
  tstyle:"How the sweet spot is picked: the <b>lowest</b> Kp that tracks almost as well as the best one.<br><br><b>Gentle</b> - smoothest (within 30% of the best response, ~5% overshoot).<br><b>Normal</b> - balanced (15%, ~10%).<br><b>Firm</b> - snappiest, more road detail (5%, ~15%).<br><br>Whatever the style, it never leaves the seat more than 12 counts short.",
  tfr:"Measure the minimum drive that moves the motor (PWMmin) and the pot noise (dead zone). Leave on unless you want to keep your own values.",
  tki:"Add Ki only if the motor settles short of the target (usually lifting your weight).",
  tkd:"Try a little damping (Kd with Ks 4) and keep it only if it clearly reduces overshoot without adding noise.",
  tstart:"Shows a short checklist, then starts. Takes about 2-3 minutes.",
- tstop:"Stops the auto-tune at once and puts back the settings the motor had before.",
+ tstop:"Stops the auto-tune or check at once and puts back the settings the motor had before. Space or Esc on the page does the same.",
+ tcheck:"<b>Check</b> tests the values the motor has <b>now</b> - test moves both ways and small steps - and says what to change. Nothing is changed. Tuned with the seat empty? Choose <b>Me</b> under In the seat and check with your weight on it. About 30 s.",
+ trider:"<b>Nobody</b>: the seat is empty while it tests. With your weight entered, auto-tune allows for it: a stricter overshoot limit (your weight carries further), a stiffer Kp (the motor is slower lifting you), slower test moves and a little Ki. Estimates - run Check with you in the seat afterwards.<br><br><b>Me</b>: you sit in the seat while it tests - the real thing. After Start you get 15 s to get in; Stop, Space or Esc ends it.",
+ tkg:"Your weight, so auto-tune can allow for it when the seat is empty. Leave it empty to tune for the empty seat. Not needed when you're in the seat.",
+ tcopy:"Copies the whole log and the result as text, to paste into a message or a forum post.",
  tgear:"Opens the Auto-Tune section with the full log and results.",
  trevert:"Puts back the settings this motor had before the auto-tune.",
  pause:"Freezes the charts so you can look at a moment. Data keeps recording; press again to continue.",
@@ -7576,7 +8373,7 @@ function applyTheme(t){const eff=t==='auto'?(mq.matches?'light':'dark'):t;docume
  document.querySelectorAll('[data-theme-set]').forEach(b=>b.classList.toggle('on',b.dataset.themeSet===t));draw();}
 mq.addEventListener('change',()=>applyTheme(cfg.theme||'dark'));
 document.querySelectorAll('[data-theme-set]').forEach(b=>b.onclick=async()=>{cfg.theme=b.dataset.themeSet;applyTheme(cfg.theme);cfg=await post('/config',{theme:cfg.theme});});
-async function loadConfig(){cfg=await (await fetch('/config')).json();MNAMES=(cfg.motor_names||['','','']).slice(0,3);applyTheme(cfg.theme||'dark');applyMotorCount();
+async function loadConfig(){cfg=await (await fetch('/config')).json();MNAMES=(cfg.motor_names||['','','']).slice(0,3);applyTheme(cfg.theme||'dark');applyMotorCount();riderFill();
  if(curView==='settings')fillSettings();              // opened straight on Settings: fill the form with what was loaded
  if(typeof v3LoadGeom==='function'&&V3)V3.layout(v3Geom);}
 
@@ -7935,25 +8732,169 @@ async function backupRestore(inp){const f=inp.files[0];inp.value='';if(!f)return
  }catch(e){$('eemsg').innerHTML='<span class="badc">That file can\'t be used: '+esc(e.message)+'.</span>';}}
 
 // ---------- auto-tune ----------
-function tuneConfirm(){$('mt_n').textContent=mfull(+$('tm').value);$('mt_a').textContent=$('tamp').value;openModal('mTune');}
-async function tuneStart(){closeModal('mTune');const r=await post('/tune/start',{motor:+$('tm').value,amp:+$('tamp').value,style:$('tstyle').value,friction:$('tfr').checked,ki:$('tki').checked,kd:$('tkd').checked});if(!r.ok)alert(r.error);}
+// 2.5: who's in the seat (and the rider's weight, kept in kg on the NAS), Check, live gauges, copy the log
+const KG_LB=0.45359237;
+const kgTxt=(kg,u)=>u==='kg'?Math.round(kg)+' kg':Math.round(kg/KG_LB)+' lb';
+function riderFill(){if(!cfg||riderFill.done)return;riderFill.done=true;const u=cfg.rider_unit==='kg'?'kg':'lb',kg=+cfg.rider_kg||0;
+ $('trider').value=cfg.rider_mode==='seated'?'seated':'empty';$('tunit').value=u;$('tunit').dataset.u=u;$('tkg').value=kg?Math.round(u==='lb'?kg/KG_LB:kg):'';riderUI();}
+function riderUnit(){const u=$('tunit').value,prev=$('tunit').dataset.u||'lb',v=+$('tkg').value;
+ if(prev!==u&&v)$('tkg').value=Math.round(u==='kg'?v*KG_LB:v/KG_LB);$('tunit').dataset.u=u;riderUI();}
+function riderUI(){const seated=$('trider').value==='seated';$('tkg').disabled=seated;$('tunit').disabled=seated;}
+function riderKg(){const v=Math.max(0,+$('tkg').value||0);return $('tunit').value==='lb'?v*KG_LB:v;}
+function tuneConfirm(mode){const chk=mode==='check';tuneConfirm.mode=chk?'check':'tune';const seated=$('trider').value==='seated',v=+$('tkg').value||0,u=$('tunit').value;
+ $('mt_what').textContent=chk?'Before checking':'Before auto-tune on';$('mt_n').textContent=mfull(+$('tm').value)+(chk?"'s values":'');$('mt_a').textContent=$('tamp').value;
+ $('mt_seat').innerHTML=seated?'<b>You will be in the seat.</b> After Start you have <b>15 s</b> to get in - sit as you do when you drive, feet and hands clear of moving parts. <b>Stop</b>, <b>Space</b> or <b>Esc</b> on this page ends it at once; keep the motor power switch in reach too.':'Your hand is near the <b>motor power switch</b>.';
+ $('mt_rider').innerHTML=chk?(seated?'It tests the values the motor has now <b>with you in the seat</b> and says what to change.':'It tests the values the motor has now, with the seat as it is. After tuning with the seat empty, choose <b>Me</b> so it tests with your weight.'):
+  (seated?'Your weight is measured, not guessed: these are the values to keep.':(v?`The seat is empty, so it allows for a <b>${v} ${u}</b> rider: stiffer, less overshoot, a little Ki. Run <b>Check</b> with you in the seat afterwards.`:'The seat is empty and no rider weight is set, so the values suit the empty seat. Enter your weight to allow for it, or choose <b>Me</b> to tune with you in the seat.'));
+ $('mt_time').innerHTML=chk?'Takes about 30 s. Nothing is changed.':'Takes about 2-3 minutes. Nothing is saved until you press <b>Save to EEPROM</b>; <b>Revert</b> undoes it.';
+ $('mt_go').textContent=chk?'Start check':'Start auto-tune';openModal('mTune');}
+async function tuneStart(){closeModal('mTune');
+ const r=await post('/tune/start',{motor:+$('tm').value,amp:+$('tamp').value,style:$('tstyle').value,friction:$('tfr').checked,ki:$('tki').checked,kd:$('tkd').checked,
+  rider:$('trider').value,rider_kg:riderKg(),rider_unit:$('tunit').value,mode:tuneConfirm.mode||'tune'});if(!r.ok)alert(r.error);else tunePoll.fast=6;}
+// Space or Esc stops a running auto-tune or check (you may be in the seat)
+document.addEventListener('keydown',e=>{if(!tuneRunning||curView==='seat')return;const tg=(e.target&&e.target.tagName)||'';
+ if(e.key==='Escape'||(e.key===' '&&!/INPUT|SELECT|TEXTAREA|BUTTON/.test(tg))){e.preventDefault();post('/tune/abort');toast('Stopping.');}});
 const NAMES={kp:'Kp',ki:'Ki',kd:'Kd',ks:'Ks',pwmmin:'PWMmin',dz:'Dead zone'};
+let tuneLast=null;
 async function tunePoll(){
- try{const s=await (await fetch('/tune/status')).json();tuneRunning=s.state==='running';
+ try{const s=await (await fetch('/tune/status')).json();tuneRunning=s.state==='running';tuneLast=s;const chk=s.mode==='check';
   const tm2=tuneRunning?s.motor-1:null;if(tm2!==tuneMotor){tuneMotor=tm2;if(tm2!=null)setSel(tm2);else updateSelUI();}
-  lockAp();$('tstart').disabled=tuneRunning||diagBusy;$('tstop').disabled=!tuneRunning;
+  lockAp();$('tstart').disabled=$('tcheck').disabled=tuneRunning||diagBusy;$('tstop').disabled=!tuneRunning;
   document.querySelectorAll('.tbar').forEach(b=>b.style.width=(s.progress||0)+'%');
-  const label={idle:'Idle - choose a motor and press Start Auto-Tune.',running:mfull(s.motor-1)+': '+s.stage,done:'Finished '+mfull(s.motor-1)+'.',aborted:'Stopped.',error:'Error - see the log.'}[s.state]||s.state;
+  const what=chk?'Check of '+mfull(s.motor-1)+"'s values":mfull(s.motor-1);
+  const label={idle:'Idle - choose a motor and press Start Auto-Tune.',running:what+': '+s.stage,done:'Finished '+(chk?'the check of '+mfull(s.motor-1)+"'s values":mfull(s.motor-1))+'.',aborted:'Stopped.',error:'Error - see the log.'}[s.state]||s.state;
   document.querySelectorAll('.tstage').forEach(e=>e.textContent=label);$('tmini').hidden=s.state==='idle';
+  const cd=s.countdown;document.querySelectorAll('.tcd').forEach(e=>{e.hidden=!cd;const h=cd?`<div class="ccount" role="status"><b>${cd}</b><span><b>Get in the seat.</b> The test starts in ${cd} s - Stop, Space or Esc ends it.</span></div>`:'';if(e.dataset.h!==h){e.innerHTML=h;e.dataset.h=h;}});
   const lg=$('tlog'),atEnd=lg.scrollTop+lg.clientHeight>=lg.scrollHeight-5,t=nameify(s.log.join('\n'));if(lg.textContent!==t){lg.textContent=t;if(atEnd)lg.scrollTop=lg.scrollHeight;}
-  let h='';if(s.result){const r=s.result;h='<table class="res"><tr><th>'+esc(mfull(r.motor-1))+'</th><th>before</th><th>after</th></tr>';
-   for(const k of Object.keys(NAMES)){const a=r.before[k],b=r.after[k];h+=`<tr><td>${NAMES[k]}</td><td>${a}</td><td class="${a!==b?'chg':''}">${b}</td></tr>`;}h+='</table>';}
-  if(s.can_revert)h+='<div style="display:flex;gap:10px"><button class="btn b-grey" data-k="trevert" onclick="tuneRevert()">Revert</button><button class="btn b-red" data-k="sav" onclick="saveEeprom()">Save to EEPROM</button></div>';
-  if($('tresult').dataset.h!==h){$('tresult').innerHTML=h;$('tresult').dataset.h=h;tipAttach($('tresult'));}
+  const h=tuneResultHtml(s);if($('tresult').dataset.h!==h){$('tresult').innerHTML=h;$('tresult').dataset.h=h;tipAttach($('tresult'));}
+  tlRender(s);
   if(s.state!=='running'&&s.state!=='idle'&&!tunePoll.reread){tunePoll.reread=true;readParams();}if(s.state==='running')tunePoll.reread=false;
  }catch(e){}
- setTimeout(tunePoll,700);}
+ setTimeout(tunePoll,tuneRunning||tunePoll.fast-->0?500:900);}
 async function tuneRevert(){await post('/tune/revert');readParams();}
+
+// the result: what changed, each direction's final figures, notes - or the check's verdict
+function dirRows(D,dirs,small,pm){const f=(v,d,u)=>v==null?'-':(+v).toFixed(d)+u;
+ let h='<table class="tdirs"><tr><th></th><th>lag</th><th>overshoot</th><th>settle</th><th>off by</th><th>drive</th><th title="small ±15 steps: overshoot · off by">small</th></tr>';
+ for(const d of D){const r=dirs[d.k]||{},q=(small||{})[d.k]||{};
+  h+=`<tr><td><span class="${d.cls}">${d.sym}</span> ${esc(d.name)}</td><td>${f(r.lag_ms,0,' ms')}</td><td>${f(r.os,0,'%')}</td><td>${f(r.settle,0,' ms')}</td><td>${f(r.sse,1,'')}</td><td>${r.drive!=null&&pm?Math.round(100*r.drive/pm)+'%':'-'}</td><td>${q.os!=null?f(q.os,0,'%')+' · '+f(q.sse,1,''):'-'}</td></tr>`;}
+ return h+'</table>';}
+function resDirs(r){const n=r.names||{p:'higher',m:'lower'},sy={up:'▲',down:'▼',left:'◀',right:'▶',higher:'▲',lower:'▼'};
+ const ord=(n.m==='up'||n.m==='left')?['m','p']:['p','m'];return ord.map((k,i)=>({k,name:n[k],sym:sy[n[k]]||'',cls:i?'db':'da'}));}
+function tuneResultHtml(s){let h='';const r=s.result;
+ if(r&&r.check){const D=resDirs(r);
+  h=`<div class="tverd ${r.ok?'ok':'bad'}"><b class="gs ${r.ok?'good':'warn'}">${r.ok?'✓':'!'}</b> <b>${esc(mfull(r.motor-1))}:</b> ${r.ok?'these values work'+(r.seated?' with you in the seat.':'.'):esc(r.issues.join('; '))+'.'}`+
+   (r.suggest&&r.suggest.length?'<ul>'+r.suggest.map(x=>'<li>'+esc(x)+'</li>').join('')+'</ul>':'')+'</div>';
+  h+=dirRows(D,r.dirs||{},r.small,(r.values||{}).pwmmax);
+  h+=`<div class="muted" style="font-size:12.5px">Kp ${r.values.kp}, Ki ${r.values.ki}, Kd ${r.values.kd}, PWMmin ${r.values.pwmmin}, PWMmax ${r.values.pwmmax}, dead zone ${r.values.dz}. Test moves at ${r.ramp_v} counts/s.</div>`;}
+ else if(r){h='<table class="res"><tr><th>'+esc(mfull(r.motor-1))+'</th><th>before</th><th>after</th></tr>';
+  for(const k of Object.keys(NAMES)){const a=r.before[k],b=r.after[k];h+=`<tr><td>${NAMES[k]}</td><td>${a}</td><td class="${a!==b?'chg':''}">${b}</td></tr>`;}h+='</table>';
+  if(r.dirs){h+='<div class="muted" style="font-size:12.5px;margin-top:-4px">Final test, each way (gradual moves at '+r.ramp_v+' counts/s):</div>'+dirRows(resDirs(r),r.dirs,r.small,r.pwmmax);}
+  if(r.notes&&r.notes.length)h+='<ul style="margin:0 0 10px;padding-left:18px;font-size:13px">'+r.notes.map(x=>'<li>'+esc(x)+'</li>').join('')+'</ul>';}
+ if(s.can_revert){const rm=s.revert_motor;h+=`<div style="display:flex;gap:10px;flex-wrap:wrap"><button class="btn b-grey" data-k="trevert" onclick="tuneRevert()">Revert${r&&r.check&&rm?' '+esc(mshort(rm-1)):''}</button><button class="btn b-red" data-k="sav" onclick="saveEeprom()">Save to EEPROM</button></div>`;}
+ return h||'<div class="muted">The values auto-tune found, or what Check says, appear here.</div>';}
+function resultText(s){const r=s.result;if(!r)return'';const D=resDirs(r),L=[];
+ const fig=x=>x?`lag ${x.lag_ms==null?'-':Math.round(x.lag_ms)+' ms'}, overshoot ${Math.round(x.os)}%, settle ${Math.round(x.settle)} ms, off by ${(+x.sse).toFixed(1)}`:'-';
+ if(r.check){L.push(`Check of ${mfull(r.motor-1)}: `+(r.ok?'these values work.':r.issues.join('; ')+'.'));(r.suggest||[]).forEach(x=>L.push('  Suggestion: '+x));
+  L.push(`  Values: Kp ${r.values.kp}, Ki ${r.values.ki}, Kd ${r.values.kd}, Ks ${r.values.ks}, PWMmin ${r.values.pwmmin}, PWMmax ${r.values.pwmmax}, dead zone ${r.values.dz}`);}
+ else{L.push(`Result for ${mfull(r.motor-1)} (not saved until Save to EEPROM):`);for(const k of Object.keys(NAMES))L.push(`  ${NAMES[k]}: ${r.before[k]} -> ${r.after[k]}`);(r.notes||[]).forEach(x=>L.push('  Note: '+x));}
+ for(const d of D)L.push(`  ${d.name}: ${fig((r.dirs||{})[d.k])}`);return L.join('\n');}
+async function copyText(t){try{if(navigator.clipboard&&window.isSecureContext){await navigator.clipboard.writeText(t);return true;}}catch(e){}
+ // the page is served over plain http from the NAS, where the clipboard API is off: copy through a hidden text box
+ const ta=document.createElement('textarea');ta.value=t;ta.setAttribute('readonly','');ta.style.cssText='position:fixed;top:0;left:0;width:2px;height:2px;opacity:0';
+ document.body.appendChild(ta);ta.focus();ta.select();ta.setSelectionRange(0,t.length);let ok=false;try{ok=document.execCommand('copy');}catch(e){}ta.remove();return ok;}
+async function copyLog(){const s=tuneLast||{};let t=nameify((s.log||[]).join('\n'));const rt=resultText(s);if(rt)t+='\n\n'+nameify(rt);
+ if(!t.trim()){toast('Nothing to copy yet - the log is empty.');return;}
+ const b=$('tcopy'),ok=await copyText(t);
+ if(ok){b.classList.add('okc');b.lastChild.textContent='Copied';clearTimeout(copyLog.h);copyLog.h=setTimeout(()=>{b.classList.remove('okc');b.lastChild.textContent='Copy';},1800);}
+ else{const sel=window.getSelection(),rg=document.createRange();rg.selectNodeContents($('tlog'));sel.removeAllRanges();sel.addRange(rg);toast('The browser blocked copying, so the log is selected: press Ctrl+C.');}}
+
+// ---- live gauges (2.5) ----
+const GSYM={up:'▲',down:'▼',left:'◀',right:'▶',higher:'▲',lower:'▼'};
+function tlDirs(lv){const d=lv.dirs||{p:{name:'higher',sym:'▲'},m:{name:'lower',sym:'▼'},order:['p','m']};return d.order.map((k,i)=>({k,name:d[k].name,sym:d[k].sym,cls:i?'db':'da'}));}
+function mark(sym,x,y,cls,s){s=s||5;const p={'▲':`M${x},${y-s}L${x+s},${y+s*.8}L${x-s},${y+s*.8}Z`,'▼':`M${x},${y+s}L${x+s},${y-s*.8}L${x-s},${y-s*.8}Z`,'◀':`M${x-s},${y}L${x+s*.8},${y-s}L${x+s*.8},${y+s}Z`,'▶':`M${x+s},${y}L${x-s*.8},${y-s}L${x-s*.8},${y+s}Z`}[sym]||`M${x-s},${y}a${s},${s} 0 1 0 ${2*s},0a${s},${s} 0 1 0 ${-2*s},0`;
+ return `<path class="${cls}" d="${p}" fill="currentColor" stroke="var(--chart)" stroke-width="1.5"/>`;}
+function legendHtml(D){return '<span class="dleg">'+D.map(d=>`<span><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true">${mark(d.sym,6,6,d.cls,5)}</svg>${esc(d.name)}</span>`).join('')+'</span>';}
+function gstat(v,g){return v==null?'none':(v<=g.good?'good':(v<=g.warn?'warn':'bad'));}
+function gaugeList(L,lv,D){const T=lv.targets||{},step=L&&L.move==='step',small=L&&L.kind==='small',pm=(lv.now||{}).pwmmax||255;
+ const v=k=>D.map(d=>L&&L[d.k]?L[d.k][k]:null),lt=T.lag_ms||80,ot=small?15:(T.os||10),ow=small?35:2*(T.os||10),se=T.sse||5;
+ const g=[];
+ if(step)g.push({k:'rise',t:'Rise',u:'ms',vals:v('rise'),good:150,warn:300,max:450,w:['quick','slow','very slow'],miss:!!L&&v('rise').some(x=>x==null)});
+ else g.push({k:'lag',t:'Lag',u:'ms',vals:v('lag_ms'),good:lt,warn:2*lt,max:3*lt,w:['good','slowish','slow']});
+ g.push({k:'os',t:'Overshoot',u:'%',vals:v('os'),good:ot,warn:ow,max:small?50:Math.max(30,Math.ceil(3*ot/5)*5),w:['good','some','too much']});
+ g.push({k:'settle',t:'Settle',u:'ms',vals:v('settle'),good:500,warn:1000,max:1500,w:['quick','slow','very slow']});
+ g.push({k:'sse',t:'Off by',u:'counts',vals:v('sse'),good:se,warn:2*se,max:4*se,dec:1,w:['close','short','far short']});
+ g.push({k:'osc',t:'Ringing',u:'swings',vals:v('osc'),good:1,warn:2,max:4,w:['calm','some','rings']});
+ g.push({k:'drive',t:'Drive',u:'% PWMmax',vals:step?[null,null]:v('drive').map(x=>x==null?null:100*x/pm),good:75,warn:92,max:100,w:['headroom','high','at max'],na:step?'not for steps':null});
+ return g;}
+function gaugeHtml(g,D){const cx=70,cy=64,R=57,r=47,P=(f,rr)=>[(cx-rr*Math.cos(Math.PI*f)).toFixed(1),(cy-rr*Math.sin(Math.PI*f)).toFixed(1)];
+ const arc=(f1,f2,rr)=>`M${P(f1,rr)}A${rr},${rr} 0 0 1 ${P(f2,rr)}`,cl=x=>Math.max(0,Math.min(1,x));
+ const zg=cl(g.good/g.max),zw=cl(g.warn/g.max),gap=.008;
+ let sv=`<path d="${arc(0,1,r)}" fill="none" stroke="var(--line)" stroke-width="9"/>`;
+ sv+=`<path d="${arc(0,Math.max(0,zg-gap),R)}" fill="none" stroke="var(--st-good)" stroke-width="5" opacity=".85"/>`;
+ if(zw>zg)sv+=`<path d="${arc(zg+gap,Math.max(zg+gap,zw-gap),R)}" fill="none" stroke="var(--st-warn)" stroke-width="5" opacity=".85"/>`;
+ if(zw<1)sv+=`<path d="${arc(zw+gap,1,R)}" fill="none" stroke="var(--st-bad)" stroke-width="5" opacity=".85"/>`;
+ sv+=`<text x="${cx-R}" y="${cy+13}" font-size="9.5" fill="var(--faint)" text-anchor="middle">0</text><text x="${cx+R}" y="${cy+13}" font-size="9.5" fill="var(--faint)" text-anchor="middle">${g.max}</text>`;
+ const vals=g.vals.map(x=>x==null||isNaN(x)?null:+x);
+ vals.forEach((x,i)=>{if(x==null)return;const f=cl(x/g.max),[x2,y2]=P(f,r+3);sv+=`<line class="${D[i].cls}" x1="${cx}" y1="${cy}" x2="${x2}" y2="${y2}" stroke="currentColor" stroke-width="3" stroke-linecap="round"/>`;});
+ sv+=`<circle cx="${cx}" cy="${cy}" r="5" fill="var(--text)"/>`;
+ const have=vals.filter(x=>x!=null),worst=g.miss?null:(have.length?Math.max(...have):null),st=g.na?'none':(g.miss?'bad':gstat(worst,g));
+ const fmt=x=>x==null?'-':(g.dec?x.toFixed(g.dec):Math.round(x));
+ // rise: a way that never got 90% of the way there is the worst case, whatever the other way did
+ const word=g.na?g.na:(g.miss?'✕ never got there':(worst==null?'-':({good:'✓ ',warn:'! ',bad:'✕ '}[st]+g.w[{good:0,warn:1,bad:2}[st]])));
+ const aria=`${g.t}: `+D.map((d,i)=>`${d.name} ${fmt(vals[i])} ${g.u}`).join(', ')+`; good up to ${g.good}`;
+ return `<div class="gauge" data-g="${g.k}"><h5>${g.t}</h5><svg viewBox="0 0 140 82" role="img" aria-label="${esc(aria)}">${sv}</svg>`+
+  `<div class="gv">${fmt(worst)}<small> ${g.u}</small></div><div class="gs ${st}">${esc(word)}</div>`+
+  `<div class="gd">${D.map((d,i)=>`<span><span class="${d.cls}">${d.sym}</span> ${fmt(vals[i])}</span>`).join('')}</div></div>`;}
+function niceMax(v){const e=Math.pow(10,Math.floor(Math.log10(v))),m=v/e;return [1,1.2,1.5,2,2.5,3,4,5,6,8,10].find(x=>x>=m-1e-9)*e;}
+function sweepSvg(rows,key,D,target,chosen){const W=330,H=160,L=36,R=12,T=14,B=26,n=rows.length,pw=W-L-R,ph=H-T-B;
+ const vals=rows.flatMap(r=>D.map(d=>r[d.k]?r[d.k][key]:null)).filter(v=>v!=null);
+ const ymax=niceMax(Math.max(1,...vals,target*1.25)),X=i=>L+pw*(i+.5)/n,Y=v=>T+ph*(1-Math.min(v,ymax)/ymax);
+ let sv='';
+ for(const t of [0,ymax/2,ymax]){const y=Y(t).toFixed(1);sv+=`<line x1="${L}" x2="${W-R}" y1="${y}" y2="${y}" stroke="var(--grid)" stroke-width="1"/><text x="${L-5}" y="${+y+3.5}" font-size="10" fill="var(--axis)" text-anchor="end" style="font-variant-numeric:tabular-nums">${+t.toFixed(1)}</text>`;}
+ const ci=rows.findIndex(r=>r.kp===chosen);
+ if(ci>=0){const cw=pw/n;sv+=`<rect x="${(X(ci)-cw/2).toFixed(1)}" y="${T-2}" width="${cw.toFixed(1)}" height="${ph+2}" fill="var(--blue)" opacity=".13" rx="3"/><text x="${X(ci).toFixed(1)}" y="${T-4}" font-size="9.5" fill="var(--text)" text-anchor="middle">chosen</text>`;}
+ if(target){const y=Y(target).toFixed(1);sv+=`<line x1="${L}" x2="${W-R}" y1="${y}" y2="${y}" stroke="var(--dim)" stroke-width="1" stroke-dasharray="4 3"/><text x="${W-R}" y="${+y-3}" font-size="9.5" fill="var(--dim)" text-anchor="end">target ${target}</text>`;}
+ const ends=[];
+ D.forEach(d=>{let seg=[],paths=[];rows.forEach((r,i)=>{const v=r[d.k]?r[d.k][key]:null;if(v==null){if(seg.length)paths.push(seg);seg=[];}else seg.push([X(i),Y(v)]);});if(seg.length)paths.push(seg);
+  paths.forEach(p=>{if(p.length>1)sv+=`<polyline class="${d.cls}" points="${p.map(q=>q.map(z=>z.toFixed(1)).join(',')).join(' ')}" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>`;});
+  rows.forEach((r,i)=>{const v=r[d.k]?r[d.k][key]:null;if(v!=null)sv+=mark(d.sym,X(i),Y(v),d.cls,4.5);});
+  const li=rows.map((r,i)=>r[d.k]&&r[d.k][key]!=null?i:-1).filter(i=>i>=0).pop();if(li!=null)ends.push({d,y:Y(rows[li][d.k][key]),x:X(li)});});
+ const step=Math.ceil(n/9);rows.forEach((r,i)=>{if(i%step===0||i===ci)sv+=`<text x="${X(i).toFixed(1)}" y="${H-B+14}" font-size="10" fill="${i===ci?'var(--text)':'var(--axis)'}" text-anchor="middle" style="font-variant-numeric:tabular-nums">${r.kp}</text>`;});
+ sv+=`<text x="${W-R}" y="${H-2}" font-size="9.5" fill="var(--axis)" text-anchor="end">Kp</text>`;
+ const cw=pw/n;rows.forEach((r,i)=>{sv+=`<rect class="hit" data-i="${i}" x="${(X(i)-cw/2).toFixed(1)}" y="${T}" width="${cw.toFixed(1)}" height="${ph}" fill="transparent"/>`;});
+ return `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="${esc(key)} for each Kp tried">${sv}</svg>`;}
+function sweepTip(r,D,lt){const f=(x,d,u)=>x==null?'-':(+x).toFixed(d)+u;
+ return `<b>Kp ${r.kp}</b> ${r.good?'<span class="gs good">✓ calm</span>':'<span class="gs bad">✕ not chosen: too lively or too far off</span>'}`+D.map(d=>{const q=r[d.k]||{};
+  return `<br><span class="${d.cls}">${d.sym}</span> ${esc(d.name)}: lag ${f(q.lag_ms,0,' ms')}, over ${f(q.os,0,'%')}, settle ${f(q.settle,0,' ms')}, off by ${f(q.sse,1,'')}`+(q.behind?', falls behind':'');}).join('');}
+function tlRender(s){const lv=s.live||{},key=JSON.stringify([s.state,s.mode,s.motor,lv]);if(tlRender.k===key)return;tlRender.k=key;
+ $('tl_sub').textContent=s.state==='idle'||!lv.phases?'idle':(s.mode==='check'?'Check':'Auto-tune')+' - '+mfull(s.motor-1)+(s.state==='running'?'':' ('+({done:'finished',aborted:'stopped',error:'error'}[s.state]||s.state)+')');
+ const ph=lv.phases||[],cur=lv.phase,ci=ph.findIndex(p=>p[0]===cur),fin=s.state==='done';
+ $('tl_steps').innerHTML=ph.map((p,i)=>`<span class="${fin||i<ci?'done':(i===ci&&s.state==='running'?'on':'')}">${esc(p[1])}</span>`).join('');
+ if(!lv.phases){return;}
+ const D=tlDirs(lv),L=lv.last;let h='';
+ if(lv.now){const on={kp:'kp',ki:'ki',kd:'kd',pwmmin:'pwmmin',speed:'kp'}[cur];
+  h+='<div class="tnow"><span style="border:0;background:none;padding-left:0">running now:</span>'+[['kp','Kp'],['ki','Ki'],['kd','Kd'],['ks','Ks'],['pwmmin','PWMmin'],['pwmmax','PWMmax'],['dz','Dead zone']].map(([k,l])=>`<span class="${k===on&&s.state==='running'?'on':''}">${l} <b>${lv.now[k]??'-'}</b></span>`).join('')+'</div>';}
+ h+=`<div class="thead"><b>${L?esc(L.label):'Waiting for the first test move'}</b><span class="muted">${L?(L.move==='ramp'?'gradual moves at '+((lv.speed||{}).ramp||'-')+' counts/s':'sharp steps (like a kerb)'):''}</span>${legendHtml(D)}</div>`;
+ h+='<div class="gauges">'+gaugeList(L,lv,D).map(g=>gaugeHtml(g,D)).join('')+'</div>';
+ // facts: pot noise, minimum drive, top speed, who's in the seat
+ const nz=lv.noise,pw=lv.pwmmin,sp=lv.speed,rd=lv.rider||{};
+ h+='<div class="tfacts">';
+ h+=`<div class="tfact">Pot noise<b>${nz?'±'+nz.sd.toFixed(2)+' counts':'-'}</b>${nz?'dead zone '+((lv.now||{}).dz??'-')+(nz.glitchy?' · <span class="gs warn">! glitches</span>':''):''}</div>`;
+ if(pw){const pos=x=>Math.max(0,Math.min(100,100*x/Math.max(1,pw.cap)));
+  h+=`<div class="tfact">Minimum drive (PWMmin)<b>${D.map(d=>`<span class="${d.cls}">${d.sym}</span> ${pw[d.k]??'…'}`).join(' &nbsp; ')}</b><div class="mm" role="img" aria-label="PWM tried ${pw.trying} of ${pw.cap}">${cur==='pwmmin'&&s.state==='running'?`<i style="left:${pos(pw.trying)}%"></i>`:''}${D.map(d=>pw[d.k]!=null?`<em class="${d.cls}" style="left:${pos(pw[d.k])}%">${d.sym}</em>`:'').join('')}</div>${cur==='pwmmin'&&s.state==='running'?'trying PWM '+pw.trying:'0 - '+pw.cap}</div>`;}
+ h+=`<div class="tfact">Top speed<b>${sp?D.map(d=>`<span class="${d.cls}">${d.sym}</span> ${sp[d.k]??'-'}`).join(' &nbsp; ')+' <small class="muted">counts/s</small>':'-'}</b>${sp?'tests at '+sp.ramp+' counts/s ('+sp.share+'%)':''}</div>`;
+ h+=`<div class="tfact">In the seat<b>${rd.mode==='seated'?'You':'Nobody'}</b>${rd.mode==='seated'?'measured with your weight':(lv.check?'checks the seat as it is':(rd.kg?'allowing for '+kgTxt(rd.kg,rd.unit):'tuned for the empty seat'))}</div>`;
+ h+='</div>';
+ const sw=lv.sweep||[];
+ if(sw.length){const T=lv.targets||{};
+  h+=`<div class="tcharts"><div class="tchart" data-c="lag_ms"><h5>Lag behind the test move (ms), each Kp tried</h5>${sweepSvg(sw,'lag_ms',D,T.lag_ms,lv.chosen)}</div>`+
+     `<div class="tchart" data-c="os"><h5>Overshoot (%), each Kp tried</h5>${sweepSvg(sw,'os',D,T.os,lv.chosen)}</div></div>`;}
+ $('tl_body').innerHTML=h;
+ $('tl_body').querySelectorAll('.tchart').forEach(c=>{const tip=document.createElement('div');tip.className='ttip';tip.hidden=true;c.appendChild(tip);
+  c.querySelectorAll('.hit').forEach(el=>{const show=()=>{const r=sw[+el.dataset.i];tip.innerHTML=sweepTip(r,D);tip.hidden=false;const cb=c.getBoundingClientRect(),eb=el.getBoundingClientRect();
+    let x=eb.left-cb.left+eb.width/2+10;tip.style.left=x+'px';tip.style.top='26px';if(x+tip.offsetWidth>cb.width-4)tip.style.left=Math.max(4,eb.left-cb.left-tip.offsetWidth-6)+'px';};
+   el.addEventListener('mouseenter',show);el.addEventListener('mouseleave',()=>tip.hidden=true);});});}
 
 // ---------- diagnostics ----------
 const FIC={fail:'✕',warn:'!',info:'i',ok:'✓'};
@@ -8995,23 +9936,31 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 motor = int(req.get("motor", 0)) % 3
                 amp = int(max(40, min(400, float(req.get("amp", 100)))))
+                kg = max(0.0, min(250.0, float(req.get("rider_kg") or 0)))
             except (TypeError, ValueError):
                 self._json({"ok": False, "error": "bad parameters"})
                 return
+            mode = "check" if req.get("mode") == "check" else "tune"
+            rider = "seated" if req.get("rider") == "seated" else "empty"
+            unit = "kg" if req.get("rider_unit") == "kg" else "lb"
             if self.diag.running():
                 self._json({"ok": False, "error": "The diagnostics check is running - wait or stop it first."})
                 return
             if self.seat.state != "idle":
                 self._json({"ok": False, "error": "Seat setup is open - finish or cancel it first."})
                 return
-            if not self.tuner.running() and self.board.connected:
+            self.cfg.update(rider_mode=rider, rider_kg=round(kg, 1), rider_unit=unit)
+            if mode == "tune" and not self.tuner.running() and self.board.connected:
                 self.backups.add("auto", f"Before auto-tune of motor {motor + 1}", self.board.read_params())
             ok, msg = self.tuner.start(motor, amp, str(req.get("style", "normal")),
                                        bool(req.get("friction", True)), bool(req.get("ki", True)),
-                                       bool(req.get("kd", True)))
+                                       bool(req.get("kd", True)), rider, kg, unit, mode)
             if ok:
-                self.events.add("tune", f"Auto-tune of motor {motor + 1} started (style {req.get('style', 'normal')}, "
-                                f"travel ±{amp}).", motor=motor + 1)
+                who = "you in the seat" if rider == "seated" else (f"seat empty, rider {kg_text(kg, unit)}" if kg
+                                                                   else "seat empty")
+                self.events.add("tune", (f"Check of motor {motor + 1}'s values started" if mode == "check" else
+                                         f"Auto-tune of motor {motor + 1} started") +
+                                f" (style {req.get('style', 'normal')}, travel ±{amp}, {who}).", motor=motor + 1)
             self._json({"ok": ok, "error": None if ok else msg})
         elif p == "/eeprom/save":
             if not self.board.connected:

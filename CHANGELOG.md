@@ -3,6 +3,60 @@
 `smc3_scope` (the page) and `SMC3_R4` (the firmware) are versioned separately. The page works with older
 firmware too; the notes say which firmware a feature needs.
 
+## Page 2.5 (firmware 1.9.3, unchanged)
+
+Auto-tune, reworked after a run on a real rig:
+
+- **Each direction on its own.** Every test moves the motor both ways - up and down for a lift, left and right for
+  the rear slide - and the log, the gauges and the result show each direction's figures. (2.4.1 also tested both
+  ways but only reported the worse one.) The board keeps one set of values per motor, so the worse direction still
+  decides; the minimum drive is measured each way as before, and a big difference between the two gets Ki.
+- **Gradual test moves.** Auto-tune first measures the motor's top speed each way with one quick move. Every test
+  after that moves the target at 60% of the slower way's top speed, easing in and out: a move the motor can follow,
+  like a game's. 2.4.1 jumped the target across the whole travel, so the motor ran flat out at PWMmax for most of
+  every test and Kp hardly mattered: on the run that prompted this, every Kp from 193 up rose in 257-276 ms.
+  - Kp is now judged on how far the motor trails the move (lag, in ms). The sweep stops once the motor follows
+    within the style's target both ways (Gentle 120 ms, Normal 80, Firm 50), or when it starts to overshoot.
+  - Small sharp steps (kerb-sized) still check that it stays calm.
+- **Who's in the seat while it tests.**
+  - **Nobody**, with your weight entered: auto-tune allows for it.
+    - The overshoot limit is about a third lower (your weight carries further).
+    - The lag target is a quarter lower: a stiffer Kp, because the motor is slower lifting you.
+    - Test moves run at 50% of top speed, and a little Ki is kept for the weight.
+    - A note says when the empty seat already uses most of PWMmax.
+
+    On the simulator with an 82 kg rider, values tuned with the seat empty and the allowance followed as closely
+    going up as values tuned with the rider in the seat (96 ms, against 127 ms without the allowance).
+  - **Me**: Start gives you 15 s to get in. Stop, Space or Esc ends it at any time. While you get in, the
+    "moves away from where it is driven" watch rests, so your weight pushing a lift can't trip it.
+  - Stopping auto-tune or Check holds the motor where it is, taken from the median of its last readings (one
+    glitchy reading must not become a target). A refusal ("Cannot start") sends nothing at all.
+- **Check** tests the motor's current values (test moves both ways, and small steps), changes nothing, and says what
+  to change. Typically you run it with you in the seat after tuning with the seat empty.
+- **Auto-tune live** shows each test as gauges:
+  - lag (rise for small steps), overshoot, settling, how far short it stops, ringing and drive used;
+  - one needle per direction, with coloured bands for what's good.
+
+  The same card shows the phases, the values running, pot noise, the minimum drive and top speed each way, and the
+  Kp sweep as two small charts: lag and overshoot for each Kp, with the figures on hover.
+- **Copy** puts the whole log and the result on the clipboard. It also works over plain http from the NAS, where
+  browsers switch the clipboard API off.
+- Small test steps go 30 counts each way. 2.4.1 stepped 15 up and 30 down, so the shorter step up often "never got
+  to 90%". "Got there" now allows for the dead zone.
+- **A glitchy pot can't spoil a tune.**
+  - Before overshoot, settling, ringing or a wrong-way start are judged, each pot reading is compared with the
+    median of the 11 around it, and one far off is replaced. Bad readings come in clusters: on the rig that prompted
+    this, about 80 a second on one pot. 2.4.1 used a 3-reading median, and one cluster could stop a tune as "moved
+    the wrong way".
+  - The watch for a motor running away from where it is driven compares cleaned readings too.
+  - The Kp sweep stops on overshoot only when it happens twice in a row.
+  - A Kp whose test is spoiled right after a calm one is tested once more. A burst of bad readings can kick the
+    motor itself, because the PID reacts to it.
+- The full check remembers which way each lift went when you answered its question, so auto-tune can name the
+  directions up and down.
+- Simulator: `--load KG` (a rider: the lifts need more drive going up and less going down, and everything carries
+  more weight) and `--vmax`. Smoke test: auto-tune's test moves are gradual, and Check changes nothing.
+
 ## Page 2.4.1 (firmware 1.9.3, unchanged)
 
 Fixes for rigs whose pots glitch (the wiper losing contact now and then: single readings 16-40 counts off, sometimes

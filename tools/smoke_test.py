@@ -24,6 +24,9 @@ Smoke test: start simulated rigs and the page, run diagnostics, check the result
 10. Glitchy pots (page 2.4.1): pots whose wipers lose contact now and then (single readings 16-40 counts off, sometimes
    a few in a row): the full check finds no crossed wiring and no wrong direction, and a motor dragged from the page is
    never switched off.
+11. Auto-tune's test moves are gradual (page 2.5): during the Kp sweep the target moves in small steps (a ramp), never
+   jumps across the travel; the gauges' data names both directions. Check tests the current values both ways, says
+   what it found and changes nothing.
 """
 import json, os, subprocess, sys, tempfile, time, urllib.request as u
 
@@ -281,6 +284,43 @@ try:
     check(not d["samples"][-1]["dis"][1] and not d["manual"]["msg"],
           f"glitchy pot, motor 2 dragged 4 times: stays on ({d['manual']['msg'][:60] or 'no stop'})")
     post(base10, "/manual/release")
+
+    # 11. gradual test moves, both directions; Check changes nothing
+    sim11, scope11, base11 = start(4720, 8720)
+    procs += [sim11, scope11]
+    before = post(base11, "/read")
+    r = post(base11, "/tune/start", {"motor": 0, "amp": 100, "style": "normal", "mode": "check", "rider": "empty"})
+    t0 = time.time()
+    st = get(base11, "/tune/status")
+    while time.time() - t0 < 120 and st["state"] == "running":
+        time.sleep(0.5)
+        st = get(base11, "/tune/status")
+    res = st.get("result") or {}
+    dirs = res.get("dirs") or {}
+    check(st["state"] == "done" and res.get("check") and dirs.get("p", {}).get("lag_ms") is not None
+          and dirs.get("m", {}).get("lag_ms") is not None,
+          f"Check: both directions measured ({st['state']}, {'fine' if res.get('ok') else res.get('issues')})")
+    after = post(base11, "/read")
+    check(all(before[k] == after[k] for k in ("Kp1", "Ki1", "Kd1", "PWM1", "DZ1")), "Check changed nothing")
+    live = st.get("live") or {}
+    check((live.get("dirs") or {}).get("p", {}).get("name") == "up" and live.get("phases"),
+          f"gauges: directions named ({(live.get('dirs') or {}).get('p')})")
+    r = post(base11, "/tune/start", {"motor": 0, "amp": 100, "style": "normal", "friction": False, "ki": True,
+                                     "kd": True})
+    t0 = time.time()
+    st = get(base11, "/tune/status")
+    while time.time() - t0 < 120 and (st.get("live") or {}).get("phase") != "kp" and st["state"] == "running":
+        time.sleep(0.3)
+        st = get(base11, "/tune/status")
+    time.sleep(0.5)
+    seq = get(base11, "/data?since=0")["samples"][-1]["seq"]
+    time.sleep(6)
+    got = get(base11, f"/data?since={seq}")["samples"]
+    post(base11, "/tune/abort")
+    ts = [x["m"][0]["t"] for x in got]
+    jumps = [abs(b - a) for a, b in zip(ts, ts[1:])]
+    check(len(set(ts)) > 20 and max(jumps or [999]) <= 40,
+          f"auto-tune test moves are gradual: {len(set(ts))} target values, largest jump {max(jumps or [0])} counts")
 finally:
     for p in procs:
         p.terminate()

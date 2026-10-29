@@ -164,12 +164,35 @@ overshoot and lag before you touch a game. Stop SimHub's motion output first.
 
 ### Auto-tune
 
-Auto-tune works on one motor at a time:
+Auto-tune works on one motor at a time and tests it **both ways**: up and down for a lift, left and right for the
+rear slide.
 
-1. It measures the friction (PWMmin) and the pot noise (dead zone).
-2. It raises Kp step by step until the motor stops tracking any better, and picks the sweet spot.
-3. It checks small, road-texture-sized moves.
-4. It adds Ki and Kd only if they clearly help.
+1. It measures the pot noise (dead zone), and the smallest drive that moves the motor each way (PWMmin).
+2. It measures the motor's top speed each way with one quick move. Every test after that is a **gradual move** at
+   60% of the slower way's top speed, easing in and out, so the motor can follow it as it follows a game.
+3. It raises Kp step by step until the motor follows within the style's lag target both ways, or starts to
+   overshoot.
+4. It checks that small, sharp, kerb-sized steps stay calm.
+5. It adds Ki and Kd only if they clearly help.
+
+Each direction is judged on its own, and the log and the result show both. The board has one set of values per
+motor, so the worse direction decides.
+
+**Who's in the seat while it tests:**
+
+- **Nobody**: tune with the seat empty and enter your weight, and auto-tune allows for it. It sets a stricter
+  overshoot limit and a stiffer Kp, runs slower test moves, and keeps a little Ki. Then press **Check** with you in
+  the seat: it tests the current values both ways, changes nothing, and says what to change.
+- **Me**: Start gives you 15 s to get in. Stop, Space or Esc ends it at once.
+
+**Auto-tune live** shows each test as gauges:
+
+- how far the motor trails the move (lag), overshoot, settling, how far short it stops, ringing, and how much of
+  PWMmax it takes;
+- one needle per direction, with a coloured band for what's good.
+
+The same card shows pot noise, the minimum drive and top speed each way, and the Kp sweep as two small charts.
+**Copy** puts the whole log and the result on the clipboard.
 
 With the motion sensor, auto-tune also watches the **seat**: the seat's own overshoot and ringing count, so it
 won't pick a Kp that keeps the motor calm but makes a flexing frame bounce.
@@ -444,7 +467,8 @@ traction loss, let each motor find its safe travel, and save. SimHub's centre is
 
 ### 5. Tune
 
-Run **auto-tune** on each motor (seat empty first, then seated), try it in a game, and **Save to EEPROM**.
+Run **auto-tune** on each motor: seat empty first, with your weight entered. Then either **Check** with you in the
+seat, or run auto-tune again with you in it. Try it in a game, and **Save to EEPROM**.
 
 **Soft start** (firmware 1.9.1): after the rig has been off the seat may have ridden down a little. At power-up, and
 when you press Enable Motors, each motor creeps back to its position instead of jumping there, then runs normally.
@@ -479,6 +503,8 @@ noise. To see what the diagnostics find, add a fault:
 | `--pot-noise 2:2.3` | motor 2's pot reads ±2.3 counts at rest, with the odd spike |
 | `--sag 2` (`--sag-pull 0.2`) | motor 2's gearbox can be driven backwards: the seat sinks while the drive is weak (harder) |
 | `--pot-glitches 2:80` | motor 2's pot wiper loses contact about 80 times a second (readings 16-40 counts off) |
+| `--load 82` | an 82 kg rider: the lifts need more drive going up and less going down, and every motor carries more weight |
+| `--vmax 1000` | slower motors (counts/s at full drive; default 2200) |
 | `--imu-lost-at 30` | the sensor goes quiet after 30 s |
 | `--seat-tilt 1.6:-2.2` | the seat isn't level with every motor at 512 (for Seat setup) |
 | `--stops 3:180:860` | motor 3 hits a mechanical stop at pot 180 and 860 |
@@ -489,7 +515,7 @@ noise. To see what the diagnostics find, add a fault:
 - The board answers like SMC3 v0.70 (`[ver]` returns 70), and the EEPROM layout is unchanged. SimHub, SimTools,
   FlyPT Mover and SMC3Utils see an ordinary SMC3.
 - The page works with every firmware from 1.3 on. Newer firmware unlocks more:
-  - 1.4: auto-tune;
+  - 1.4: auto-tune, and Check;
   - 1.5: Disable Motors;
   - 1.6: smoothing settings;
   - 1.7: full diagnostics;
