@@ -3,6 +3,21 @@
 `smc3_scope` (the page) and `SMC3_R4` (the firmware) are versioned separately. The page works with older
 firmware too; the notes say which firmware a feature needs.
 
+## Page 2.7.1 (firmware 1.9.4, unchanged)
+
+- **Help, Wiring the whole rig**: one drawing of the board, the three IBT-2 bridges (RPWM, LPWM, R_EN + L_EN, VCC,
+  GND, B+ / B-, M+ / M-), the motors with their pots, the motion sensor through the MAX3232, the 5V / GND strip, the
+  motor supply and USB to the PC, with the connections as a table. Also in the README
+  ([docs/img/wiring.png](docs/img/wiring.png)). Help also shows the motion sensor's own drawing now.
+- **Update balloon**: a newer page or firmware on GitHub shows as an **Update** balloon on the header's Settings
+  button (instead of text in the status line); its tooltip says what's new, and Settings then opens on the Updates
+  card.
+- The header shows the page's version next to the firmware's. LOW POWER is shorter (its tooltip explains it).
+- Quick Controls: Return to center, Resume SimHub, Read from board and Save to EEPROM wrap their text onto two
+  lines on a narrow card (at 125 % zoom, for example) instead of running over the buttons' edges.
+
+Update: in the page - Settings, Updates, Update page.
+
 ## Page 2.7 (firmware 1.9.4, unchanged)
 
 **Updates from GitHub.** Settings has a new **Updates** card:

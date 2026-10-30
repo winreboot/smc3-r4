@@ -300,8 +300,9 @@ own firmware 0.4.0 or newer (Arduino IDE, Tools, Firmware Updater).
 
 ![Firmware update: SMC3_R4 1.9.3 installed over WiFi](docs/img/firmware-update.png)
 
-**Updates** (page 2.7): the page asks GitHub twice a day what the newest release has, and the header says **Update
-available** when there's a newer page or firmware.
+**Updates** (page 2.7): the page asks GitHub twice a day what the newest release has. When there's a newer page or
+firmware, a balloon on the header's **Settings** button says **Update**; it leads straight here. The header shows the
+page's version next to the board's firmware version.
 
 - **Update page** downloads the new page, checks it (GitHub's SHA-256, its version, that Python can read it) and
   restarts into it - the board isn't touched and settings stay. It's kept in the data folder, so it survives
@@ -422,7 +423,12 @@ The Help section in the page sums everything up, including every LED matrix code
 
 ![WT901C-232 wiring: DB9 plug with screw terminals, MAX3232 module, UNO R4 WiFi](docs/img/sensor-wiring.png)
 
-Wiring is the same as the original SMC3 on an UNO, so existing rigs need no changes:
+Wiring is the same as the original SMC3 on an UNO, so existing rigs need no changes. The whole rig - board, three
+IBT-2 bridges, motors with their pots, the motion sensor and the motor supply - in one drawing (also in the page's
+Help):
+
+![Wiring the whole rig: UNO R4 WiFi, three IBT-2 bridges on D2-D11, pots on A0-A2, MAX3232 and WT901C on D0/D1](docs/img/wiring.png)
+
 
 | | PWM | Bridge pins (ENA / ENB) | Feedback pot (wiper) |
 |---|---|---|---|
@@ -430,8 +436,9 @@ Wiring is the same as the original SMC3 on an UNO, so existing rigs need no chan
 | Motor 2 | D10 | D4 / D5 | A1 |
 | Motor 3 | D11 | D6 / D7 | A2 |
 
-The pots' outer pins go to 5 V and GND. For how each bridge input connects to an IBT-2, follow the original SMC3
-wiring diagrams on xsimulator.net.
+On an IBT-2 (`MODE2`): **PWM** goes to its LPWM, **ENA** to RPWM, and **ENB** to R_EN and L_EN joined; its VCC and GND
+to the board's 5V and GND; R_IS and L_IS stay free; B+ / B- to the motor supply and M+ / M- to the motor. The pots'
+outer pins go to 5 V and GND.
 
 ### Pot noise filter
 
