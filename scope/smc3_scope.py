@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-smc3_scope v2.7.2 - live scope, tuner and auto-tuner for the SMC3_R4 motion controller (Arduino UNO R4 WiFi).
+smc3_scope v2.7.3 - live scope, tuner and auto-tuner for the SMC3_R4 motion controller (Arduino UNO R4 WiFi).
 
 Connects to the board's TCP telemetry port, keeps a rolling buffer of samples and serves a web page with live
 charts, a parameter editor (sends ordinary SMC3 commands back to the board), test signals and a per-motor
@@ -12,6 +12,10 @@ Every option can also come from the environment (Docker): SMC3_HOST, SMC3_PORT, 
 SMC3_DATA_DIR.  Settings changed in the page (board address, theme, auto-find) are saved to
 <data dir>/config.json and survive restarts and upgrades.  Standard-library Python 3.8+ only.
 
+v2.7.3: Update page no longer refuses while the page holds the seat (Return to center, a dragged knob) or a test signal
+        runs: just before the restart it gives the seat back to SimHub (the motors stay where they are) and stops the
+        test signal. It still waits for auto-tune, the full check, Seat setup and a firmware update, which change the
+        board's settings for a while.
 v2.7.2: auto-tune and the full check cope with WiFi stalls (the R4's WiFi module blocks the board's loop for a second
         or more now and then): a test move the stall spoiled - readings missing, or targets that reached the board
         bunched up so the ramp was really a jump - is done again (up to three times) instead of stopping auto-tune
@@ -140,7 +144,7 @@ v1.4: settings dialog (board address, port, find-board scan, auto-find), day/nig
       fixed a thread race that made the page flash "not reachable".
 """
 
-VERSION = "2.7.2"
+VERSION = "2.7.3"
 
 import argparse
 import base64
@@ -7560,10 +7564,11 @@ def _release_notes(body, limit=1800):
 
 
 class Updater:
-    def __init__(self, cfg, events, data_dir, fw_text_fn, busy=None):
+    def __init__(self, cfg, events, data_dir, fw_text_fn, busy=None, prepare=None):
         self.cfg, self.events, self.data_dir = cfg, events, data_dir
         self.fw_text = fw_text_fn                    # -> the board's firmware version text, or None (not known yet)
-        self.busy = busy                             # -> text while something moves the motors
+        self.busy = busy                             # -> text while auto-tune, a check, Seat setup ... must finish
+        self.prepare = prepare                       # ends Move motors / a test signal just before the restart
         self.lock = threading.Lock()
         self.latest = None                           # what the last check found
         self.checked = 0.0                           # when the last check was done (or failed)
@@ -7780,6 +7785,9 @@ class Updater:
                         self.msg = f"Restarting as soon as this is done: {why}"
                 time.sleep(1.0)
             try:
+                if self.prepare:
+                    self.prepare()
+                    time.sleep(0.3)                      # let "SimHub may drive again" reach the board
                 self.restart()
             except Exception as e:
                 log(f"restart failed: {e}")
@@ -10926,7 +10934,7 @@ details.oks .flist{margin-top:6px}
  <h2>Update the page to <span id="mu_v"></span></h2>
  <ul>
   <li>The page downloads it from GitHub, checks it and <b>restarts into it</b> - a few seconds, then this tab reloads.</li>
-  <li>The <b>board and the motors aren't touched</b>, and SimHub keeps running. Settings, profiles and backups stay.</li>
+  <li>Nothing on the <b>board</b> changes and SimHub keeps running. If the page holds the seat (Return to center, a dragged knob) it gives it back to SimHub first, and a test signal stops. Settings, profiles and backups stay.</li>
   <li><b>Go back to built-in</b> (here, afterwards) undoes it. If the new page doesn't start, the next start runs this one again.</li>
  </ul>
  <p class="note" id="mu_note"></p>
@@ -13099,14 +13107,29 @@ def main():
     Handler.diag.fwup = Handler.fwup
 
     def busy_update():
-        why = busy()
-        if why:
-            return why
+        """What a page update waits for (2.7.3): the things that change the board's settings for a while and put
+        them back at the end. Move motors / Return to center and a test signal don't count - prepare_update ends
+        them just before the restart."""
+        if Handler.seat.state != "idle":
+            return "Seat setup is open - finish or cancel it first."
+        if Handler.diag.moving():
+            return "The diagnostics check is moving the motors - wait for it or stop it."
+        if Handler.tuner.running():
+            return "Auto-tune is running - wait for it or stop it."
         if Handler.fwup.state == "running":
             return "A firmware update is running - wait for it to finish."
-        if Handler.manual.status().get("active"):
-            return "The motors are being moved by hand (Move motors) - finish that first."
         return None
+
+    def prepare_update():
+        """Just before the page restarts (an update, or back to the built-in page): give the seat back to SimHub if
+        the page holds it (Return to center, a dragged knob - every motor stays where it is) and stop a test
+        signal. Nothing else on the board changes."""
+        with Handler.manual.lock:
+            if Handler.manual.active:
+                Handler.manual._end("The page restarts for an update: SimHub drives the seat again.")
+        if gen.mode != "off":
+            gen.set(mode="off")
+            events.add("test", "Test signal stopped: the page restarts for an update.", quiet=True)
     def board_fw():
         fw = board.fw_cache
         if not fw or not board.connected:
@@ -13114,7 +13137,7 @@ def main():
         if not board.fw_version and fw[1] >= 19 and time.time() - board.connected_at < 6:
             return None                                  # 1.9.2+ sends its exact version a moment after connecting
         return fw_text(fw[1], board.diag, board.fw_version)
-    Handler.upd = Updater(cfg, events, args.data, board_fw, busy_update)
+    Handler.upd = Updater(cfg, events, args.data, board_fw, busy_update, prepare_update)
     events.add("scope", f"smc3_scope v{VERSION} started (board {cfg.get('host') or 'not set'}:{cfg.get('port')}, "
                f"{cfg.get('motors')} motors in use).", quiet=True)
 

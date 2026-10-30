@@ -212,8 +212,10 @@ tick box switches the twice-a-day check off. Nothing is installed by itself.
 
 - **Update page** downloads the new `smc3_scope_v<version>.py` from the release, checks it (GitHub's SHA-256 of the
   file, its version line, and that Python can read it) and restarts into it - a few seconds; the tab reloads by
-  itself. The board and the motors aren't touched, SimHub keeps running, and settings, profiles and backups stay. It
-  waits while auto-tune, a check, Seat setup, a test signal, moving the motors or a firmware update is running.
+  itself. Nothing on the board changes, SimHub keeps running, and settings, profiles and backups stay. If the page
+  holds the seat (Return to center, a dragged knob) it gives it back to SimHub first - the motors stay where they
+  are - and a test signal stops. It waits while auto-tune, the full check, Seat setup or a firmware update runs: they
+  have the board on temporary settings until they finish.
 - **Download firmware** only downloads the `.ino`: open it in the Arduino IDE and upload it over USB (SimHub closed),
   or **Sketch, Export Compiled Binary** and install the `.bin` in **Settings, Firmware update**, over WiFi. Firmware
   is never installed by itself.

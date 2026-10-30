@@ -3,6 +3,17 @@
 `smc3_scope` (the page) and `SMC3_R4` (the firmware) are versioned separately. The page works with older
 firmware too; the notes say which firmware a feature needs.
 
+## Page 2.7.3 (firmware 1.9.4, unchanged)
+
+- **Update page just updates**: it no longer refuses with "The motors are being moved by hand (Move motors)" when
+  the page holds the seat after Return to center or a dragged knob. Just before the restart it gives the seat back to
+  SimHub (every motor stays where it is) and stops a test signal. It still waits for auto-tune, the full check, Seat
+  setup and a firmware update, which have the board on temporary settings until they finish. The same for Go back to
+  built-in.
+
+Update: in the page - Settings, Updates, Update page. (From 2.7.2 or older, press Resume SimHub first if the page
+holds the seat: the page that is running decides.)
+
 ## Page 2.7.2 (firmware 1.9.4, unchanged)
 
 Auto-tune and the full check cope with WiFi stalls. The UNO R4 WiFi's WiFi module now and then blocks the board's loop
