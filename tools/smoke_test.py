@@ -29,10 +29,14 @@ Smoke test: start simulated rigs and the page, run diagnostics, check the result
    what it found and changes nothing.
 12. Auto-tune moves out and back from the start position (page 2.6): during the Kp sweep the seat first goes up from
    where it started, back, then down, and never further than the test travel from the start.
+13. Updates from GitHub (page 2.7), against a stand-in for GitHub's API: the check finds the newer page and firmware,
+   the header knows, Update downloads, checks and restarts into the new page (kept in <data>/updates), a restart of
+   the started file hands over to it, and Go back to built-in returns to the started file and stays there.
 Case 10 also checks firmware 1.9.4's pot glitch filter (simulated): the board counts the glitches, the live data stays
 clean, so the finding is a warning that names the filter, and the report shows the board's own version (1.9.4).
 """
-import json, os, subprocess, sys, tempfile, time, urllib.request as u
+import hashlib, json, os, subprocess, sys, tempfile, threading, time, urllib.request as u
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SIM = os.path.join(HERE, "simboard.py")
@@ -44,16 +48,19 @@ def get(base, p):
 
 
 def post(base, p, o=None):
-    return json.loads(u.urlopen(u.Request(base + p, data=json.dumps(o or {}).encode(), method="POST"), timeout=60).read())
+    return json.loads(u.urlopen(u.Request(base + p, data=json.dumps(o or {}).encode(), method="POST",
+                                          headers={"X-SMC3": "1"}), timeout=60).read())
 
 
-def start(port, web, *sim_args, bind=None):
+def start(port, web, *sim_args, bind=None, env=None):
     data = tempfile.mkdtemp(prefix="smc3-smoke-")
     sim = subprocess.Popen([sys.executable, SIM, str(port), "--tuned", *sim_args], stdout=subprocess.DEVNULL)
     time.sleep(0.5)
     log = open(os.path.join(data, "scope.log"), "w")
     scope = subprocess.Popen([sys.executable, SCOPE, "--host", "127.0.0.1", "--port", str(port), "--web", str(web),
-                              "--data", data] + (["--bind", bind] if bind else []), stdout=log, stderr=subprocess.STDOUT)
+                              "--data", data] + (["--bind", bind] if bind else []), stdout=log, stderr=subprocess.STDOUT,
+                             env=env)
+    scope.data = data
     scope.log_path = log.name
     base = f"http://127.0.0.1:{web}"
     for _ in range(60):
@@ -343,6 +350,79 @@ try:
     check(first_off > c0 and max(ts) - c0 <= 102 and c0 - min(ts) <= 102 and max(ts) - c0 >= 60 and c0 - min(ts) >= 60,
           f"auto-tune goes up first and stays within the test travel of the start "
           f"(start {c0}, first move to {first_off}, range {min(ts)}-{max(ts)})")
+
+    # 13. updates from GitHub (page 2.7), against a stand-in for GitHub's API
+    for p in procs:
+        p.terminate()
+    src = open(SCOPE).read()
+    old_v = src.split('VERSION = "', 1)[1].split('"', 1)[0]
+    new_page = src.replace(f'VERSION = "{old_v}"', 'VERSION = "99.0"', 1).encode()
+
+    class FakeGitHub(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            if self.path == "/repos/winreboot/smc3-r4/releases/latest":
+                body = json.dumps({"tag_name": "v99.0", "name": "v99.0", "html_url": "https://github.com/", "body": "test",
+                                   "assets": [{"name": "smc3_scope_v99.0.py", "browser_download_url": f"http://127.0.0.1:4799/p",
+                                               "digest": "sha256:" + hashlib.sha256(new_page).hexdigest()},
+                                              {"name": "SMC3_R4_v9.9.ino", "browser_download_url": "http://127.0.0.1:4799/f"}]}).encode()
+            elif self.path == "/p":
+                body = new_page
+            else:
+                self.send_response(404)
+                self.end_headers()
+                return
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+    fake = ThreadingHTTPServer(("127.0.0.1", 4799), FakeGitHub)
+    threading.Thread(target=fake.serve_forever, daemon=True).start()
+    env = dict(os.environ, SMC3_GITHUB_API="http://127.0.0.1:4799")
+    sim, scope, base = start(4713, 8713, env=env)
+    procs += [sim, scope]
+    st = post(base, "/update/check")
+    check(st["page"]["latest"] == "99.0" and st["page"]["newer"] and st["fw"]["latest"] == "9.9" and st["fw"]["newer"]
+          and st["fw"]["download"].endswith("/f"), "update check finds page 99.0 and firmware 9.9 (download only)")
+    check(get(base, "/data?since=0")["upd"] == {"page": "99.0", "fw": "9.9"}, "the header knows")
+    r = post(base, "/update/install")
+    t0, now = time.time(), None
+    while time.time() - t0 < 30 and now != "99.0":
+        time.sleep(0.5)
+        try:
+            now = get(base, "/update/status")["page"]["running"]
+        except OSError:
+            pass
+    check(r["ok"] and now == "99.0" and os.path.isfile(os.path.join(scope.data, "updates", "smc3_scope_v99.0.py")),
+          "Update downloads the page, keeps it in <data>/updates and restarts into it")
+    scope.terminate()
+    scope.wait(10)
+    time.sleep(0.5)
+    scope2 = subprocess.Popen([sys.executable, SCOPE, "--host", "127.0.0.1", "--port", "4713", "--web", "8713",
+                               "--data", scope.data], stdout=open(scope.log_path, "a"), stderr=subprocess.STDOUT, env=env)
+    scope2.log_path = scope.log_path
+    procs.append(scope2)
+    t0, st = time.time(), None
+    while time.time() - t0 < 30:
+        try:
+            st = get(base, "/update/status")
+            break
+        except OSError:
+            time.sleep(0.5)
+    check(st and st["page"]["running"] == "99.0" and st["page"]["from_update"] and st["page"]["builtin"] == old_v,
+          "a restart of the started file hands over to the update")
+    r = post(base, "/update/rollback")
+    t0, now = time.time(), None
+    while time.time() - t0 < 30 and now != old_v:
+        time.sleep(0.5)
+        try:
+            now = get(base, "/update/status")["page"]["running"]
+        except OSError:
+            pass
+    check(r["ok"] and now == old_v, f"Go back to built-in returns to v{old_v}")
+    fake.shutdown()
 finally:
     for p in procs:
         p.terminate()

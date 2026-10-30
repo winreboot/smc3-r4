@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-smc3_scope v2.6.2 - live scope, tuner and auto-tuner for the SMC3_R4 motion controller (Arduino UNO R4 WiFi).
+smc3_scope v2.7 - live scope, tuner and auto-tuner for the SMC3_R4 motion controller (Arduino UNO R4 WiFi).
 
 Connects to the board's TCP telemetry port, keeps a rolling buffer of samples and serves a web page with live
 charts, a parameter editor (sends ordinary SMC3 commands back to the board), test signals and a per-motor
@@ -12,6 +12,14 @@ Every option can also come from the environment (Docker): SMC3_HOST, SMC3_PORT, 
 SMC3_DATA_DIR.  Settings changed in the page (board address, theme, auto-find) are saved to
 <data dir>/config.json and survive restarts and upgrades.  Standard-library Python 3.8+ only.
 
+v2.7: updates from GitHub. The page asks the repository's latest release twice a day (Settings, Updates; or Check now)
+      and says when there is a newer page or firmware - in the header too. Update page downloads the new page into
+      <data dir>/updates, checks it (GitHub's SHA-256, its version, that it compiles) and restarts into it; the file
+      you started (in Docker the image's) hands over to it at every start while it is newer, so the update survives
+      restarts and re-created containers; one that doesn't start, or stops three times in a row within 10 minutes,
+      is dropped (SMC3_NO_UPDATE=1 skips it). Go back to built-in undoes it. A restart waits until nothing moves the
+      motors; on Windows the started file stays as the page's parent. Firmware is offered as a download only (the
+      .ino, to flash with the Arduino IDE or export as .bin for Settings, Firmware update).
 v2.6.2: nothing changes in what the page does. A step-by-step install guide (docs/INSTALL.md) for Windows, Mac, Linux,
         Raspberry Pi, Docker and Synology Container Manager, and a ready-made Docker image (ghcr.io/<owner>/smc3-scope,
         for amd64, arm64 and arm/v7) that GitHub Actions builds for every release tag; scope/compose.prebuilt.yaml uses
@@ -120,21 +128,27 @@ v1.4: settings dialog (board address, port, find-board scan, auto-find), day/nig
       fixed a thread race that made the page flash "not reachable".
 """
 
-VERSION = "2.6.2"
+VERSION = "2.7"
 
 import argparse
 import base64
 import collections
+import hashlib
 import json
 import math
 import os
 import random
 import re
+import signal
 import socket
 import statistics
 import struct
+import subprocess
+import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 import zlib
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -184,7 +198,7 @@ class Config:
     DEFAULTS = {"host": "", "port": 4210, "theme": "dark", "auto_find": True, "scan_subnet": "",
                 "motors": 3, "disable_unused": True, "motor_names": ["", "", ""],
                 "layout": "tl", "tl_dir": 1, "lift_dir": {}, "lift_sink": {}, "rider_mode": "empty", "rider_kg": 0, "rider_unit": "lb",
-                "tune_speed": {}}
+                "tune_speed": {}, "update_check": True, "update_repo": ""}
     # layout: "tl" = motors 1 and 2 lift the front corners, motor 3 slides the rear left / right (traction loss,
     #         the seat turning about a pivot at the front); "lifts" = all three motors lift the seat.
     # tl_dir: +1 = higher numbers move the rear to the right, -1 = to the left (Seat setup or the full check asks).
@@ -193,6 +207,8 @@ class Config:
     #          the full check (page 2.6) - auto-tune's "up" is the other way, until lift_dir is answered.
     # rider_*: auto-tune's "who's in the seat" and the rider's weight (kg; shown in rider_unit). tune_speed: per motor,
     #          the test-move speed and top speeds auto-tune measured, so Check runs the same moves.
+    # update_check: ask GitHub twice a day whether there's a newer page or firmware (page 2.7). update_repo: where
+    #          from ("owner/name", empty = winreboot/smc3-r4) - only in config.json, the page can't change it.
 
     def __init__(self, data_dir, env_host, env_port):
         self.lock = threading.Lock()
@@ -281,6 +297,7 @@ class Board:
     def __init__(self, cfg):
         self.cfg = cfg
         self.sock = None
+        self.stopped = False
         self.connected = False
         self.lock = threading.Lock()
         self.slock = threading.Lock()
@@ -442,10 +459,15 @@ class Board:
     def reconnect(self):
         self._drop()
 
+    def stop(self):
+        """For good (a restart into a page update, Windows): let go of the board for the next page."""
+        self.stopped = True
+        self._drop()
+
     # ---- incoming ----
     def _reader(self):
         buf = b""
-        while True:
+        while not self.stopped:
             if not self.sock:
                 host, port = self.cfg.get("host"), int(self.cfg.get("port"))
                 if not host:
@@ -489,6 +511,7 @@ class Board:
                     time.sleep(1.0)                  # programmed, or busy with another client): don't hammer it
                 continue
             buf = self._parse(buf)
+        self._drop()                                     # stopped
 
     def _drop(self):
         with self.lock:
@@ -7234,6 +7257,456 @@ class ManualControl:
 
 
 # --------------------------------------------------------------------------------------------------------------
+# Updates from GitHub (page 2.7): the page asks the repository's latest release, twice a day (or when you press
+# Check now), whether there is a newer page or firmware.
+#
+#   Page:     Update downloads smc3_scope_v<version>.py from the release into <data dir>/updates, checks it (GitHub's
+#             SHA-256 when the release lists one, its own version line, and that Python can compile it) and restarts.
+#             The file that was started (the built-in one - in Docker the image's) stays as it is: at every start it
+#             hands over to the downloaded update if that is newer than itself. So an update survives a restart and a
+#             re-created container, and a newer image (or file) simply wins over an older update.
+#             An update that doesn't get as far as serving the page, or stops three times in a row within 10 minutes
+#             of starting, is dropped and the built-in one runs. SMC3_NO_UPDATE=1 skips the update altogether.
+#   Firmware: only offered as a download (the .ino from the release) - it's flashed with the Arduino IDE, or exported
+#             as a .bin and installed in Settings, Firmware update.
+#
+#   Restarting: on Linux / macOS / Docker the process replaces itself (os.execv: same process, PID 1 in Docker stays
+#   PID 1). Windows has no such thing, so there the started file stays as a small parent that runs the page as its
+#   child and starts the next one when the child asks for a restart (exit code 75) - so a service wrapper, the console
+#   window or Ctrl+C still see one program.
+# --------------------------------------------------------------------------------------------------------------
+
+UPDATE_REPO = "winreboot/smc3-r4"                    # where releases come from (config: update_repo)
+UPDATE_API = os.environ.get("SMC3_GITHUB_API", "https://api.github.com").rstrip("/")   # overridable for testing
+UPDATE_EVERY_S = 12 * 3600                           # automatic check: twice a day
+UPDATE_RETRY_S = 15 * 60                             # ... and again after 15 min when GitHub couldn't be asked
+UPDATE_STABLE_S = 600                                # an update that runs this long (or whose page runs) is fine
+UPDATE_MAX_STARTS = 3                                # starts in a row that didn't last UPDATE_STABLE_S
+UPDATE_MAX_BYTES = 20_000_000
+RESTART_RC = 75                                      # child -> parent: "start the right page again" (spawn mode)
+SPAWN = os.name == "nt" or os.environ.get("SMC3_RESTART_SPAWN") == "1"   # the second only for testing on Linux
+PAGE_ASSET = re.compile(r"^smc3_scope_v(\d+(?:\.\d+){1,3})\.py$")
+FW_ASSET = re.compile(r"^SMC3_R4_v(\d+(?:\.\d+){1,3})\.ino$")
+
+
+def vkey(v):
+    """'2.6.10' -> (2, 6, 10), so versions compare as numbers. Trailing zeros don't count (2.7 == 2.7.0), and
+    anything after the numbers is ignored (1.9.4-mine -> (1, 9, 4)); no number at all sorts lowest."""
+    m = re.match(r"\s*[vV]?(\d+(?:\.\d+)*)", str(v or ""))
+    if not m:
+        return (0,)
+    k = [int(x) for x in m.group(1).split(".")]
+    while len(k) > 1 and k[-1] == 0:
+        k.pop()
+    return tuple(k)
+
+
+def _ustate_path(data_dir):
+    return os.path.join(data_dir, "updates", "state.json")
+
+
+def read_update_state(data_dir):
+    """updates/state.json: {file, version, status: new | trying | ok | failed | off, starts, builtin, builtin_file}.
+    Anything unexpected in it reads as nothing installed, so a damaged file can't stop the page from starting."""
+    try:
+        with open(_ustate_path(data_dir)) as f:
+            st = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(st, dict) or not isinstance(st.get("file"), str) or not isinstance(st.get("version"), str):
+        return {}
+    for k in ("status", "builtin", "builtin_file", "why"):
+        if k in st and not isinstance(st[k], str):
+            st.pop(k)
+    if not isinstance(st.get("starts"), int):
+        st["starts"] = 0
+    return st
+
+
+def write_update_state(data_dir, st):
+    p = _ustate_path(data_dir)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    tmp = f"{p}.{os.getpid()}.{threading.get_ident()}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(st, f, indent=2)
+    os.replace(tmp, p)
+
+
+def _choose(data_dir):
+    """Which file should run now: the downloaded update (and note that it is being tried), or None for this one."""
+    st = read_update_state(data_dir)
+    f, v, status = st.get("file"), st.get("version"), st.get("status")
+    if not f or status in ("off", "failed") or vkey(v) <= vkey(VERSION) or not os.path.isfile(f):
+        return None
+    if os.path.abspath(f) == os.path.abspath(__file__):
+        return None                                  # we are the update
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    if status == "trying":                           # started last time, never got as far as serving the page
+        st.update(status="failed", failed_at=now, why="it didn't get as far as serving the page")
+        write_update_state(data_dir, st)
+        log(f"the page update v{v} didn't start last time - running the built-in v{VERSION} instead")
+        return None
+    if st["starts"] >= UPDATE_MAX_STARTS:            # it serves, then stops - over and over
+        st.update(status="failed", failed_at=now,
+                  why=f"it stopped {st['starts']} times in a row within {UPDATE_STABLE_S // 60} minutes of starting")
+        write_update_state(data_dir, st)
+        log(f"the page update v{v} keeps stopping - running the built-in v{VERSION} instead")
+        return None
+    st.update(status="trying", starts=st["starts"] + 1, builtin=VERSION, builtin_file=os.path.abspath(__file__))
+    write_update_state(data_dir, st)
+    log(f"handing over to the page update v{v} ({f})")
+    return f
+
+
+def _child_args(path, argv):
+    return [sys.executable, "-u", path] + list(argv)
+
+
+def supervise(path, argv, data_dir):
+    """Spawn mode (Windows): run the page as a child and start the right one again whenever it asks to restart.
+    Never returns."""
+    env = dict(os.environ, SMC3_DATA_DIR=os.path.abspath(data_dir), SMC3_SUPERVISED="1")
+    own = os.path.abspath(__file__)
+    while True:
+        try:
+            child = subprocess.Popen(_child_args(path, argv), env=env)
+        except OSError as e:
+            log(f"couldn't start {path}: {e}")
+            if path == own:
+                os._exit(1)
+            path = own
+            continue
+        if os.name != "nt":                          # (testing on Linux) a stop for us stops the page too
+            def fwd(sig, _frame, c=child):
+                c.terminate()
+            signal.signal(signal.SIGTERM, fwd)
+        try:
+            rc = child.wait()
+        except KeyboardInterrupt:                    # Ctrl+C reaches the child as well
+            try:
+                child.wait(5)
+            except (subprocess.TimeoutExpired, KeyboardInterrupt):
+                child.kill()
+            os._exit(0)
+        if rc != RESTART_RC:
+            os._exit(rc if 0 <= rc < 256 else 1)
+        path = _choose(data_dir) or own
+
+
+def handoff_to_update(data_dir, argv):
+    """At start, before anything else: hand over to a page update downloaded from GitHub when it is newer than this
+    file. Returns only if this file should serve the page."""
+    if os.environ.get("SMC3_SUPERVISED") == "1":
+        return                                       # our parent has chosen already
+    if os.environ.get("SMC3_NO_UPDATE") == "1":
+        log("SMC3_NO_UPDATE=1: a page update downloaded from GitHub isn't used")
+        return
+    try:
+        path = _choose(data_dir)
+        if not path:
+            return
+        if SPAWN:
+            supervise(path, argv, data_dir)
+        os.environ["SMC3_DATA_DIR"] = os.path.abspath(data_dir)   # the update's own default would be next to it
+        sys.stdout.flush()
+        os.execv(sys.executable, _child_args(path, argv))
+    except Exception as e:                           # never let an update stop the page from starting
+        log(f"page update not used: {e}")
+
+
+def confirm_update(data_dir):
+    """Called once this page serves: if it is the update being tried, it starts. (Whether it keeps running is
+    counted by `starts`, which Updater clears after 10 minutes or once its own page has loaded.)"""
+    try:
+        st = read_update_state(data_dir)
+        if st.get("file") and os.path.abspath(st["file"]) == os.path.abspath(__file__) and st.get("status") == "trying":
+            st["status"] = "ok"
+            write_update_state(data_dir, st)
+    except Exception as e:
+        log(f"couldn't note that the update works: {e}")
+
+
+def _release_notes(body, limit=1800):
+    """A release's Markdown as plain text for the page: no pictures, HTML, ** or `, code fences or link targets, and
+    hard-wrapped paragraphs and list items joined back into one line each."""
+    out, code = [], False
+    for line in str(body or "").replace("\r", "").split("\n"):
+        if re.match(r"^\s*```", line):
+            code = not code
+            continue
+        if code:
+            out.append("    " + line.strip())
+            continue
+        if re.match(r"^\s*!\[", line) or re.match(r"^\s*<", line):
+            continue
+        line = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", line)
+        line = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", line)
+        line = line.replace("**", "").replace("`", "")
+        line = re.sub(r"^\s*>\s?", "", line)
+        line = re.sub(r"^#+\s*", "", line).rstrip()
+        starts = not line.strip() or re.match(r"^\s*([-*+]|\d+\.)\s", line)
+        if out and out[-1].strip() and line.strip() and not starts and not out[-1].startswith("    "):
+            out[-1] += " " + line.strip()                # a wrapped line: back onto the one before
+        else:
+            out.append(line)
+    text = re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip()
+    return text if len(text) <= limit else text[:limit].rsplit("\n", 1)[0] + "\n..."
+
+
+class Updater:
+    def __init__(self, cfg, events, data_dir, fw_text_fn, busy=None):
+        self.cfg, self.events, self.data_dir = cfg, events, data_dir
+        self.fw_text = fw_text_fn                    # -> the board's firmware version text, or None (not known yet)
+        self.busy = busy                             # -> text while something moves the motors
+        self.lock = threading.Lock()
+        self.latest = None                           # what the last check found
+        self.checked = 0.0                           # when the last check was done (or failed)
+        self.next_check = time.time() + 20           # the first one 20 s after start
+        self.error = None
+        self.state, self.msg = "idle", ""            # idle | checking | downloading | restarting
+        self.announced = set()
+        self.server = None                           # set by main(): spawn mode stops it before restarting
+        self.restart_pending = False
+        self.page_seen = False
+        self.started = time.time()
+        st = read_update_state(data_dir)
+        own = os.path.abspath(__file__)
+        self.running_update = bool(st.get("file")) and os.path.abspath(st["file"]) == own
+        self.builtin = (st.get("builtin") or "?") if self.running_update else VERSION
+        self.builtin_file = (st.get("builtin_file") or "") if self.running_update else own
+        if st.get("file") and not self.running_update and st.get("status") == "failed" \
+                and vkey(st.get("version")) > vkey(VERSION):
+            self.msg = (f"The page update v{st['version']} was dropped ({st.get('why') or 'it did not start'}), "
+                        f"so the built-in v{VERSION} runs.")
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def repo(self):
+        r = str(self.cfg.get("update_repo") or UPDATE_REPO).strip()
+        return r if re.match(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", r) else UPDATE_REPO
+
+    def _loop(self):
+        stable_done = False
+        while True:
+            time.sleep(5)
+            if not stable_done and (self.page_seen or time.time() - self.started > UPDATE_STABLE_S):
+                stable_done = True
+                self._stable()
+            if self.cfg.get("update_check") and time.time() >= self.next_check:
+                self.check()
+
+    def seen(self):
+        """This page's own script has loaded in a browser (it sends its version with /data)."""
+        if not self.page_seen:
+            self.page_seen = True
+
+    def _stable(self):
+        if not self.running_update:
+            return
+        try:
+            st = read_update_state(self.data_dir)
+            if st.get("file") and os.path.abspath(st["file"]) == os.path.abspath(__file__) and st.get("starts"):
+                st["starts"] = 0
+                write_update_state(self.data_dir, st)
+        except Exception as e:
+            log(f"update state not written: {e}")
+
+    def _get(self, url, accept, limit):
+        req = urllib.request.Request(url, headers={"Accept": accept, "User-Agent": f"smc3_scope/{VERSION}"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            data = r.read(limit + 1)
+        if len(data) > limit:
+            raise ValueError("the download is far too big")
+        return data
+
+    def check(self):
+        with self.lock:
+            if self.state != "idle":
+                return self.status()
+            self.state = "checking"
+        ok = False
+        try:
+            rel = json.loads(self._get(f"{UPDATE_API}/repos/{self.repo()}/releases/latest",
+                                       "application/vnd.github+json", 2_000_000))
+            page = fw = None
+            for a in rel.get("assets") or []:
+                name, url = str(a.get("name") or ""), str(a.get("browser_download_url") or "")
+                if not (url.startswith("https://") or UPDATE_API.startswith("http://")):
+                    continue
+                m = PAGE_ASSET.match(name)
+                if m and (not page or vkey(m.group(1)) > vkey(page["version"])):
+                    page = {"version": m.group(1), "name": name, "url": url, "digest": a.get("digest")}
+                m = FW_ASSET.match(name)
+                if m and (not fw or vkey(m.group(1)) > vkey(fw["version"])):
+                    fw = {"version": m.group(1), "name": name, "url": url}
+            self.latest = {"tag": rel.get("tag_name"), "title": rel.get("name") or rel.get("tag_name"),
+                           "url": rel.get("html_url"), "published": str(rel.get("published_at") or "")[:10],
+                           "notes": _release_notes(rel.get("body")), "page": page, "fw": fw}
+            self.error = None
+            ok = True
+            if page and vkey(page["version"]) > vkey(VERSION) and page["version"] not in self.announced:
+                self.announced.add(page["version"])
+                self.events.add("scope", f"A new page is out on GitHub: v{page['version']} (this is v{VERSION}). "
+                                "Settings, Updates.")
+        except urllib.error.HTTPError as e:
+            self.error = (f"GitHub has no release for {self.repo()} (404)." if e.code == 404 else
+                          f"GitHub said no ({e.code} - too many requests from this address?); it tries again later."
+                          if e.code in (403, 429) else f"GitHub answered {e.code}; it tries again later.")
+        except Exception as e:
+            self.error = f"Couldn't reach GitHub ({e}). Is this machine on the internet?"
+        finally:
+            self.checked = time.time()
+            self.next_check = self.checked + (UPDATE_EVERY_S if ok else UPDATE_RETRY_S)
+            with self.lock:
+                self.state = "idle"
+        return self.status()
+
+    def _dropped(self, version):
+        """The user went back from this version, or it failed: don't nag about it in the header."""
+        st = read_update_state(self.data_dir)
+        return st.get("version") == version and st.get("status") in ("off", "failed")
+
+    def status(self):
+        lt = self.latest or {}
+        page, fw = lt.get("page"), lt.get("fw")
+        board_fw = self.fw_text() if self.fw_text else None
+        fw_newer = None if not fw or not board_fw else vkey(fw["version"]) > vkey(board_fw)   # None: board unknown
+        return {
+            "enabled": bool(self.cfg.get("update_check")), "repo": self.repo(), "state": self.state, "msg": self.msg,
+            "checked_ago": None if not self.checked else int(time.time() - self.checked), "error": self.error,
+            "release": {k: lt.get(k) for k in ("tag", "title", "url", "published", "notes")} if lt else None,
+            "page": {"running": VERSION, "from_update": self.running_update, "builtin": self.builtin,
+                     "latest": page["version"] if page else None,
+                     "newer": bool(page) and vkey(page["version"]) > vkey(VERSION),
+                     "dropped": bool(page) and self._dropped(page["version"])},
+            "fw": {"board": board_fw, "latest": fw["version"] if fw else None, "newer": fw_newer,
+                   "download": fw["url"] if fw else None, "name": fw["name"] if fw else None},
+        }
+
+    def summary(self):
+        """For the header: only what's newer (and not a page update you went back from)."""
+        lt = self.latest or {}
+        page, fw = lt.get("page"), lt.get("fw")
+        board_fw = self.fw_text() if self.fw_text else None
+        return {"page": page["version"] if page and vkey(page["version"]) > vkey(VERSION)
+                and not self._dropped(page["version"]) else None,
+                "fw": fw["version"] if fw and board_fw and vkey(fw["version"]) > vkey(board_fw) else None}
+
+    def install(self):
+        page = (self.latest or {}).get("page")
+        if not page or vkey(page["version"]) <= vkey(VERSION):
+            return {"ok": False, "error": "There's no newer page on GitHub - press Check now first."}
+        why = self.busy() if self.busy else None
+        if why:
+            return {"ok": False, "error": why}
+        with self.lock:
+            if self.state != "idle":
+                return {"ok": False, "error": "An update check or download is already running."}
+            self.state, self.msg = "downloading", f"Downloading v{page['version']}..."
+        try:
+            raw = self._get(page["url"], "application/octet-stream", UPDATE_MAX_BYTES)
+            dg = str(page.get("digest") or "")
+            if dg.startswith("sha256:") and hashlib.sha256(raw).hexdigest() != dg[7:].lower():
+                raise ValueError("the download doesn't match GitHub's SHA-256 - try again")
+            src = raw.decode("utf-8")
+            m = re.search(r'^VERSION = "([^"]+)"', src, re.M)
+            if not m or m.group(1) != page["version"]:
+                raise ValueError(f"that file isn't page v{page['version']}")
+            compile(src, page["name"], "exec")           # it must at least be valid Python here
+            d = os.path.join(self.data_dir, "updates")
+            os.makedirs(d, exist_ok=True)
+            path = os.path.join(d, page["name"])
+            with open(path + ".part", "wb") as f:
+                f.write(raw)
+            os.replace(path + ".part", path)
+            write_update_state(self.data_dir, {
+                "file": os.path.abspath(path), "version": page["version"], "status": "new", "starts": 0,
+                "builtin": self.builtin, "builtin_file": self.builtin_file,
+                "installed": time.strftime("%Y-%m-%d %H:%M:%S")})
+            for old in os.listdir(d):                    # only now: keep just this one
+                if PAGE_ASSET.match(old) and old != page["name"]:
+                    try:
+                        os.remove(os.path.join(d, old))
+                    except OSError:
+                        pass
+        except Exception as e:
+            with self.lock:
+                self.state, self.msg = "idle", ""
+            return {"ok": False, "error": f"Update not installed: {e}"}
+        self.events.add("scope", f"Page update v{page['version']} downloaded - restarting into it.")
+        with self.lock:
+            self.state, self.msg = "restarting", f"Restarting into v{page['version']}..."
+        self._restart_soon()
+        return {"ok": True, "version": page["version"]}
+
+    def rollback(self):
+        """Back to the built-in page (the file that was started, or the Docker image's), and stay there."""
+        why = self.busy() if self.busy else None
+        if why:
+            return {"ok": False, "error": why}
+        with self.lock:
+            if self.state != "idle":
+                return {"ok": False, "error": "An update is being checked or installed - wait a moment."}
+            st = read_update_state(self.data_dir)
+            if not st.get("file"):
+                return {"ok": False, "error": "No page update is installed."}
+            if self.running_update and not (self.builtin_file and os.path.isfile(self.builtin_file)):
+                return {"ok": False, "error": f"The built-in page ({self.builtin_file or '?'}) isn't there any more."}
+            st["status"] = "off"
+            write_update_state(self.data_dir, st)
+            if not self.running_update:
+                return {"ok": True, "restarting": False}
+            self.state, self.msg = "restarting", f"Going back to v{self.builtin}..."
+        self.events.add("scope", f"Going back to the built-in page v{self.builtin}.")
+        self._restart_soon()
+        return {"ok": True, "restarting": True, "version": self.builtin}
+
+    def _restart_soon(self):
+        def go():
+            time.sleep(1.0)                              # let the answer reach the browser first
+            said = None
+            while True:                                  # never in the middle of moving the motors
+                why = self.busy() if self.busy else None
+                if not why:
+                    break
+                if why != said:
+                    said = why
+                    with self.lock:
+                        self.msg = f"Restarting as soon as this is done: {why}"
+                time.sleep(1.0)
+            try:
+                self.restart()
+            except Exception as e:
+                log(f"restart failed: {e}")
+                with self.lock:
+                    self.state, self.msg = "idle", f"The restart didn't work ({e}); it is used at the next start."
+        threading.Thread(target=go, daemon=True).start()
+
+    def restart(self):
+        """Start the right page again: the file that was started chooses (the update, or itself)."""
+        log("restarting for the page update")
+        if SPAWN:                                        # main() takes it from here once the server has stopped
+            self.restart_pending = True
+            threading.Thread(target=self.server.shutdown, daemon=True).start()
+            return
+        start = self.builtin_file if self.builtin_file and os.path.isfile(self.builtin_file) \
+            else os.path.abspath(__file__)
+        os.environ["SMC3_DATA_DIR"] = os.path.abspath(self.data_dir)
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os.execv(sys.executable, _child_args(start, sys.argv[1:]))
+
+    def after_serving(self, board):
+        """main(), after the server stopped: in spawn mode, run the next page (or let the parent do it)."""
+        if not self.restart_pending:
+            return
+        board.stop()
+        sys.stdout.flush()
+        if os.environ.get("SMC3_SUPERVISED") == "1":
+            os._exit(RESTART_RC)                         # the parent starts the right one
+        supervise(_choose(self.data_dir) or os.path.abspath(__file__), sys.argv[1:], self.data_dir)
+
+
+# --------------------------------------------------------------------------------------------------------------
 # Web page and artwork (seat logo, rig and motor pictures cropped from the dashboard design; Michroma font,
 # SIL Open Font License 1.1, Copyright 2011 The Michroma Project Authors)
 # --------------------------------------------------------------------------------------------------------------
@@ -7978,7 +8451,7 @@ main[data-view=tools]{grid-template-columns:minmax(0,1.75fr) minmax(0,1fr);grid-
 main[data-view=profiles]{grid-template-columns:minmax(0,1fr) minmax(360px,430px);grid-template-areas:"genres pid" "profiles pid"}
 main[data-view=autotune]{grid-template-columns:minmax(360px,430px) minmax(0,1fr);grid-template-areas:"tune tunelive" "tuneres tunelive" "tunelog tunelog" "graphs graphs"}
 main[data-view=eeprom]{grid-template-columns:minmax(0,1fr) minmax(360px,430px);grid-template-areas:"eeprom pid" "backups pid"}
-main[data-view=settings]{grid-template-columns:repeat(2,minmax(0,1fr));grid-template-areas:"settings global" "settings mnames" "led sensor" "fwupd fwupd" "diag diag"}
+main[data-view=settings]{grid-template-columns:repeat(2,minmax(0,1fr));grid-template-areas:"settings global" "settings mnames" "led sensor" "upd upd" "fwupd fwupd" "diag diag"}
 main[data-view=help]{grid-template-columns:1fr;grid-template-areas:"help"}
 main[data-view=seat]{grid-template-columns:minmax(0,1fr) minmax(300px,380px);grid-template-areas:"seat seatlive" "graphs graphs"}
 main[data-view=view3d]{grid-template-columns:1fr;grid-template-areas:"v3d"}
@@ -8235,6 +8708,10 @@ ul.tips{margin:6px 0 10px;padding-left:18px}ul.tips li{color:var(--dim);margin:4
 #fw_board{flex-wrap:nowrap;align-items:flex-start}#fw_board .dot{margin-top:3px}#fw_board span{flex:1;min-width:0}
 .fwinfo{font-size:14px;margin:6px 0 2px;line-height:1.5}.fwinfo b{font-family:var(--mono)}
 .fwhow ol{margin:4px 0 8px;padding-left:20px;font-size:14px;line-height:1.5}.fwhow li{margin:4px 0}
+.pill a.upl{color:#ffb020;text-decoration:none;font-weight:600}.pill a.upl:hover{text-decoration:underline}
+#up_page,#up_fw{flex-wrap:nowrap;align-items:flex-start;margin:2px 0 8px}#up_page .dot,#up_fw .dot{margin-top:3px}#up_page>span,#up_fw>span{flex:1;min-width:0}
+.upnotes{white-space:pre-wrap;font-size:13px;line-height:1.5;color:var(--dim);max-height:230px;overflow:auto;margin:6px 0 8px;padding:8px 10px;border:1px solid var(--line);border-radius:7px;background:var(--card-2)}
+#updcard label.chk{margin-top:12px}
 .fwlog{font-family:var(--mono);font-size:12.5px;color:var(--dim);margin-top:6px;line-height:1.55}
 
 /* tooltips */
@@ -8822,6 +9299,26 @@ details.oks .flist{margin-top:6px}
   <div class="msg" id="sn_msg"></div>
  </section>
 
+ <!-- updates from GitHub (page 2.7) -->
+ <section class="card wide" id="updcard" style="grid-area:upd" data-views="settings">
+  <div class="ct"><svg class="i" viewBox="0 0 24 24"><path d="M20 12a8 8 0 1 1-2.3-5.7"/><path d="M20 4v5h-5"/></svg>Updates <small>from GitHub</small></div>
+  <div class="dgrid">
+   <div>
+    <div class="sstat" id="up_page"><i class="dot"></i><span>Page v__VERSION__</span></div>
+    <div class="sstat" id="up_fw"><i class="dot"></i><span>Firmware: not checked yet</span></div>
+    <div class="sbtns">
+     <button class="btn b-blue" id="up_go" data-k="up_go" onclick="updAsk()" hidden>Update page</button>
+     <a class="btn b-orange" id="up_dl" data-k="up_dl" href="#" hidden>Download firmware</a>
+     <button class="btn b-grey" id="up_check" data-k="up_check" onclick="updCheck()">Check now</button>
+     <button class="btn b-grey" id="up_back" data-k="up_back" onclick="updBack()" hidden>Go back to built-in</button>
+    </div>
+    <label class="chk" data-k="up_auto"><input type="checkbox" id="up_auto" onchange="updAuto()"><span>Check GitHub for new versions twice a day</span></label>
+    <div class="msg" id="up_msg"></div>
+   </div>
+   <div class="fwhow" id="up_notes"><p class="note">Press <b>Check now</b> to see what the newest release on GitHub has.</p></div>
+  </div>
+ </section>
+
  <!-- firmware update (page 2.3, firmware 1.9.2) -->
  <section class="card wide" id="fwcard" style="grid-area:fwupd" data-views="settings">
   <div class="ct"><svg class="i" viewBox="0 0 24 24"><path d="M12 15V3M7 8l5-5 5 5"/><path d="M5 15v4a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-4"/></svg>Firmware update <small>over WiFi</small></div>
@@ -8893,6 +9390,7 @@ details.oks .flist{margin-top:6px}
     <h3>Diagnostics</h3><p>Settings section. <b>Quick check</b> reads the board and listens for a few seconds; <b>Full check</b> also moves each motor a little to see which way it goes, how much drive it needs, whether the wiring is swapped and how it answers a small step - and can ask you what you saw. Both make one file (saved on the NAS too) to download and give to whoever helps you. The page also watches while you drive and notes pot glitches, a motor moving the wrong way or stalling, hunting, cutoffs, the tilt limit and board restarts. It also keeps a <b>load map</b>: where each motor falls behind or runs at full power, each way across its travel - a quick check after a session names where the rig struggles (lifting a heavy driver, say). With the motion sensor, the full check also measures the seat itself: degrees per count, bounce and play in the linkage - for the traction-loss motor, how far the seat turns. For the rear slide it asks whether the rear went left or right.</p>
     <h3>Status bar</h3><p>LOW POWER means no position commands for 15 s, so the board runs at quarter drive until SimHub or this page sends targets again.</p>
     <h3>Firmware update (firmware 1.9.2)</h3><p>Settings, Firmware update installs new firmware over WiFi - no USB cable, and SimHub can stay open (with its motion output paused). In the Arduino IDE open the new .ino and use <b>Sketch, Export Compiled Binary</b>; choose that .bin on the page and press Install. The page checks the file (an SMC3_R4 build for the UNO R4 WiFi, and which version), the board switches the motors off, its WiFi module downloads and checks the file and installs it, and the page confirms the new version once the board is back. The board remembers the WiFi name and password it last joined with, so a build with the placeholders still connects. Needs the WiFi module's own firmware 0.4.0 or newer (0.5.0+ shows progress): Arduino IDE, Tools, Firmware Updater, with SimHub closed (it keeps the USB port busy) - and since that erases the sketch on the board, upload SMC3_R4 again over USB afterwards. The first install of it (SMC3_R4_v1.9.3.ino - 1.9.2 didn't compile in the Arduino IDE) goes over USB.</p>
+    <h3>Updates (page 2.7)</h3><p>Settings, Updates: the page asks GitHub twice a day (or when you press <b>Check now</b>) whether the newest release has a newer page or firmware, and says so in the header. <b>Update page</b> downloads the new page, checks it and restarts into it - the board isn't touched, and settings stay. The downloaded page is kept in the data folder (<code>updates</code>), so it is used again after a restart or a re-created Docker container, until a newer one comes, or a newer image or file is started. <b>Go back to built-in</b> undoes it. Firmware is only downloaded: flash the .ino with the Arduino IDE, or export the .bin and install it in Firmware update.</p>
     <h3>Soft start (firmware 1.9.1)</h3><p>After the rig has been off the seat may have ridden down a little. At power-up, and when you press Enable Motors, each motor creeps from wherever it is to its position (SimHub's centre at power-up) instead of jumping there - 60 counts/s by default, easing in and out. Once it has caught up everything runs normally. A seat that rode down past an end stop is allowed to come back (only going further out switches the motor off), the tilt limit waits, and the board keeps full power meanwhile. Settings, Loop, PWM &amp; smoothing: Soft start.</p></div>
    <div><h3>Seat setup (firmware 1.9)</h3><p>Levels the platform first and makes that SimHub's centre: the board adds a <b>level trim</b> to every position SimHub sends, so SimHub's middle (512) is the level seat - and the seat goes level at power-up. With the motion sensor it levels itself (each motor moves a little to learn how it tilts the seat, then the page moves them until the sensor reads level, choosing the level position nearest the middle of every motor); without it you nudge the motors with a spirit level on the seat. On a traction-loss rig only motors 1 and 2 level the seat; you <b>centre</b> motor 3, the rear slide, so the seat points straight ahead, and tell the page which way the rear went for +10.</p>
     <p>Then each motor moves slowly away from level, both ways, and stops at the tilt you allow, when it pushes against something, at the end of its Clip window, or when you press Stop (space bar). The rear slide stops at the <b>traction loss you allow</b> - how far the seat may turn each way, measured by the sensor. From what it found the page suggests <b>travel limits</b> (the board never sends a motor past them), <b>end stops</b> (a motor that gets past one anyway is switched off: E1-E3) and <b>tilt limits</b> for each direction (every motor stops: E4). While Seat setup is open the board ignores SimHub's positions; Cancel puts everything back. Auto-tune, the test signal and the full check stay inside the travel limits.</p>
@@ -8936,6 +9434,17 @@ details.oks .flist{margin-top:6px}
  </ul>
  <p class="note" id="mf_note"></p>
  <div style="display:flex;gap:10px;margin-top:12px"><button class="btn b-orange" onclick="fwInstall()">Install</button><button class="btn b-grey" onclick="closeModal('mFw')">Cancel</button></div>
+</div></div>
+
+<div class="modal" id="mUpd"><div class="box">
+ <h2>Update the page to <span id="mu_v"></span></h2>
+ <ul>
+  <li>The page downloads it from GitHub, checks it and <b>restarts into it</b> - a few seconds, then this tab reloads.</li>
+  <li>The <b>board and the motors aren't touched</b>, and SimHub keeps running. Settings, profiles and backups stay.</li>
+  <li><b>Go back to built-in</b> (here, afterwards) undoes it. If the new page doesn't start, the next start runs this one again.</li>
+ </ul>
+ <p class="note" id="mu_note"></p>
+ <div style="display:flex;gap:10px;margin-top:12px"><button class="btn b-blue" onclick="updInstall()">Update</button><button class="btn b-grey" onclick="closeModal('mUpd')">Cancel</button></div>
 </div></div>
 
 <div class="modal" id="mDiag"><div class="box">
@@ -9015,6 +9524,12 @@ const TIPS={
  sn_search:"The board tries the usual baud rates until the sensor answers - normally by itself while the sensor is switched on. This makes it look again for 30 s.",
  smooth:"<b>Target smoothing</b> - how softly the motor eases into each new position SimHub sends (a low-pass filter on the target).<br><br><b>Off / 4 ms:</b> raw, every bump and kerb comes through - rally.<br><b>8-16 ms:</b> crisp but not jagged - circuit racing.<br><b>32-64 ms:</b> soft and floaty - flight, space, trucks.<br><br>Times are at Fpid/1 (double them at Fpid/2). Needs firmware 1.6.",
  fw_file:"<b>Firmware file</b> (firmware 1.9.2 or newer on the board). In the Arduino IDE: open the new SMC3_R4 .ino, choose Arduino UNO R4 WiFi, then <b>Sketch, Export Compiled Binary</b>. Pick the <b>.bin</b> it writes into the sketch's build folder (not the .hex or .elf). The page checks it before anything is sent to the board.",
+ up_go:"<b>Update the page</b> to the newest release on GitHub: it downloads the new page file, checks it (GitHub's SHA-256, its version, that it is valid Python), keeps it in the data folder (updates) and restarts into it. Nothing on the board changes. In Docker the image stays as it is; the update is used at every start until a newer image comes along.",
+ up_dl:"<b>Download the firmware</b> (.ino) from the newest release - it isn't installed by itself. Open it in the Arduino IDE (it offers to make a folder of the same name: yes), and upload it over USB with SimHub closed - or use <b>Sketch, Export Compiled Binary</b> and install the .bin below in Firmware update, over WiFi.",
+ up_check:"Ask GitHub now what the newest release has (page and firmware). Needs this machine to reach api.github.com.",
+ up_back:"Go back to the page that was started (in Docker: the image's) and stay there - the downloaded update isn't used any more. Update page brings it back.",
+ up_auto:"Ask GitHub twice a day (the first time 20 s after the page starts) whether there's a newer page or firmware. The header and the event log say when there is. Nothing is installed by itself.",
+ st_upd:"A newer version is on GitHub. Click to see it (Settings, Updates).",
  fw_go:"<b>Install on the board</b>: the motors switch off, the board's WiFi module downloads the file from this page, checks it and installs it, the board restarts and the seat creeps back with the soft start. Under a minute. Pause SimHub's motion output first.",
  fw_clear:"Forget the chosen file (and clear a failed update's message on the board and the matrix).",
  soft:"<b>Soft start</b> (firmware 1.9.1). When the rig has been off, the seat may have ridden down a little. At power-up - and when you press Enable Motors - each motor creeps from wherever it is to where it should be at this speed, easing in and out, instead of jumping there; once it has caught up everything runs normally. 60 counts/s moves a lift about 2° a second. Meanwhile a seat that rode down past an end stop may come back, and the tilt limit waits. Saved on the board at once.",
@@ -9128,7 +9643,7 @@ function nameify(t){if(!t||!MNAMES.some(x=>x))return t;const tag=i=>MNAMES[i-1]?
  return t.replace(/\b([Mm])otor ([123])\b(?! \()/g,(a,c,x)=>a+tag(+x));}
 const escn=t=>esc(nameify(t));
 const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-async function post(url,obj){const r=await fetch(url,{method:'POST',body:JSON.stringify(obj||{})});return r.json()}
+async function post(url,obj){const r=await fetch(url,{method:'POST',headers:{'X-SMC3':'1'},body:JSON.stringify(obj||{})});return r.json()}   // the header: other websites can't send it
 function txt(t){return post('/cmd',{text:t})}
 function closeModal(id){$(id).style.display='none'}
 function openModal(id){$(id).style.display='flex'}
@@ -9189,7 +9704,7 @@ function showView(){let v=location.hash.slice(1);if(!VIEWS.includes(v))v='dashbo
  document.querySelectorAll('#nav a').forEach(a=>a.classList.toggle('on',a.getAttribute('href')==='#'+v));
  const eb=$('expBtn');eb.dataset.k=v==='graphs'?'collapse':'expand';eb.dataset.tip=TIPS[eb.dataset.k];
  eb.innerHTML=v==='graphs'?'<svg class="i" viewBox="0 0 24 24"><path d="M4 14h6v6M20 10h-6V4M14 10l7-7M3 21l7-7"/></svg>':'<svg class="i" viewBox="0 0 24 24"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>';
- if(v==='profiles'){loadProfiles();loadGenres();} if(v==='settings'){fillSettings();diagLists();loadBoard(true);fwLoad(true);} if(v==='tuning')loadBoard(true); if(v==='eeprom')loadBackups();
+ if(v==='profiles'){loadProfiles();loadGenres();} if(v==='settings'){fillSettings();diagLists();loadBoard(true);fwLoad(true);updLoad();} if(v==='tuning')loadBoard(true); if(v==='eeprom')loadBackups();
  if(v==='seat'){ssFilled=null;ssPoll();} if(typeof v3Show==='function')v3Show(v==='view3d');
  chartHeight();}
 window.addEventListener('hashchange',showView);
@@ -9229,6 +9744,64 @@ function useHost(h){$('s_host').value=h;saveSettings();}
 // ---------- firmware update over WiFi (page 2.3, firmware 1.9.2) ----------
 let fwSt=null,fwTimer=null;
 const kB=n=>Math.round((n||0)/1024)+' kB';
+// ---------- updates from GitHub (page 2.7) ----------
+let upSt=null,upWait=null;
+const vk=v=>String(v||'').split('.').map(x=>+x||0);
+const vgt=(a,b)=>{const x=vk(a),y=vk(b);for(let i=0;i<Math.max(x.length,y.length);i++){const d=(x[i]||0)-(y[i]||0);if(d)return d>0;}return false;};
+function agoText(s){if(s==null)return'';if(s<90)return'just now';if(s<5400)return Math.round(s/60)+' min ago';if(s<129600)return Math.round(s/3600)+' h ago';return Math.round(s/86400)+' days ago';}
+async function updLoad(){try{updShow(await (await fetch('/update/status')).json());}catch(e){}}
+function updGo(){setTimeout(()=>{const c=$('updcard');if(c)c.scrollIntoView({behavior:'smooth',block:'start'});},80);}
+function updShow(r){upSt=r;const p=r.page||{},f=r.fw||{},rel=r.release,idle=r.state==='idle';let cls,h;
+ if(p.newer){cls='warn';h=`Page <b>v${esc(p.latest)}</b> is out - this is v${esc(p.running)}.`+(p.dropped?' <span class="muted">Not used now: you went back from it, or it didn\'t start.</span>':'');}
+ else if(p.latest){cls='on';h=`Page v${esc(p.running)} - `+(vgt(p.running,p.latest)?`newer than the release (v${esc(p.latest)}).`:'the newest.');}
+ else{cls='';h=`Page v${esc(p.running)}`+(rel?' - the newest release has no page file.':'.');}
+ if(p.from_update)h+=` <span class="muted">Updated from GitHub; built-in v${esc(p.builtin||'?')}.</span>`;
+ $('up_page').innerHTML=`<i class="dot ${cls}"></i><span>${h}</span>`;
+ if(f.latest){if(f.newer===true){cls='warn';h=`Firmware <b>${esc(f.latest)}</b> is out - the board runs ${esc(f.board)}.`;}
+  else if(f.newer===false){cls='on';h=`Firmware ${esc(f.board)} on the board - `+(vgt(f.board,f.latest)?`newer than the release (${esc(f.latest)}).`:'the newest.');}
+  else{cls='';h=`Newest firmware: <b>${esc(f.latest)}</b> <span class="muted">(the board isn't connected, so its version isn't known)</span>`;}}
+ else{cls='';h=rel?'The newest release has no firmware file.':'Firmware: not checked yet.';}
+ $('up_fw').innerHTML=`<i class="dot ${cls}"></i><span>${h}</span>`;
+ $('up_go').hidden=!p.newer;$('up_go').textContent='Update page to v'+(p.latest||'');$('up_go').disabled=!idle;
+ const dl=$('up_dl');dl.hidden=!f.download;if(f.download){dl.href=f.download;dl.textContent='Download firmware '+f.latest;dl.className='btn '+(f.newer===false?'b-grey':'b-orange');}
+ $('up_back').hidden=!p.from_update;$('up_back').disabled=!idle;$('up_check').disabled=!idle;$('up_auto').checked=!!r.enabled;
+ let m='';
+ if(r.state==='checking')m='Asking GitHub…';
+ else if(r.state!=='idle')m=esc(r.msg||'');
+ else if(r.error)m='<span class="badc">'+esc(r.error)+'</span>';
+ else{if(r.msg)m='<div class="warnc">'+esc(r.msg)+'</div>';
+  if(r.checked_ago!=null)m+=`<span class="muted">Checked ${agoText(r.checked_ago)}`+(rel?` · newest release ${esc(rel.title||rel.tag||'')}${rel.published?' ('+esc(rel.published)+')':''}`:'')+` · ${esc(r.repo)}</span>`;
+  else if(!r.enabled)m+='<span class="muted">Automatic checks are off.</span>';}
+ if(!upWait)$('up_msg').innerHTML=m;
+ let n='';
+ if(rel){n=`<b>${esc(rel.title||rel.tag||'')}</b>`+(rel.published?` <span class="muted">${esc(rel.published)}</span>`:'')+
+   (rel.notes?`<div class="upnotes">${esc(rel.notes)}</div>`:'')+(rel.url?`<a href="${esc(rel.url)}" target="_blank" rel="noopener">The release on GitHub</a>`:'');
+  if(f.download)n+=`<ol><li><b>Download firmware</b> gives you ${esc(f.name||'the .ino')}. Open it in the Arduino IDE (board: Arduino UNO R4 WiFi); it offers to put it into a folder of the same name - say yes.</li><li>Your WiFi name and password go into <code>WIFI_SSID</code> / <code>WIFI_PASS</code> (firmware 1.9.2 or newer remembers them, so the placeholders work too).</li><li>Upload over USB with SimHub closed - or <b>Sketch, Export Compiled Binary</b> and install the .bin below, over WiFi.</li></ol>`;}
+ else n='<p class="note">Press <b>Check now</b> to see what the newest release on GitHub has.</p>';
+ $('up_notes').innerHTML=n;tipAttach($('updcard'));
+ clearTimeout(updShow.t);if(!idle&&!upWait&&curView==='settings')updShow.t=setTimeout(updLoad,1500);}   // a check or install going on
+async function updCheck(){$('up_check').disabled=true;$('up_msg').textContent='Asking GitHub…';
+ try{updShow(await post('/update/check'));}catch(e){$('up_msg').innerHTML='<span class="badc">No answer from the page.</span>';$('up_check').disabled=false;}}
+async function updAuto(){cfg=await post('/config',{update_check:$('up_auto').checked});updLoad();}
+function updAsk(){const p=(upSt||{}).page||{};if(!p.newer)return;$('mu_v').textContent='v'+p.latest;
+ $('mu_note').innerHTML='This is v'+esc(p.running)+'.'+(p.from_update?'':' The page you started stays as it is - it hands over to the update at every start.');openModal('mUpd');}
+function updWaitFor(v,what){let t0=Date.now();upWait=v;$('up_msg').innerHTML=esc(what)+' <span class="muted">(the page restarts - this tab reloads by itself)</span>';
+ const tick=async()=>{try{const r=await (await fetch('/update/status',{cache:'no-store'})).json();
+   if(r.page&&r.page.running===v){location.reload();return;}
+   if(r.state==='restarting'){if(r.msg)$('up_msg').innerHTML=esc(r.msg);t0=Date.now();}      // still waiting (e.g. for the motors): no time limit
+   else if(r.state==='idle'&&Date.now()-t0>4000){upWait=null;updShow(r);return;}           // no restart after all - the card says why
+  }catch(e){}
+  if(Date.now()-t0>90000){upWait=null;$('up_msg').innerHTML='<span class="badc">The page hasn\'t come back as v'+esc(v)+' after 90 s.</span> Reload this tab; if it doesn\'t open, start the page again (or restart the container) - it goes back to the built-in page by itself if the update didn\'t start.';return;}
+  setTimeout(tick,1500);};
+ setTimeout(tick,2500);}
+async function updInstall(){closeModal('mUpd');$('up_go').disabled=true;$('up_msg').textContent='Downloading…';
+ let r;try{r=await post('/update/install');}catch(e){r={ok:false,error:'No answer from the page.'};}
+ if(!r.ok){$('up_msg').innerHTML='<span class="badc">'+esc(r.error||'The update didn\'t install.')+'</span>';$('up_go').disabled=false;return;}
+ updWaitFor(r.version,'Installed v'+r.version+' - restarting into it…');}
+async function updBack(){const p=(upSt||{}).page||{};
+ let r;try{r=await post('/update/rollback');}catch(e){r={ok:false,error:'No answer from the page.'};}
+ if(!r.ok){$('up_msg').innerHTML='<span class="badc">'+esc(r.error||'That didn\'t work.')+'</span>';return;}
+ if(r.restarting)updWaitFor(r.version,'Going back to v'+r.version+'…');else{toast(esc(r.note||'The downloaded update won\'t be used.'));updLoad();}}
 async function fwLoad(fresh){try{fwShow(await (await fetch('/fw/status'+(fresh?'?fresh=1':''))).json());}catch(e){}}
 function fwShow(r){fwSt=r;const b=r.board||{},f=r.file,running=r.state==='running';
  let cls,h;
@@ -9320,7 +9893,7 @@ async function saveNames(){const names=[0,1,2].map(m=>{const v=$('nsel'+m).value
 
 // ---------- live data ----------
 async function poll(){
- try{const r=await fetch('/data?since='+lastSeq);const j=await r.json();
+ try{const r=await fetch('/data?since='+lastSeq+'&v=__VERSION__');const j=await r.json();
   if(j.samples.length){data.push(...j.samples);lastSeq=data[data.length-1].seq;}
   const keep=parseFloat($('win').value)*1000+500;
   if(data.length&&!paused){const tEnd=data[data.length-1].ms;data=data.filter(s=>tEnd-s.ms<=keep);}
@@ -9345,6 +9918,7 @@ function updateStatus(j){const s=data[data.length-1];const fresh_inc=watch.newes
   if(s.roll!=null)h+=`<span data-k="seatchart">Seat ${s.roll.toFixed(1)}° / ${s.pitch.toFixed(1)}°</span>`;}
  if(j.scanning)h+='<span>searching for the board…</span>';
  if(tuneRunning)h+='<span class="ok">auto-tune running</span>';
+ const up=j.upd||{};if(up.page||up.fw)h+=`<span data-k="st_upd"><a class="upl" href="#settings" onclick="updGo()">Update available: ${[up.page?'page v'+esc(up.page):'',up.fw?'firmware '+esc(up.fw):''].filter(Boolean).join(' · ')}</a></span>`;
  $('pill').innerHTML=h;tipAttach($('pill'));
  // system status
  const fresh=s&&connected; const on=s?s.dis.slice(0,NM).filter(d=>!d).length:0;
@@ -10377,6 +10951,7 @@ class Handler(BaseHTTPRequestHandler):
     diag: Diagnostics = None
     seat: "SeatSetup" = None
     fwup: "FirmwareUpdate" = None
+    upd: "Updater" = None
 
     def log_message(self, *a):          # quiet
         pass
@@ -10424,6 +10999,8 @@ class Handler(BaseHTTPRequestHandler):
             imu = self.board.imu
             if self.seat.state != "idle":
                 self.seat.last_poll = time.time()        # the page is still there
+            if q.get("v", [""])[0] == VERSION:
+                self.upd.seen()                          # this version's own page runs in a browser
             self._json({"connected": self.board.connected, "host": self.cfg.get("host"),
                         "samples": self.board.since(since, limit=1500), "fw": self._fw(),
                         "fwnum": (self.board.fw_cache or [0, 0])[1],
@@ -10434,9 +11011,11 @@ class Handler(BaseHTTPRequestHandler):
                         "imu": imu if (imu and time.time() - imu["t"] < 1.0) else None,
                         "seat": {"open": self.seat.state != "idle", "action": self.seat.action,
                                  "trim": [self.board.trim(m) for m in range(3)]},
-                        "manual": self.manual.status()})
+                        "manual": self.manual.status(), "upd": self.upd.summary()})
         elif u.path == "/config":
             self._json(self.cfg.public())
+        elif u.path == "/update/status":                 # 2.7: newer page / firmware on GitHub
+            self._json(self.upd.status())
         elif u.path == "/fw/status":                     # 2.3: firmware update
             st = self.fwup.status()
             st["board"] = self.fwup.board_view(fresh=parse_qs(u.query).get("fresh", ["0"])[0] == "1")
@@ -10635,6 +11214,19 @@ class Handler(BaseHTTPRequestHandler):
         if p == "/fw/clear":
             self._json(self.fwup.clear())
             return
+        if p.startswith("/update/") and self.headers.get("X-SMC3") != "1":
+            # the page sends this header; another website open in the same browser can't (without asking first)
+            self._json({"ok": False, "error": "Only the page itself can do that."}, 403)
+            return
+        if p == "/update/check":
+            self._json(self.upd.check())
+            return
+        if p == "/update/install":
+            self._json(self.upd.install())
+            return
+        if p == "/update/rollback":
+            self._json(self.upd.rollback())
+            return
         if p == "/cmd":
             ok = False
             if self.diag.moving() and ("word" in req or "pair" in req):
@@ -10743,6 +11335,8 @@ class Handler(BaseHTTPRequestHandler):
                 kw["layout"] = req["layout"]
             if req.get("tl_dir") in (1, -1, "1", "-1"):
                 kw["tl_dir"] = int(req["tl_dir"])
+            if "update_check" in req:
+                kw["update_check"] = bool(req["update_check"])
             before = {k: self.cfg.get(k) for k in kw}
             self.cfg.update(**kw)
             changed = [f"{k} {before[k]} -> {self.cfg.get(k)}" for k in kw if before[k] != self.cfg.get(k)]
@@ -10975,6 +11569,7 @@ def main():
     ap.add_argument("--data", default=os.environ.get("SMC3_DATA_DIR", default_data),
                     help="folder for config.json (settings made in the page)")
     args = ap.parse_args()
+    handoff_to_update(args.data, sys.argv[1:])        # 2.7: a newer page downloaded from GitHub runs instead
 
     cfg = Config(args.data, args.host.strip(), str(args.port).strip())
     events = EventLog(args.data)
@@ -11012,6 +11607,24 @@ def main():
     Handler.manual.seat_open = lambda: Handler.seat.state != "idle"
     Handler.monitor.manual = Handler.manual
     Handler.diag.fwup = Handler.fwup
+
+    def busy_update():
+        why = busy()
+        if why:
+            return why
+        if Handler.fwup.state == "running":
+            return "A firmware update is running - wait for it to finish."
+        if Handler.manual.status().get("active"):
+            return "The motors are being moved by hand (Move motors) - finish that first."
+        return None
+    def board_fw():
+        fw = board.fw_cache
+        if not fw or not board.connected:
+            return None
+        if not board.fw_version and fw[1] >= 19 and time.time() - board.connected_at < 6:
+            return None                                  # 1.9.2+ sends its exact version a moment after connecting
+        return fw_text(fw[1], board.diag, board.fw_version)
+    Handler.upd = Updater(cfg, events, args.data, board_fw, busy_update)
     events.add("scope", f"smc3_scope v{VERSION} started (board {cfg.get('host') or 'not set'}:{cfg.get('port')}, "
                f"{cfg.get('motors')} motors in use).", quiet=True)
 
@@ -11046,14 +11659,18 @@ def main():
     if srv is None:
         raise SystemExit("no free port found")
     srv.daemon_threads = True
+    confirm_update(args.data)                           # 2.7: a page update that gets this far works
     Handler.fwup.port = srv.server_address[1]           # the board fetches firmware updates from this port
     where = "localhost" if args.bind == "127.0.0.1" else "<this machine's IP>"
     log(f"smc3_scope v{VERSION}   board {cfg.get('host') or '(not set)'}:{cfg.get('port')}   "
         f"page http://{where}:{port}   settings {cfg.path}")
+    Handler.upd.server = srv
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
         pass
+    srv.server_close()
+    Handler.upd.after_serving(board)                    # Windows: a page update restarts from here
 
 
 if __name__ == "__main__":

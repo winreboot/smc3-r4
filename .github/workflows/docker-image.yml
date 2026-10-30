@@ -1,7 +1,7 @@
 name: docker-image
 
 # Builds the page (scope/) as a ready-made Docker image for every release tag and puts it on the GitHub Container
-# Registry:  ghcr.io/<owner>/smc3-scope:latest  (and :2.6.2, :2.6 ...)  for PCs and NAS (amd64), Raspberry Pi 4/5
+# Registry:  ghcr.io/<owner>/smc3-scope:latest  (and :2.7, :2.6.2, :2.6 ...)  for PCs and NAS (amd64), Raspberry Pi 4/5
 # and ARM NAS (arm64), and older 32-bit Raspberry Pi OS (arm/v7). Run it by hand from the Actions tab if needed.
 
 on:
@@ -38,9 +38,11 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ steps.name.outputs.image }}
+          # release tags are v2.7, v2.6.2 ... - the semver type needs three parts, so match them instead:
+          # v2.6.2 -> 2.6.2 and 2.6, v2.7 -> 2.7; a release tag also gets latest
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
+            type=match,pattern=^v(\d+\.\d+(?:\.\d+)*)$,group=1
+            type=match,pattern=^v(\d+\.\d+),group=1
             type=ref,event=branch
           labels: |
             org.opencontainers.image.title=smc3-scope

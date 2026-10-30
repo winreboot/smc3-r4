@@ -49,8 +49,10 @@ python3 smc3_scope.py --host 192.168.1.50 --bind 0.0.0.0 --web 8198
 | `diagnostics/events.jsonl` | The event log. |
 | `diagnostics/incidents/` | Problems the watcher noticed, each with a few seconds of telemetry. The newest 40 are kept. |
 | `diagnostics/reports/` | Diagnostics files from the quick and full checks. The newest 20 are kept. |
+| `updates/` | A newer page downloaded from GitHub (Settings, Updates, 2.7) and `state.json`: which file, and whether it started. |
 
-To upgrade, rebuild with the new `smc3_scope.py`. Keep the data folder, and everything carries over.
+To upgrade, press **Update page** in Settings, Updates - or rebuild with the new `smc3_scope.py`. Keep the data
+folder, and everything carries over.
 
 The LED matrix and motion sensor settings (firmware 1.8) and the seat set-up (firmware 1.9: level trim, travel
 limits, end stops, tilt limits) are not in the data folder: they live on the board itself, so they stay with the rig.
@@ -60,6 +62,32 @@ limits, end stops, tilt limits) are not in the data folder: they live on the boa
 Settings, Firmware update (firmware 1.9.2 on the board) keeps the chosen file in memory only. While an update runs
 the board fetches it from `http://<this machine>:<web port>/ota/<number>.ota`; that address answers only during an
 update and only for its number.
+
+## Updates from GitHub
+
+Twice a day (and on **Check now**) the page asks `https://api.github.com/repos/winreboot/smc3-r4/releases/latest`
+what the newest release has: `smc3_scope_v<version>.py` and `SMC3_R4_v<version>.ino` among its files.
+
+- **Update page** downloads the page file into `<data>/updates`, checks GitHub's SHA-256 of it (when the release
+  lists one), its `VERSION` line and that it compiles, writes `updates/state.json` (`new`) and restarts - once
+  nothing is moving the motors - with the same options. The file you started decides what runs: at every start it
+  hands over to the update if the update is newer than itself and isn't `off` or `failed` (`trying`, one more start
+  counted). Once the update serves it says `ok`; after 10 minutes, or once its own page has loaded in a browser, the
+  start count is cleared.
+- A start that finds `trying` (the last one didn't get as far as serving) or three counted starts (it serves, then
+  stops - a crash loop under a restart policy) sets `failed`, and the file you started runs instead.
+  `SMC3_NO_UPDATE=1` skips the hand-over altogether.
+- Restarting: `os.execv` on Linux, macOS and in Docker (same process - PID 1 stays PID 1). On Windows the file you
+  started stays as a parent: it runs the page as a child and starts the right one again when the child exits with
+  code 75 (`SMC3_RESTART_SPAWN=1` does the same on Linux, for testing).
+- **Go back to built-in** sets `off` and restarts. Firmware is only offered as a download link; the browser fetches
+  it from GitHub.
+- The three `/update/` POSTs need the header `X-SMC3: 1`, which the page sends and another website open in the same
+  browser can't (without a CORS preflight this server doesn't answer).
+
+`update_check` in `config.json` (the tick box) switches the twice-a-day check off; `update_repo` (only in
+`config.json`) points a fork at its own releases. `SMC3_GITHUB_API` replaces `https://api.github.com` for testing
+(`tools/smoke_test.py` runs a stand-in).
 
 ## Moving the motors from the page
 

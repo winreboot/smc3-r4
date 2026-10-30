@@ -1,6 +1,6 @@
 # smc3-scope from the ready-made image - nothing to build. Start with:
 #     docker compose -f compose.prebuilt.yaml up -d
-# Update later with:
+# Update later in the page (Settings, Updates, Update page - kept in the data folder), or with:
 #     docker compose -f compose.prebuilt.yaml pull && docker compose -f compose.prebuilt.yaml up -d
 # Page: http://<this machine's IP>:8198
 #
@@ -13,7 +13,7 @@ name: smc3-scope
 
 services:
   smc3-scope:
-    image: ghcr.io/winreboot/smc3-scope:latest   # or pin a version, e.g. :2.6.2
+    image: ghcr.io/winreboot/smc3-scope:latest   # or pin a version, e.g. :2.7
     container_name: smc3-scope
     restart: unless-stopped
     environment:

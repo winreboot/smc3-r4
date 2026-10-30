@@ -13,6 +13,9 @@ no database, no internet connection. Run it on whatever is on all the time near 
 
 SimHub keeps the board's USB port as before; the page talks to the board over WiFi, so both run at the same time.
 
+Once it runs, the page keeps itself up to date: **Settings, Updates** says when GitHub has a newer page or firmware,
+and **Update page** installs the new page with one click, whichever way you run it ([Updates](#updates)).
+
 ## Before you start
 
 1. **The board runs SMC3_R4 firmware and is on your WiFi.** Flashing is in [firmware/README.md](../firmware/README.md)
@@ -36,7 +39,7 @@ You can also skip the address: the page's **Settings, Find board on network** lo
    opens, type (use the name of the file you downloaded):
 
    ```bat
-   py smc3_scope_v2.6.2.py --bind 0.0.0.0 --web 8198 --host 192.168.1.50
+   py smc3_scope_v2.7.py --bind 0.0.0.0 --web 8198 --host 192.168.1.50
    ```
 
    `--host` is your board's address (you can leave it out and set it in the page). Keep this window open: closing
@@ -54,13 +57,14 @@ Settings, profiles, backups and diagnostics are kept in the folder `smc3-scope-d
 ```bat
 @echo off
 cd /d "%~dp0"
-start "smc3-scope" /min py smc3_scope_v2.6.2.py --bind 0.0.0.0 --web 8198
+start "smc3-scope" /min py smc3_scope_v2.7.py --bind 0.0.0.0 --web 8198
 ```
 
 press Win+R, type `shell:startup`, Enter, and put a shortcut to `smc3-scope.bat` in the folder that opens.
 
-**Update:** download the new `smc3_scope_v<version>.py` into the same folder, close the old window and start the
-new file (change the name in the `.bat` too). Your settings stay - they're in `smc3-scope-data`.
+**Update:** from the page - Settings, Updates, **Update page** ([Updates](#updates)). Or by hand: download
+the new `smc3_scope_v<version>.py` into the same folder, close the old window and start the new file (change the name
+in the `.bat` too). Your settings stay - they're in `smc3-scope-data`.
 
 ---
 
@@ -73,8 +77,8 @@ new file (change the name in the `.bat` too). Your settings stay - they're in `s
 
    ```sh
    mkdir -p ~/smc3-scope && cd ~/smc3-scope
-   curl -LO https://github.com/winreboot/smc3-r4/releases/latest/download/smc3_scope_v2.6.2.py
-   python3 smc3_scope_v2.6.2.py --bind 0.0.0.0 --web 8198 --host 192.168.1.50
+   curl -LO https://github.com/winreboot/smc3-r4/releases/latest/download/smc3_scope_v2.7.py
+   python3 smc3_scope_v2.7.py --bind 0.0.0.0 --web 8198 --host 192.168.1.50
    ```
 
 3. **Open** `http://<this computer's address>:8198` (or <http://localhost:8198> on the same machine). A Mac asks
@@ -92,7 +96,7 @@ Wants=network-online.target
 [Service]
 User=pi
 WorkingDirectory=/home/pi/smc3-scope
-ExecStart=/usr/bin/python3 /home/pi/smc3-scope/smc3_scope_v2.6.2.py --bind 0.0.0.0 --web 8198
+ExecStart=/usr/bin/python3 /home/pi/smc3-scope/smc3_scope_v2.7.py --bind 0.0.0.0 --web 8198
 Restart=always
 RestartSec=5
 
@@ -109,7 +113,8 @@ systemctl status smc3-scope        # should say "active (running)"
 journalctl -u smc3-scope -f        # its log, Ctrl+C to leave
 ```
 
-**Update:** download the new file, change the name in `ExecStart`, then `sudo systemctl daemon-reload && sudo
+**Update:** from the page - Settings, Updates, **Update page** ([Updates](#updates)); systemd keeps running the same
+service. Or by hand: download the new file, change the name in `ExecStart`, then `sudo systemctl daemon-reload && sudo
 systemctl restart smc3-scope`.
 
 ---
@@ -117,8 +122,8 @@ systemctl restart smc3-scope`.
 ## Docker: ready-made image
 
 Every release is built as an image for PCs and NAS (amd64), Raspberry Pi 4/5 and ARM NAS (arm64) and older 32-bit
-Raspberry Pi OS (arm/v7): `ghcr.io/winreboot/smc3-scope`. Tags: `latest`, the version (`2.6.2`) and the minor
-version (`2.6`).
+Raspberry Pi OS (arm/v7): `ghcr.io/winreboot/smc3-scope`. Tags: `latest`, the version (`2.7`, `2.6.2`) and the
+minor version (`2.6`).
 
 **One command:**
 
@@ -139,7 +144,7 @@ docker compose -f compose.prebuilt.yaml up -d
 Settings, profiles, backups and diagnostics are kept in `./data` next to the compose file (with `docker run`, in the
 Docker volume `smc3-scope-data`).
 
-**Update:**
+**Update:** from the page - Settings, Updates, **Update page** ([Updates](#updates)). Or pull the new image:
 
 ```sh
 docker compose -f compose.prebuilt.yaml pull && docker compose -f compose.prebuilt.yaml up -d
@@ -176,7 +181,8 @@ DSM 7.2 or newer, no SSH needed:
 
 3. **Next, Done.** It downloads the image and starts it. Open `http://<NAS address>:8198`.
 
-**Update:** Container Manager, **Project**, right-click `smc3-scope`, **Stop**; when it has stopped, right-click it
+**Update:** from the page - Settings, Updates, **Update page** ([Updates](#updates)). Or the new image: Container
+Manager, **Project**, right-click `smc3-scope`, **Stop**; when it has stopped, right-click it
 again and **Build** - that pulls the newest image and starts it. (Or **Image**, which marks images with an update,
 and **Update**.)
 
@@ -193,8 +199,44 @@ docker compose up -d --build
 ```
 
 Data is kept in `scope/data`; to keep it elsewhere:
-`SMC3_DATA=/volume1/docker/smc3-scope-data docker compose up -d --build`. Update with `git pull` and the same
-`docker compose up -d --build`.
+`SMC3_DATA=/volume1/docker/smc3-scope-data docker compose up -d --build`. Update from the page, or with `git pull`
+and the same `docker compose up -d --build`.
+
+---
+
+## Updates
+
+From page 2.7 on, the page asks GitHub twice a day (the first time 20 s after it starts) what the newest release
+has, and **Settings, Updates** shows it - the header says **Update available** too. **Check now** asks at once; the
+tick box switches the twice-a-day check off. Nothing is installed by itself.
+
+- **Update page** downloads the new `smc3_scope_v<version>.py` from the release, checks it (GitHub's SHA-256 of the
+  file, its version line, and that Python can read it) and restarts into it - a few seconds; the tab reloads by
+  itself. The board and the motors aren't touched, SimHub keeps running, and settings, profiles and backups stay. It
+  waits while auto-tune, a check, Seat setup, a test signal, moving the motors or a firmware update is running.
+- **Download firmware** only downloads the `.ino`: open it in the Arduino IDE and upload it over USB (SimHub closed),
+  or **Sketch, Export Compiled Binary** and install the `.bin` in **Settings, Firmware update**, over WiFi. Firmware
+  is never installed by itself.
+- **Go back to built-in** returns to the page you started and stays there.
+
+**Where the update lives.** The new page goes into the data folder, in `updates/` (`smc3-scope-data/updates`, in
+Docker `/data/updates`); the file you started - in Docker the image's - stays as it was. At every start the file
+you started hands over to the update when the update is newer. So:
+
+- an update survives a restart, a reboot and a re-created container;
+- a newer image (or a newer file you start yourself) simply wins over an older update;
+- if an update doesn't get as far as serving the page, or stops three times in a row within 10 minutes of starting,
+  the next start runs the file you started again (Docker's `restart: unless-stopped` and the systemd service above
+  start it again by themselves) and the card says why;
+- on Linux, macOS and in Docker the process restarts in place (same process); on Windows the file you started stays
+  as a small parent that runs the page, so the window, Ctrl+C and a service wrapper still see one program.
+
+**If an update misbehaves** and the page can't be used to go back: start the page with the environment variable
+`SMC3_NO_UPDATE=1` (Docker: `-e SMC3_NO_UPDATE=1`, or under `environment:` in the compose file), or delete the
+`updates` folder in the data folder, and start it again. The file you started runs, with your settings.
+
+It needs this machine to reach `api.github.com` and GitHub's download servers. Updates come from
+`winreboot/smc3-r4`; a fork can set `"update_repo": "owner/name"` in `config.json` (the page itself can't change it).
 
 ---
 
@@ -224,6 +266,7 @@ whenever you change them there; otherwise what you set in the page stays.
 | Port already in use | The page then takes the next free port and says which in its window; or choose one, e.g. `--web 8199` (Docker: `-p 8199:8199 -e SMC3_WEB_PORT=8199`). |
 | `docker pull` asks for a login | The package isn't public yet - the repository owner makes it public once (see below). |
 | Firmware update from the page can't start | The page must be reachable from the board: `--bind 0.0.0.0`, firewall open, and in Docker the same port number on both sides. The board's WiFi module needs firmware 0.4.0 or newer. |
+| Updates: "Couldn't reach GitHub" | This machine (in Docker: the container) needs internet access to `api.github.com` and GitHub's download servers. The rest of the page works without it. |
 | `python` / `py` not found (Windows) | Re-run the Python installer and tick **Add python.exe to PATH**, or use the full path to `python.exe`. |
 
 ## Try it without a rig

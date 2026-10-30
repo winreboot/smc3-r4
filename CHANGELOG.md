@@ -3,6 +3,29 @@
 `smc3_scope` (the page) and `SMC3_R4` (the firmware) are versioned separately. The page works with older
 firmware too; the notes say which firmware a feature needs.
 
+## Page 2.7 (firmware 1.9.4, unchanged)
+
+**Updates from GitHub.** Settings has a new **Updates** card:
+
+- The page asks GitHub twice a day (the first time 20 s after it starts; **Check now** asks at once) what the newest
+  release has, and says when there's a newer page or firmware - in the card, in the header (**Update available**),
+  and once in the event log. The tick box switches the check off.
+- **Update page** downloads the new page into the data folder (`updates/`), checks it (GitHub's SHA-256 of the file,
+  its version, that Python can compile it) and restarts into it; the tab reloads by itself. The board isn't touched.
+  It waits while anything moves the motors or a firmware update runs.
+- The file you started (in Docker, the image's) stays as it was and hands over to the update at every start while
+  the update is newer: the update survives restarts and re-created containers, and a newer image wins over an older
+  update. An update that doesn't get as far as serving the page, or stops three times in a row within 10 minutes of
+  starting, is dropped at the next start; `SMC3_NO_UPDATE=1` skips it. **Go back to built-in** undoes it.
+- A restart waits until nothing is moving the motors. On Windows the started file stays as the parent of the page,
+  so a console window or service wrapper still sees one program.
+- **Download firmware** downloads the release's `.ino` - firmware is never installed by itself. The card says how to
+  flash it (Arduino IDE over USB, or export the `.bin` for Firmware update).
+- The Docker image workflow tags two-part versions too (`v2.7` -> `2.7`; its semver rule needed three parts).
+- Smoke test case 13: a stand-in for GitHub's API - check, update, hand-over at restart, going back.
+
+Update: the page only - this once by hand (or a new image); later ones from the page.
+
 ## Page 2.6.2 (firmware 1.9.4, unchanged)
 
 Nothing changes in what the page does. New:

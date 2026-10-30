@@ -300,6 +300,18 @@ own firmware 0.4.0 or newer (Arduino IDE, Tools, Firmware Updater).
 
 ![Firmware update: SMC3_R4 1.9.3 installed over WiFi](docs/img/firmware-update.png)
 
+**Updates** (page 2.7): the page asks GitHub twice a day what the newest release has, and the header says **Update
+available** when there's a newer page or firmware.
+
+- **Update page** downloads the new page, checks it (GitHub's SHA-256, its version, that Python can read it) and
+  restarts into it - the board isn't touched and settings stay. It's kept in the data folder, so it survives
+  restarts and re-created Docker containers; **Go back to built-in** undoes it, and an update that doesn't start is
+  dropped by itself.
+- **Download firmware** downloads the new `.ino` only - flash it with the Arduino IDE, or export the `.bin` and use
+  Firmware update above.
+
+![Updates: a newer page and firmware on GitHub (a test release)](docs/img/updates.png)
+
 ### LED matrix
 
 The board's 12x8 matrix shows one thing at a time, readable from across the room. These previews are rendered from
@@ -482,11 +494,13 @@ board on network**).
 [latest release](https://github.com/winreboot/smc3-r4/releases/latest) and run
 
 ```sh
-python3 smc3_scope_v2.6.2.py --host 192.168.1.50 --bind 0.0.0.0 --web 8198
+python3 smc3_scope_v2.7.py --host 192.168.1.50 --bind 0.0.0.0 --web 8198
 ```
 
 (`py` instead of `python3` on Windows). `--bind 0.0.0.0` makes the page reachable from other devices; without it,
 the page is on this machine only - and the board can't fetch firmware updates from it.
+
+From then on the page updates itself: Settings, **Updates**, **Update page** (page 2.7 or newer).
 
 ### 3. SimHub
 
