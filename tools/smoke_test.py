@@ -35,8 +35,13 @@ Smoke test: start simulated rigs and the page, run diagnostics, check the result
 13. Updates from GitHub (page 2.7), against a stand-in for GitHub's API: the check finds the newer page and firmware,
    the header knows, Update downloads, checks and restarts into the new page (kept in <data>/updates), a restart of
    the started file hands over to it, and Go back to built-in returns to the started file and stays there.
+15. The USB cable (page 2.8, firmware 1.9.5): the simulated board's USB port is a pseudo-terminal; the page's own
+   bridge (--usb-bridge) links it to the page, which takes over from WiFi: telemetry over USB, the quick check runs
+   there and the report says so, firmware updates are refused on the cable, a second bridge waits, Back to WiFi stops
+   the bridge and the page is on WiFi again. With firmware 1.9.4 the page notices the board can't stream over USB and
+   the bridge stops, saying 1.9.5 is needed. (POSIX only.)
 Case 10 also checks firmware 1.9.4's pot glitch filter (simulated): the board counts the glitches, the live data stays
-clean, so the finding is a warning that names the filter, and the report shows the board's own version (1.9.4).
+clean, so the finding is a warning that names the filter, and the report shows the board's own version (1.9.5).
 """
 import hashlib, json, os, subprocess, sys, tempfile, threading, time, urllib.request as u
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -292,10 +297,10 @@ try:
     gl = [f for f in s["result"]["findings"] if f.get("code") == "glitch" and f.get("motor") == 2]
     check(gl and gl[0]["level"] == "warn" and "glitch filter holds each" in gl[0]["detail"]
           and "Pot noise filter" in gl[0]["fix"],
-          f"glitchy pot on firmware 1.9.4: a warning that names both filters "
+          f"glitchy pot on firmware 1.9.4+: a warning that names both filters "
           f"({[(f['level'], f['detail'][-90:]) for f in gl]})")
     fwtxt = (get(base10, "/diag/file?name=" + s["result"]["name"]).get("board") or {}).get("firmware")
-    check(fwtxt == "1.9.4", f"the report shows the board's own firmware version ({fwtxt})")
+    check(fwtxt == "1.9.5", f"the report shows the board's own firmware version ({fwtxt})")
     time.sleep(2)
     t = get(base10, "/data?since=0")["samples"][-1]["m"][1]["t"]
     for k in range(4):
@@ -370,6 +375,47 @@ try:
           f"{text14.count('WiFi hiccup')} moves repeated)")
     check("Something else" not in text14 and "Couldn't see the move" not in text14,
           "... and no false 'something else is moving it' / 'couldn't see the move' stop")
+
+    # 15. the USB cable (page 2.8, firmware 1.9.5) - POSIX only (the simulator's USB port is a pseudo-terminal)
+    if os.name == "posix":
+        def usb_wait(b, kind, t=15):
+            t0 = time.time()
+            while time.time() - t0 < t:
+                d = get(b, "/data?since=0")
+                if d["connected"] and d["link"]["kind"] == kind and (kind == "wifi" or d["link"]["streaming"]):
+                    return d
+                time.sleep(0.3)
+            return None
+
+        for tag, port, web, extra in (("new", 4725, 8725, []), ("old", 4726, 8726, ["--fw194"])):
+            tty = os.path.join(tempfile.mkdtemp(prefix="smc3-usb-"), "ttyUSB")
+            sim15, scope15, base15 = start(port, web, "--usb", tty, *extra)
+            procs += [sim15, scope15]
+            blog = os.path.join(scope15.data, "bridge.log")
+            br = subprocess.Popen([sys.executable, SCOPE, "--usb-bridge", tty, "--page", base15],
+                                  stdout=open(blog, "w"), stderr=subprocess.STDOUT)
+            procs.append(br)
+            if tag == "old":
+                br.wait(40)
+                check(br.returncode == 2 and "1.9.5" in open(blog).read() and usb_wait(base15, "wifi"),
+                      "firmware 1.9.4: the bridge stops, saying 1.9.5 is needed; the page stays on WiFi")
+                continue
+            d = usb_wait(base15, "usb")
+            check(d is not None and d["link"]["bridge"].startswith("py-"), "the bridge links the page over the USB cable")
+            n0 = get(base15, "/data?since=0")["samples"][-1]["seq"]
+            time.sleep(2)
+            n1 = get(base15, "/data?since=0")["samples"][-1]["seq"]
+            check(170 <= n1 - n0 <= 230, f"telemetry over USB: {n1 - n0} samples in 2 s")
+            s = run_check(base15, "quick")
+            rep = json.loads(u.urlopen(base15 + "/diag/file?name=" + s["result"]["name"]).read())
+            check(s["state"] == "done" and not problems(s) and rep["board"]["link"]["kind"] == "usb",
+                  f"quick check over the cable: no problems {problems(s)}")
+            fwb = get(base15, "/fw/status")["board"]
+            check(not fwb["capable"] and "USB cable" in (fwb["problem"] or ""), "firmware update refused on the cable")
+            r = post(base15, "/usb/drop")
+            br.wait(15)
+            check(r["ok"] and br.returncode == 2 and usb_wait(base15, "wifi") is not None,
+                  "Back to WiFi: the bridge stops, the page is on WiFi again")
 
     # 13. updates from GitHub (page 2.7), against a stand-in for GitHub's API
     for p in procs:

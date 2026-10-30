@@ -68,8 +68,17 @@ updates, 1.9.1 soft start only, 1.9 neither), with the soft start - and remember
   --wifi-fw X.Y.Z      the WiFi module's own firmware (default 0.5.2; 0.4.x = no progress while downloading,
                        older = refused)
   --ota-fail WHAT      crc = the file arrives damaged, flash = the WiFi module can't program the board
+
+The USB port (page 2.8, firmware 1.9.5 USB page mode; the simulator says 1.9.5 unless an older version is asked for):
+  --usb PATH           the board's USB serial port, as a pseudo-terminal: PATH becomes a link to it (open it like
+                       COM5 - with smc3_scope.py --usb-bridge PATH --page ...). Over it the board speaks SMC3 as to
+                       SimHub; after [kU1] (every second, or it ends after 5 s) it streams telemetry there instead and
+                       stops serving WiFi, as 1.9.5 does
+  --fw194              firmware 1.9.4: no USB page mode ([kU] is ignored, USB only answers SMC3 commands)
+  --usb-reset SEC      opening the USB port resets the board (as some USB-serial boards do): it restarts when the
+                       first bytes arrive and doesn't answer for SEC seconds (WiFi joining in setup())
 """
-import argparse, math, random, re, socket, struct, threading, time, urllib.request, zlib
+import argparse, math, os, random, re, select, socket, struct, threading, time, urllib.request, zlib
 
 ap = argparse.ArgumentParser()
 ap.add_argument("port", type=int)
@@ -121,6 +130,9 @@ ap.add_argument("--stalls", type=float, default=0.0,
 ap.add_argument("--vmax", type=float, default=2200.0, help="counts/s at full drive (default 2200; ~1000 is a slow rig)")
 ap.add_argument("--no-potfilter", action="store_true", help="firmware 1.9.3: no pot glitch filter (the PID sees every glitch)")
 ap.add_argument("--tuned", action="store_true", help="start with sane settings (Kp 250, Ki 0, Kd 0, PWMmin 30, dead zone 2)")
+ap.add_argument("--usb", default="", help="the board's USB port as a pseudo-terminal, linked at this path (page 2.8)")
+ap.add_argument("--fw194", action="store_true", help="firmware 1.9.4: no USB page mode")
+ap.add_argument("--usb-reset", type=float, default=0.0, help="opening the USB port restarts the board, silent SEC s")
 args = ap.parse_args()
 
 PID_HZ, SUB = 4000, 40
@@ -159,7 +171,8 @@ START = {}                                    # --start: where the pots are at p
 for st_ in args.start:
     m_, pot_ = st_.split(":")
     START[int(m_) - 1] = float(pot_)
-FW = {"ver": ("1.9" if args.old19 else ("1.9.1" if args.fw191 else ("1.9.3" if args.no_potfilter else "1.9.4"))) if args.fw >= 19 else f"{args.fw // 10}.{args.fw % 10}"}
+FW = {"ver": ("1.9" if args.old19 else ("1.9.1" if args.fw191 else ("1.9.3" if args.no_potfilter else
+       ("1.9.4" if args.fw194 else "1.9.5")))) if args.fw >= 19 else f"{args.fw // 10}.{args.fw % 10}"}
 
 
 def _vt(v):
@@ -189,6 +202,13 @@ def build_flags():                            # what [rd!] and the diagnostics f
 
 def ota_fw():                                 # firmware 1.9.2: updates from the page, WiFi memory
     return args.fw >= 19 and _vt(FW["ver"]) >= (1, 9, 2)
+
+
+def usbpage_fw():                             # firmware 1.9.5: the page can use the USB cable
+    return args.fw >= 19 and _vt(FW["ver"]) >= (1, 9, 5)
+
+
+USBP = {"on": False, "ka": 0.0, "starts": 0, "fd": None, "extras": False}   # 1.9.5 USB page mode
 
 
 WIFI_FW = tuple(int(x) for x in args.wifi_fw.split("."))
@@ -347,6 +367,7 @@ def boot(cold=True):
     t0 = time.time()
     usb = {"ok": 0, "tgt": 0, "bad": 0, "tcp": 0, "last": 0.0, "last_tgt": 0.0}
     reset_flags = [1, 0, 0] if cold else [0, 0, 1]
+    USBP["on"] = False
 
 
 def save_eeprom():
@@ -785,7 +806,7 @@ def diag_frame():
         pl += struct.pack("<5h", c.trim, c.tlo, c.thi, c.elo, c.ehi)
     pl += struct.pack("<4h", *TILT4)
     fl = (1 if seat_saved() else 0) | (2 if eeprom[66] == 0xB9 else 0) | (4 if EXTRAS_ANY[0] else 0) | \
-        (8 if time.time() < HOLD[0] else 0)
+        (8 if time.time() < HOLD[0] else 0) | (16 if USBP["on"] else 0)
     hz = int(SEAT.rate) if (fresh and SEAT.all) else 0
     pl += struct.pack("<BIHH3h3hh", fl, usb.get("held", 0), hz, hz, *SEAT.acc, *SEAT.gyro, 2950)
     if not soft_fw():
@@ -994,7 +1015,7 @@ def handle_cmd(c, a, b, out, cl=None):
             elif ord("1") <= b <= ord("3"): C[b - ord("1")].disabled, C[b - ord("1")].reason = True, 2
         elif c == "f" and args.fw >= 16:
             fshift, frate = min(a, 8), b * 100
-        elif c == "u" and ota_fw() and cl is not None:   # 1.9.2: firmware update (from the page only)
+        elif c == "u" and ota_fw() and cl is not None and not cl.get("usb"):   # 1.9.2: firmware update (WiFi only)
             v = VREG[0] & 0xFFFF
             if b == ord("="):
                 if a == ord("P"): OTA["port"] = v
@@ -1073,6 +1094,8 @@ def client(conn):
             return
         if time.time() < STALL["until"]:          # --stalls: the loop is blocked - nothing read, nothing sent
             continue
+        if USBP["on"]:                            # 1.9.5 USB page mode: no WiFi calls at all
+            continue
         try:
             d = conn.recv(4096)
             if d == b"": return
@@ -1109,8 +1132,145 @@ def client(conn):
             return
 
 
+USB_CL = {"extras": False, "peer": "", "usb": True}
+
+
+def usb_write(data):
+    fd = USBP["fd"]
+    if fd is None or not data:
+        return
+    view = memoryview(data)
+    end = time.time() + 0.5
+    while view and time.time() < end:
+        try:
+            n = os.write(fd, view)
+            view = view[n:]
+        except BlockingIOError:
+            select.select([], [fd], [], 0.02)
+        except OSError:
+            return
+
+
+def usb_cmd(c, a, b, out):
+    """One SMC3 command over the USB port: SimHub's, or (1.9.5, after [kU1]) the page's."""
+    global last_target_t
+    now = time.time()
+    if c == "k" and a == ord("U"):
+        if not usbpage_fw():
+            with lock:
+                usb["ok"] += 1; usb["last"] = now; last_target_t = now
+            return                                # 1.9.4: an unknown seat command - nothing happens
+        if b in (0, ord("0")):
+            if USBP["on"]:
+                usb_page_end()
+            return
+        if 1 <= OTA["state"] <= 5:
+            return                                # not during a firmware update
+        USBP["ka"] = now
+        if not USBP["on"]:
+            with lock:
+                USBP["on"] = True
+                USBP["starts"] += 1
+                USB_CL["extras"] = False
+                for cn in list(clients):          # the page left WiFi for the cable
+                    try: cn.close()
+                    except OSError: pass
+                clients.clear()
+        return
+    if USBP["on"]:                                # the page's command, as over WiFi
+        handle_cmd(c, a, b, out, USB_CL)
+        return
+    with lock:                                    # SimHub / SMC3Utils
+        usb["ok"] += 1; usb["last"] = now
+        last_target_t = now                       # any USB command keeps full power
+        if c in "ABC":
+            usb["tgt"] += 1; usb["last_tgt"] = now
+            board["last_pos"] = now
+            if args.fw >= 19 and now < HOLD[0]:
+                usb["held"] = usb.get("held", 0) + 1
+                return
+            C["ABC".index(c)].set_target(a * 256 + b)
+            return
+    if c == "r" and a == ord("d") and b in (ord("d"), ord("u")):
+        return                                    # the diagnostics and update frames are the page's only
+    if c in "xu":
+        return
+    handle_cmd(c, a, b, out, None)
+    with lock:
+        usb["tcp"] -= 1                           # (handle_cmd counted it as the page's)
+
+
+def usb_page_end():
+    with lock:
+        USBP["on"] = False
+        USB_CL["extras"] = False
+
+
+def usb_port():
+    """--usb: the board's USB serial port (a pseudo-terminal)."""
+    import tty
+    master, slave = os.openpty()
+    tty.setraw(slave)                             # no echo, no line editing - as a real serial port
+    os.set_blocking(master, False)
+    USBP["fd"] = master
+    name = os.ttyname(slave)
+    try:
+        os.unlink(args.usb)
+    except OSError:
+        pass
+    os.symlink(name, args.usb)
+    print("simboard USB port", args.usb, "->", name, flush=True)
+    buf = b""
+    last_send = time.time()
+    booting_until = None
+    while True:
+        r, _, _ = select.select([master], [], [], 0.01)
+        if r:
+            try:
+                d = os.read(master, 4096)
+            except (BlockingIOError, OSError):
+                d = b""
+            if d and args.usb_reset and booting_until is None:   # --usb-reset: the port opening restarts the board
+                booting_until = time.time() + args.usb_reset
+                with lock:
+                    boot(cold=False)
+                    samples.clear()
+                    for cn in list(clients):
+                        try: cn.close()
+                        except OSError: pass
+                    clients.clear()
+                usb_write(b"SMC3_R4 v" + FW["ver"].encode() + b" WiFi connected, IP 127.0.0.1 SMC3CAPS:ota1\r\n")
+            if booting_until and time.time() < booting_until:
+                continue                          # still in setup(): nothing is read
+            buf += d
+        out = []
+        while len(buf) >= 5:
+            if buf[0:1] == b"[" and buf[4:5] == b"]":
+                usb_cmd(chr(buf[1]), buf[2], buf[3], out); buf = buf[5:]
+            else:
+                with lock:
+                    usb["bad"] += 1
+                buf = buf[1:]
+        now = time.time()
+        if USBP["on"] and now - USBP["ka"] > 5.0:  # no [kU1] for 5 s: page mode ends
+            usb_page_end()
+        if USBP["on"] and now - last_send >= 0.05:
+            last_send = now
+            with lock:
+                batch = samples[-5:]; samples.clear()
+            if batch:
+                out.append(b"SM3T" + bytes([1, len(batch)]) + b"".join(batch))
+                if USB_CL["extras"]:
+                    with lock:
+                        out.append(extras_frame())
+        for o in out:
+            usb_write(o)
+
+
 boot(cold=True)
 threading.Thread(target=sim_loop, daemon=True).start()
+if args.usb:
+    threading.Thread(target=usb_port, daemon=True).start()
 threading.Thread(target=fake_simhub, daemon=True).start()
 threading.Thread(target=stall_maker, daemon=True).start()
 srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

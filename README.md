@@ -16,14 +16,17 @@ The page lets you:
   **travel limits, end stops and tilt limits** on the board;
 - **move each motor by dragging its slider**, or send the whole seat back to center with one button;
 - find out why when something goes wrong, and where the rig struggles under load;
-- **update the firmware over WiFi**: pick the `.bin` from the Arduino IDE and press Install.
+- **update the firmware over WiFi**: pick the `.bin` from the Arduino IDE and press Install;
+- **calibrate over the USB cable** instead of WiFi, with SimHub closed: one line pasted into Win+R on the sim PC, and
+  the page talks to the board without WiFi's hiccups.
 
 It knows two kinds of rig: **two front lifts plus a traction-loss motor** (motors 1 and 2 lift the front corners,
 motor 3 is mounted horizontally and swings the rear left and right about a pivot at the front - the default), and
 **three lifts**. Pick yours under Settings, Motor names.
 
 SimHub keeps driving the rig over USB exactly as before. The page talks to the board over WiFi, so both run at
-the same time. You can open it from any browser, including your phone.
+the same time. You can open it from any browser, including your phone. For calibration with SimHub closed, the page
+can use the USB cable instead (page 2.8, firmware 1.9.5): see [USB cable for calibration](docs/INSTALL.md#usb-cable-for-calibration).
 
 ![Dashboard: three motors moving under SimHub, motor 2 selected](docs/img/dashboard.png)
 
@@ -501,7 +504,7 @@ board on network**).
 [latest release](https://github.com/winreboot/smc3-r4/releases/latest) and run
 
 ```sh
-python3 smc3_scope_v2.7.py --host 192.168.1.50 --bind 0.0.0.0 --web 8198
+python3 smc3_scope_v2.8.py --host 192.168.1.50 --bind 0.0.0.0 --web 8198
 ```
 
 (`py` instead of `python3` on Windows). `--bind 0.0.0.0` makes the page reachable from other devices; without it,
@@ -524,7 +527,9 @@ traction loss, let each motor find its safe travel, and save. SimHub's centre is
 ### 5. Tune
 
 Run **auto-tune** on each motor: seat empty first, with your weight entered. Then either **Check** with you in the
-seat, or run auto-tune again with you in it. Try it in a game, and **Save to EEPROM**.
+seat, or run auto-tune again with you in it. Try it in a game, and **Save to EEPROM**. Over WiFi a hiccup now and then
+makes auto-tune redo a test move; for a steadier link close SimHub and use the **USB cable** (Settings, USB cable -
+page 2.8, firmware 1.9.5).
 
 **Soft start** (firmware 1.9.1): after the rig has been off the seat may have ridden down a little. At power-up, and
 when you press Enable Motors, each motor creeps back to its position instead of jumping there, then runs normally.
@@ -582,10 +587,12 @@ noise. To see what the diagnostics find, add a fault:
   - 1.9.1: soft start;
   - 1.9.2: firmware updates from the page, and the board remembers its WiFi;
   - 1.9.3: the same, and it compiles in the Arduino IDE (1.9.2 didn't);
-  - 1.9.4: a pot glitch filter - a reading too far from the last one to be the motor is held back for up to 10 ms.
+  - 1.9.4: a pot glitch filter - a reading too far from the last one to be the motor is held back for up to 10 ms;
+  - 1.9.5: USB page mode - the page can use the USB cable instead of WiFi (calibration with SimHub closed).
 
   See the [CHANGELOG](CHANGELOG.md).
-- New commands are documented in [docs/PROTOCOL.md](docs/PROTOCOL.md). They go over WiFi; USB stays plain SMC3.
+- New commands are documented in [docs/PROTOCOL.md](docs/PROTOCOL.md). They go over WiFi; USB stays plain SMC3
+  unless the page asks for USB page mode (`[kU1]`, 1.9.5).
 
 ## Credits and licence
 

@@ -97,6 +97,16 @@ motors itself: 50 times a second it sends each motor's position, eased in and ou
 commands (`[kH 30]`: 3 s). So if this server stops, SimHub has the seat back within 3 s; Resume SimHub gives it back
 at once (`[kH 0]`). A dropped connection to the board, or anything else that moves the motors, ends it too.
 
+## The USB cable (2.8)
+
+With firmware 1.9.5 the page can reach the board over its USB cable instead of WiFi, for calibration with SimHub
+closed. A bridge on the PC with the cable connects out to the page (`POST /usb/link` on the web port, then the board's
+bytes both ways), the page drops its WiFi connection and uses the cable until the bridge ends; it sends `[kU1]` every
+second so the board streams over USB and leaves WiFi alone. Windows: the page serves a PowerShell bridge at
+`/usb-bridge.ps1` with its own address in it (Settings, USB cable shows the line for Win+R). Anywhere else:
+`smc3_scope.py --usb-bridge PORT --page http://<page>:<port>` (pyserial if installed; Linux and macOS work without).
+Details in [docs/PROTOCOL.md](../docs/PROTOCOL.md#the-usb-bridge-page-28).
+
 ## Security
 
 The page has no login, and it can move the rig and change its settings. Keep it on your home network; don't

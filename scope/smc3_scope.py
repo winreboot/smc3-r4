@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """
-smc3_scope v2.7.3 - live scope, tuner and auto-tuner for the SMC3_R4 motion controller (Arduino UNO R4 WiFi).
+smc3_scope v2.8 - live scope, tuner and auto-tuner for the SMC3_R4 motion controller (Arduino UNO R4 WiFi).
 
 Connects to the board's TCP telemetry port, keeps a rolling buffer of samples and serves a web page with live
 charts, a parameter editor (sends ordinary SMC3 commands back to the board), test signals and a per-motor
-auto-tune.  SimHub keeps the USB port; this runs alongside it.
+auto-tune.  SimHub keeps the USB port; this runs alongside it.  For calibration with SimHub closed the page can use
+the USB cable instead (firmware 1.9.5): a bridge on the PC with the cable links it -
+
+    python3 smc3_scope.py --usb-bridge COM5 --page http://<page address>:<port>
+
+or, on Windows with nothing installed, the PowerShell bridge from Settings, USB cable.
 
     python3 smc3_scope.py --host 192.168.1.50 --bind 0.0.0.0 --web 8198
 
@@ -12,6 +17,18 @@ Every option can also come from the environment (Docker): SMC3_HOST, SMC3_PORT, 
 SMC3_DATA_DIR.  Settings changed in the page (board address, theme, auto-find) are saved to
 <data dir>/config.json and survive restarts and upgrades.  Standard-library Python 3.8+ only.
 
+v2.8: the USB cable for calibration (firmware 1.9.5). The board's WiFi module now and then holds the board's loop up
+      for a second or more, so the page's moves lag and auto-tune redoes test moves. With SimHub closed, a bridge on
+      the PC the board is plugged into links the page to the board's USB port: Settings, USB cable has the one line to
+      paste into Win+R (a PowerShell bridge, nothing to install; or smc3_scope.py --usb-bridge COM5 --page URL). The
+      bridge connects out to the page (POST /usb/link, then raw bytes both ways); the page takes the link over from
+      WiFi, sends [kU1] every second, and the board streams its telemetry over USB and makes no WiFi calls at all.
+      Closing the bridge (or Back to WiFi) sends [kU0]: the board and the page go back to WiFi by themselves. The
+      header says USB cable or WiFi. A bridge waits while auto-tune, the full check, Seat setup or a firmware update
+      runs; a board without 1.9.5 is noticed (it answers but doesn't stream) and the bridge told so. Firmware updates
+      stay WiFi only. Back to WiFi waits for a running auto-tune or check; a new connection during auto-tune ends it and
+      the previous settings go back to the board (at once, or once it is reachable again). Simulator: --usb PATH (a
+      pseudo-terminal), --fw194, --usb-reset SEC.
 v2.7.3: Update page no longer refuses while the page holds the seat (Return to center, a dragged knob) or a test signal
         runs: just before the restart it gives the seat back to SimHub (the motors stay where they are) and stops the
         test signal. It still waits for auto-tune, the full check, Seat setup and a firmware update, which change the
@@ -144,7 +161,7 @@ v1.4: settings dialog (board address, port, find-board scan, auto-find), day/nig
       fixed a thread race that made the page flash "not reachable".
 """
 
-VERSION = "2.7.3"
+VERSION = "2.8"
 
 import argparse
 import base64
@@ -155,6 +172,7 @@ import math
 import os
 import random
 import re
+import select
 import signal
 import socket
 import statistics
@@ -214,7 +232,7 @@ class Config:
     DEFAULTS = {"host": "", "port": 4210, "theme": "dark", "auto_find": True, "scan_subnet": "",
                 "motors": 3, "disable_unused": True, "motor_names": ["", "", ""],
                 "layout": "tl", "tl_dir": 1, "lift_dir": {}, "lift_sink": {}, "rider_mode": "empty", "rider_kg": 0, "rider_unit": "lb",
-                "tune_speed": {}, "update_check": True, "update_repo": ""}
+                "tune_speed": {}, "update_check": True, "update_repo": "", "usb_link": True}
     # layout: "tl" = motors 1 and 2 lift the front corners, motor 3 slides the rear left / right (traction loss,
     #         the seat turning about a pivot at the front); "lifts" = all three motors lift the seat.
     # tl_dir: +1 = higher numbers move the rear to the right, -1 = to the left (Seat setup or the full check asks).
@@ -225,6 +243,7 @@ class Config:
     #          the test-move speed and top speeds auto-tune measured, so Check runs the same moves.
     # update_check: ask GitHub twice a day whether there's a newer page or firmware (page 2.7). update_repo: where
     #          from ("owner/name", empty = winreboot/smc3-r4) - only in config.json, the page can't change it.
+    # usb_link: a USB bridge on the PC with the cable may take over from WiFi (page 2.8; off = WiFi only).
 
     def __init__(self, data_dir, env_host, env_port):
         self.lock = threading.Lock()
@@ -338,6 +357,14 @@ class Board:
         self.fw_version = None               # e.g. "1.9.2", from the last "SM3U" frame of this connection
         self.conn_id = 0                     # counts connections, so work for one that already dropped can stop
         self.connected_at = 0.0
+        # page 2.8: the USB cable, through a bridge on the PC it is plugged into (firmware 1.9.5 "USB page mode")
+        self.link = "wifi"                   # what self.sock is: "wifi" (the board's TCP port) or "usb" (a bridge)
+        self.usb = None                      # the bridge while linked: computer, port, since, telemetry seen, ...
+        self.usb_pending = None              # (socket, info, done event) handed over by POST /usb/link
+        self.usb_last = None                 # how the last USB link ended (shown in Settings)
+        self.usb_refused = {}                # bridge id -> why the page won't take that bridge again
+        self.reply_seq = 0                   # counts replies ([rd?] answers), to see the board answering
+        self.pending_restore = None          # auto-tune's settings to send again once the board is back (2.8)
 
     def start(self):
         """Start connecting - called once everything that reacts to a connection is set up."""
@@ -488,7 +515,129 @@ class Board:
         return dict(self.params)
 
     def reconnect(self):
+        if self.link != "usb":                       # the address only matters again once the USB link ends
+            self._drop()
+
+    # ---- the USB cable (page 2.8, firmware 1.9.5) ----
+    def attach_usb(self, sock, info):
+        """A bridge on the PC with the USB cable connected (POST /usb/link). The reader takes it over from WiFi. Returns
+        an event that is set once the link has ended (the request's thread waits for it)."""
+        done = threading.Event()
+        with self.lock:
+            old, self.usb_pending = self.usb_pending, (sock, info, done)
+        if old:
+            old[2].set()
+        return done                                  # the reader thread makes the switch (it owns every switch)
+
+    def detach_usb(self, why, refuse=False):
+        """End the USB link from the page (Back to WiFi, or a board that can't do it). refuse: that bridge gets this
+        reason if it tries again."""
+        with self.lock:
+            pend, self.usb_pending = self.usb_pending, None
+        if pend:                                     # one still waiting to be taken: turn it away too
+            if refuse and pend[1].get("id"):
+                self.usb_refused[pend[1]["id"]] = why
+            pend[2].set()
+        u = self.usb
+        if self.link != "usb" or not u:
+            return bool(pend)
+        if refuse and u.get("id"):
+            self.usb_refused[u["id"]] = why
+        u["end"] = why
+        self.send(b"[kU\x00]")                       # the board goes back to WiFi at once (not 5 s later)
         self._drop()
+        return True
+
+    def link_info(self):
+        u = self.usb
+        if self.link == "usb" and u:
+            return {"kind": "usb", "computer": u.get("computer"), "port": u.get("port"), "since": u.get("since"),
+                    "age": round(time.time() - u["since"], 1), "streaming": bool(u.get("tel_at")),
+                    "bridge": u.get("version")}
+        return {"kind": "wifi", "host": self.current_host}
+
+    def _take_usb(self):
+        with self.lock:
+            pend, self.usb_pending = self.usb_pending, None
+        if not pend:
+            return False
+        sock, info, done = pend
+        now = time.time()
+        with self.lock:
+            self.sock = sock
+            self.link = "usb"
+            self.usb = dict(info, since=now, done=done, tel_at=None, ka_at=0.0, reply0=self.reply_seq, end=None,
+                            last_ms=None)
+        self.conn_id += 1
+        self.connected_at = now
+        self.connected = True
+        self.last_rx = now
+        self.fw_version = None
+        self._keepalive(now)
+        where = f"{info.get('computer') or 'the PC'}, {info.get('port') or 'its USB port'}"
+        log(f"connected to the board over the USB cable ({where})")
+        self._ev("link", f"Connected to the board over the USB cable ({where}). WiFi rests meanwhile.", quiet=True)
+        if self.on_connect:
+            threading.Thread(target=self.on_connect, daemon=True).start()
+        return True
+
+    def _keepalive(self, now):
+        """[kU1] every second keeps the board in USB page mode (it ends 5 s after the last one)."""
+        u = self.usb
+        if u and now - u["ka_at"] >= 1.0:
+            u["ka_at"] = now
+            self.send(b"[kU\x01]")
+
+    def _usb_stream(self, u, ms):
+        """Telemetry arrived over the cable. The first time, or when the board restarted meanwhile (its clock went
+        back - a board that resets when the port opens), read the board's settings again: over WiFi a restart is a
+        new connection, over the cable it isn't."""
+        now = time.time()
+        again = False
+        if not u["tel_at"]:
+            u["tel_at"] = now
+            self._ev("link", "The board streams over the USB cable (firmware 1.9.5 USB page mode).", quiet=True)
+            again = now - u["since"] > 2.5               # it wasn't streaming at once: it was starting, and what the
+                                                         # page asked meanwhile went unanswered
+        elif ms and u["last_ms"] and ms + 2000 < u["last_ms"]:
+            self._ev("link", "The board restarted (over the USB cable) - reading its settings again.", quiet=True)
+            again = True
+        if ms:
+            u["last_ms"] = ms
+        if again and self.on_connect:
+            self.conn_id += 1
+            self.connected_at = now
+            threading.Thread(target=self.on_connect, daemon=True).start()
+
+    def _usb_watch(self, now):
+        """Called by the reader while linked over USB: keepalive, and give up on a board that can't stream."""
+        u = self.usb
+        if not u:
+            return
+        self._keepalive(now)
+        if u["tel_at"]:
+            return
+        age = now - u["since"]
+        if now - u.get("probe_at", 0.0) >= 3.0:       # a board still starting (if opening the port reset it) answers
+            u["probe_at"] = now                          # once it runs: 1.9.5 streams by then, older ones only answer
+            self.send(b"[rd!]")
+        if self.reply_seq > u["reply0"] and not u.get("answer_at"):
+            u["answer_at"] = now                         # the board answers (it may have been starting until now)
+        if age > 6 and u.get("answer_at") and now - u["answer_at"] > 3.5:
+            # it has answered for a while (and had [kU1] at least three times since), but sends no telemetry: it is
+            # older than 1.9.5
+            fw = self.fwnum()
+            old = "1.9.4 or older" if fw == 19 else (f"{fw // 10}.{fw % 10}" if fw else "an old one")
+            why = (f"The board answers on the cable, but its firmware ({old}) has no USB link - that needs firmware "
+                   "1.9.5 or newer. Install it (Settings, Firmware update, or the Arduino IDE), then run the bridge "
+                   "again.")
+            self._ev("link", "USB cable: " + why, quiet=False)
+            self.detach_usb(why, refuse=True)
+        elif age > 45:
+            why = (f"The board didn't answer on {u.get('port') or 'that port'} in 45 s. Is it the Arduino's port? "
+                   "(Run the bridge again: it lists the ports it can see when there are several.)")
+            self._ev("link", "USB cable: " + why, quiet=False)
+            self.detach_usb(why, refuse=True)
 
     def stop(self):
         """For good (a restart into a page update, Windows): let go of the board for the next page."""
@@ -497,18 +646,42 @@ class Board:
 
     # ---- incoming ----
     def _reader(self):
-        buf = b""
+        buf = [b""]
         while not self.stopped:
+            try:
+                self._reader_pass(buf)
+            except Exception as e:                       # never let the reader die: the page would stay disconnected
+                log(f"[reader] {e!r}")
+                self._drop()
+                time.sleep(1.0)
+        self._drop()                                     # stopped
+
+    def _reader_pass(self, bufref):
+        """One pass of the reader: connect (WiFi, or a waiting USB link), or receive and parse."""
+        buf = bufref[0]
+        try:
+            if self.usb_pending and self.sock:           # 2.8: a bridge is waiting - end what we have, take it next
+                u = self.usb
+                if u and not u.get("end"):
+                    u["end"] = "The bridge linked again."
+                self._drop()
             if not self.sock:
+                buf = b""
+                if self._take_usb():                     # page 2.8: a bridge brought the USB cable
+                    return
                 host, port = self.cfg.get("host"), int(self.cfg.get("port"))
                 if not host:
-                    time.sleep(1)
-                    continue
+                    time.sleep(0.5)
+                    return
                 try:
                     s = socket.create_connection((host, port), timeout=5)
                     s.settimeout(1.0)
+                    if self.usb_pending:                 # the cable arrived while this connected: take that
+                        s.close()
+                        return
                     with self.lock:
                         self.sock = s
+                    self.link = "wifi"
                     self.conn_id += 1
                     self.connected_at = time.time()
                     self.connected = True
@@ -521,8 +694,12 @@ class Board:
                         threading.Thread(target=self.on_connect, daemon=True).start()
                 except OSError:
                     self.connected = False
-                    time.sleep(2)
-                    continue
+                    for _ in range(8):                   # 2 s, but pick up a USB link at once
+                        if self.usb_pending or self.stopped:
+                            break
+                        time.sleep(0.25)
+                    return
+            usb = self.link == "usb"
             try:
                 chunk = self.sock.recv(4096)
                 if not chunk:
@@ -530,19 +707,32 @@ class Board:
                 buf += chunk
                 self.last_rx = time.time()
             except socket.timeout:
-                if time.time() - self.last_rx > 5:
+                quiet = time.time() - self.last_rx
+                if usb:
+                    self._usb_watch(time.time())
+                    u = self.usb
+                    if u and u["tel_at"] and quiet > 5:
+                        u["end"] = "The board stopped sending over the cable for 5 s."
+                        self._drop()
+                elif quiet > 5:
                     log("board stopped sending - reconnecting")
                     self._ev("link", "The board stopped sending data for 5 s - reconnecting.", quiet=True)
                     self._drop()
-                continue
+                return
             except (OSError, AttributeError):
                 quick = time.time() - self.connected_at < 2.0
+                u = self.usb
+                if usb and u and not u.get("end"):
+                    u["end"] = "The bridge closed the link (its window was closed, or the cable came out)."
                 self._drop()
-                if quick:                            # accepted and closed at once (a board restarting, being
+                if quick and not usb:                # accepted and closed at once (a board restarting, being
                     time.sleep(1.0)                  # programmed, or busy with another client): don't hammer it
-                continue
+                return
             buf = self._parse(buf)
-        self._drop()                                     # stopped
+            if usb:
+                self._usb_watch(time.time())
+        finally:
+            bufref[0] = buf
 
     def _drop(self):
         with self.lock:
@@ -553,10 +743,21 @@ class Board:
                 pass
             was = self.sock is not None
             self.sock = None
-        if was:
+            u, usb = self.usb, self.link == "usb"
+            self.link, self.usb = "wifi", None
+        if usb and u:                                    # page 2.8: the USB link ended - back to WiFi
+            why = u.get("end") or "The link ended."
+            self.usb_last = {"computer": u.get("computer"), "port": u.get("port"), "since": u.get("since"),
+                             "until": time.time(), "why": why}
+            log(f"USB cable link ended: {why}")
+            self._ev("link", f"The USB cable link ended: {why} The page goes back to WiFi.", quiet=True)
+            u["done"].set()
+        elif was:
             self.disconnected_since = time.time()
             log("disconnected from board")
             self._ev("link", "Disconnected from the board.", quiet=True)
+        if usb:
+            self.disconnected_since = time.time()
         self.connected = False
         self.fw_version = None
 
@@ -573,6 +774,9 @@ class Board:
                     return buf
                 for i in range(count):
                     self._add_sample(struct.unpack_from(SAMPLE_FMT, buf, 6 + i * SAMPLE_BYTES))
+                u = self.usb
+                if u and self.link == "usb":
+                    self._usb_stream(u, count and struct.unpack_from("<I", buf, 6)[0])
                 buf = buf[need:]
             elif buf[:4] == b"SM3X":                       # firmware 1.9: the sensor's acceleration and gyro
                 if len(buf) < 6:
@@ -642,6 +846,7 @@ class Board:
             })
 
     def _add_reply(self, code, a, b):
+        self.reply_seq += 1
         if code not in PARAM_CODES:
             return
         name, kind = PARAM_CODES[code]
@@ -1210,7 +1415,12 @@ class Tuner:
                 return False, "An auto-tune is already running."
             if not self.board.connected:
                 return False, "The board is not connected."
+            if self.board.pending_restore:
+                return False, ("The page is still putting back the settings from the last auto-tune (the link dropped "
+                               "during it) - try again in a few seconds.")
             self.motor, self.mode = motor, ("check" if mode == "check" else "tune")
+            self.conn0 = self.board.conn_id              # 2.8: a new connection mid-run (the USB bridge closed, the
+                                                         # board restarted) ends the run - the board may not be as it was
             self.state, self.stage, self.progress = "running", "Starting", 0
             self.lines, self.result, self.abort_flag = [], None, False
             self.applied, self.countdown, self.live, self.ramp_v = False, None, {}, None
@@ -1364,6 +1574,9 @@ class Tuner:
             raise TuneAbort("Stopped by you.")
         if not self.board.connected:
             raise TuneAbort("Lost the connection to the board.")
+        if self.board.conn_id != getattr(self, "conn0", self.board.conn_id):
+            raise TuneAbort("The connection to the board changed during the run (the USB bridge closed, or the "
+                            "board restarted).")
         new = self.board.since(self.chk_seq)
         if not new:
             return
@@ -1636,9 +1849,15 @@ class Tuner:
             pass
 
     def _restore_and_hold(self):
+        """Stop the move, then put the settings back. False when the link to the board is gone (2.8): the page then
+        sends them again as soon as it is back (main(), on_connect) - else the board would keep the test values."""
         self._hold_here()                                # first stop the move, then put the settings back
         if self.mode == "tune" and self.original and self.orig_motor == self.motor:
             self._apply(self.original)
+            if not self.board.connected:
+                self.board.pending_restore = {"motor": self.motor, "params": dict(self.original), "t": time.time()}
+                return False
+        return True
 
     def _countdown(self, secs):
         """'I'm in the seat': nothing moves until the countdown ends (Stop works all along)."""
@@ -1803,8 +2022,11 @@ class Tuner:
                 elif e.kind == "refuse":
                     pass                                 # nothing was moved or changed: leave it all alone
                 elif self.mode == "tune" and self.original and self.applied:
-                    self._restore_and_hold()
-                    self.say("Previous settings restored; the motor holds where it is.")
+                    if self._restore_and_hold():
+                        self.say("Previous settings restored; the motor holds where it is.")
+                    else:
+                        self.say("The link to the board is gone, so the previous settings couldn't be sent yet - the "
+                                 "page sends them as soon as the board is back.")
                 else:
                     self._hold_here()
             except Exception as e2:
@@ -2803,6 +3025,7 @@ def decode_diag(pl, ver=1):
                      "saved": bool(fl & 1), "in_eeprom": bool(fl & 2), "page_holds": bool(fl & 8),
                      "simhub_held": held}
         d["extras_on"] = bool(fl & 4)
+        d["usb_page"] = bool(fl & 16)                    # firmware 1.9.5: the page is on the USB cable
         if "sensor" in d:
             d["sensor"].update({"accel_per_s": acc_hz, "gyro_per_s": gyro_hz,
                                 "accel_gyro": d["sensor"]["accel_gyro"] or (acc_hz > 0 and gyro_hz > 0),
@@ -4573,7 +4796,7 @@ class Diagnostics:
         s = b.latest() if connected else None
         board = {"connected": connected, "address": f"{cfg.get('host')}:{cfg.get('port')}",
                  "firmware": fw_text(fw[1], dg, b.fw_version) if fw[1] else ("1.3 or older" if params.get("Kp1") is not None else None),
-                 "fw_num": fw[1], "reverse_motor1": bool(fw[0] & 1)}
+                 "fw_num": fw[1], "reverse_motor1": bool(fw[0] & 1), "link": b.link_info()}
         if not connected:
             board["disconnected_for"] = _ago(time.time() - b.disconnected_since)
         if s:
@@ -5019,7 +5242,7 @@ def analyze(rep):
                 why = (" This is the classic cause of sudden violent jerks: for a moment the controller thinks the motor "
                        "is somewhere else and drives hard.")
             fwfix = ("" if pot_filter_fw else " Firmware 1.9.4 also holds short glitches back from the motors (flash "
-                     "SMC3_R4_v1.9.4.ino" + (", or Settings, Firmware update" if upd_ok else " over USB")
+                     "SMC3_R4_v1.9.5.ino" + (", or Settings, Firmware update" if upd_ok else " over USB")
                      + ").")
             add(lvl, f"Motor {n}'s pot reading jumps (glitches)",
                 f"Readings that change faster than any motor can move: {gl_fw} counted by the board"
@@ -5199,11 +5422,11 @@ def analyze(rep):
                 "(soft start)", f"At {sst['rate']} counts/s after power-up or Enable Motors; normal once it has caught "
                 "up.", code="soft_creeping")
     elif board.get("seat_setup") is not None and board.get("wifi") is None:
-        add("info", "Firmware 1.9.4 adds a soft start, updates from this page and a pot glitch filter",
+        add("info", "Firmware 1.9.5 adds a soft start, updates from this page, a pot glitch filter and the USB cable link",
             "With 1.9 the motors go straight to their positions at power-up - a seat that rode down while the rig "
-            "was off jumps back. 1.9.4 also lets you install later firmware from Settings, Firmware update, and "
+            "was off jumps back. 1.9.5 also lets you install later firmware from Settings, Firmware update, and "
             "keeps pot glitches away from the motors.",
-            "Flash SMC3_R4_v1.9.4.ino over USB with the Arduino IDE.", code="soft_fw")
+            "Flash SMC3_R4_v1.9.5.ino over USB with the Arduino IDE.", code="soft_fw")
     # ---- firmware update over WiFi (firmware 1.9.2) ----
     wfi = board.get("wifi")
     fup = board.get("firmware_update") or {}
@@ -5233,9 +5456,9 @@ def analyze(rep):
                 "This build has no WiFi details of its own (or they didn't work), so it used the ones it last joined "
                 "with.", code="wifi_remembered")
     elif sst is not None:
-        add("info", "Firmware 1.9.4 can be updated from this page",
+        add("info", "Firmware 1.9.5 can be updated from this page",
             "Settings, Firmware update installs later firmware over WiFi - no USB cable, SimHub can stay open.",
-            "Flash SMC3_R4_v1.9.4.ino over USB once with the Arduino IDE.", code="update_fw")
+            "Flash SMC3_R4_v1.9.5.ino over USB once with the Arduino IDE.", code="update_fw")
     # ---- seat set-up (firmware 1.9) ----
     ss = board.get("seat_setup")
     if ss:
@@ -6881,6 +7104,11 @@ class FirmwareUpdate:
         if not b.connected:
             v["problem"] = "The board is not connected."
             return v
+        if b.link == "usb":                              # 2.8: the board makes no WiFi calls while on the cable
+            v["fw"] = fw_text(b.fwnum(), b.diag, b.fw_version) if b.fwnum() else None
+            v["problem"] = ("The page talks to the board over the USB cable: firmware updates go over WiFi. Close the "
+                            "USB bridge's window first - the page goes back to WiFi by itself.")
+            return v
         d = (b.read_diag() if fresh or not b.diag else b.diag) or b.diag or {}
         fwn = b.fwnum()
         v["fw"] = fw_text(fwn, d, b.fw_version) if fwn else None
@@ -6895,7 +7123,7 @@ class FirmwareUpdate:
                                 "0.4.0 or newer. Update it once over USB: " + WIFI_MODULE_STEPS)
         else:
             v["problem"] = ("The board runs firmware " + (v["fw"] or "older than 1.7") + ", which can't be updated from "
-                            "the page. Flash SMC3_R4_v1.9.4.ino over USB with the Arduino IDE once - from then on "
+                            "the page. Flash SMC3_R4_v1.9.5.ino over USB with the Arduino IDE once - from then on "
                             "updates can come from here.")
         if self.bind in ("127.0.0.1", "localhost", "::1"):
             v["capable"] = False
@@ -7818,6 +8046,468 @@ class Updater:
         if os.environ.get("SMC3_SUPERVISED") == "1":
             os._exit(RESTART_RC)                         # the parent starts the right one
         supervise(_choose(self.data_dir) or os.path.abspath(__file__), sys.argv[1:], self.data_dir)
+
+
+# --------------------------------------------------------------------------------------------------------------
+# The USB cable (page 2.8, firmware 1.9.5): a bridge on the PC the board is plugged into links the page to the board's
+# USB port, for calibration with SimHub closed. The bridge connects out to the page (POST /usb/link on the web port,
+# then raw bytes both ways), so nothing on the PC listens and the PC's firewall doesn't ask. The page sends [kU1] every
+# second over the link; the board then streams its telemetry over USB and makes no WiFi calls at all.
+#   Windows:  the PowerShell bridge the page serves at /usb-bridge.ps1 (nothing to install) - Settings, USB cable has
+#             the one line to run.
+#   Any OS:   python3 smc3_scope.py --usb-bridge COM5 --page http://<page address>:<port>   (pyserial if installed;
+#             on Linux and macOS it works without)
+# --------------------------------------------------------------------------------------------------------------
+
+USB_BAUD = 500000                                    # what the firmware opens its USB serial at (as SimHub does)
+USB_KU_OFF = b"[kU\x00]"
+BRIDGE_VERSION = "py-" + VERSION
+
+
+def _clean_hdr(v, n=60):
+    return re.sub(r"[\x00-\x1f\x7f]", "", str(v or ""))[:n]
+
+
+def usb_bridge_ps1(page_url):
+    """The PowerShell bridge, with this page's address filled in (served at /usb-bridge.ps1; ASCII only, so Windows
+    PowerShell 5.1 reads it right whatever it assumes about the encoding)."""
+    return USB_BRIDGE_PS1.replace("__PAGE__", page_url).replace("__VERSION__", VERSION)
+
+
+USB_BRIDGE_PS1 = r"""# SMC3 R4 USB bridge (smc3_scope __VERSION__): lets the smc3_scope page talk to the board over the USB cable instead
+# of WiFi - for calibration (auto-tune, the full check, Seat setup) with SimHub closed. Windows PowerShell 5.1 or
+# PowerShell 7, nothing to install. Needs firmware 1.9.5 or newer on the board.
+#   From the page: Settings, USB cable - press Win+R and paste the line shown there.
+#   As a file:     powershell -NoProfile -ExecutionPolicy Bypass -File smc3-usb-bridge.ps1 [http://<page>:<port>] [COMx]
+# Close this window (or press Ctrl+C) when you're done, then start SimHub again.
+
+$ErrorActionPreference = 'Stop'
+$smc3Page = '__PAGE__'
+$smc3Port = ''
+if ($args.Count -ge 1 -and $args[0]) { $smc3Page = [string]$args[0] }
+if ($args.Count -ge 2 -and $args[1]) { $smc3Port = [string]$args[1] }
+if ($smc3Page -eq '' -or $smc3Page -like '*PAGE__*') { $smc3Page = '' }
+
+function Smc3-Say([string]$text, [string]$colour) {
+    if (-not $colour) { $colour = 'Gray' }
+    Write-Host $text -ForegroundColor $colour
+}
+
+function Smc3-Ports {
+    $list = @()
+    try {
+        $list = @(Get-CimInstance -ClassName Win32_PnPEntity -Filter "Name LIKE '%(COM%'" -ErrorAction Stop | ForEach-Object {
+            if ([string]$_.Name -match '\((COM\d+)\)') {
+                New-Object PSObject -Property @{ Port = $Matches[1]; Name = [string]$_.Name;
+                                                 Arduino = ([string]$_.PNPDeviceID -match 'VID_2341') }
+            }
+        })
+    } catch { $list = @() }
+    if ($list.Count -eq 0) {
+        $list = @([System.IO.Ports.SerialPort]::GetPortNames() | Sort-Object -Unique | ForEach-Object {
+            New-Object PSObject -Property @{ Port = $_; Name = $_; Arduino = $false }
+        })
+    }
+    return ,$list
+}
+
+function Smc3-Head($ns) {
+    # the page's answer: status line and headers (byte by byte, so nothing after them is read)
+    $head = New-Object System.Text.StringBuilder
+    while (-not $head.ToString().EndsWith("`r`n`r`n")) {
+        $c = $ns.ReadByte()
+        if ($c -lt 0) { throw 'The page closed the connection.' }
+        [void]$head.Append([char]$c)
+        if ($head.Length -gt 16384) { throw 'That is not the smc3_scope page.' }
+    }
+    return $head.ToString()
+}
+
+function Smc3-Bridge {
+    Smc3-Say 'SMC3 R4 USB bridge - the page talks to the board over this USB cable instead of WiFi.' Cyan
+    if (-not $smc3Page) {
+        $smc3Page = (Read-Host 'Address of the smc3_scope page (as in your browser, e.g. http://192.168.1.20:8088)').Trim()
+    }
+    if ($smc3Page -notmatch '^https?://') { $smc3Page = 'http://' + $smc3Page }
+    $uri = [Uri]$smc3Page
+    if ($uri.Scheme -ne 'http') { throw 'The bridge needs the page''s plain http:// address (not https or a reverse proxy).' }
+
+    if (-not $smc3Port) {
+        $ports = Smc3-Ports
+        $ard = @($ports | Where-Object { $_.Arduino })
+        if ($ard.Count -eq 1) { $smc3Port = $ard[0].Port }
+        elseif ($ports.Count -eq 1) { $smc3Port = $ports[0].Port }
+        elseif ($ports.Count -eq 0) { throw 'No COM port on this PC. Is the board plugged in with its USB cable?' }
+        else {
+            Smc3-Say 'COM ports on this PC:'
+            foreach ($p in $ports) {
+                $tag = ''
+                if ($p.Arduino) { $tag = '   <- Arduino' }
+                Smc3-Say ('  ' + $p.Name + $tag)
+            }
+            $smc3Port = (Read-Host 'Which one is the board (e.g. COM5)').Trim().ToUpper()
+        }
+    }
+
+    $sp = New-Object System.IO.Ports.SerialPort -ArgumentList $smc3Port, 500000, ([System.IO.Ports.Parity]::None), 8, ([System.IO.Ports.StopBits]::One)
+    $sp.Handshake = [System.IO.Ports.Handshake]::None
+    $sp.ReadBufferSize = 65536
+    $sp.DtrEnable = $true
+    $sp.RtsEnable = $true
+    try { $sp.Open() }
+    catch {
+        throw ($smc3Port + ' is in use or missing: close SimHub (and SMC3Utils, the Arduino IDE''s Serial Monitor), ' +
+               'check the port, then run this again. (' + $_.Exception.Message + ')')
+    }
+    $ss = $sp.BaseStream
+    $kuOff = [byte[]](0x5B, 0x6B, 0x55, 0x00, 0x5D)
+    $id = [guid]::NewGuid().ToString('N').Substring(0, 12)
+    $tS = $null
+    $bufS = New-Object byte[] 4096
+    $bufN = New-Object byte[] 4096
+    Smc3-Say ('Board: ' + $smc3Port + ' at 500000 baud.   Page: ' + $uri.Authority) Gray
+    try {
+        while ($true) {
+            $tcp = New-Object System.Net.Sockets.TcpClient
+            $tcp.NoDelay = $true
+            try { $tcp.Connect($uri.Host, $uri.Port) }
+            catch {
+                Smc3-Say ('Can''t reach the page at ' + $uri.Authority + ' - trying again in 5 s (is the address right?)') Yellow
+                $tcp.Close(); Start-Sleep -Seconds 5; continue
+            }
+            $ns = $tcp.GetStream()
+            $ns.ReadTimeout = 15000
+            $req = "POST /usb/link HTTP/1.1`r`nHost: " + $uri.Authority + "`r`nX-SMC3: 1`r`nX-SMC3-Bridge: " + $id +
+                   "`r`nX-SMC3-Computer: " + $env:COMPUTERNAME + "`r`nX-SMC3-Port: " + $smc3Port +
+                   "`r`nX-SMC3-Bridge-Version: ps-__VERSION__`r`nContent-Length: 0`r`n`r`n"
+            $rb = [System.Text.Encoding]::ASCII.GetBytes($req)
+            $head = ''
+            try {
+                $ns.Write($rb, 0, $rb.Length)
+                $head = Smc3-Head $ns
+            }
+            catch {
+                Smc3-Say ('No answer from the page (' + $_.Exception.GetBaseException().Message + ') - trying again in 5 s') Yellow
+                $tcp.Close(); Start-Sleep -Seconds 5; continue
+            }
+            $code = 0
+            if ($head -match '^HTTP/\S+ (\d+)') { $code = [int]$Matches[1] }
+            if ($code -ne 200) {
+                $msg = ''
+                try { $msg = (New-Object System.IO.StreamReader($ns, [System.Text.Encoding]::UTF8)).ReadToEnd().Trim() } catch { }
+                $tcp.Close()
+                if (-not $msg) { $msg = 'The page answered ' + $code + '.' }
+                if ($code -eq 409) { Smc3-Say ('Waiting: ' + $msg + ' (trying again in 5 s)') Yellow; Start-Sleep -Seconds 5; continue }
+                throw $msg
+            }
+            $ns.ReadTimeout = [System.Threading.Timeout]::Infinite
+            Smc3-Say ''
+            Smc3-Say 'LINKED: the page now talks to the board over this USB cable (no WiFi).' Green
+            Smc3-Say 'Calibrate in the page. When you are done, close this window (or press Ctrl+C), then start SimHub.' Green
+            if ($null -eq $tS) { $tS = $ss.ReadAsync($bufS, 0, $bufS.Length) }
+            $tN = $ns.ReadAsync($bufN, 0, $bufN.Length)
+            $up = 0; $down = 0; $since = Get-Date; $shown = Get-Date; $heard = Get-Date; $why = ''
+            while ($true) {
+                $i = [System.Threading.Tasks.Task]::WaitAny([System.Threading.Tasks.Task[]]@($tS, $tN), 500)
+                if ($i -eq 0) {
+                    $n = 0
+                    try { $n = $tS.Result } catch { throw ('The USB port stopped working (cable unplugged?): ' + $_.Exception.GetBaseException().Message) }
+                    if ($n -le 0) { throw 'The USB port closed.' }
+                    try { $ns.Write($bufS, 0, $n) } catch { $why = 'The connection to the page dropped.'; $tS = $ss.ReadAsync($bufS, 0, $bufS.Length); break }
+                    $up += $n
+                    $tS = $ss.ReadAsync($bufS, 0, $bufS.Length)
+                } elseif ($i -eq 1) {
+                    $n = 0
+                    try { $n = $tN.Result } catch { $n = -1 }
+                    if ($n -le 0) { $why = 'The page ended the link.'; break }
+                    $ss.Write($bufN, 0, $n)
+                    $down += $n
+                    $heard = Get-Date
+                    $tN = $ns.ReadAsync($bufN, 0, $bufN.Length)
+                }
+                $now = Get-Date
+                if (($now - $heard).TotalSeconds -gt 6) { $why = 'The page went quiet for 6 s (network down, or the NAS off?).'; break }
+                if (($now - $shown).TotalSeconds -ge 2) {
+                    $shown = $now
+                    $t = [int]($now - $since).TotalSeconds
+                    Write-Host -NoNewline ("`r  linked {0}:{1:00}   board -> page {2} kB   page -> board {3} kB   " -f [int][math]::Floor($t / 60), ($t % 60), [int]($up / 1024), [int]($down / 1024))
+                }
+            }
+            Write-Host ''
+            try { $ss.Write($kuOff, 0, $kuOff.Length) } catch { }
+            $tcp.Close()
+            Smc3-Say ($why + ' Linking again in 3 s (close this window to stop).') Yellow
+            Start-Sleep -Seconds 3
+        }
+    }
+    finally {
+        try { $ss.Write($kuOff, 0, $kuOff.Length) } catch { }
+        try { $sp.Close() } catch { }
+    }
+}
+
+try { Smc3-Bridge }
+catch { Write-Host ''; Smc3-Say ('Stopped: ' + $_.Exception.Message) Red }
+Read-Host 'Press Enter to close this window' | Out-Null
+"""
+
+
+# ---- the Python bridge (smc3_scope.py --usb-bridge PORT --page URL) ----
+
+class _SerialPort:
+    """The board's USB serial port: pyserial when it is installed, else termios (Linux, macOS)."""
+
+    def __init__(self, path, baud=USB_BAUD):
+        self.path, self.ser, self.fd = path, None, None
+        try:
+            import serial                                    # pyserial
+        except ImportError:
+            serial = None
+        if serial is not None:
+            try:
+                self.ser = serial.Serial(path, baud, timeout=0.05, write_timeout=2, exclusive=True)
+            except TypeError:                                # pyserial before 3.3: no exclusive
+                self.ser = serial.Serial(path, baud, timeout=0.05, write_timeout=2)
+            return
+        if os.name == "nt":
+            raise OSError("On Windows the Python bridge needs pyserial (py -m pip install pyserial) - or use the "
+                          "PowerShell bridge: Settings, USB cable.")
+        import termios, fcntl
+        fd = os.open(path, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+        try:
+            try:
+                fcntl.ioctl(fd, termios.TIOCEXCL)            # nobody else opens it meanwhile
+            except OSError:
+                pass
+            a = termios.tcgetattr(fd)
+            a[0] = 0                                         # iflag: raw
+            a[1] = 0                                         # oflag
+            a[2] = termios.CS8 | termios.CREAD | termios.CLOCAL
+            a[3] = 0                                         # lflag: no echo, no line editing
+            speed = getattr(termios, "B%d" % baud, None)
+            if speed is not None:
+                a[4] = a[5] = speed
+            a[6][termios.VMIN] = 0
+            a[6][termios.VTIME] = 0
+            termios.tcsetattr(fd, termios.TCSANOW, a)
+            if speed is None:                                # macOS has no B500000: set it with IOSSIOSPEED
+                if sys.platform != "darwin":
+                    raise OSError(f"this system can't set {baud} baud without pyserial (pip install pyserial)")
+                try:
+                    fcntl.ioctl(fd, 0x80045402, struct.pack("i", baud))
+                except OSError as e:
+                    raise OSError(f"couldn't set {baud} baud ({e}) - install pyserial (pip3 install pyserial)")
+            try:                                             # DTR and RTS on, as SimHub and the Arduino IDE do
+                fcntl.ioctl(fd, termios.TIOCMBIS, struct.pack("I", termios.TIOCM_DTR | termios.TIOCM_RTS))
+            except (OSError, AttributeError):
+                pass
+        except Exception:
+            os.close(fd)
+            raise
+        self.fd = fd
+
+    def read(self, timeout=0.05):
+        if self.ser is not None:
+            b = self.ser.read(1)
+            return b + self.ser.read(self.ser.in_waiting) if b and self.ser.in_waiting else b
+        r, _, _ = select.select([self.fd], [], [], timeout)
+        if not r:
+            return b""
+        try:
+            b = os.read(self.fd, 4096)
+        except BlockingIOError:
+            return b""
+        if not b:
+            raise OSError("the USB port closed")
+        return b
+
+    def write(self, data):
+        if self.ser is not None:
+            self.ser.write(data)
+            return
+        view = memoryview(data)
+        end = time.time() + 2.0
+        while view:
+            try:
+                n = os.write(self.fd, view)
+                view = view[n:]
+            except BlockingIOError:
+                if time.time() > end:
+                    raise OSError("the USB port doesn't take data")
+                select.select([], [self.fd], [], 0.05)
+
+    def close(self):
+        try:
+            if self.ser is not None:
+                self.ser.close()
+            elif self.fd is not None:
+                os.close(self.fd)
+        except OSError:
+            pass
+
+
+def _page_addr(page):
+    u = urlparse(page if "://" in page else "http://" + page)
+    if u.scheme != "http":
+        raise SystemExit("The bridge needs the page's plain http:// address (not https or a reverse proxy).")
+    return u.hostname, u.port or 80, u.netloc
+
+
+def _bridge_link(ser, page, port_name, bid, say):
+    """One link to the page. Returns ("again", why) when the page or the network ended it, ("wait", why) when the
+    page is busy, or raises SystemExit with the page's reason when it won't take this bridge."""
+    host, port, netloc = _page_addr(page)
+    try:
+        s = socket.create_connection((host, port), timeout=10)
+    except OSError as e:
+        return "wait", f"Can't reach the page at {netloc} ({e.strerror or e}) - is the address right?"
+    s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    req = (f"POST /usb/link HTTP/1.1\r\nHost: {netloc}\r\nX-SMC3: 1\r\nX-SMC3-Bridge: {bid}\r\n"
+           f"X-SMC3-Computer: {_clean_hdr(socket.gethostname())}\r\nX-SMC3-Port: {_clean_hdr(port_name)}\r\n"
+           f"X-SMC3-Bridge-Version: {BRIDGE_VERSION}\r\nContent-Length: 0\r\n\r\n")
+    head = b""
+    try:
+        s.sendall(req.encode())
+        s.settimeout(15)
+        while b"\r\n\r\n" not in head:
+            c = s.recv(1)
+            if not c:
+                s.close()
+                return "wait", "The page closed the connection."
+            head += c
+            if len(head) > 16384:
+                s.close()
+                return "wait", "That doesn't look like the smc3_scope page - is the address right?"
+    except OSError as e:                                 # (socket.timeout is one)
+        s.close()
+        return "wait", f"No answer from the page ({e or 'timed out'})."
+    m = re.match(rb"HTTP/\S+ (\d+)", head)
+    code = int(m.group(1)) if m else 0
+    if code != 200:
+        body = b""
+        try:
+            while True:
+                c = s.recv(4096)
+                if not c:
+                    break
+                body += c
+        except OSError:
+            pass
+        s.close()
+        msg = body.decode("utf-8", "replace").strip() or f"The page answered {code}."
+        if code == 409:
+            return "wait", msg
+        raise SystemExit(msg)
+    say("LINKED: the page now talks to the board over this USB cable (no WiFi). Calibrate in the page; press Ctrl+C "
+        "here when you are done, then start SimHub.")
+    stop = threading.Event()
+    why = ["The page ended the link."]
+    count = {"up": 0, "down": 0, "heard": time.time()}
+    s.settimeout(0.5)
+
+    def page_to_board():
+        try:
+            while not stop.is_set():
+                try:
+                    d = s.recv(4096)
+                except socket.timeout:
+                    continue
+                if not d:
+                    break
+                ser.write(d)
+                count["down"] += len(d)
+                count["heard"] = time.time()
+        except OSError as e:
+            if not stop.is_set():                        # (not when this side closed it)
+                why[0] = f"The connection to the page dropped ({e})."
+        stop.set()
+
+    t = threading.Thread(target=page_to_board, daemon=True)
+    t.start()
+    t0 = shown = time.time()
+    try:
+        while not stop.is_set():
+            d = ser.read()
+            if d:
+                try:
+                    s.sendall(d)
+                except OSError:
+                    why[0] = "The connection to the page dropped."
+                    break
+                count["up"] += len(d)
+            now = time.time()
+            if now - count["heard"] > 6.0:                 # the page sends [kU1] every second
+                why[0] = "The page went quiet for 6 s (network down, or the page's machine off?)."
+                break
+            if now - shown >= 2.0 and sys.stdout.isatty():
+                shown = now
+                sec = int(now - t0)
+                sys.stdout.write(f"\r  linked {sec // 60}:{sec % 60:02d}   board -> page {count['up'] // 1024} kB   "
+                                 f"page -> board {count['down'] // 1024} kB   ")
+                sys.stdout.flush()
+    finally:
+        stop.set()
+        try:
+            s.close()
+        except OSError:
+            pass
+        t.join(1.0)
+        if sys.stdout.isatty():
+            sys.stdout.write("\n")
+    return "again", why[0]
+
+
+def usb_bridge_main(port_name, page, quiet=False):
+    """smc3_scope.py --usb-bridge PORT --page URL: link the page to the board's USB port until Ctrl+C."""
+    def say(msg):
+        if not quiet:
+            print(msg, flush=True)
+    if not page:
+        raise SystemExit("--usb-bridge needs --page http://<the page's address>:<port> (as in your browser).")
+    _page_addr(page)
+    try:
+        ser = _SerialPort(port_name)
+    except OSError as e:
+        raise SystemExit(f"{port_name} is in use or missing: close SimHub (and SMC3Utils, the Arduino IDE's Serial "
+                         f"Monitor), check the port, then run this again. ({e})")
+    bid = "%012x" % random.getrandbits(48)
+    say(f"SMC3 R4 USB bridge {BRIDGE_VERSION}: board {port_name} at {USB_BAUD} baud, page {page}")
+
+    def _stop(*_):
+        raise KeyboardInterrupt
+    try:                                             # Ctrl+C and a plain kill both end it cleanly ([kU0] first)
+        signal.signal(signal.SIGINT, signal.default_int_handler)
+        signal.signal(signal.SIGTERM, _stop)
+    except (ValueError, OSError, AttributeError):
+        pass
+    try:
+        while True:
+            kind, why = _bridge_link(ser, page, port_name, bid, say)
+            if kind == "again":
+                try:
+                    ser.write(USB_KU_OFF)
+                except OSError:
+                    pass
+                say(f"{why} Linking again in 3 s (Ctrl+C to stop).")
+                time.sleep(3)
+            else:
+                say(f"Waiting: {why} (trying again in 5 s)")
+                time.sleep(5)
+    except KeyboardInterrupt:
+        say("Stopped.")
+    except SystemExit as e:
+        say(f"Stopped: {e}")
+        return 2
+    except OSError as e:
+        say(f"Stopped: the USB port stopped working - is the cable still in? ({e})")
+        return 2
+    finally:
+        try:
+            ser.write(USB_KU_OFF)
+        except OSError:
+            pass
+        ser.close()
+    return 0
 
 
 # --------------------------------------------------------------------------------------------------------------
@@ -9941,7 +10631,7 @@ main[data-view=tools]{grid-template-columns:minmax(0,1.75fr) minmax(0,1fr);grid-
 main[data-view=profiles]{grid-template-columns:minmax(0,1fr) minmax(360px,430px);grid-template-areas:"genres pid" "profiles pid"}
 main[data-view=autotune]{grid-template-columns:minmax(360px,430px) minmax(0,1fr);grid-template-areas:"tune tunelive" "tuneres tunelive" "tunelog tunelog" "graphs graphs"}
 main[data-view=eeprom]{grid-template-columns:minmax(0,1fr) minmax(360px,430px);grid-template-areas:"eeprom pid" "backups pid"}
-main[data-view=settings]{grid-template-columns:repeat(2,minmax(0,1fr));grid-template-areas:"settings global" "settings mnames" "led sensor" "upd upd" "fwupd fwupd" "diag diag"}
+main[data-view=settings]{grid-template-columns:repeat(2,minmax(0,1fr));grid-template-areas:"settings global" "settings mnames" "usb usb" "led sensor" "upd upd" "fwupd fwupd" "diag diag"}
 main[data-view=help]{grid-template-columns:1fr;grid-template-areas:"help"}
 main[data-view=seat]{grid-template-columns:minmax(0,1fr) minmax(300px,380px);grid-template-areas:"seat seatlive" "graphs graphs"}
 main[data-view=view3d]{grid-template-columns:1fr;grid-template-areas:"v3d"}
@@ -10198,6 +10888,13 @@ ul.tips{margin:6px 0 10px;padding-left:18px}ul.tips li{color:var(--dim);margin:4
 #fw_board{flex-wrap:nowrap;align-items:flex-start}#fw_board .dot{margin-top:3px}#fw_board span{flex:1;min-width:0}
 .fwinfo{font-size:14px;margin:6px 0 2px;line-height:1.5}.fwinfo b{font-family:var(--mono)}
 .fwhow ol{margin:4px 0 8px;padding-left:20px;font-size:14px;line-height:1.5}.fwhow li{margin:4px 0}
+.usbsteps{margin:8px 0 10px;padding-left:20px;font-size:14px;line-height:1.5}.usbsteps li{margin:6px 0}
+.cmdbox{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:center;margin:6px 0;max-width:100%}
+.cmdbox code{min-width:0;font-family:var(--mono);font-size:12.5px;padding:7px 9px;border-radius:8px;background:var(--bg);border:1px solid var(--line);overflow-x:auto;white-space:nowrap;user-select:all}
+.cmdbox .btn{height:auto;min-height:34px;padding:4px 12px}
+.usbb{color:var(--blue);font-weight:600}
+.tnusb{font-size:12.5px;margin:8px 0 0;color:var(--dim)}
+#usb_stat{flex-wrap:nowrap;align-items:flex-start}#usb_stat .dot{margin-top:5px}#usb_stat>span{flex:1;min-width:0}
 
 #up_page,#up_fw{flex-wrap:nowrap;align-items:flex-start;margin:2px 0 8px}#up_page .dot,#up_fw .dot{margin-top:3px}#up_page>span,#up_fw>span{flex:1;min-width:0}
 .upnotes{white-space:pre-wrap;font-size:13px;line-height:1.5;color:var(--dim);max-height:230px;overflow:auto;margin:6px 0 8px;padding:8px 10px;border:1px solid var(--line);border-radius:7px;background:var(--card-2)}
@@ -10555,6 +11252,7 @@ details.oks .flist{margin-top:6px}
    <a class="btn b-grey ibtn" href="#autotune" data-k="tgear"><svg class="i" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M4.9 19.1L7 17M17 7l2.1-2.1"/></svg></a>
   </div>
   <div class="tcd" hidden></div>
+  <p class="tnusb" id="tn_usb" hidden>On WiFi a hiccup can make auto-tune redo a move. For calibration the <a href="#settings" onclick="setTimeout(()=>$('usbcard').scrollIntoView({block:'start'}),300)">USB cable</a> is steadier.</p>
   <div id="tmini" hidden><div class="bar"><div class="tbar"></div></div><div class="muted tstage"></div></div>
  </section>
 
@@ -10761,6 +11459,35 @@ details.oks .flist{margin-top:6px}
   </div>
  </section>
 
+ <!-- USB cable (page 2.8, firmware 1.9.5) -->
+ <section class="card wide" id="usbcard" style="grid-area:usb" data-views="settings">
+  <div class="ct"><svg class="i" viewBox="0 0 24 24"><path d="M12 3v14"/><path d="M9 6l3-3 3 3"/><path d="M12 13l-4-2V8"/><circle cx="8" cy="7" r="1.2"/><path d="M12 11l4-2V6.5"/><rect x="14.8" y="4.2" width="2.4" height="2.4"/><circle cx="12" cy="19" r="2"/></svg>USB cable <small>for calibration, instead of WiFi</small></div>
+  <div class="dgrid">
+   <div>
+    <div class="sstat" id="usb_stat"><i class="dot"></i><span>Not read yet</span></div>
+    <label class="chk" data-k="usb_allow"><input type="checkbox" id="usb_allow" onchange="usbAllow()"><span>Let a USB bridge take over from WiFi</span></label>
+    <ol class="usbsteps">
+     <li><b>Close SimHub</b> - it holds the board's USB port while it runs.</li>
+     <li>On the PC the board is plugged into, press <b>Win+R</b>, paste this line and press Enter:
+      <div class="cmdbox"><code id="usb_cmd"></code><button class="btn b-grey" id="usb_copy" data-k="usb_copy" onclick="usbCopy()">Copy</button></div>
+      A window opens, finds the board's COM port and links it to this page.</li>
+     <li>The page switches to the cable by itself - the header says <b class="usbb">USB cable</b>. Run auto-tune, the full check or Seat setup as usual.</li>
+     <li>When you're done, close the bridge window (or press <b>Back to WiFi</b>). The page goes back to WiFi by itself; start SimHub again.</li>
+    </ol>
+    <div class="sbtns">
+     <button class="btn b-blue" id="usb_drop" data-k="usb_drop" onclick="usbDrop()" hidden>Back to WiFi</button>
+     <a class="btn b-grey" id="usb_dl" data-k="usb_dl" href="/usb-bridge.ps1?dl=1">Download the bridge (.ps1)</a>
+    </div>
+    <div class="msg" id="usb_msg"></div>
+   </div>
+   <div class="fwhow">
+    <p class="note"><b>Why:</b> the board's WiFi module now and then holds the board up for a second or more. Then the page's moves lag, and auto-tune has to do a test move again. On the cable the board sends its live data over USB and makes no WiFi calls at all, so nothing waits.</p>
+    <p class="note">Needs firmware <b>1.9.5</b> or newer on the board, and works with SimHub closed only - one program at a time can have the USB port. The bridge connects out to this page (nothing listens on the PC, so its firewall doesn't ask) and needs nothing installed (Windows PowerShell). Firmware updates from the page still go over WiFi.</p>
+    <p class="note">Mac or Linux (or Windows with Python and pyserial): <code id="usb_py"></code></p>
+   </div>
+  </div>
+ </section>
+
  <!-- LED matrix (firmware 1.8) -->
  <section class="card" style="grid-area:led" data-views="settings" id="ledcard">
   <div class="ct"><svg class="i" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M7 15v-3M10 15V9M13 15v-5M16 15v-2"/></svg>LED matrix <small>on the board</small></div>
@@ -10880,6 +11607,7 @@ details.oks .flist{margin-top:6px}
     <h3>Diagnostics</h3><p>Settings section. <b>Quick check</b> reads the board and listens for a few seconds; <b>Full check</b> also moves each motor a little to see which way it goes, how much drive it needs, whether the wiring is swapped and how it answers a small step - and can ask you what you saw. Both make one file (saved on the NAS too) to download and give to whoever helps you. The page also watches while you drive and notes pot glitches, a motor moving the wrong way or stalling, hunting, cutoffs, the tilt limit and board restarts. It also keeps a <b>load map</b>: where each motor falls behind or runs at full power, each way across its travel - a quick check after a session names where the rig struggles (lifting a heavy driver, say). With the motion sensor, the full check also measures the seat itself: degrees per count, bounce and play in the linkage - for the traction-loss motor, how far the seat turns. For the rear slide it asks whether the rear went left or right.</p>
     <h3>Status bar</h3><p>LOW POWER means no position commands for 15 s, so the board runs at quarter drive until SimHub or this page sends targets again.</p>
     <h3>Firmware update (firmware 1.9.2)</h3><p>Settings, Firmware update installs new firmware over WiFi - no USB cable, and SimHub can stay open (with its motion output paused). In the Arduino IDE open the new .ino and use <b>Sketch, Export Compiled Binary</b>; choose that .bin on the page and press Install. The page checks the file (an SMC3_R4 build for the UNO R4 WiFi, and which version), the board switches the motors off, its WiFi module downloads and checks the file and installs it, and the page confirms the new version once the board is back. The board remembers the WiFi name and password it last joined with, so a build with the placeholders still connects. Needs the WiFi module's own firmware 0.4.0 or newer (0.5.0+ shows progress): Arduino IDE, Tools, Firmware Updater, with SimHub closed (it keeps the USB port busy) - and since that erases the sketch on the board, upload SMC3_R4 again over USB afterwards. The first install of it (SMC3_R4_v1.9.3.ino - 1.9.2 didn't compile in the Arduino IDE) goes over USB.</p>
+    <h3>USB cable for calibration (page 2.8, firmware 1.9.5)</h3><p>The board's WiFi module now and then holds the board up for a second or more, so the page's moves can lag and auto-tune redoes a test move. For calibration, link the page to the board over its USB cable instead: close SimHub, then on the PC with the cable press <b>Win+R</b> and paste the line from <b>Settings, USB cable</b>. That starts a small bridge (Windows PowerShell, nothing to install) which finds the board's COM port and links it to the page; the header then says <b>USB cable</b> and the board makes no WiFi calls at all. Close the bridge window when you're done - the page and the board go back to WiFi by themselves - and start SimHub again. Settings, USB cable can also turn bridges away (WiFi only). Firmware updates from the page still go over WiFi.</p>
     <h3>Updates (page 2.7)</h3><p>Settings, Updates: the page asks GitHub twice a day (or when you press <b>Check now</b>) whether the newest release has a newer page or firmware, and says so in the header. <b>Update page</b> downloads the new page, checks it and restarts into it - the board isn't touched, and settings stay. The downloaded page is kept in the data folder (<code>updates</code>), so it is used again after a restart or a re-created Docker container, until a newer one comes, or a newer image or file is started. <b>Go back to built-in</b> undoes it. Firmware is only downloaded: flash the .ino with the Arduino IDE, or export the .bin and install it in Firmware update.</p>
     <h3>Soft start (firmware 1.9.1)</h3><p>After the rig has been off the seat may have ridden down a little. At power-up, and when you press Enable Motors, each motor creeps from wherever it is to its position (SimHub's centre at power-up) instead of jumping there - 60 counts/s by default, easing in and out. Once it has caught up everything runs normally. A seat that rode down past an end stop is allowed to come back (only going further out switches the motor off), the tilt limit waits, and the board keeps full power meanwhile. Settings, Loop, PWM &amp; smoothing: Soft start.</p></div>
    <div><h3>Seat setup (firmware 1.9)</h3><p>Levels the platform first and makes that SimHub's centre: the board adds a <b>level trim</b> to every position SimHub sends, so SimHub's middle (512) is the level seat - and the seat goes level at power-up. With the motion sensor it levels itself (each motor moves a little to learn how it tilts the seat, then the page moves them until the sensor reads level, choosing the level position nearest the middle of every motor); without it you nudge the motors with a spirit level on the seat. On a traction-loss rig only motors 1 and 2 level the seat; you <b>centre</b> motor 3, the rear slide, so the seat points straight ahead, and tell the page which way the rear went for +10.</p>
@@ -11070,6 +11798,12 @@ const TIPS={
  s_save:"Save these settings on the NAS and reconnect.",
  s_scan:"Search every address on the network for an SMC3 board (about 5 seconds).",
  st_conn:"Whether this page is receiving live data from the board.",
+ st_usb:"The page talks to the board over the USB cable, through the bridge on the PC (Settings, USB cable). WiFi rests meanwhile. Close the bridge window to go back to WiFi.",
+ st_wifi:"The page talks to the board over WiFi. For calibration the USB cable is steadier: Settings, USB cable.",
+ usb_allow:"Off: the page stays on WiFi and turns a bridge away.",
+ usb_copy:"Copies the line to paste into Win+R (or a PowerShell window) on the PC with the USB cable.",
+ usb_drop:"Ends the USB link now: the board and the page go back to WiFi. Run the bridge again to use the cable.",
+ usb_dl:"The same bridge as a file, to keep on that PC: right-click it, Run with PowerShell.",
  st_page:"Version of this page (smc3_scope). Settings, Updates says when GitHub has a newer one.",
  updballoon:"A newer page or firmware is on GitHub. Click to see it (Settings, Updates).",
  st_fw:"Firmware version on the board. Auto-tune needs 1.4 or newer, Disable Motors 1.5.",
@@ -11200,7 +11934,7 @@ function showView(){let v=location.hash.slice(1);if(!VIEWS.includes(v))v='dashbo
  document.querySelectorAll('#nav a').forEach(a=>a.classList.toggle('on',a.getAttribute('href')==='#'+v));
  const eb=$('expBtn');eb.dataset.k=v==='graphs'?'collapse':'expand';eb.dataset.tip=TIPS[eb.dataset.k];
  eb.innerHTML=v==='graphs'?'<svg class="i" viewBox="0 0 24 24"><path d="M4 14h6v6M20 10h-6V4M14 10l7-7M3 21l7-7"/></svg>':'<svg class="i" viewBox="0 0 24 24"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>';
- if(v==='profiles'){loadProfiles();loadGenres();} if(v==='settings'){fillSettings();diagLists();loadBoard(true);fwLoad(true);updLoad();} if(v==='tuning')loadBoard(true); if(v==='eeprom')loadBackups();
+ if(v==='profiles'){loadProfiles();loadGenres();} if(v==='settings'){fillSettings();diagLists();loadBoard(true);fwLoad(true);updLoad();usbLoad();} if(v==='tuning')loadBoard(true); if(v==='eeprom')loadBackups();
  if(v==='seat'){ssFilled=null;ssPoll();} if(typeof v3Show==='function')v3Show(v==='view3d');
  chartHeight();}
 window.addEventListener('hashchange',showView);
@@ -11246,6 +11980,28 @@ const vk=v=>String(v||'').split('.').map(x=>+x||0);
 const vgt=(a,b)=>{const x=vk(a),y=vk(b);for(let i=0;i<Math.max(x.length,y.length);i++){const d=(x[i]||0)-(y[i]||0);if(d)return d>0;}return false;};
 function agoText(s){if(s==null)return'';if(s<90)return'just now';if(s<5400)return Math.round(s/60)+' min ago';if(s<129600)return Math.round(s/3600)+' h ago';return Math.round(s/86400)+' days ago';}
 async function updLoad(){try{updShow(await (await fetch('/update/status')).json());}catch(e){}}
+// ---------- USB cable (2.8) ----------
+function usbShow(r){usbSt=r;const l=r.link||{},u=l.kind==='usb';
+ $('usb_cmd').textContent=`powershell -NoProfile -ExecutionPolicy Bypass -Command "irm ${location.origin}/usb-bridge.ps1 | iex"`;
+ $('usb_py').textContent=`python3 smc3_scope_v__VERSION__.py --usb-bridge /dev/ttyACM0 --page ${location.origin}`;
+ $('usb_allow').checked=!!r.allowed;$('usb_drop').hidden=!u;$('usb_drop').disabled=false;
+ let cls,h;
+ if(u){cls=l.streaming?'on':'warn';h=`On the <b>USB cable</b> - ${esc(l.computer||'the PC')}, ${esc(l.port||'?')}, for ${esc(durText(l.age))}`+(l.streaming?'':' <span class="muted">- waiting for the board\'s data…</span>');}
+ else if(connected){cls='';h=`On <b>WiFi</b>`+(l.host?` (${esc(l.host)})`:'')+(r.allowed?'. Start the bridge to switch to the cable.':'. <span class="muted">WiFi only: a bridge is turned away.</span>');}
+ else{cls='off';h='Not connected to the board.'+(r.allowed?' A bridge can link it over the cable.':'');}
+ $('usb_stat').innerHTML=`<i class="dot ${cls}"></i><span>${h}</span>`;
+ let m='';
+ if(!u&&r.busy&&r.allowed)m+=`<div class="warnc">A bridge would wait now: ${esc(r.busy)}</div>`;
+ if(location.protocol==='https:')m+='<div class="warnc">This page is open over https (a reverse proxy?): the bridge needs its plain http:// address - open the page that way to get the right line.</div>';
+ if(r.last)m+=`<span class="muted">Last USB link: ${esc(r.last.computer||'?')}, ${esc(r.last.port||'?')}, ended ${esc(agoText(r.last.ago))} - ${esc(r.last.why||'')}</span>`;
+ $('usb_msg').innerHTML=m;tipAttach($('usbcard'));}
+function durText(s){s=Math.max(0,Math.round(s||0));return s<60?s+' s':s<3600?Math.floor(s/60)+' min':Math.floor(s/3600)+' h '+Math.floor(s%3600/60)+' min';}
+async function usbLoad(){try{usbShow(await (await fetch('/usb/status',{cache:'no-store'})).json());}catch(e){}}
+async function usbAllow(){const r=await post('/config',{usb_link:$('usb_allow').checked});if(r.error)toast(esc(r.error)+' The cable stays until then.',true);else cfg=r;usbLoad();}
+async function usbDrop(){$('usb_drop').disabled=true;try{const r=await post('/usb/drop');usbShow(r);
+ if(r.ok===false&&r.error){toast(esc(r.error)+' Back to WiFi after that.',true);$('usb_drop').disabled=false;}else toast('Back to WiFi: the bridge window says so too.');}catch(e){$('usb_drop').disabled=false;}}
+async function usbCopy(){const b=$('usb_copy'),ok=await copyText($('usb_cmd').textContent);
+ b.textContent=ok?'Copied':'Copy failed';clearTimeout(usbCopy.h);usbCopy.h=setTimeout(()=>b.textContent='Copy',1800);if(!ok)toast('The browser didn\'t allow copying - select the line and copy it by hand.',true);}
 function updGo(){setTimeout(()=>{const c=$('updcard');if(c)c.scrollIntoView({behavior:'smooth',block:'start'});},80);}
 function updShow(r){upSt=r;const p=r.page||{},f=r.fw||{},rel=r.release,idle=r.state==='idle';let cls,h;
  if(p.newer){cls='warn';h=`Page <b>v${esc(p.latest)}</b> is out - this is v${esc(p.running)}.`+(p.dropped?' <span class="muted">Not used now: you went back from it, or it didn\'t start.</span>':'');}
@@ -11375,7 +12131,7 @@ async function sensorAct(a){if(a==='setup'&&!confirm('Set the sensor up: 100 rea
  const r=await post('/board/sensor/action',{action:a});if(!r.ok){$('sn_msg').innerHTML='<span class="badc">'+esc(r.error)+'</span>';return;}showBoard(r,false);
  $('sn_msg').innerHTML='<span class="okc">'+{level:'Levelled: this seat position now reads 0° / 0°.',setup:'Sent. If the rate doesn\'t change within a few seconds, the board\'s TX (D1) isn\'t reaching the sensor - set it in WitMotion\'s software instead (100 Hz, 115200 baud, angles + acceleration + gyro).',search:'Looking for the sensor for 30 s.'}[a]+'</span>';
  if(a==='setup')setTimeout(()=>loadBoard(false),4000);}
-setInterval(()=>{if(curView==='settings'&&document.visibilityState==='visible')loadBoard(false);},3000);
+setInterval(()=>{if(curView==='settings'&&document.visibilityState==='visible'){loadBoard(false);usbLoad();}},3000);
 function fillNames(){let h='';
  for(let m=0;m<3;m++){const v=MNAMES[m]||'',preset=!v||NAMEOPTS.includes(v);
   h+=`<div class="nrow" data-m="${m}"${m>=NM?' hidden':''}><span class="badge">${m+1}</span><select id="nsel${m}" data-k="n_name" onchange="nameSel(${m})"><option value="">Not named (Motor ${m+1})</option>`+
@@ -11407,8 +12163,11 @@ async function poll(){
   const ls=data[data.length-1];$('dg_live').innerHTML=diagMotor!=null&&ls?`<span class="mtag m${diagMotor+1}">${esc(mshort(diagMotor))}</span>pot ${ls.m[diagMotor].f.toFixed(1)}  target ${ls.m[diagMotor].t}  drive ${ls.m[diagMotor].p.toFixed(0)}`:'';
  }catch(e){if(++misses>=5){$('pill').innerHTML='<span><i class="dot off"></i>Page server not reachable</span>';}}
  setTimeout(poll,100);}
+let linkK='wifi',usbSt=null;
 function updateStatus(j){const s=data[data.length-1];const fresh_inc=watch.newest>seenInc();
  let h=connected?'<span data-k="st_conn"><i class="dot on"></i>Board Connected</span>'+(man.active?'<span class="mheld" data-k="st_held">Page has the seat</span>':''):`<span data-k="st_conn"><i class="dot off"></i>Not connected <span class="muted" style="font-weight:400">(${esc(j.host||'no address set')})</span></span>`;
+ linkK=(j.link||{}).kind||'wifi';
+ if(connected)h+=linkK==='usb'?'<span class="usbb" data-k="st_usb">USB cable</span>':'<span data-k="st_wifi">WiFi</span>';
  if(j.fw)h+=`<span data-k="st_fw">fw v${esc(j.fw)}</span>`;
  h+='<span data-k="st_page">page v__VERSION__</span>';
  if(s&&connected){h+=`<span data-k="st_isr">ISR max ${s.isr} µs</span><span data-k="st_div">Fpid/${s.div}</span>`+(s.low?'<span class="bad" data-k="st_low">LOW POWER</span>':'<span class="ok" data-k="st_full">Full power</span>');
@@ -11416,6 +12175,8 @@ function updateStatus(j){const s=data[data.length-1];const fresh_inc=watch.newes
  if(j.scanning)h+='<span>searching for the board…</span>';
  if(tuneRunning)h+='<span class="ok">auto-tune running</span>';
  $('pill').innerHTML=h;
+ const tu=$('tn_usb');if(tu)tu.hidden=!(connected&&linkK==='wifi'&&curView==='autotune');
+ if(curView==='settings'&&usbSt&&((usbSt.link||{}).kind||'wifi')!==linkK){usbLoad();fwLoad(false);}
  const up=j.upd||{},ub=$('updBalloon'),what=[up.page?'page v'+up.page:'',up.fw?'firmware '+up.fw:''].filter(Boolean);
  if(ub){ub.hidden=!what.length;if(what.length){const t='<b>Update available</b> on GitHub: '+esc(what.join(' and '))+'. Click to see it (Settings, Updates).';if(ub.dataset.tip!==t)ub.dataset.tip=t;}}tipAttach($('pill'));
  // system status
@@ -12450,6 +13211,7 @@ class Handler(BaseHTTPRequestHandler):
     seat: "SeatSetup" = None
     fwup: "FirmwareUpdate" = None
     upd: "Updater" = None
+    usb_busy = None                     # 2.8: callable -> why a USB bridge has to wait, or None
 
     def log_message(self, *a):          # quiet
         pass
@@ -12509,9 +13271,25 @@ class Handler(BaseHTTPRequestHandler):
                         "imu": imu if (imu and time.time() - imu["t"] < 1.0) else None,
                         "seat": {"open": self.seat.state != "idle", "action": self.seat.action,
                                  "trim": [self.board.trim(m) for m in range(3)]},
-                        "manual": self.manual.status(), "upd": self.upd.summary()})
+                        "manual": self.manual.status(), "upd": self.upd.summary(),
+                        "link": self.board.link_info()})
         elif u.path == "/config":
             self._json(self.cfg.public())
+        elif u.path == "/usb/status":                    # 2.8: the USB cable
+            self._json(self._usb_status())
+        elif u.path == "/usb-bridge.ps1":                # 2.8: the Windows bridge, with this page's address in it
+            host = re.sub(r"[^A-Za-z0-9.:\[\]_-]", "", self.headers.get("Host") or "")[:100]
+            if not host:
+                host = f"127.0.0.1:{self.server.server_address[1]}"
+            body = usb_bridge_ps1("http://" + host).replace("\n", "\r\n").encode("ascii", "replace")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            if parse_qs(u.query).get("dl"):
+                self.send_header("Content-Disposition", 'attachment; filename="smc3-usb-bridge.ps1"')
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
         elif u.path == "/update/status":                 # 2.7: newer page / firmware on GitHub
             self._json(self.upd.status())
         elif u.path == "/fw/status":                     # 2.3: firmware update
@@ -12690,7 +13468,72 @@ class Handler(BaseHTTPRequestHandler):
     def _seat_post(self, what, req):
         _seat_post_impl(self, what, req)
 
+    def _text(self, msg, code):
+        body = msg.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except OSError:
+            pass
+
+    def _usb_status(self):
+        b = self.board
+        last = dict(b.usb_last, ago=round(time.time() - b.usb_last["until"])) if b.usb_last else None
+        return {"allowed": bool(self.cfg.get("usb_link")), "link": b.link_info(), "last": last,
+                "busy": Handler.usb_busy() if Handler.usb_busy else None}
+
+    def _usb_link(self):
+        """2.8: a bridge on the PC with the USB cable. Answers, then the connection carries the board's bytes both ways
+        until either side ends it; this thread waits meanwhile."""
+        h = self.headers
+        if h.get("X-SMC3") != "1":
+            self._text("Only the smc3_scope USB bridge can do that.", 403)
+            return
+        info = {"id": _clean_hdr(h.get("X-SMC3-Bridge"), 40), "computer": _clean_hdr(h.get("X-SMC3-Computer")),
+                "port": _clean_hdr(h.get("X-SMC3-Port"), 40), "version": _clean_hdr(h.get("X-SMC3-Bridge-Version"), 30),
+                "from": self.client_address[0]}
+        b = self.board
+        why, code = None, 409
+        u = b.usb
+        if not self.cfg.get("usb_link"):
+            why, code = ("This page is set to WiFi only: in the page, Settings, USB cable, tick \"Let a USB bridge "
+                         "take over\" first."), 403
+        elif info["id"] and info["id"] in b.usb_refused:
+            why, code = b.usb_refused[info["id"]], 410
+        elif b.link == "usb" and u and u.get("id") != info["id"]:
+            why = f"Another USB bridge is linked already ({u.get('computer') or '?'}, {u.get('port') or '?'})."
+        elif b.usb_pending:
+            why = "Another USB bridge is linking right now."
+        else:
+            why = Handler.usb_busy() if Handler.usb_busy else None
+        if why:
+            self._text(why, code)
+            return
+        if b.link == "usb" and u:                        # the same bridge again: its old link is gone
+            u["end"] = "The bridge linked again."
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("X-SMC3-Page", VERSION)
+        self.end_headers()
+        self.wfile.flush()
+        self.close_connection = True
+        sock = self.connection
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
+        sock.settimeout(1.0)
+        self.events.add("link", f"A USB bridge linked: {info['computer'] or '?'} ({info['from']}), "
+                        f"{info['port'] or '?'}, bridge {info['version'] or '?'}.", quiet=True)
+        b.attach_usb(sock, info).wait()
+
     def do_POST(self):
+        if self.path == "/usb/link":                     # 2.8: no JSON body - the connection becomes the link
+            self._usb_link()
+            return
         n = int(self.headers.get("Content-Length", "0") or 0)
         if self.path.startswith("/fw/upload"):           # 2.3: the firmware file, as it is
             if n <= 0 or n > 2_000_000:
@@ -12712,12 +13555,21 @@ class Handler(BaseHTTPRequestHandler):
         if p == "/fw/clear":
             self._json(self.fwup.clear())
             return
-        if p.startswith("/update/") and self.headers.get("X-SMC3") != "1":
+        if (p.startswith("/update/") or p.startswith("/usb/")) and self.headers.get("X-SMC3") != "1":
             # the page sends this header; another website open in the same browser can't (without asking first)
             self._json({"ok": False, "error": "Only the page itself can do that."}, 403)
             return
         if p == "/update/check":
             self._json(self.upd.check())
+            return
+        if p == "/usb/drop":                             # 2.8: Back to WiFi
+            why = Handler.usb_busy() if Handler.usb_busy else None
+            if why and self.board.link == "usb":         # switching mid-way would leave the board on test settings
+                self._json({"ok": False, "error": why, **self._usb_status()})
+                return
+            ok = self.board.detach_usb("You switched back to WiFi in the page. Run the bridge again to use the cable.",
+                                       refuse=True)
+            self._json({"ok": ok, **self._usb_status()})
             return
         if p == "/update/install":
             self._json(self.upd.install())
@@ -12835,6 +13687,14 @@ class Handler(BaseHTTPRequestHandler):
                 kw["tl_dir"] = int(req["tl_dir"])
             if "update_check" in req:
                 kw["update_check"] = bool(req["update_check"])
+            if "usb_link" in req:
+                kw["usb_link"] = bool(req["usb_link"])
+                why = Handler.usb_busy() if Handler.usb_busy else None
+                if not kw["usb_link"] and why and self.board.link == "usb":
+                    self._json({**self.cfg.public(), "error": why})     # not mid-way: keep the cable for now
+                    return
+                if not kw["usb_link"]:
+                    self.board.detach_usb("The page was set to WiFi only (Settings, USB cable).", refuse=True)
             before = {k: self.cfg.get(k) for k in kw}
             self.cfg.update(**kw)
             changed = [f"{k} {before[k]} -> {self.cfg.get(k)}" for k in kw if before[k] != self.cfg.get(k)]
@@ -13066,7 +13926,13 @@ def main():
                                                                         "smc3-scope-data")
     ap.add_argument("--data", default=os.environ.get("SMC3_DATA_DIR", default_data),
                     help="folder for config.json (settings made in the page)")
+    ap.add_argument("--usb-bridge", metavar="PORT", default="",
+                    help="run as the USB bridge instead of the page: link the page (--page) to the board on this serial "
+                         "port (COM5, /dev/ttyACM0) - for calibration with SimHub closed (firmware 1.9.5)")
+    ap.add_argument("--page", default="", help="with --usb-bridge: the page's address, e.g. http://192.168.1.20:8088")
     args = ap.parse_args()
+    if args.usb_bridge:                               # 2.8: the bridge, not the page
+        sys.exit(usb_bridge_main(args.usb_bridge, args.page))
     handoff_to_update(args.data, sys.argv[1:])        # 2.7: a newer page downloaded from GitHub runs instead
 
     cfg = Config(args.data, args.host.strip(), str(args.port).strip())
@@ -13099,6 +13965,19 @@ def main():
             return "A test signal is running - stop it first."
         return None
     Handler.fwup.busy_check = busy
+
+    def usb_busy():
+        """2.8: what a USB bridge waits for before it takes over from WiFi (switching mid-way would spoil it)."""
+        if Handler.seat.state != "idle":
+            return "Seat setup is open in the page - finish or cancel it first."
+        if Handler.diag.moving():
+            return "The page's full check is moving the motors - wait for it or stop it."
+        if Handler.tuner.running():
+            return "Auto-tune is running in the page - wait for it or stop it."
+        if Handler.fwup.state == "running":
+            return "A firmware update is running - wait for it to finish."
+        return None
+    Handler.usb_busy = usb_busy
     Handler.manual = ManualControl(board, cfg, events)
     Handler.manual.busy = lambda: busy() or ("A firmware update is running." if Handler.fwup.state == "running"
                                              else None)
@@ -13147,6 +14026,18 @@ def main():
         time.sleep(1.5)
         if board.conn_id != cid or not board.connected:  # that connection is gone already
             return
+        rs = board.pending_restore                       # 2.8: auto-tune was cut off when the link dropped
+        if rs:
+            m, p = rs["motor"], rs["params"]
+            board.cmd_word("DEF"[m], p["kp"]); board.cmd_word("GHI"[m], p["ki"]); board.cmd_word("JKL"[m], p["kd"])
+            board.cmd_word("MNO"[m], max(1, p["ks"]))
+            board.cmd_pair("PQR"[m], p["pwmmin"], p["pwmmax"]); board.cmd_pair("VWX"[m], p["dz"], p["pwmrev"])
+            time.sleep(0.3)
+            if board.conn_id == cid and board.connected:
+                board.pending_restore = None
+                events.add("tune", f"Auto-tune of motor {m + 1} was cut off when the link to the board dropped: its "
+                           f"previous settings (Kp {p['kp']}, Ki {p['ki']}, Kd {p['kd']}) were sent to the board again "
+                           f"now.", quiet=False)
         pr = board.read_params()
         if pr.get("Kp1") is not None:
             Handler.backups.add("auto", "Settings found on the board when the page connected", pr)

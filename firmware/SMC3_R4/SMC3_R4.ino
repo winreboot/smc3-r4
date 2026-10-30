@@ -41,9 +41,22 @@
 // Pots: wiper must stay within 0-5 V (the R4 is a 5 V board, so existing wiring is fine).
 //****************************************************************************************************************
 
-#define FW_VERSION     "1.9.4"         // shown in the USB boot banner; [ver] still answers 70 for SMC3Utils
+#define FW_VERSION     "1.9.5"         // shown in the USB boot banner; [ver] still answers 70 for SMC3Utils
 #define FW_VERSION_NUM 19              // reported by [rd!] so smc3_scope can check what it is talking to (1.9.x = 19)
-#define FW_CAPS        "SMC3CAPS:ota1,wifimem1"   // 1.9.2: what this build can do - smc3_scope looks for it in a .bin
+#define FW_CAPS        "SMC3CAPS:ota1,wifimem1,usbpage1"   // 1.9.2: what this build can do - smc3_scope looks for it in a .bin
+
+// v1.9.5 changes: the page can talk over the USB cable instead of WiFi, for calibration with SimHub closed.  [kU1]
+//                over USB switches the USB port to "page mode" for USB_PAGE_TIMEOUT_MS (5 s); the page repeats it
+//                every second, and [kU0] (or 5 s without it) ends it.  While it is on, the telemetry ("SM3T"/"SM3X")
+//                and the diagnostics frame go out over USB, USB position commands are the page's (the seat hold
+//                doesn't drop them, and they don't count as SimHub's), and the board makes no WiFi call at all - the
+//                WiFi module's round-trips are what held up the loop now and then.  The WiFi link picks up again
+//                when page mode ends.  SimHub on USB is unchanged: without [kU1] nothing is different.  The
+//                diagnostics flags byte gets bit 4 (USB page mode on); [rdu] answers over USB too (the version
+//                text - firmware updates themselves stay WiFi only); FW_CAPS says "usbpage1".
+//                Also: loop() reads the clock again after the USB commands - one parsed a millisecond after loop() took
+//                "now" made "now - LastPacketMillis" wrap, so the board ran a pass at LOW POWER (and page mode would
+//                have ended at once).
 
 // v1.9.4 changes: pot glitch filter.  A pot reading that is more than POT_JUMP_COUNTS (16) away from the last good one
 //                can't be the motor moving (that would be 64000 counts/s) - the wiper lost contact for a moment.  The
@@ -263,7 +276,7 @@
 //    [ena]/[en1]/[en2]/[en3]   Enable motors
 //    [dis]/[di1]/[di2]/[di3]   Disable motors (brake, stay off until enabled) - new in 1.5
 //    [fab]                     Smoothing shift a (0-8) and max speed b*100 counts/s - new in 1.6 ([rdf] reads)
-//    [rdd]                     Diagnostics frame "SM3D" (WiFi client only) - new in 1.7, version 2 in 1.8
+//    [rdd]                     Diagnostics frame "SM3D" (the page only: WiFi, or USB in page mode) - new in 1.7
 //    [lvf]                     Matrix view v (0 bars, 1 horizon, 2 quiet) and flags f - new in 1.8 ([rdl] reads)
 //    [ift]                     Sensor flags f (bit0 on, bit1 swap roll/pitch, bit2 invert roll, bit3 invert
 //                              pitch) and tilt limit t degrees (0 = off) - new in 1.8 ([rdi] reads)
@@ -276,6 +289,8 @@
 //                              f = 80 / 81: the sensor's level roll / pitch x100 (saved at once) - 1.9;
 //                              f = 82: soft-start speed, counts/s, 0 = off (saved at once) - 1.9.1
 //    [kSV] [kRL] [kCL] [kHn]   Seat set-up: save, reload saved, clear, page holds the seat n x 100 ms - 1.9
+//    [kU1] / [kU0]             USB only: the page is on the USB cable for the next 5 s (repeat every second) / no
+//                              longer - telemetry and [rdd] come over USB, no WiFi calls meanwhile - 1.9.5
 //    [xe1] / [xe0]             Sensor acceleration + gyro after every telemetry burst on / off - 1.9
 //    [uP=] [uT=] [uI=] [uJ=]   Firmware update (WiFi client only): value register = the page's web port, the
 //                              file's number (http://<page>:<port>/ota/<number, 4 hex digits>.ota), the page's
@@ -421,6 +436,10 @@ int          SerialFeedbackEnabled = 0;
 unsigned long LastPacketMillis = 0;
 unsigned long LastMonitorMillis = 0;
 uint8_t      ReplyTarget = 0;                 // 0 = reply over USB, 1 = reply to the TCP client
+bool         UsbPage = false;                 // 1.9.5: the page is on the USB cable ([kU1]): telemetry there, no WiFi
+unsigned long UsbPageMillis = 0;              // ... last [kU1]
+uint32_t     UsbPageStarts = 0;               // ... how often it was switched on (test / diagnostics)
+#define USB_PAGE_TIMEOUT_MS 5000              // page mode ends this long after the last [kU1]
 
 //----------------------------------------------------------------------------------------------------------------
 //  Network state (loop() only)
@@ -1445,19 +1464,24 @@ void OtaCommand(uint8_t a, uint8_t b);
 #endif
 void ImuCommand(uint8_t a, uint8_t b);
 static inline uint8_t SensorState();
+void UsbPageCommand(uint8_t n);
 
 // source 0 = USB (SimHub / SMC3Utils), 1 = TCP (smc3_scope.py).  Same command set on both.
 // "Host alive" for the comms-timeout power reduction = any USB packet, or a position command over TCP
 // (reading telemetry alone must not keep the rig at full power).
+// 1.9.5: in USB page mode the USB commands are the page's: counted as the page's, never held for the seat set-up, and
+// (as over WiFi) only its position commands keep the rig at full power.
 unsigned long TcpLastTargetMillis = 0;
 
 void ParseCommand(const unsigned int *buf, uint8_t source)
 {
     bool isTarget = (buf[0] == 'A' || buf[0] == 'B' || buf[0] == 'C');
-    if (source == 0 || isTarget) { LastPacketMillis = millis(); }
+    bool usbPage = (source == 0 && UsbPage);
+    bool fromPage = (source == 1 || usbPage);
+    if ((source == 0 && !usbPage) || isTarget) { LastPacketMillis = millis(); }
     if (isTarget) { LastPosMillis = millis(); }
-    if (source == 1 && isTarget) { TcpLastTargetMillis = millis(); }
-    if (source == 0)
+    if (fromPage && isTarget) { TcpLastTargetMillis = millis(); }
+    if (source == 0 && !usbPage)
     {
         UsbFramesOk++;
         LastUsbPacketMillis = millis();
@@ -1467,12 +1491,13 @@ void ParseCommand(const unsigned int *buf, uint8_t source)
     {
         TcpFramesOk++;
     }
+    (void)fromPage;                              // (only used with WiFi)
     ReplyTarget = source;
     unsigned int b1 = buf[1];
     unsigned int b2 = buf[2];
     int word = (int)((b1 * 256) + b2);
 
-    if (isTarget && source == 0 && PageHolds())  // Seat setup is moving the seat: SimHub waits (1.9)
+    if (isTarget && source == 0 && !usbPage && PageHolds())  // Seat setup is moving the seat: SimHub waits (1.9)
     {
         UsbHeldFrames++;
         ReplyTarget = 0;
@@ -1532,8 +1557,8 @@ void ParseCommand(const unsigned int *buf, uint8_t source)
                     case 'l': SendTwoValues('l', LedView, LedFlags); break;            // 1.8: matrix view + flags
                     case 'i': SendTwoValues('i', SensorState(), TiltLimitDeg); break;  // 1.8: sensor state + tilt limit
 #if ENABLE_WIFI
-                    case 'd': if (source == 1) { SendDiag(); } break;      // 1.7: diagnostics frame (WiFi only)
-                    case 'u': if (source == 1) { SendOtaFrame(); } break;  // 1.9.2: firmware update state
+                    case 'd': if (fromPage) { SendDiag(); } break;         // 1.7: diagnostics frame (the page only)
+                    case 'u': if (fromPage) { SendOtaFrame(); } break;     // 1.9.2: update state + version text
 #endif
                     default: break;
                 }
@@ -1581,10 +1606,13 @@ void ParseCommand(const unsigned int *buf, uint8_t source)
             ImuCommand(b1, b2);
             break;
         case 'w': ValueReg = (int16_t)(uint16_t)word; break;     // 1.9: value register for [k]
-        case 'k': SeatCommand((uint8_t)b1, (uint8_t)b2); break;  // 1.9: seat set-up
+        case 'k':                                                // 1.9: seat set-up
+            if (b1 == 'U') { if (source == 0) { UsbPageCommand((uint8_t)b2); } }   // 1.9.5: page on the USB cable
+            else { SeatCommand((uint8_t)b1, (uint8_t)b2); }
+            break;
 #if ENABLE_WIFI
         case 'x':                                                // 1.9: sensor acceleration + gyro frames
-            if (b1 == 'e' && source == 1) { TelExtras = (b2 == '1' || b2 == 1); }
+            if (b1 == 'e' && fromPage) { TelExtras = (b2 == '1' || b2 == 1); }
             break;
         case 'u':                                                // 1.9.2: firmware update (from the page only)
             if (source == 1) { OtaCommand((uint8_t)b1, (uint8_t)b2); }
@@ -2054,6 +2082,15 @@ bool ReadIpText()
     return true;
 }
 
+// 1.9.5: to the page, wherever it is - the USB cable in page mode, else the WiFi client
+bool PageWrite(const uint8_t *buf, size_t n)
+{
+    if (UsbPage) { Serial.write(buf, n); return true; }
+    if (!ClientUp) { return false; }
+    if (TcpClient.write(buf, n) == 0) { ClientUp = false; return false; }
+    return true;
+}
+
 void TelemetrySample(unsigned long now)
 {
     if (TelCount >= TEL_MAX_SAMPLES) { return; }
@@ -2111,7 +2148,7 @@ void TelemetrySend()
     }
     AccPeak_mg = 0;                              // per burst, sent or not
     AccBurstN = 0;
-    if (TcpClient.write(TelBuf, n) == 0) { ClientUp = false; }
+    PageWrite(TelBuf, n);
     TelCount = 0;
 }
 
@@ -2136,8 +2173,10 @@ void TelemetrySend()
 //   second | int16 raw acceleration x, y, z, raw gyro x, y, z, temperature x100.
 //   Version 4 (1.9.1) adds:  uint16 soft-start speed (counts/s, 0 = off) | uint8 motors still creeping (bit n =
 //   motor n+1).
-// Only ever sent to the WiFi client, so SimHub and SMC3Utils on USB never see it.
+//   1.9.5: flags bit4 = USB page mode on.
+// Only ever sent to the page (the WiFi client, or USB in page mode), so SimHub and SMC3Utils on USB never see it.
 uint8_t MatrixError();
+int8_t  LastRssi = -127;                         // 1.9.5: in USB page mode the last reading is sent (no WiFi calls)
 
 void SendDiag()
 {
@@ -2157,9 +2196,13 @@ void SendDiag()
     Put16(p, (int)(b > 65535UL ? 65535UL : b)); p += 2;
     Put32(p, LoopMaxUs); p += 4;
     LoopMaxUs = 0;
-    int32_t rssi = WiFi.RSSI();                   // one modem round-trip, only when asked
-    if (rssi < -127) { rssi = -127; } else if (rssi > 0) { rssi = 0; }
-    *p++ = (uint8_t)(int8_t)rssi;
+    if (!UsbPage)
+    {
+        int32_t rssi = WiFi.RSSI();               // one modem round-trip, only when asked
+        if (rssi < -127) { rssi = -127; } else if (rssi > 0) { rssi = 0; }
+        LastRssi = (int8_t)rssi;
+    }
+    *p++ = (uint8_t)LastRssi;
     *p++ = (uint8_t)BuildFlags();
     *p++ = (uint8_t)FW_VERSION_NUM;
     for (uint8_t m = 0; m < NUM_MOTORS; m++)
@@ -2215,6 +2258,7 @@ void SendDiag()
     if (EEPROM.read(SEAT_EE) == 0xB9) { fl |= 2; }
     if (TelExtras) { fl |= 4; }
     if (PageHolds()) { fl |= 8; }
+    if (UsbPage) { fl |= 16; }
     *p++ = fl;
     Put32(p, UsbHeldFrames); p += 4;
     Put16(p, ImuAccHz);  p += 2;
@@ -2240,7 +2284,7 @@ void SendDiag()
     buf[0] = 'S'; buf[1] = 'M'; buf[2] = '3'; buf[3] = 'D';
     buf[4] = 5;
     buf[5] = (uint8_t)len;
-    if (TcpClient.write(buf, 6 + len) == 0) { ClientUp = false; }
+    PageWrite(buf, 6 + len);
 }
 
 //****************************************************************************************************************
@@ -2292,7 +2336,7 @@ void SendOtaFrame()
     b[0] = 'S'; b[1] = 'M'; b[2] = '3'; b[3] = 'U'; b[4] = 1; b[5] = 23;
     OtaFrameDue = false;
     OtaLastFrame = millis();
-    if (ClientUp && TcpClient.write(b, sizeof(b)) == 0) { ClientUp = false; }
+    PageWrite(b, sizeof(b));                     // 1.9.5: over USB in page mode (the version text; updates stay WiFi)
 }
 
 void OtaFail(int code)
@@ -2524,6 +2568,53 @@ void ServiceNetwork(unsigned long now)
     }
 }
 
+// 1.9.5: USB page mode.  [kU1] from USB switches it on (or keeps it on) for USB_PAGE_TIMEOUT_MS, [kU0] ends it.
+// Not while a firmware update runs: that needs the WiFi module.
+void UsbPageEnd()
+{
+    UsbPage = false;
+    TelCount = 0;
+    TelExtras = false;                           // the page asks for them again wherever it connects next
+    NetLastSample = NetLastSend = NetLastPoll = NetLastCheck = NetLastAccept = millis();
+}
+
+void UsbPageCommand(uint8_t n)
+{
+    if (n == 0 || n == '0') { if (UsbPage) { UsbPageEnd(); } return; }
+    if (UpdateRunning()) { return; }
+    unsigned long now = millis();
+    UsbPageMillis = now;
+    if (UsbPage) { return; }
+    if (ClientUp)                                // the page left WiFi for the cable: drop the old connection
+    {
+        TcpClient.stop();
+        ClientUp = false;
+    }
+    UsbPage = true;
+    UsbPageStarts++;
+    TelCount = 0;
+    TelExtras = false;
+    NetLastSample = NetLastSend = now;
+}
+
+void ServiceUsbPage(unsigned long now)           // loop() in page mode, instead of ServiceOta()/ServiceNetwork()
+{
+    if ((long)(now - UsbPageMillis) > (long)USB_PAGE_TIMEOUT_MS) { UsbPageEnd(); return; }
+    if (now - NetLastSample >= TELEMETRY_SAMPLE_MS)
+    {
+        NetLastSample += TELEMETRY_SAMPLE_MS;
+        if (now - NetLastSample > 200) { NetLastSample = now; }
+        TelemetrySample(now);
+    }
+    if (now - NetLastSend >= TELEMETRY_SEND_MS)
+    {
+        NetLastSend = now;
+        TelemetrySend();
+    }
+}
+
+#else
+void UsbPageCommand(uint8_t) {}                  // no WiFi build: no telemetry to send, nothing changes
 #endif // ENABLE_WIFI
 
 //****************************************************************************************************************
@@ -2849,7 +2940,7 @@ void UpdateMatrix()
         }
 #if ENABLE_WIFI
         // Re-scroll the address every minute while the page isn't connected (and nothing is wrong)
-        else if (ErrN == 0 && (LedFlags & 2) && WifiUp && !ClientUp && WifiText[0] != 'E'
+        else if (ErrN == 0 && (LedFlags & 2) && WifiUp && !ClientUp && !UsbPage && WifiText[0] != 'E'
                  && (now - LastIpScroll) >= IP_SCROLL_REPEAT_MS)
         {
             LastIpScroll = now;
@@ -2998,6 +3089,9 @@ void loop()
     uint32_t loopStartUs = micros();
 
     CheckSerial();
+    now = millis();                             // 1.9.5: the commands just parsed stamped millis() - keep "now" at or after
+                                                // them, or "now - LastPacketMillis" wraps (a one-pass LOW POWER, and page
+                                                // mode ending at once)
 
 #if IMU_PORT
     PollImu();
@@ -3023,8 +3117,15 @@ void loop()
     }
 
 #if ENABLE_WIFI
-    ServiceOta(now);                            // 1.9.2: firmware update, one step per pass
-    ServiceNetwork(now);
+    if (UsbPage)                                // 1.9.5: the page is on the USB cable - no WiFi calls at all
+    {
+        ServiceUsbPage(now);
+    }
+    else
+    {
+        ServiceOta(now);                        // 1.9.2: firmware update, one step per pass
+        ServiceNetwork(now);
+    }
 #endif
 
 #if LED_MATRIX

@@ -43,10 +43,11 @@ are two separate bytes. The same commands work over USB (SimHub, SMC3Utils) and 
 | `[kf=]` | 1.9 | Seat set-up field f = value register. f = 16 × motor (0-2) + 0 level trim (counts, −300…300), 1 travel low, 2 travel high, 3 end stop low, 4 end stop high (pot counts 0-1023); f = 64 + d: tilt limit × 10 for d = 0 roll + (right side down), 1 roll −, 2 pitch + (front up), 3 pitch − (0 = none); f = 80 / 81: the sensor's level roll / pitch (raw × 100, saved at once); f = 82 (1.9.1): soft-start speed in counts/s, 0 = off (saved at once in EEPROM 105-107). |
 | `[kSV]` `[kRL]` `[kCL]` | 1.9 | Save the seat set-up (EEPROM 66-104; `[sav]` saves it too) / reload the saved one / clear it (no trim, no travel limits or end stops; tilt limits stay) until saved or restarted. |
 | `[kHn]` | 1.9 | The page holds the seat for n × 100 ms: position commands from USB (SimHub) are counted but ignored meanwhile. n = 0 gives the seat back at once. Seat setup refreshes it every second, and so does page 2.4 while you move the motors from the page (a motor card's knob, Return to center). |
-| `[xe1]` `[xe0]` | 1.9 | WiFi only: send an "SM3X" frame (the sensor's acceleration and gyro) after every telemetry burst / stop. Off for every new connection. |
+| `[kU1]` `[kU0]` | 1.9.5 | USB only: USB page mode on for the next 5 s (the page repeats it every second) / off now - see [USB page mode](#usb-page-mode-firmware-195). Any non-zero byte (1 or '1') switches it on. Ignored during a firmware update. |
+| `[xe1]` `[xe0]` | 1.9 | The page only (WiFi, or USB in page mode): send an "SM3X" frame (the sensor's acceleration and gyro) after every telemetry burst / stop. Off for every new connection. |
 | `[uP=]` `[uT=]` `[uI=]` `[uJ=]` | 1.9.2 | WiFi only. Firmware update: the value register is the page's web port / the file's number / the page's address bytes 1-2 / 3-4 (0 = the address the page connects from). The board fetches `http://<address>:<port>/ota/<number as 4 hex digits>.ota`. |
 | `[uGO]` `[uOK]` | 1.9.2 | WiFi only. Start the firmware update (below) / clear a finished or failed one. |
-| `[rdu]` | 1.9.2 | WiFi only. One "SM3U" frame (below): the update's state and this firmware's version text. |
+| `[rdu]` | 1.9.2 | The page only (WiFi; 1.9.5 also USB in page mode). One "SM3U" frame (below): the update's state and this firmware's version text. |
 
 ### Seat set-up (firmware 1.9)
 
@@ -66,7 +67,50 @@ the target in force (after trim and limits), in pot counts.
 Over WiFi, position commands count as "host alive" (since 1.4), so tests from the page run at full power. Reading
 telemetry alone doesn't.
 
-## Telemetry (WiFi, TCP port 4210)
+### USB page mode (firmware 1.9.5)
+
+For calibration with SimHub closed the page can talk to the board over the USB cable instead of WiFi - the WiFi
+module's round-trips block the board's loop now and then (a second or more), which delays the page's commands and
+its telemetry. `[kU1]` over USB switches the USB port to page mode for 5 s; the page repeats it every second, and
+`[kU0]` (or 5 s without `[kU1]`) ends it. While it is on:
+
+* the telemetry ("SM3T", and "SM3X" after `[xe1]`) goes out over USB instead of WiFi, at the same rate, and `[rdd]`
+  and `[rdu]` answer over USB;
+* USB position commands are the page's: never held back by `[kH]`, not counted as SimHub's in the diagnostics frame,
+  and - as over WiFi - only position commands keep the rig at full power (`[kU1]` alone doesn't);
+* the board makes **no WiFi call at all**: it doesn't serve the TCP port, doesn't check the link, and the diagnostics
+  frame repeats the last RSSI it read. A WiFi connection that was open is closed when page mode starts. Firmware
+  updates (`[u…]`) stay WiFi only, and `[kU1]` is ignored while one runs.
+
+Without `[kU1]` nothing changes: SimHub and SMC3Utils on USB work as before. The diagnostics frame's flags (version 3
+block) get bit4 = page mode on; `FW_CAPS` in the .bin says `usbpage1`. The USB port runs at 500000 baud (as SimHub
+opens it).
+
+### The USB bridge (page 2.8)
+
+The page usually runs somewhere else (a NAS), so a small bridge on the PC with the cable links the two. It opens the
+board's COM port at 500000 baud and connects **out** to the page's web port:
+
+```
+POST /usb/link HTTP/1.1
+X-SMC3: 1
+X-SMC3-Bridge: <random id for this run>
+X-SMC3-Computer: <PC name>      X-SMC3-Port: COM5      X-SMC3-Bridge-Version: ps-2.8 | py-2.8
+Content-Length: 0
+```
+
+The page answers `200` and from then on the connection carries the board's bytes both ways, unchanged (TCP_NODELAY on
+both ends). The page sends `[kU1]` every second over it. Other answers, as plain text with the reason: `409` wait and
+try again (auto-tune, the full check, Seat setup or a firmware update is running, or another bridge is linked), `403`
+the page is set to WiFi only, `410` the page won't take this bridge again (Back to WiFi was pressed, or the board
+can't do page mode - older than 1.9.5 - or didn't answer). When the link ends the bridge sends `[kU0]` to the board
+and links again after 3 s (so a page restart doesn't end it); the page goes back to WiFi by itself. As the page sends
+`[kU1]` every second, a bridge that hears nothing from it for 6 s takes the link for dead and links again.
+
+The Windows bridge is a PowerShell script the page serves at `/usb-bridge.ps1` with its own address filled in
+(`?dl=1` to download it); the page file itself is the bridge on any OS with `--usb-bridge PORT --page URL`.
+
+## Telemetry (WiFi, TCP port 4210 - or USB in page mode, firmware 1.9.5)
 
 The board pushes frames to the connected client. Everything is little-endian.
 
@@ -106,7 +150,7 @@ Firmware 1.9.2 sends, after `[rdu]`, whenever the update's state changes and fou
   uint8 WiFi module firmware major, minor, patch   char[8] this firmware's version ("1.9.2", zero-padded)
 ```
 
-## Diagnostics frame (`[rdd]`, firmware 1.7)
+## Diagnostics frame (`[rdd]`, firmware 1.7; over USB in page mode since 1.9.5)
 
 ```
 'S' 'M' '3' 'D'  uint8 version (1)  uint8 payloadLength   payload:
@@ -133,7 +177,8 @@ Firmware 1.9.2 sends, after `[rdu]`, whenever the update's state changes and fou
   version 3 (1.9) continues:
   3 × { int16 level trim, travel low, travel high, end stop low, end stop high }
   int16 tilt limits ×10 (roll +, roll −, pitch +, pitch −)
-  uint8 flags: bit0 the seat set-up running is the saved one, bit1 one is saved, bit2 "SM3X" frames on, bit3 the page holds the seat
+  uint8 flags: bit0 the seat set-up running is the saved one, bit1 one is saved, bit2 "SM3X" frames on, bit3 the page holds the seat,
+        bit4 USB page mode on (1.9.5)
   uint32 SimHub position commands ignored while held   uint16 acceleration packets, gyro packets in the last second
   int16 raw acceleration x, y, z   int16 raw gyro x, y, z   int16 temperature ×100
   version 4 (1.9.1) continues:

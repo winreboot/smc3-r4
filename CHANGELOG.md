@@ -3,6 +3,39 @@
 `smc3_scope` (the page) and `SMC3_R4` (the firmware) are versioned separately. The page works with older
 firmware too; the notes say which firmware a feature needs.
 
+## Page 2.8 (firmware 1.9.5)
+
+**The USB cable for calibration.** The UNO R4 WiFi's WiFi module now and then holds the board's loop up for a second
+or more, so the page's moves lag and auto-tune has to redo test moves (2.7.2). With SimHub closed, the page can now
+talk to the board over its USB cable instead, and the board then makes no WiFi call at all.
+
+- **Settings, USB cable** has one line to paste into **Win+R** on the PC the board is plugged into. It starts a small
+  bridge (Windows PowerShell, nothing to install) that finds the board's COM port and links it to the page. The page
+  takes over from WiFi by itself - the header says **USB cable** - and goes back to WiFi when you close the bridge
+  window or press **Back to WiFi**. Then start SimHub again.
+- The bridge connects out to the page's web port, so the page can stay on the NAS and the PC's firewall doesn't ask.
+  It waits while auto-tune, the full check, Seat setup or a firmware update runs, links again by itself after a page
+  restart, and says why if the page won't take it (WiFi only, Back to WiFi, a board without 1.9.5).
+- macOS, Linux (or Windows with Python and pyserial): `smc3_scope_v2.8.py --usb-bridge PORT --page URL` is the same
+  bridge.
+- The header shows **WiFi** or **USB cable** next to Board Connected; the auto-tune view suggests the cable while on
+  WiFi; diagnostics files say which link was used. Firmware updates from the page stay WiFi only.
+- Back to WiFi (and WiFi only) wait while auto-tune, the full check or Seat setup runs. If the link changes during
+  auto-tune anyway (the bridge window closed, the board restarted), auto-tune stops and puts the motor's previous
+  settings back - at once, or as soon as the board is reachable again.
+
+**Firmware 1.9.5:** USB page mode. `[kU1]` over USB (the page repeats it every second; `[kU0]` or 5 s without it
+ends it) sends the telemetry, `[rdd]` and `[rdu]` over USB instead of WiFi, takes USB position commands as the page's
+(not held back, not counted as SimHub's) and skips every WiFi call. Without `[kU1]` nothing changes for SimHub. See
+[docs/PROTOCOL.md](docs/PROTOCOL.md#usb-page-mode-firmware-195). Also: `loop()` reads the clock again after the USB
+commands, so a command parsed a millisecond after the loop's start no longer makes the comms timeout wrap (one pass
+at LOW POWER).
+
+Simulator: `--usb PATH` (the board's USB port as a pseudo-terminal), `--fw194`.
+
+Update: flash `SMC3_R4_v1.9.5.ino` (Settings, Firmware update over WiFi, or the Arduino IDE), and the page - Settings,
+Updates, Update page.
+
 ## Page 2.7.3 (firmware 1.9.4, unchanged)
 
 - **Update page just updates**: it no longer refuses with "The motors are being moved by hand (Move motors)" when

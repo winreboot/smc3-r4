@@ -39,7 +39,7 @@ You can also skip the address: the page's **Settings, Find board on network** lo
    opens, type (use the name of the file you downloaded):
 
    ```bat
-   py smc3_scope_v2.7.py --bind 0.0.0.0 --web 8198 --host 192.168.1.50
+   py smc3_scope_v2.8.py --bind 0.0.0.0 --web 8198 --host 192.168.1.50
    ```
 
    `--host` is your board's address (you can leave it out and set it in the page). Keep this window open: closing
@@ -57,7 +57,7 @@ Settings, profiles, backups and diagnostics are kept in the folder `smc3-scope-d
 ```bat
 @echo off
 cd /d "%~dp0"
-start "smc3-scope" /min py smc3_scope_v2.7.py --bind 0.0.0.0 --web 8198
+start "smc3-scope" /min py smc3_scope_v2.8.py --bind 0.0.0.0 --web 8198
 ```
 
 press Win+R, type `shell:startup`, Enter, and put a shortcut to `smc3-scope.bat` in the folder that opens.
@@ -77,8 +77,8 @@ in the `.bat` too). Your settings stay - they're in `smc3-scope-data`.
 
    ```sh
    mkdir -p ~/smc3-scope && cd ~/smc3-scope
-   curl -LO https://github.com/winreboot/smc3-r4/releases/latest/download/smc3_scope_v2.7.py
-   python3 smc3_scope_v2.7.py --bind 0.0.0.0 --web 8198 --host 192.168.1.50
+   curl -LO https://github.com/winreboot/smc3-r4/releases/latest/download/smc3_scope_v2.8.py
+   python3 smc3_scope_v2.8.py --bind 0.0.0.0 --web 8198 --host 192.168.1.50
    ```
 
 3. **Open** `http://<this computer's address>:8198` (or <http://localhost:8198> on the same machine). A Mac asks
@@ -96,7 +96,7 @@ Wants=network-online.target
 [Service]
 User=pi
 WorkingDirectory=/home/pi/smc3-scope
-ExecStart=/usr/bin/python3 /home/pi/smc3-scope/smc3_scope_v2.7.py --bind 0.0.0.0 --web 8198
+ExecStart=/usr/bin/python3 /home/pi/smc3-scope/smc3_scope_v2.8.py --bind 0.0.0.0 --web 8198
 Restart=always
 RestartSec=5
 
@@ -240,6 +240,33 @@ you started hands over to the update when the update is newer. So:
 It needs this machine to reach `api.github.com` and GitHub's download servers. Updates come from
 `winreboot/smc3-r4`; a fork can set `"update_repo": "owner/name"` in `config.json` (the page itself can't change it).
 
+## USB cable for calibration
+
+From page 2.8 with firmware 1.9.5 on the board, the page can talk to the board over its USB cable instead of WiFi -
+for auto-tune, the full check and Seat setup. The board's WiFi module now and then holds the board up for a second
+or more; on the cable nothing waits. Only with SimHub closed: one program at a time can have the USB port.
+
+1. Close SimHub.
+2. On the PC the board is plugged into, open the page in a browser, **Settings, USB cable**, press **Copy**, then
+   press **Win+R**, paste and press Enter. The line looks like this (with your page's address):
+
+       powershell -NoProfile -ExecutionPolicy Bypass -Command "irm http://192.168.1.20:8198/usb-bridge.ps1 | iex"
+
+   A window opens: the bridge finds the board's COM port (it asks if there are several) and links it to the page.
+   It uses Windows PowerShell - nothing to install - and connects out to the page, so no firewall question.
+3. The page switches over by itself: the header says **USB cable**. Calibrate as usual.
+4. Close the bridge window (or press **Back to WiFi** in the page). The board and the page go back to WiFi by
+   themselves. Start SimHub again.
+
+The page can be anywhere on your network (the NAS, a Raspberry Pi): only the bridge runs on the PC with the cable.
+**Download the bridge (.ps1)** on the same card gives you the script as a file to keep on that PC (right-click, Run
+with PowerShell - it asks for the page's address). On macOS and Linux, or Windows with Python and pyserial, the page
+file is the bridge too:
+
+    python3 smc3_scope_v2.8.py --usb-bridge /dev/ttyACM0 --page http://192.168.1.20:8198
+
+**Settings, USB cable** can also turn bridges away (WiFi only). Firmware updates from the page still go over WiFi.
+
 ---
 
 ## Options
@@ -253,6 +280,7 @@ Every option works on the command line or as an environment variable (Docker):
 | `--web` | `SMC3_WEB_PORT` | 8080 | The page's port. The examples here use 8198. |
 | `--bind` | `SMC3_BIND` | 127.0.0.1 (Docker image: 0.0.0.0) | `0.0.0.0` = reachable from other devices, and the board can fetch firmware updates. `127.0.0.1` = this computer only. |
 | `--data` | `SMC3_DATA_DIR` | `smc3-scope-data` next to the file (Docker image: `/data`) | Where settings, profiles, backups and diagnostics are kept. |
+| `--usb-bridge PORT` | | | Run as the USB bridge instead of the page: link the page (`--page http://...`) to the board on this serial port (2.8). |
 
 Settings you change in the page (board address, theme, motors in use, motor names ...) are saved there too. The
 board address and port from the command line (or `SMC3_HOST` / `SMC3_PORT`) are used the first time, and again
@@ -269,6 +297,10 @@ whenever you change them there; otherwise what you set in the page stays.
 | `docker pull` asks for a login | The package isn't public yet - the repository owner makes it public once (see below). |
 | Firmware update from the page can't start | The page must be reachable from the board: `--bind 0.0.0.0`, firewall open, and in Docker the same port number on both sides. The board's WiFi module needs firmware 0.4.0 or newer. |
 | Auto-tune says "WiFi hiccup during that move - doing it again", or stops with "The WiFi link to the board kept stalling" | The board's WiFi drops out for a second or more now and then. Put the board closer to the router (or an access point), keep the 2.4 GHz channel clear, and update the board's WiFi module (Arduino IDE, Tools, Firmware Updater). A few repeated moves are harmless. |
+| USB bridge: "COM5 is in use or missing" | Close SimHub (and SMC3Utils, the Arduino IDE's Serial Monitor) - only one program can have the port. Check the board is plugged into this PC. |
+| USB bridge: "needs firmware 1.9.5 or newer" | The board answers on the cable but its firmware can't send the page's data over USB. Install SMC3_R4 1.9.5 (Settings, Firmware update, or the Arduino IDE), then run the bridge again. |
+| USB bridge: "Can't reach the page" | Use the page's plain `http://` address as in your browser (not https or a reverse proxy). The page must listen on the network (`--bind 0.0.0.0`; the Docker image does). |
+| USB bridge: "Waiting: Auto-tune is running ..." | The bridge links as soon as auto-tune, the full check, Seat setup or a firmware update has finished - switching mid-way would spoil it. |
 | Updates: "Couldn't reach GitHub" | This machine (in Docker: the container) needs internet access to `api.github.com` and GitHub's download servers. The rest of the page works without it. |
 | `python` / `py` not found (Windows) | Re-run the Python installer and tick **Add python.exe to PATH**, or use the full path to `python.exe`. |
 
