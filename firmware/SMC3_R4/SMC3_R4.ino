@@ -41,9 +41,18 @@
 // Pots: wiper must stay within 0-5 V (the R4 is a 5 V board, so existing wiring is fine).
 //****************************************************************************************************************
 
-#define FW_VERSION     "1.9.3"         // shown in the USB boot banner; [ver] still answers 70 for SMC3Utils
+#define FW_VERSION     "1.9.4"         // shown in the USB boot banner; [ver] still answers 70 for SMC3Utils
 #define FW_VERSION_NUM 19              // reported by [rd!] so smc3_scope can check what it is talking to (1.9.x = 19)
 #define FW_CAPS        "SMC3CAPS:ota1,wifimem1"   // 1.9.2: what this build can do - smc3_scope looks for it in a .bin
+
+// v1.9.4 changes: pot glitch filter.  A pot reading that is more than POT_JUMP_COUNTS (16) away from the last good one
+//                can't be the motor moving (that would be 64000 counts/s) - the wiper lost contact for a moment.  The
+//                last good reading now stands in for it, for up to POT_HOLD_MS (10 ms: 40 readings at 4 kHz, fewer with
+//                a PID divider) in a row, so the PID no longer kicks the motor at every glitch.  A change that lasts longer is real (a slipped pot, a broken
+//                wire) and goes through - the cutoff still trips on it, at most 10 ms later.  The glitch counter
+//                (diagnostics) still counts every raw glitch, so a bad pot still shows.  POT_FILTER 0 switches it off;
+//                the build flags ([rd!] and the diagnostics frame, bit 5) say whether a build has it.
+//                Nothing else changed: protocol, EEPROM and settings as in 1.9.3.
 
 // v1.9.3 changes: compiles in the Arduino IDE.  1.9.2 stopped with "sorry, unimplemented: string literal in function
 //                template signature": the UNO R4 boards package compiles with GCC 7, which can't have the update
@@ -225,9 +234,15 @@
 #define COMMS_TIMEOUT_MS 15000     // same 15 s as the original before dropping to low power
 #define POT_JUMP_COUNTS  16        // a pot reading that moves more than this in one PID cycle (1/4 ms) is a glitch:
                                    // no motor can do that (it would be 64000 counts/s), the wiper lost contact
+#define POT_FILTER       1         // 1.9.4: hold the last good pot reading through a glitch (0 = off, as 1.9.3)
+#define POT_HOLD_MS      10        // ... for at most this long (10 ms = 40 readings at 4 kHz; fewer with SMC3Utils'
+                                   // PID divider, so it stays 10 ms)
 
 #if TARGET_MAX_RATE > 30000
 #error "TARGET_MAX_RATE must be 30000 or less"
+#endif
+#if POT_FILTER && (POT_HOLD_MS < 1 || POT_HOLD_MS > 60)
+#error "POT_HOLD_MS must be 1-60"
 #endif
 
 //    COMMAND SET (unchanged):
@@ -380,6 +395,8 @@ volatile int16_t  CutoffAtFb[NUM_MOTORS]    = {-1, -1, -1};    // pot reading (0
 volatile uint16_t PotJumps[NUM_MOTORS]      = {0, 0, 0};       // glitches (> POT_JUMP_COUNTS in one cycle) since power-up
 volatile uint16_t PotJumpMax_q[NUM_MOTORS]  = {0, 0, 0};       // biggest cycle-to-cycle change since the last [rdd], Q4
 volatile int      FbMin_q[NUM_MOTORS]       = {16383, 16383, 16383};   // pot range seen since the last [rdd], Q4
+volatile int      FbRaw_q[NUM_MOTORS]       = {512 << POS_SHIFT, 512 << POS_SHIFT, 512 << POS_SHIFT};  // last raw read
+volatile uint8_t  FbHeld[NUM_MOTORS]        = {0, 0, 0};       // 1.9.4: readings in a row held back as glitches
 volatile int      FbMax_q[NUM_MOTORS]       = {0, 0, 0};
 
 uint8_t       ResetFlags[3] = {0, 0, 0};                       // RSTSR0, RSTSR1, RSTSR2 as found at boot
@@ -594,6 +611,9 @@ static inline int BuildFlags()
 #endif
 #if ENABLE_WIFI && WIFI_STATIC_IP
     flags |= 16;
+#endif
+#if POT_FILTER
+    flags |= 32;                               // 1.9.4: pot glitch filter
 #endif
     return flags;
 }
@@ -914,19 +934,42 @@ void PidIsr(timer_callback_args_t *p_args)
     PIDProcessCounter = 0;
 
     uint32_t t0 = CycleCount();
+#if POT_FILTER
+    // 1.9.4: readings a glitch may be held for - POT_HOLD_MS at this PID rate (4 kHz / SMC3Utils' divider)
+    const uint8_t holdN = (uint8_t)((POT_HOLD_MS * (PID_RATE_HZ / 1000) + PIDProcessDivider - 1) / PIDProcessDivider);
+#endif
 
     for (uint8_t m = 0; m < NUM_MOTORS; m++)
     {
         Goal_q[m] = SmoothTarget(m, Target[m]);
         int fb = analogRead(FeedbackPin[m]);
 
-        // diagnostics: pot glitches (a jump no motor could make in 1/4 ms) and the range seen
-        int jump = fb - Feedback_q[m];
+        // diagnostics: pot glitches (a jump no motor could make in 1/4 ms) and the range seen - on the raw readings,
+        // so a bad pot shows even with the filter below
+        int jump = fb - FbRaw_q[m];
         if (jump < 0) { jump = -jump; }
         if (jump > (POT_JUMP_COUNTS << POS_SHIFT) && PotJumps[m] < 65535) { PotJumps[m]++; }
         if (jump > PotJumpMax_q[m]) { PotJumpMax_q[m] = (uint16_t)jump; }
         if (fb < FbMin_q[m]) { FbMin_q[m] = fb; }
         if (fb > FbMax_q[m]) { FbMax_q[m] = fb; }
+        FbRaw_q[m] = fb;
+#if POT_FILTER
+        // 1.9.4: a reading this far from the last good one is a glitch, not the motor: the last good one stands in,
+        // for up to POT_HOLD_MS in a row; a change that lasts longer is real and goes through
+        {
+            int dg = fb - Feedback_q[m];
+            if (dg < 0) { dg = -dg; }
+            if (dg > (POT_JUMP_COUNTS << POS_SHIFT) && FbHeld[m] < holdN)
+            {
+                FbHeld[m]++;
+                fb = Feedback_q[m];
+            }
+            else
+            {
+                FbHeld[m] = 0;
+            }
+        }
+#endif
         Feedback_q[m] = fb;
 
         bool past = (fb > (CutHi[m] << POS_SHIFT)) || (fb < (CutLo[m] << POS_SHIFT));   // SMC3 cutoff + 1.9 end stops
@@ -2905,6 +2948,8 @@ void setup()
         GoalAcc[m] = (SoftRate > 0) ? ((long)fb << 8) : ((long)fb10 << 12);
         Goal_q[m] = (SoftRate > 0) ? fb : (fb10 << POS_SHIFT);
         Feedback_q[m] = fb;
+        FbRaw_q[m] = fb;
+        FbHeld[m] = 0;
         PidLastPosition[m] = fb;
     }
 

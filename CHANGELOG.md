@@ -3,6 +3,54 @@
 `smc3_scope` (the page) and `SMC3_R4` (the firmware) are versioned separately. The page works with older
 firmware too; the notes say which firmware a feature needs.
 
+## Page 2.6 and firmware 1.9.4
+
+- **Auto-tune moves out and back from where the seat starts**, the way you move a knob on the dashboard: up by the
+  test travel, back to the start, down, back to the start (right, back, left, back for the rear slide).
+  - The seat never goes further than the test travel from where it was.
+  - Each direction is measured twice, going away from the start and coming back to it.
+  - 2.5 went from the bottom of the travel to the top and back, so every test seemed to start by going down.
+  - The small kerb-sized steps (±30 counts from the start, as big as before) and Check work the same way.
+  - The top speed is timed on two equal moves, down and back up over twice the test travel, after a gentle move up.
+  - A short test travel still gets a gradual move: at least 0.3 s.
+  - Each test move holds 1.3 s at its end, up to 2 s for a slow motor, so a slow motor still creeping in at the
+    low Kp the sweep starts with isn't taken for a restless one.
+  - The "moves away from where it is driven" stop needs it to last 150 ms longer, so a cluster of pot glitches
+    can't fake it (one simulated run in sixteen with a badly glitching pot on firmware 1.9.3 stopped falsely); a
+    motor wired backwards still stops within a fraction of a second.
+- **The sweep charts scale to the results.** 2.5's overshoot chart ran up to the limit line, so gradual test moves
+  that overshoot 0-2 % drew a flat line at the bottom. The scale now fits the values (the limit line shows when it
+  fits, otherwise its value is printed), and tabs switch the second chart between overshoot, off by and
+  settle time, with the peak value shown.
+- **Which way a lift sinks.** The full check notes which way a lift's numbers run when its corner sinks under the
+  seat's weight - drifting while its motor is switched off, or sinking at low drive - and keeps it.
+  - Until you answer the full check's question, auto-tune goes by that for up and down (and says so in the log).
+  - Diagnostics warns when the two front lifts seem to run opposite ways for higher numbers: one of them would move
+    the wrong way in games. Besides sinking, a lift that needs clearly less drive one way counts (the weight helps
+    it down). Compared in SimHub's numbers, so a motor 1 mirrored with REVERSE_MOTOR1 is allowed for. The fix names
+    the drag test, SimHub's Invert, REVERSE_MOTOR1 for motor 1, or swapping both the motor wires and the pot's outer
+    wires.
+- **Pot glitches.**
+  - **Firmware 1.9.4** holds a pot reading back when it is more than 16 counts from the last good one (no motor
+    moves that far in 1/4 ms), for up to 10 ms (`POT_HOLD_MS`: 40 readings at 4 kHz, fewer with SMC3Utils' PID
+    divider); a change that lasts longer is real and goes through, so a broken pot still trips the cutoff, at most
+    10 ms later. The glitch counter in Diagnostics still counts every raw glitch. `POT_FILTER 0` switches it off;
+    build flag bit 5 tells the page whether a build has it. Nothing else changed: protocol, EEPROM and settings as
+    in 1.9.3.
+  - **Pot noise filter**, in the README (Hardware) and the page's Help: a drawing, the parts and the wiring rules
+    for an RC filter at the Arduino - 1 kΩ in the wiper wire, 100 nF and 1 MΩ from the A pin to GND - with shielded
+    cable grounded at the Arduino end only.
+  - The glitch and noise findings point to it; on 1.9.4 a glitchy pot is a warning (the motor no longer kicks), and
+    on older firmware the fix also suggests 1.9.4.
+- Diagnostics reports the board's own firmware version text (1.9.3 showed as 1.9.2).
+- Simulator: firmware 1.9.4 with its filter (`--no-potfilter` for 1.9.3); `--sag-high M`, a lift whose weight pulls
+  it towards higher numbers.
+- Smoke test: auto-tune goes up first and stays within the test travel of the start; a glitchy pot on 1.9.4 gives a
+  warning that names the filter; the report shows the board's own version.
+
+Update: the page as usual. Firmware 1.9.4 is optional - flash `SMC3_R4_v1.9.4.ino` over USB, or from the page
+(Settings, Firmware update) once the WiFi module runs 0.4.0 or newer.
+
 ## Page 2.5 (firmware 1.9.3, unchanged)
 
 Auto-tune, reworked after a run on a real rig:

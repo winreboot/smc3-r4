@@ -83,7 +83,8 @@ cover:
 - impossible settings: PWMmax 0, PWMmin at or above PWMmax, Kp 0, no cutoff, Clip outside the cutoff;
 - unsaved settings;
 - motors that are off;
-- pots at the end of their travel, noisy pots or glitchy pots;
+- pots at the end of their travel, noisy pots or glitchy pots (with the RC filter in the README's Pot noise filter,
+  and whether the firmware holds glitches back - 1.9.4);
 - buzz and hunting;
 - motors at their power limit or lagging;
 - full-check results: reversed, swapped, not moving, moving one way only, unstable, PWMmin too low;
@@ -92,6 +93,9 @@ cover:
   not levelled, wobbling, sending angles only (1.9 can add gyro and acceleration); the seat bouncing, play in a
   linkage, how many degrees each motor tilts the seat (or, for the rear slide, turns it);
 - the rig layout: a lift that turns the seat, a traction-loss motor that tilts it or that you saw lift the seat;
+  two front lifts that seem to run opposite ways for higher numbers (from which way each corner sank under the
+  seat's weight - drifting while its motor was off, sinking at low drive, or needing clearly less drive that way;
+  compared in SimHub's numbers, so REVERSE_MOTOR1 is allowed for);
 - soft start (firmware 1.9.1): off, or a motor still creeping to its position; firmware 1.9 without it;
 - firmware updates (1.9.2): the WiFi module's own firmware too old to update from the page (or to show progress), the
   last update failed and why, the board joined WiFi with the details it remembers, firmware 1.9.1 that can't be

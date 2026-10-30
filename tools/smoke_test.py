@@ -27,6 +27,10 @@ Smoke test: start simulated rigs and the page, run diagnostics, check the result
 11. Auto-tune's test moves are gradual (page 2.5): during the Kp sweep the target moves in small steps (a ramp), never
    jumps across the travel; the gauges' data names both directions. Check tests the current values both ways, says
    what it found and changes nothing.
+12. Auto-tune moves out and back from the start position (page 2.6): during the Kp sweep the seat first goes up from
+   where it started, back, then down, and never further than the test travel from the start.
+Case 10 also checks firmware 1.9.4's pot glitch filter (simulated): the board counts the glitches, the live data stays
+clean, so the finding is a warning that names the filter, and the report shows the board's own version (1.9.4).
 """
 import json, os, subprocess, sys, tempfile, time, urllib.request as u
 
@@ -275,6 +279,13 @@ try:
     bad = [f["title"] for f in s["result"]["findings"] if f["level"] == "fail" and
            ("mixed up" in f["title"] or "WRONG" in f["title"])]
     check(s["state"] == "done" and not bad, f"glitchy pots, full check: no false wiring or direction finding {bad}")
+    gl = [f for f in s["result"]["findings"] if f.get("code") == "glitch" and f.get("motor") == 2]
+    check(gl and gl[0]["level"] == "warn" and "glitch filter holds each" in gl[0]["detail"]
+          and "Pot noise filter" in gl[0]["fix"],
+          f"glitchy pot on firmware 1.9.4: a warning that names both filters "
+          f"({[(f['level'], f['detail'][-90:]) for f in gl]})")
+    fwtxt = (get(base10, "/diag/file?name=" + s["result"]["name"]).get("board") or {}).get("firmware")
+    check(fwtxt == "1.9.4", f"the report shows the board's own firmware version ({fwtxt})")
     time.sleep(2)
     t = get(base10, "/data?since=0")["samples"][-1]["m"][1]["t"]
     for k in range(4):
@@ -316,11 +327,22 @@ try:
     seq = get(base11, "/data?since=0")["samples"][-1]["seq"]
     time.sleep(6)
     got = get(base11, f"/data?since={seq}")["samples"]
+    seq2 = get(base11, "/data?since=0")["samples"][-1]["seq"]
+    time.sleep(7)
+    more = get(base11, f"/data?since={seq2}")["samples"]
     post(base11, "/tune/abort")
     ts = [x["m"][0]["t"] for x in got]
     jumps = [abs(b - a) for a, b in zip(ts, ts[1:])]
     check(len(set(ts)) > 20 and max(jumps or [999]) <= 40,
           f"auto-tune test moves are gradual: {len(set(ts))} target values, largest jump {max(jumps or [0])} counts")
+
+    # 12. out and back from the start position, up first (page 2.6)
+    ts = [x["m"][0]["t"] for x in got + more]
+    c0 = ts[0]
+    first_off = next((t for t in ts if abs(t - c0) > 5), c0)
+    check(first_off > c0 and max(ts) - c0 <= 102 and c0 - min(ts) <= 102 and max(ts) - c0 >= 60 and c0 - min(ts) >= 60,
+          f"auto-tune goes up first and stays within the test travel of the start "
+          f"(start {c0}, first move to {first_off}, range {min(ts)}-{max(ts)})")
 finally:
     for p in procs:
         p.terminate()

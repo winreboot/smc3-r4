@@ -165,14 +165,17 @@ overshoot and lag before you touch a game. Stop SimHub's motion output first.
 ### Auto-tune
 
 Auto-tune works on one motor at a time and tests it **both ways**: up and down for a lift, left and right for the
-rear slide.
+rear slide. Every test goes **out and back from where the seat starts**, the way you'd move a knob on the
+dashboard: up, back to the start, down, back to the start (right, back, left, back for the rear slide). So the seat
+never goes further than the test travel from where it was, and each direction is measured going away from the start
+and coming back to it.
 
 1. It measures the pot noise (dead zone), and the smallest drive that moves the motor each way (PWMmin).
 2. It measures the motor's top speed each way with one quick move. Every test after that is a **gradual move** at
    60% of the slower way's top speed, easing in and out, so the motor can follow it as it follows a game.
 3. It raises Kp step by step until the motor follows within the style's lag target both ways, or starts to
    overshoot.
-4. It checks that small, sharp, kerb-sized steps stay calm.
+4. It checks that small, sharp, kerb-sized steps (±30 counts from the start) stay calm.
 5. It adds Ki and Kd only if they clearly help.
 
 Each direction is judged on its own, and the log and the result show both. The board has one set of values per
@@ -191,7 +194,8 @@ motor, so the worse direction decides.
   PWMmax it takes;
 - one needle per direction, with a coloured band for what's good.
 
-The same card shows pot noise, the minimum drive and top speed each way, and the Kp sweep as two small charts.
+The same card shows pot noise, the minimum drive and top speed each way, and the Kp sweep as two small charts
+that scale to the results; the tabs switch the second one between overshoot, off by and settle time.
 **Copy** puts the whole log and the result on the clipboard.
 
 With the motion sensor, auto-tune also watches the **seat**: the seat's own overshoot and ringing count, so it
@@ -291,8 +295,8 @@ The page checks the file first (an SMC3_R4 build for the UNO R4 WiFi, which vers
 update format. The board switches the motors off, its WiFi module downloads the file, checks it and programs the
 board - the same way a USB upload does - and the board restarts; the seat creeps back with the soft start and the
 page confirms the new version. If anything fails before programming, the old firmware keeps running and the card
-says why. The first install of it (1.9.3; 1.9.2 didn't compile) goes over USB, and the WiFi module needs its own firmware 0.4.0 or newer
-(Arduino IDE, Tools, Firmware Updater).
+says why. The first install of it (1.9.3 or later; 1.9.2 didn't compile) goes over USB, and the WiFi module needs its
+own firmware 0.4.0 or newer (Arduino IDE, Tools, Firmware Updater).
 
 ![Firmware update: SMC3_R4 1.9.3 installed over WiFi](docs/img/firmware-update.png)
 
@@ -334,6 +338,11 @@ It also **asks you what you saw**: which way each corner went, and where it is o
 motor, whether the rear went left or right. That's the one thing sensors can't tell, for example whether the motion
 will be upside down in games. A motor that moves the wrong
 way is stopped at once and left off.
+
+It also notes which way each lift's numbers run when its corner **sinks** under the seat's weight (drifting while
+its motor is off, or sinking at low drive). Until you answer the question, auto-tune goes by that for up and down,
+and the results warn when the two front lifts seem to run opposite ways (also when one needs clearly less drive one
+way - the weight helps it down) - one of them would then move the wrong way in games.
 
 | Before it starts | "Watch now", then the question |
 |---|---|
@@ -410,6 +419,31 @@ Wiring is the same as the original SMC3 on an UNO, so existing rigs need no chan
 
 The pots' outer pins go to 5 V and GND. For how each bridge input connects to an IBT-2, follow the original SMC3
 wiring diagrams on xsimulator.net.
+
+### Pot noise filter
+
+Diagnostics counts **pot glitches**: readings that jump further in 1/4 ms than any motor can move. Most come from the
+motor PWM getting into the pot wires, and each one makes the PID kick the motor for a moment. Firmware 1.9.4 holds
+a glitch back in software (the board still counts them), and three small parts per pot at the Arduino stop most of
+them reaching the board at all:
+
+![Pot noise filter: 1 kΩ in the wiper wire, 100 nF and 1 MΩ from the A pin to GND, shielded cable](docs/img/pot-filter.png)
+
+| Part (for three pots) | Where | What it does |
+|---|---|---|
+| 3 × resistor 1 kΩ, ¼ W (R1) | in the wiper wire, at the Arduino | with C1: a low-pass filter (0.1 ms) - the 25 kHz PWM spikes go, the motor's own movement passes untouched |
+| 3 × ceramic capacitor 100 nF, 50 V, X7R, marked 104 (C1) | A pin to GND | |
+| 3 × resistor 1 MΩ, ¼ W (R2) | A pin to GND | a broken wiper wire reads 0, so the cutoff still trips (otherwise C1 would hold the last position) |
+| perfboard, or a screw-terminal proto shield | next to the Arduino | keeps the parts close to the pins |
+| 3-core shielded cable, about 0.25 mm² (22-24 AWG), foil or braid with a drain wire | each pot run | the shield goes to GND **at the Arduino end only** |
+| optional: clip-on ferrites | motor cables, near the IBT-2 boards | less noise from the motor wires |
+
+Keep C1 at 1 µF or less: a bigger one delays the reading and the motors start to hunt. Wiring rules that cost
+nothing: the pot GND goes straight to an Arduino GND pin (not to the IBT-2 or the motor supply), pot cables stay
+5 cm or more from motor cables and cross them at right angles, and each motor's two wires are twisted together. A
+pot that still glitches is losing contact (wear) - no filter fixes that: fit a conductive-plastic pot (for example
+Bourns 6639S-1-103, 10 kΩ) or a contactless Hall-effect sensor with a 0-5 V output (for example TT Electronics
+6127V1A180L.5FS), keeping its travel away from the ends of its range. The same drawing is in the page's Help.
 
 ## Getting started
 
@@ -502,7 +536,8 @@ noise. To see what the diagnostics find, add a fault:
 | `--heavy 1` | a heavy load on motor 1: lifting needs much more drive, worse near the top |
 | `--pot-noise 2:2.3` | motor 2's pot reads ±2.3 counts at rest, with the odd spike |
 | `--sag 2` (`--sag-pull 0.2`) | motor 2's gearbox can be driven backwards: the seat sinks while the drive is weak (harder) |
-| `--pot-glitches 2:80` | motor 2's pot wiper loses contact about 80 times a second (readings 16-40 counts off) |
+| `--pot-glitches 2:80` | motor 2's pot wiper loses contact about 80 times a second (readings 16-40 counts off); `--no-potfilter` = firmware 1.9.3, whose PID sees every glitch |
+| `--sag-high 1` | like `--sag`, but the weight pulls motor 1 towards higher numbers (a lift whose numbers run the other way) |
 | `--load 82` | an 82 kg rider: the lifts need more drive going up and less going down, and every motor carries more weight |
 | `--vmax 1000` | slower motors (counts/s at full drive; default 2200) |
 | `--imu-lost-at 30` | the sensor goes quiet after 30 s |
@@ -524,7 +559,8 @@ noise. To see what the diagnostics find, add a fault:
     for the 3D view, moving the motors from the page (page 2.4);
   - 1.9.1: soft start;
   - 1.9.2: firmware updates from the page, and the board remembers its WiFi;
-  - 1.9.3: the same, and it compiles in the Arduino IDE (1.9.2 didn't).
+  - 1.9.3: the same, and it compiles in the Arduino IDE (1.9.2 didn't);
+  - 1.9.4: a pot glitch filter - a reading too far from the last one to be the motor is held back for up to 10 ms.
 
   See the [CHANGELOG](CHANGELOG.md).
 - New commands are documented in [docs/PROTOCOL.md](docs/PROTOCOL.md). They go over WiFi; USB stays plain SMC3.

@@ -29,7 +29,7 @@ are two separate bytes. The same commands work over USB (SimHub, SMC3Utils) and 
 | Command | Since | Meaning |
 |---|---|---|
 | `[rd$]` | 1.3 | Worst control-interrupt time in µs since the last read |
-| `[rd!]` | 1.4 | Build flags (bit0 REVERSE_MOTOR1; since 1.7 also bit1 MODE2, bit2 IMU, bit3 LED matrix, bit4 static IP) and firmware number (17 = 1.7) |
+| `[rd!]` | 1.4 | Build flags (bit0 REVERSE_MOTOR1; since 1.7 also bit1 MODE2, bit2 IMU, bit3 LED matrix, bit4 static IP; since 1.9.4 bit5 pot glitch filter) and firmware number (17 = 1.7) |
 | `[dis]` `[di1]`–`[di3]` | 1.5 | Disable all motors or one (brake, stay off until enabled) |
 | `[fab]` / `[rdf]` | 1.6 | Smoothing shift a (0–8, time constant 2^a / 4 ms at Fpid/1) and max speed b × 100 counts/s (0 = off) / read them |
 | `[rdd]` | 1.7 | Diagnostics frame (below). WiFi only. Version 2 since 1.8. |

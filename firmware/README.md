@@ -43,7 +43,7 @@ What the R4 hardware adds:
 
 ### Updating from the page (1.9.2 and later)
 
-Once the board runs 1.9.3 (1.9.2 didn't compile in the Arduino IDE), later firmware can be installed over WiFi:
+Once the board runs 1.9.3 or later (1.9.2 didn't compile in the Arduino IDE), later firmware can be installed over WiFi:
 
 1. Open the new sketch and choose **Sketch, Export Compiled Binary**. `WIFI_SSID` / `WIFI_PASS` may stay as
    placeholders - the board uses the details it remembers.
@@ -74,6 +74,7 @@ its bootloader. The board restarts with the new firmware and the page checks the
 | `TARGET_SMOOTH_SHIFT` | 6 (16 ms) | Default target smoothing: 4 = 4 ms … 8 = 64 ms, 0 = off. It's a setting since 1.6. |
 | `TARGET_MAX_RATE` | 0 (off) | Default max speed in counts per second. It's a setting since 1.6. |
 | `D_FILTER_SHIFT` | 3 | Low-pass filter on the derivative term. |
+| `POT_FILTER`, `POT_HOLD_MS` | 1, 10 | 1.9.4: a pot reading more than 16 counts from the last good one is a glitch; the last good one stands in for up to 10 ms (40 readings at 4 kHz, fewer with SMC3Utils' PID divider). 0 = off, as 1.9.3. The glitch counter counts raw readings either way. |
 | `LED_MATRIX`, `LED_FPS` | 1, 20 | Use the matrix; refresh rate. |
 | `LED_DEFAULT_VIEW`, `LED_DEFAULT_FLAGS` | 0, 3 | What a board that was never set shows: motor bars, idle trace on, address every minute. The page's Settings change it. |
 | `LED_IDLE_AFTER_MS`, `LED_HORIZON_DEG` | 20000, 10 | When the idle trace starts; how many degrees move the seat horizon to the edge. |
@@ -151,6 +152,7 @@ lapses by itself after 3 s if the page goes away). The commands are in [docs/PRO
 
 | Version | Change |
 |---|---|
+| 1.9.4 | Pot glitch filter: a reading more than 16 counts from the last good one (no motor moves that far in 1/4 ms) is held back for up to 10 ms, so the PID no longer kicks the motor at every glitch. A change that lasts longer goes through, so a broken pot still trips the cutoff, at most 10 ms later. Diagnostics still counts every raw glitch; build flag bit 5 (`[rd!]`, diagnostics frame) says the filter is in. Protocol, EEPROM and settings as in 1.9.3. For the hardware side see the README's Pot noise filter. |
 | 1.9.3 | Compiles in the Arduino IDE: 1.9.2 stopped with "sorry, unimplemented: string literal in function template signature" (the boards package's GCC 7). Same features. |
 | 1.9.2 | Firmware update over WiFi from the page (`[u..]`, `[rdu]`, "SM3U"; uses the board's WiFi module and `OTAUpdate.h` from the boards package). The board remembers the WiFi name and password it last joined with (EEPROM 112-210). `[rdd]` frame version 5. Matrix: `ERROR E7 UPDATE FAILED`. |
 | 1.9.1 | Soft start: after power-up and Enable Motors each motor creeps to its position instead of jumping (`[k 82 '=']` sets the speed, EEPROM 105-107); a seat that rode down past an end stop may come back, PWMrev stays off and the tilt limit waits meanwhile. `[rdd]` frame version 4. |

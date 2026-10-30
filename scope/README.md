@@ -34,7 +34,7 @@ python3 smc3_scope.py --host 192.168.1.50 --bind 0.0.0.0 --web 8198
 
 | File | What it holds |
 |---|---|
-| `config.json` | Settings made in the page: board address, theme, motors in use, motor names, what motor 3 does (traction loss or a lift), which way the rear goes and each lift goes for higher numbers, auto-tune's "who's in the seat" and rider's weight, and the test-move speed auto-tune measured for each motor (Check uses it). |
+| `config.json` | Settings made in the page: board address, theme, motors in use, motor names, what motor 3 does (traction loss or a lift), which way the rear goes and each lift goes for higher numbers (and which way each lift's corner sank in the last full check), auto-tune's "who's in the seat" and rider's weight, and the test-move speed auto-tune measured for each motor (Check uses it). |
 | `seat.json` | The last Seat setup: where the seat is level (and the rear centred), how each motor tilts it, how far the rear slide turns it per count, the ends found and the limits saved. The 3D view uses it; the limits themselves live on the board. |
 | `profiles.json` | Named profiles. |
 | `backups.json` | Backups of the board settings: every Save to EEPROM, every bigger change, and manual ones. |

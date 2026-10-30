@@ -42,8 +42,12 @@ Motion sensor (firmware 1.8): a WT901C on the seat (mounted 1.3/-0.8 degrees off
   --sag M              motor M's gearbox can be driven backwards: the seat's weight pulls it towards lower numbers
                        whenever the drive is weak (it sinks while gently driven up)
   --sag-pull X         how hard (drive units, default 0.09; 0.2 = it sinks even at a fifth of full drive)
+  --sag-high M         like --sag, but the weight pulls motor M towards HIGHER numbers (a lift whose numbers run the
+                       other way - the full check notices which way a corner sinks, page 2.6)
   --pot-glitches M:N   motor M's pot wiper loses contact about N times a second: single readings 16-40 counts off,
                        now and then a burst of them lasting up to 25 ms (page 2.4.1: nothing may take that for a move)
+  --no-potfilter       firmware 1.9.3: no pot glitch filter - the PID and the telemetry see every glitch (the default
+                       is 1.9.4, which holds the last good reading through a glitch of up to 10 ms)
   --sensor-on          start with the sensor switched on in the board's settings
 
 Seat set-up (firmware 1.9):
@@ -56,7 +60,7 @@ Soft start (firmware 1.9.1): after power-up and Enable Motors each motor creeps 
                        heads for its centre (512 + level trim), as the real one does
   --old19              firmware 1.9 without the soft start (diagnostics frame version 3)
 
-Firmware update over WiFi (firmware 1.9.2+; the simulator says 1.9.3, the default): [uP=] [uT=] [uI=] [uJ=] [uGO] [uOK] [rdu]; the board fetches
+Firmware update over WiFi (firmware 1.9.2+; the simulator says 1.9.4, the default): [uP=] [uT=] [uI=] [uJ=] [uGO] [uOK] [rdu]; the board fetches
 http://<page>:<port>/ota/<token>.ota, decodes and checks it like the UNO R4 WiFi's WiFi module (magic, LZSS, CRC),
 "programs" itself - it drops the connection, stays away ~4 s and comes back as the version in the file (1.9.2+ with
 updates, 1.9.1 soft start only, 1.9 neither), with the soft start - and remembers its WiFi like 1.9.2 does.
@@ -92,6 +96,9 @@ ap.add_argument("--slop", default="")
 ap.add_argument("--heavy", type=int, default=0)
 ap.add_argument("--pot-noise", default="")
 ap.add_argument("--sag", type=int, default=0)
+ap.add_argument("--sag-high", type=int, default=0,
+                help="like --sag, but the seat's weight pulls this motor towards HIGHER numbers (a lift whose numbers "
+                     "run the other way)")
 ap.add_argument("--sag-pull", type=float, default=0.09)
 ap.add_argument("--pot-glitches", action="append", default=[])
 ap.add_argument("--sensor-on", action="store_true")
@@ -109,6 +116,7 @@ ap.add_argument("--load", type=float, default=0.0,
                 help="a rider of this many kg: the lifts need more drive going up and less going down, every motor "
                      "carries more weight (slower to start and stop), the rear slide more friction")
 ap.add_argument("--vmax", type=float, default=2200.0, help="counts/s at full drive (default 2200; ~1000 is a slow rig)")
+ap.add_argument("--no-potfilter", action="store_true", help="firmware 1.9.3: no pot glitch filter (the PID sees every glitch)")
 ap.add_argument("--tuned", action="store_true", help="start with sane settings (Kp 250, Ki 0, Kd 0, PWMmin 30, dead zone 2)")
 args = ap.parse_args()
 
@@ -148,7 +156,7 @@ START = {}                                    # --start: where the pots are at p
 for st_ in args.start:
     m_, pot_ = st_.split(":")
     START[int(m_) - 1] = float(pot_)
-FW = {"ver": ("1.9" if args.old19 else ("1.9.1" if args.fw191 else "1.9.3")) if args.fw >= 19 else f"{args.fw // 10}.{args.fw % 10}"}
+FW = {"ver": ("1.9" if args.old19 else ("1.9.1" if args.fw191 else ("1.9.3" if args.no_potfilter else "1.9.4"))) if args.fw >= 19 else f"{args.fw // 10}.{args.fw % 10}"}
 
 
 def _vt(v):
@@ -160,6 +168,20 @@ def _vt(v):
 
 def soft_fw():                                # firmware 1.9.1: soft start
     return args.fw >= 19 and _vt(FW["ver"]) >= (1, 9, 1)
+
+
+_PF = {"ver": None, "on": False}
+
+
+def pot_filter():                             # firmware 1.9.4: pot glitch filter (follows an update from the page)
+    if _PF["ver"] != FW["ver"]:               # (called 12000 times a second: parse the version only when it changes)
+        _PF["ver"], _PF["on"] = FW["ver"], args.fw >= 19 and _vt(FW["ver"]) >= (1, 9, 4)
+    return _PF["on"]
+
+
+def build_flags():                            # what [rd!] and the diagnostics frame say about the build
+    f = (2 | 4 | 8) if args.fw >= 18 else (2 | 8) if args.fw >= 17 else 0
+    return f | (32 if pot_filter() else 0)
 
 
 def ota_fw():                                 # firmware 1.9.2: updates from the page, WiFi memory
@@ -209,6 +231,7 @@ class Chan:                                   # the firmware's per-motor state
         self.cut, self.clip = 23, 100
         self.cum = 0; self.ilim = 0; self.lastpos = 512 << 4; self.dterm = 0; self.kdcnt = 0
         self.disabled = True; self.reason = 3; self.fb_q = 512 << 4; self.pid_q = 0
+        self.raw_q = 512 << 4; self.held = 0                                        # 1.9.4 pot glitch filter
         self.trips = 0; self.trip_at = -1; self.jumps = 0; self.jmax = 0; self.fmin = 16383; self.fmax = 0
         self.trim, self.tlo, self.thi, self.elo, self.ehi = 0, 0, 1023, 0, 1023     # 1.9 seat set-up
         self.soft, self.soft_ticks, self.soft_out, self.soft_since = False, 0, 0, 0.0   # 1.9.1 soft start
@@ -307,7 +330,7 @@ def boot(cold=True):
     SEAT.found_at = None; SEAT.packets = 0
     for c in C:
         p = P[potmap[c.i]]
-        c.fb_q = int(p.pot_x * 16); c.lastpos = c.fb_q
+        c.fb_q = int(p.pot_x * 16); c.lastpos = c.fb_q; c.raw_q = c.fb_q; c.held = 0
         lo, hi = c.window()
         c.goal_acc = (max(lo, min(hi, int(p.pot_x))) << 12); c.goal_q = c.goal_acc >> 8
         if args.fw >= 19 and (any(ch.trim for ch in C) or START):
@@ -522,9 +545,15 @@ def chan_tick(c):
     if args.glitch == c.i + 1 and (TICKS[0] // 3) % 6000 < 4:     # wiper drops out for ~1 ms every 1.5 s
         pos = random.uniform(150, 300)
     fb = max(0, min(16383, int(round(pos * 16))))
-    j = abs(fb - c.fb_q)
+    j = abs(fb - c.raw_q)                     # diagnostics count the raw glitches, filter or not
     if j > 16 * 16 and c.jumps < 65535: c.jumps += 1
     c.jmax = max(c.jmax, j); c.fmin = min(c.fmin, fb); c.fmax = max(c.fmax, fb)
+    c.raw_q = fb
+    if pot_filter():                          # 1.9.4: hold the last good reading through a glitch, up to 40 readings
+        if abs(fb - c.fb_q) > 16 * 16 and c.held < 40:
+            c.held += 1; fb = c.fb_q
+        else:
+            c.held = 0
     c.fb_q = fb
     clo, chi = c.cut_window() if args.fw >= 19 else (c.cut, 1023 - c.cut)
     past = fb > (chi << 4) or fb < (clo << 4)
@@ -577,9 +606,10 @@ def phys_tick(p, d, brake):
     if args.dead == p.i + 1: d, brake = 0.0, True
     if args.oneway == p.i + 1 and d < 0: d = 0.0
     p.dl += (d - p.dl) * DT / (0.035 if args.hunt == p.i + 1 else TLAG)   # --hunt: sluggish drive -> limit cycle
-    if args.sag == p.i + 1:                   # --sag: back-drivable; the weight pulls towards lower numbers
-        net = (0.0 if brake else p.dl) - SAG_PULL - (0.0012 * kg if _lifts(p.i) else 0.0)
-        fr = FRIC_UP if net > 0 else FRIC_DN
+    if args.sag == p.i + 1 or args.sag_high == p.i + 1:   # --sag: back-drivable; the weight pulls it down
+        sgn = 1.0 if args.sag_high == p.i + 1 else -1.0      # --sag-high: "down" is towards higher numbers
+        net = (0.0 if brake else p.dl) + sgn * (SAG_PULL + (0.0012 * kg if _lifts(p.i) else 0.0))
+        fr = FRIC_UP if net * -sgn > 0 else FRIC_DN       # lifting is the harder way
         deff = math.copysign(max(0.0, abs(net) - fr), net) if net != 0 else 0.0
         if brake:                             # the bridge brakes: it sinks slowly
             p.v += (deff * VMAX * 0.15 - p.v) * DT / 0.012
@@ -611,7 +641,8 @@ def phys_tick(p, d, brake):
 
 def seat_tick():
     """Seat angle from the linkages: stiff (follows within a few ms) or, with --flex, a bouncy spring."""
-    x1, x2, x3 = (P[i].link for i in range(3))
+    x1, x2, x3 = ((1024 - P[i].link) if args.sag_high == i + 1 else P[i].link   # --sag-high: that lift's
+                  for i in range(3))                                           # numbers run the other way
     roll_t = DEG_PER_COUNT * (x1 - x2) / 2.0 + SEAT_TILT[0]
     if args.layout == "tl":                   # front lifts, the rear on a pivot; motor 3 turns the seat
         pitch_t = DEG_PER_COUNT * ((x1 + x2) / 2.0 - 512) + SEAT_TILT[1]
@@ -717,7 +748,7 @@ def diag_frame():
     since = lambda x: 65535 if not x else min(65535, int((now - x) * 1000))
     pl = struct.pack("<I3BB4I2HIbBB", ms, *reset_flags, 1, usb["ok"], usb["tgt"], usb["bad"], usb["tcp"],
                      since(usb["last"]), since(usb["last_tgt"]), random.randint(800, 4000), -58,
-                     (2 | 4 | 8) if args.fw >= 18 else (2 | 8), min(args.fw, 19))
+                     build_flags(), min(args.fw, 19))
     for c in C:
         pl += struct.pack("<BHhHHHH", c.reason, c.trips, c.trip_at, c.jumps, min(65535, c.jmax), c.fmin, c.fmax)
         c.jmax, c.fmin, c.fmax = 0, c.fb_q, c.fb_q
@@ -997,7 +1028,7 @@ def handle_cmd(c, a, b, out, cl=None):
             elif k == "~": out.append(reply2("~", 25, 25))
             elif k == "$": out.append(replyw("$", 70))
             elif k == "!" and args.fw >= 14:
-                out.append(reply2("!", (2 | 4 | 8) if args.fw >= 18 else (2 | 8) if args.fw >= 17 else 0, args.fw))
+                out.append(reply2("!", build_flags(), args.fw))
             elif k == "l" and args.fw >= 18: out.append(reply2("l", board["view"], board["lflags"]))
             elif k == "i" and args.fw >= 18: out.append(reply2("i", sensor_state(time.time()), tilt_deg()))
             elif k == "f" and args.fw >= 16: out.append(reply2("f", fshift, frate // 100))

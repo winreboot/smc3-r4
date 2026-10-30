@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-smc3_scope v2.5 - live scope, tuner and auto-tuner for the SMC3_R4 motion controller (Arduino UNO R4 WiFi).
+smc3_scope v2.6 - live scope, tuner and auto-tuner for the SMC3_R4 motion controller (Arduino UNO R4 WiFi).
 
 Connects to the board's TCP telemetry port, keeps a rolling buffer of samples and serves a web page with live
 charts, a parameter editor (sends ordinary SMC3 commands back to the board), test signals and a per-motor
@@ -12,6 +12,23 @@ Every option can also come from the environment (Docker): SMC3_HOST, SMC3_PORT, 
 SMC3_DATA_DIR.  Settings changed in the page (board address, theme, auto-find) are saved to
 <data dir>/config.json and survive restarts and upgrades.  Standard-library Python 3.8+ only.
 
+v2.6: auto-tune moves out and back from the start position, the way you move a knob on the dashboard: up (or right) by
+      the test travel, back to the start, down (left), back to the start - so the seat never goes further than that from
+      where it was, each direction is tested going away from the start and coming back, and a test no longer starts by
+      going down (2.5 went from the bottom of the travel to the top and back). Small steps are +-30 counts from the
+      start; the top speed is timed on two equal moves (down and back up over twice the travel); a short travel still
+      gets a gradual move (at least 0.3 s). The sweep charts scale to the results (2.5's overshoot chart ran up to the
+      limit line, so 0-2 % looked flat) and switch between overshoot, off by and settle time. The full check notices
+      which way a lift's numbers run when its corner sinks (drift with the motor off, or sinking at low drive): auto-
+      tune says up and down from that until you answer the question. Diagnostics warns when the two front lifts seem to
+      run opposite ways (from that, or from needing clearly less drive one way; compared in SimHub's numbers, so
+      REVERSE_MOTOR1 is allowed for). Pot glitches: firmware 1.9.4 holds a glitch back from the PID for up to 10 ms (the
+      board still counts them; build flag bit 5 says the filter is in), and Help, Pot noise filter has the drawing and
+      parts of an RC filter (1 kOhm, 100 nF, 1 MOhm per pot) and the wiring rules; the glitch and noise findings point
+      there. Diagnostics reports the board's own firmware version (1.9.3 showed as 1.9.2). Sweep moves hold up to 2 s on
+      a slow motor (1.3 s cut a slow motor's sweep short at Kp 40), a motor still creeping in isn't called too lively,
+      and the wrong-way stop needs it to last 150 ms longer, so a cluster of glitchy readings can't fake it. Simulator:
+      firmware 1.9.4 with its filter, also after an update from the page (--no-potfilter for 1.9.3), --sag-high.
 v2.5: auto-tune tests each direction on its own (up and down for a lift, left and right for the rear slide) and
       reports both; after measuring the motor's top speed each way (one quick move), every test is a gradual move at
       60% of the slower way's top speed, so the motor can follow it and Kp is judged on how closely it follows (2.4.1
@@ -91,7 +108,7 @@ v1.4: settings dialog (board address, port, find-board scan, auto-find), day/nig
       fixed a thread race that made the page flash "not reachable".
 """
 
-VERSION = "2.5"
+VERSION = "2.6"
 
 import argparse
 import base64
@@ -154,12 +171,14 @@ def lift_motors(cfg):
 class Config:
     DEFAULTS = {"host": "", "port": 4210, "theme": "dark", "auto_find": True, "scan_subnet": "",
                 "motors": 3, "disable_unused": True, "motor_names": ["", "", ""],
-                "layout": "tl", "tl_dir": 1, "lift_dir": {}, "rider_mode": "empty", "rider_kg": 0, "rider_unit": "lb",
+                "layout": "tl", "tl_dir": 1, "lift_dir": {}, "lift_sink": {}, "rider_mode": "empty", "rider_kg": 0, "rider_unit": "lb",
                 "tune_speed": {}}
     # layout: "tl" = motors 1 and 2 lift the front corners, motor 3 slides the rear left / right (traction loss,
     #         the seat turning about a pivot at the front); "lifts" = all three motors lift the seat.
     # tl_dir: +1 = higher numbers move the rear to the right, -1 = to the left (Seat setup or the full check asks).
     # lift_dir: {"1": +1 | -1} which way a lift goes for higher numbers, from the full check's question (page 2.5).
+    # lift_sink: {"1": +1 | -1} which way a lift's numbers go when its corner sinks under the seat's weight, seen by
+    #          the full check (page 2.6) - auto-tune's "up" is the other way, until lift_dir is answered.
     # rider_*: auto-tune's "who's in the seat" and the rider's weight (kg; shown in rider_unit). tune_speed: per motor,
     #          the test-move speed and top speeds auto-tune measured, so Check runs the same moves.
 
@@ -726,6 +745,8 @@ RAMP_SHARE = 0.6             # test moves run at this share of the slower direct
 RIDER_REF_KG = 80.0          # a rider this heavy (176 lb) gets the full allowance when the seat is tuned empty
 COUNTDOWN_S = 15             # "I'm in the seat": time to get in before anything moves
 SETTLE_OK_MS = 500           # gauges: settling within this is good, within twice this is fair
+SMALL_STEP = 30              # small test steps (kerb-sized), counts each way from the start position (page 2.6)
+RAMP_MIN_S = 0.3             # a test move takes at least this long, so a short travel still gets a gradual move
 PHASES = [("countdown", "Get in"), ("prep", "Prepare"), ("noise", "Pot noise"), ("pwmmin", "Min drive"),
           ("speed", "Top speed"), ("kp", "Kp sweep"), ("small", "Small moves"), ("ki", "Ki"), ("kd", "Kd"),
           ("final", "Final check")]
@@ -1093,6 +1114,7 @@ class Tuner:
         self.moved = False                       # this run has sent a target that differs from where it began
         self.start_t = None                      # the target when the run began
         self.quiet_until = 0.0                   # the wrong-way watch rests until then (getting into the seat)
+        self.away_since = None                   # board ms when the wrong-way watch first saw "moving away" (2.6)
         self.cur_p = None                        # the motor's values (check mode: what to keep)
 
     # ---- public ----
@@ -1201,7 +1223,13 @@ class Tuner:
             kind = "slide"
         else:
             seen = (cfg.get("lift_dir") or {}).get(str(m + 1))
-            d = (1 if int(seen) > 0 else -1) if seen in (1, -1, "1", "-1") else (-1 if self.rev else 1)
+            sink = (cfg.get("lift_sink") or {}).get(str(m + 1))
+            if seen in (1, -1, "1", "-1"):
+                d = 1 if int(seen) > 0 else -1
+            elif sink in (1, -1, "1", "-1"):                   # 2.6: up is away from where its corner sinks
+                d = -1 if int(sink) > 0 else 1
+            else:
+                d = -1 if self.rev else 1
             names = {d: "up", -d: "down"}
             sym = {d: "▲", -d: "▼"}
             kind = "lift"
@@ -1295,9 +1323,11 @@ class Tuner:
         # while someone gets into the seat: their weight can push a lift away from where it holds (page 2.5).
         if now < self.quiet_until:
             self.hist.clear()
+            self.away_since = None
         elif len(self.hist) > 2:
             t_end = self.hist[-1][0]
             win = [h for h in self.hist if t_end - h[0] <= 300]
+            away = False
             if len(win) >= 10 and t_end - win[0][0] >= 250:
                 es = [h[2] for h in win]
                 if all(abs(e) > 30 for e in es) and (all(e > 0 for e in es) or all(e < 0 for e in es)):
@@ -1305,9 +1335,16 @@ class Tuner:
                     pushing = all(h[3] * sg > 15 for h in win)
                     fw = _hampel([h[1] for h in win])        # 2.5: a cluster of glitchy readings can't fake it
                     moved = (statistics.median(fw[-7:]) - statistics.median(fw[:7])) * sg
-                    if pushing and moved < -max(10.0, 3.0 * self.noise_sd):
-                        raise TuneAbort(f"Motor {n} moves AWAY from where it is driven. The motor or the pot is "
-                                        f"wired backwards.", "unsafe")
+                    away = pushing and moved < -max(10.0, 3.0 * self.noise_sd)
+            # 2.6: only when it is still so 150 ms later - a cluster of glitchy readings at one end of the window has
+            # moved out of it by then; a motor wired backwards is still running away
+            if not away:
+                self.away_since = None
+            elif self.away_since is None:
+                self.away_since = t_end
+            elif t_end - self.away_since >= 150:
+                raise TuneAbort(f"Motor {n} moves AWAY from where it is driven. The motor or the pot is wired "
+                                f"backwards.", "unsafe")
 
     def _ramp_move(self, x, v):
         """Move the target to x at v counts/s, easing in and out over ~0.12 s: a test move the motor can follow, like
@@ -1385,14 +1422,31 @@ class Tuner:
                             f"backwards.", "unsafe")
         return r
 
-    def _step_pair(self, hi, lo, p, hold=2.0, ramp=True):
-        """A move to hi, then to lo: one each way. The result is the worse of the two (that's what the choices go
-        by), with each direction's own figures under 'dp' (towards higher counts) and 'dm' (lower)."""
-        a = self._move(hi, hold, p, ramp)
-        b = self._move(lo, hold, p, ramp)
-        r = worst(a, b)
-        r["dp"], r["dm"] = (a, b) if hi > lo else (b, a)
-        seats = [x for x in (a, b) if x.get("seat_os") is not None]
+    def _hold(self):
+        """How long a sweep test move holds at its end: 1.3 s, longer for a slow motor (down to 2.0 s at test moves of
+        160 counts/s or slower) - at the low Kp the sweep starts with, a slow motor is still catching up after the
+        move, and its creeping would look like a restless hold (page 2.6)."""
+        v = self.ramp_v or 300
+        return 1.3 if v >= 300 else round(min(2.0, 1.3 + (300 - v) / 200.0), 2)
+
+    def _first_way(self):
+        """Which way a test sets off: up for a lift (whichever way its numbers run), right for the rear slide."""
+        return -1 if self.dn.get(-1) in ("up", "right") else 1
+
+    def _test_set(self, c, A, p, hold=1.6, ramp=True):
+        """One test (page 2.6): from the start position c out and back each way - up, back to the start, down, back
+        to the start (right and left for the rear slide), as you move a knob on the dashboard - so the seat never
+        goes further than A from where it started, and each direction is measured twice: moving away from the start
+        and coming back to it. (2.5 went from the bottom of the travel to the top and back, so every test seemed to
+        start by going down.) The result is the worst of the four moves, with each direction's worse move under 'dp'
+        (towards higher counts) and 'dm' (lower)."""
+        first = self._first_way()
+        moves = [self._move(x, hold, p, ramp) for x in (c + first * A, c, c - first * A, c)]
+        towards = {first: (moves[0], moves[3]), -first: (moves[1], moves[2])}
+        dp, dm = worst(*towards[1]), worst(*towards[-1])
+        r = worst(dp, dm)
+        r["dp"], r["dm"] = dp, dm
+        seats = [x for x in moves if x.get("seat_os") is not None]
         if seats:
             # with the motion sensor, the seat's own overshoot and ringing count too: a setting that keeps the motor
             # calm but makes the frame bounce isn't calm
@@ -1538,19 +1592,25 @@ class Tuner:
                             f"the load with PWMmax {p['pwmmax']}, or something binds.")
         return found
 
-    def _measure_speed(self, p, lo, hi, share, change=True):
+    def _measure_speed(self, p, c, A, share, change=True):
         """Top speed each way from one quick move each way (the target jumps; Kp 120-200 so the drive is at or near
-        PWMmax for most of it). The test moves then run at `share` of the slower way."""
+        PWMmax for most of it): gently up by A from the start position, then a jump down to A below the start and
+        one back up - the same 2A each way, so both are timed alike - then gently back to the start. The test moves
+        then run at `share` of the slower way."""
         n = self.motor + 1
         q = dict(p)
         if change:              # the Kp the motor had before (the PWMmin search leaves a low one), within 120-200
             ref = (self.original or p)["kp"]
             q.update(kp=int(min(SPEED_KP[1], max(SPEED_KP[0], ref))), ki=0, kd=0, ks=1)
             self._apply(q)
-        self._ramp_to(lo)
-        self._settle(lo, 3.0)
-        r = self._step_pair(hi, lo, q, hold=1.6, ramp=False)
-        v = {1: r["dp"].get("vtop") or 0.0, -1: r["dm"].get("vtop") or 0.0}
+        first = self._first_way()
+        self._ramp_to(c + first * A)
+        self._settle(c + first * A, 3.0)
+        b = self._move(c - first * A, 1.6, q, ramp=False)       # the second way, timed over 2A
+        a = self._move(c + first * A, 1.6, q, ramp=False)       # the first way, the same 2A
+        self._ramp_to(c)
+        self._settle(c, 2.0)
+        v = {first: a.get("vtop") or 0.0, -first: b.get("vtop") or 0.0}
         if min(v.values()) < 15:
             slow = 1 if v[1] < v[-1] else -1
             raise TuneAbort(f"motor {n} hardly moves {self.dn[slow]} on a full move ({v[slow]:.0f} counts/s with "
@@ -1564,6 +1624,11 @@ class Tuner:
                 ramp = cap
                 self.say(f"The board's Max speed setting ({filt[1] * 100} counts/s) limits the test moves to "
                          f"{cap} counts/s.")
+        slow_cap = int(A / RAMP_MIN_S / 10.0) * 10              # a short travel still gets a gradual move
+        if 30 <= slow_cap < ramp:
+            ramp = slow_cap
+            self.say(f"Test moves capped at {slow_cap} counts/s, so a move of {A} counts still takes "
+                     f"{RAMP_MIN_S:.1f} s.")
         self.ramp_v = int(max(30, min(1200, ramp)))
         self._lv(speed={"p": round(v[1]), "m": round(v[-1]), "ramp": self.ramp_v,
                         "share": round(share * 100), "pwmmax": p["pwmmax"]})
@@ -1665,16 +1730,18 @@ class Tuner:
         self.runaway_limit = 2 * A + 80
         self.cur = s["m"][m]["t"]
         self.start_t, self.moved, self.cur_p = self.cur, False, dict(orig)
-        self.recent.clear(); self.hist.clear()
+        self.recent.clear(); self.hist.clear(); self.away_since = None
         self.recent.append((time.time(), self.cur))
         self.chk_seq, self.interf, self.t_start = b.seq, 0, time.time()
         self._now(orig)
         if self.dn[1] in ("up", "down"):
+            how = ("" if (b.cfg.get("lift_dir") or {}).get(str(n)) else
+                   (" - from the last full check: this corner sank towards " +
+                    ("higher" if self.dn[1] == "down" else "lower") + " numbers under the seat's weight"
+                    if (b.cfg.get("lift_sink") or {}).get(str(n)) else
+                    " - assumed, as SimHub expects; the Diagnostics full check asks which way the seat really goes"))
             self.say(f"Directions: {self.dn[1]} = higher counts" +
-                     (" (motor 1 is mirrored in the firmware)" if self.rev else "") +
-                     ("" if (b.cfg.get("lift_dir") or {}).get(str(n)) else
-                      " - assumed, as SimHub expects; the Diagnostics full check asks which way the seat really goes")
-                     + ".")
+                     (" (motor 1 is mirrored in the firmware)" if self.rev else "") + how + ".")
         elif self.dn[1] in ("right", "left"):
             self.say(f"Directions: higher counts move the rear to the {self.dn[1]}.")
         self._lv(travel=A)
@@ -1784,7 +1851,7 @@ class Tuner:
                      (" (how the seat turns, for the traction-loss motor)." if self.motor == tl_motor(self.board.cfg)
                       else "."))
         self._phase("speed", "Measuring top speed", 30)
-        vtop = self._measure_speed(p, lo, hi, share)
+        vtop = self._measure_speed(p, c, A, share)
         try:
             ts = dict(b.cfg.get("tune_speed") or {})
             ts[str(n)] = {"ramp": self.ramp_v, "top": [round(vtop[1]), round(vtop[-1])], "pwmmax": p["pwmmax"],
@@ -1797,8 +1864,8 @@ class Tuner:
         self._phase("kp", "Sweeping Kp", 33)
         p.update(ki=0, kd=0, ks=1, kp=KP_START)
         self._apply(p)
-        self._ramp_to(lo)
-        self._settle(lo, 3.0)
+        self._ramp_to(c)
+        self._settle(c, 3.0)
         calm2 = self._calm(2.0)
 
         def good(r):
@@ -1816,21 +1883,22 @@ class Tuner:
             self.progress = 33 + int(37 * math.log(kp / KP_START) / math.log(KP_MAX / KP_START))
             p["kp"] = int(round(kp))
             self._apply(p)
-            self._settle(lo, 1.0)
-            r = self._step_pair(hi, lo, p)
+            self._settle(c, 1.0)
+            r = self._test_set(c, A, p, hold=self._hold())
             if (not good(r) and results and good(results[-1][1]) and r["reached"] and not r.get("behind")
                     and r["os"] <= OS_STOP and r["osc"] < 4 and r["pid_std"] <= PID_NOISE_MAX):
                 # one bad test right after a calm one: a glitchy pot can kick the motor (a burst of bad readings
                 # makes the PID push hard for a moment) - test this Kp once more before believing it (page 2.5)
                 self.say(f"Kp {p['kp']}: {fmt(r, self.dn)} - testing it once more, to be sure.")
-                self._settle(lo, 1.0)
-                r = self._step_pair(hi, lo, p)
+                self._settle(c, 1.0)
+                r = self._test_set(c, A, p, hold=self._hold())
             results.append((p["kp"], r))
             sweep = sweep + [{"kp": p["kp"], "p": _slim(r["dp"]), "m": _slim(r["dm"]), "good": good(r)}]
             self._lv(sweep=sweep)
             self._show(f"Kp {p['kp']}", r)
             self.say(f"Kp {p['kp']}: {fmt(r, self.dn)}")
-            if r["os"] > OS_STOP or r["osc"] >= 4 or r["fb_std"] > self._calm(2.5, 2.0):
+            # (a restless hold counts only once the motor got there: a slow motor still creeping in isn't lively)
+            if r["os"] > OS_STOP or r["osc"] >= 4 or (r["reached"] and r["fb_std"] > self._calm(2.5, 2.0)):
                 self.say("Too lively - stopping the sweep here.")
                 why = "edge"
                 break
@@ -1934,11 +2002,11 @@ class Tuner:
         self._phase("small", "Checking small movements", 72)
         self._apply(p)
         for _ in range(3):
-            self._ramp_to(c - 15)               # from one side, so both steps are 30 counts (2.4.1: 15 up, 30 down)
-            self._settle(c - 15, 2.0)
-            rs = self._step_pair(c + 15, c - 15, p, hold=1.5, ramp=False)
-            self._show(f"Small ±15 steps, Kp {p['kp']}", rs, "small")
-            self.say(f"Small ±15 steps at Kp {p['kp']}: {fmt(rs, self.dn)}")
+            self._ramp_to(c)
+            self._settle(c, 2.0)
+            rs = self._test_set(c, SMALL_STEP, p, hold=1.3, ramp=False)
+            self._show(f"Small ±{SMALL_STEP} steps, Kp {p['kp']}", rs, "small")
+            self.say(f"Small ±{SMALL_STEP} steps at Kp {p['kp']}: {fmt(rs, self.dn)}")
             if (rs["osc"] >= 2 or rs["os"] > 35 or rs["fb_std"] > self._calm(1.5)) and p["kp"] > KP_START:
                 p["kp"] = max(KP_START, int(p["kp"] * 0.8))
                 self._apply(p)
@@ -1952,13 +2020,12 @@ class Tuner:
         self._phase("ki", "Checking steady-state error (Ki)", 76)
 
         def measure(label):
-            self._ramp_to(lo)
-            self._settle(lo, 2.0)
-            big = self._step_pair(hi, lo, p, hold=2.5)
+            self._ramp_to(c)
+            self._settle(c, 2.0)
+            big = self._test_set(c, A, p, hold=2.0)
             self._show(label + ", test moves", big)
-            self._ramp_to(c - 15)
-            self._settle(c - 15, 2.0)
-            small = self._step_pair(c + 15, c - 15, p, hold=1.5, ramp=False)
+            self._settle(c, 1.0)
+            small = self._test_set(c, SMALL_STEP, p, hold=1.3, ramp=False)
             self._show(label + ", small steps", small, "small")
             return big, small
 
@@ -2008,14 +2075,15 @@ class Tuner:
         if do_kd and r_base["os"] > 2:
             def score(r):
                 return r["os"] + r["settle"] / 40.0
-            self._ramp_to(lo)
-            self._settle(lo, 2.0)
+            self._ramp_to(c)
+            self._settle(c, 2.0)
             best = None
             for i, kd in enumerate(KD_STEPS):
                 self.progress = 88 + 2 * i
                 p.update(ks=4, kd=kd)
                 self._apply(p)
-                r = self._step_pair(hi, lo, p)
+                self._settle(c, 1.0)
+                r = self._test_set(c, A, p, hold=self._hold())
                 self._show(f"Kd {kd}", r)
                 self.say(f"Kd {kd} (Ks 4): {fmt(r, self.dn)}")
                 if r["pid_std"] > r_base["pid_std"] * 1.5 + 3 or r["fb_std"] > self._calm(2.0) or r["osc"] >= 2:
@@ -2112,19 +2180,18 @@ class Tuner:
                             "pwmmax": p["pwmmax"]})
             self.say(f"Test moves at {self.ramp_v} counts/s, as in the last auto-tune of this motor.")
         else:
-            self._measure_speed(p, lo, hi, RAMP_SHARE, change=False)
+            self._measure_speed(p, c, A, RAMP_SHARE, change=False)
         self._phase("big", "Test moves", 40)
-        self._ramp_to(lo)
-        self._settle(lo, 3.0)
-        big = self._step_pair(hi, lo, p, hold=2.5)
+        self._ramp_to(c)
+        self._settle(c, 3.0)
+        big = self._test_set(c, A, p, hold=2.0)
         self._show("Test moves", big)
         self.say(f"Test moves: {fmt(big, self.dn)}")
         self._phase("small", "Small steps", 75)
-        self._ramp_to(c - 15)
-        self._settle(c - 15, 2.0)
-        small = self._step_pair(c + 15, c - 15, p, hold=1.5, ramp=False)
-        self._show("Small ±15 steps", small, "small")
-        self.say(f"Small ±15 steps: {fmt(small, self.dn)}")
+        self._settle(c, 2.0)
+        small = self._test_set(c, SMALL_STEP, p, hold=1.3, ramp=False)
+        self._show(f"Small ±{SMALL_STEP} steps", small, "small")
+        self.say(f"Small ±{SMALL_STEP} steps: {fmt(small, self.dn)}")
         self._ramp_to(c)
         self._settle(c, 2.0)
         # verdict, each way
@@ -3488,6 +3555,7 @@ class MotionCheck:
         self.other_interf = 0
         self.base_other = {}
         self.cross_lim = {}
+        self.drift = {}                              # motor number -> counts/s it drifted while switched off (2.6)
         self.expect_on = False
         self.watch = None
         self.step_watch = None
@@ -3715,9 +3783,24 @@ class MotionCheck:
             if rate:
                 self.say(f"motor {k + 1}, switched off, drifts {rate:+.0f} counts/s on its own (the seat's weight?) - "
                          f"allowed for")
+                self.drift[k + 1] = round(rate, 1)
+                if abs(rate) >= 8 and k != tl_motor(self.d.cfg):
+                    self.note_sink(k + 1, 1 if rate > 0 else -1)
             self.base_other[k] = (fb[k], s2["m"][k]["t"], tb, rate)
             self.cross_lim[k] = max(12.0, 6 * nz)
         self.seed_fwin()
+
+    def note_sink(self, n, sgn):
+        """A lift's corner sinks under the seat's weight towards higher (+1) or lower (-1) numbers - so for that motor
+        higher numbers move the seat down (+1) or up (-1). Kept on the NAS: auto-tune names its directions by it
+        until the full check's question is answered (page 2.6)."""
+        try:
+            ls = dict(self.d.cfg.get("lift_sink") or {})
+            if ls.get(str(n)) != sgn:
+                ls[str(n)] = sgn
+                self.d.cfg.update(lift_sink=ls)
+        except Exception:
+            pass
 
     def others_back(self):
         self.base_other = {}
@@ -3742,7 +3825,7 @@ class MotionCheck:
     # ---- the procedure ----
     def run(self, ask):
         b, m, n, o = self.b, self.m, self.n, self.orig
-        r = {"motor": n, "result": None, "message": "", "settings": dict(o)}
+        r = {"motor": n, "result": None, "message": "", "settings": dict(o), "others_drift": self.drift}
         time.sleep(0.3)                                  # let the telemetry catch up with the previous motor's check
         s = b.latest()
         if not s:
@@ -3850,6 +3933,8 @@ class MotionCheck:
                 w = wrong.pop(d)
                 r["sinks_when_weak"] = {"driven": "up" if d > 0 else "down", "at_drive": w["lvl"], "from": w["from"],
                                         "to": w["to"]}
+                if m != tl_motor(self.d.cfg) and abs(w["to"] - w["from"]) >= 5:
+                    self.note_sink(n, 1 if w["to"] > w["from"] else -1)
                 self.say(f"it moves towards {way(-d)} numbers at drive {found[-d]}, so going the wrong way when driven "
                          f"towards {way(d)} numbers at drive {w['lvl']} was the load pulling it (it sinks while the "
                          f"drive is weak) - trying more drive")
@@ -4313,7 +4398,7 @@ class Diagnostics:
         dg = b.read_diag() if connected and fw[1] >= 17 else None
         s = b.latest() if connected else None
         board = {"connected": connected, "address": f"{cfg.get('host')}:{cfg.get('port')}",
-                 "firmware": fw_text(fw[1], dg) if fw[1] else ("1.3 or older" if params.get("Kp1") is not None else None),
+                 "firmware": fw_text(fw[1], dg, b.fw_version) if fw[1] else ("1.3 or older" if params.get("Kp1") is not None else None),
                  "fw_num": fw[1], "reverse_motor1": bool(fw[0] & 1)}
         if not connected:
             board["disconnected_for"] = _ago(time.time() - b.disconnected_since)
@@ -4332,7 +4417,7 @@ class Diagnostics:
                           "build": {"bridge": "IBT-2 / BTS7960 (MODE2)" if dg["build"] & 2 else
                                     "PWM + direction pins (MODE1)", "reverse_motor1": bool(dg["build"] & 1),
                                     "imu": bool(dg["build"] & 4), "led_matrix": bool(dg["build"] & 8),
-                                    "static_ip": bool(dg["build"] & 16)},
+                                    "static_ip": bool(dg["build"] & 16), "pot_filter": bool(dg["build"] & 32)},
                           "usb": {"commands_ok": dg["usb_ok"], "position_commands": dg["usb_targets"],
                                   "bytes_thrown_away": dg["usb_bad_bytes"],
                                   "ms_since_last_command": dg["ms_since_usb"],
@@ -4511,6 +4596,12 @@ def analyze(rep):
     w60 = {x["motor"]: x for x in watch.get("last_60_min", {}).get("motors", [])}
     counts = watch.get("last_24_h_problem_counts", {})
     fwn = board.get("fw_num") or 0
+    pot_filter_fw = bool((board.get("build") or {}).get("pot_filter"))   # 1.9.4 holds pot glitches back (build flag)
+    try:
+        _mod = tuple(int(x) for x in str((board.get("wifi") or {}).get("module_fw") or "0").split(".")[:3])
+    except ValueError:
+        _mod = ()
+    upd_ok = bool(board.get("wifi")) and _mod >= (0, 4, 0)    # the page can update the firmware over WiFi
     dgm = {x["motor"]: x for x in board.get("motors", [])} if board.get("motors") else {}
     livem = {x["motor"]: x for x in live.get("motors", [])}
     checks = {x["motor"]: x for x in rep.get("check", [])} if isinstance(rep.get("check"), list) else {}
@@ -4726,13 +4817,13 @@ def analyze(rep):
             if nz > 4:
                 add("fail", f"Motor {n}'s pot is very noisy at rest (±{nz:.1f} counts)",
                     "Noise makes the motor buzz, hunt and feel gritty." + extra,
-                    f"Use shielded or twisted pot wires, run them away from the motor wires, give the pots a good ground "
-                    f"back to the Arduino GND, and add a 100 nF capacitor from {pin[2]} to GND. A worn pot also does "
-                    f"this - replace it.", n, "noise")
+                    f"Use shielded pot cable, run it away from the motor wires, give the pots a good ground back to the "
+                    f"Arduino GND, and fit the pot filter (Help, Pot noise filter: 1 kΩ in the wiper wire, 100 nF from "
+                    f"{pin[2]} to GND). A worn pot also does this - replace it.", n, "noise")
             elif nz > 1.5:
                 add("warn", f"Motor {n}'s pot is noisy at rest (±{nz:.1f} counts)", "More than the usual ±0.3-1." + extra,
-                    f"Check the pot wiring and ground; a 100 nF capacitor from {pin[2]} to GND helps. Raise the dead zone "
-                    f"to about {int(3 * nz) + 1} meanwhile.", n, "noise")
+                    f"Check the pot wiring and ground; the pot filter in Help (1 kΩ in the wiper wire, 100 nF from "
+                    f"{pin[2]} to GND) helps. Raise the dead zone to about {int(3 * nz) + 1} meanwhile.", n, "noise")
             else:
                 add("ok", f"Motor {n}'s pot is quiet at rest (±{nz:.2f} counts)", code="noise_ok", motor=n)
         pn = lm.get("pid_noise_at_rest")
@@ -4742,13 +4833,28 @@ def analyze(rep):
                 "balances these).", n, "buzz")
         if gl_tel or (gl_fw and not noisy):
             lvl = "fail" if (gl_fw > 20 or gl_tel > 2) else "warn"
+            if pot_filter_fw and not gl_tel:
+                lvl = "warn"                             # 1.9.4 kept them away from the motor
+            if pot_filter_fw and gl_tel:
+                why = (" The firmware's glitch filter holds short glitches back (up to 10 ms), but the jumps in the "
+                       "live data got past it - they lasted longer - so the motor did react to those.")
+            elif pot_filter_fw:
+                why = (" The firmware's glitch filter holds each short glitch back, so the motor no longer kicks at "
+                       "them - but the pot or its wiring is still picking them up.")
+            else:
+                why = (" This is the classic cause of sudden violent jerks: for a moment the controller thinks the motor "
+                       "is somewhere else and drives hard.")
+            fwfix = ("" if pot_filter_fw else " Firmware 1.9.4 also holds short glitches back from the motors (flash "
+                     "SMC3_R4_v1.9.4.ino" + (", or Settings, Firmware update" if upd_ok else " over USB")
+                     + ").")
             add(lvl, f"Motor {n}'s pot reading jumps (glitches)",
                 f"Readings that change faster than any motor can move: {gl_fw} counted by the board"
-                + (f", {gl_tel} big jumps seen in the live data" if gl_tel else "") + ". This is the classic cause of "
-                "sudden violent jerks: for a moment the controller thinks the motor is somewhere else and drives hard.",
-                f"The pot wiper is losing contact: a worn or dirty pot, or a loose connector / crimp on the wire to "
-                f"{pin[2]}. Re-seat the connectors; if it continues, replace the pot (a sealed or contactless one lasts "
-                f"longer).", n, "glitch")
+                + (f", {gl_tel} big jumps seen in the live data" if gl_tel else "") + "." + why,
+                f"Most come from the motor PWM getting into the pot wires: fit the pot filter (Help, Pot noise filter: "
+                f"1 kΩ in the wiper wire, 100 nF and 1 MΩ from {pin[2]} to GND, at the Arduino), use shielded cable "
+                f"and keep it away from the motor wires. If it continues, the wiper is losing contact: re-seat the "
+                f"connectors, or replace the pot (conductive plastic, or a contactless Hall sensor)." + fwfix,
+                n, "glitch")
         c = counts.get(f"wrong_direction m{n}", 0)
         if c:
             ck_ok = (checks.get(n) or {}).get("result") == "ok"
@@ -4919,10 +5025,11 @@ def analyze(rep):
                 "(soft start)", f"At {sst['rate']} counts/s after power-up or Enable Motors; normal once it has caught "
                 "up.", code="soft_creeping")
     elif board.get("seat_setup") is not None and board.get("wifi") is None:
-        add("info", "Firmware 1.9.3 adds a soft start and updates from this page",
+        add("info", "Firmware 1.9.4 adds a soft start, updates from this page and a pot glitch filter",
             "With 1.9 the motors go straight to their positions at power-up - a seat that rode down while the rig "
-            "was off jumps back. 1.9.3 also lets you install later firmware from Settings, Firmware update.",
-            "Flash SMC3_R4_v1.9.3.ino over USB with the Arduino IDE.", code="soft_fw")
+            "was off jumps back. 1.9.4 also lets you install later firmware from Settings, Firmware update, and "
+            "keeps pot glitches away from the motors.",
+            "Flash SMC3_R4_v1.9.4.ino over USB with the Arduino IDE.", code="soft_fw")
     # ---- firmware update over WiFi (firmware 1.9.2) ----
     wfi = board.get("wifi")
     fup = board.get("firmware_update") or {}
@@ -4952,9 +5059,9 @@ def analyze(rep):
                 "This build has no WiFi details of its own (or they didn't work), so it used the ones it last joined "
                 "with.", code="wifi_remembered")
     elif sst is not None:
-        add("info", "Firmware 1.9.3 can be updated from this page",
+        add("info", "Firmware 1.9.4 can be updated from this page",
             "Settings, Firmware update installs later firmware over WiFi - no USB cable, SimHub can stay open.",
-            "Flash SMC3_R4_v1.9.3.ino over USB once with the Arduino IDE.", code="update_fw")
+            "Flash SMC3_R4_v1.9.4.ino over USB once with the Arduino IDE.", code="update_fw")
     # ---- seat set-up (firmware 1.9) ----
     ss = board.get("seat_setup")
     if ss:
@@ -5225,6 +5332,55 @@ def analyze(rep):
                     "Either the name is wrong (fix it under Settings, Motor names), or the motor cables are on the wrong "
                     "channels - then SimHub's output for that corner drives a different corner. Check which bridge "
                     "(D9 / D10 / D11) drives which motor.", n, "name_clash")
+    # ---- which way each lift's numbers run, from how it sinks (page 2.6) ----
+    sink, drift = {}, {}
+    for n, ck in checks.items():
+        for k, rate in (ck.get("others_drift") or {}).items():
+            k = int(k)
+            if abs(rate) >= 8 and k != tln and abs(rate) > abs(drift.get(k, 0)):
+                drift[k] = rate
+        du, dd = ck.get("drive_to_move_up"), ck.get("drive_to_move_down")
+        if n != tln and du and dd and max(du, dd) >= 1.3 * min(du, dd) and abs(du - dd) >= 15:
+            # the weight helps one way: it needed clearly less drive towards where the corner sinks
+            sink.setdefault(n, []).append((1 if du < dd else -1, f"it needed drive {du} to move to higher numbers, "
+                                           f"{dd} to lower"))
+        sw = ck.get("sinks_when_weak")
+        if sw and n != tln and abs(sw["to"] - sw["from"]) >= 5:
+            sink.setdefault(n, []).append((1 if sw["to"] > sw["from"] else -1,
+                                           f"driven {sw['driven']} gently it went {sw['from']:.0f} -> {sw['to']:.0f}"))
+    for k, rate in drift.items():
+        sink.setdefault(k, []).append((1 if rate > 0 else -1, f"switched off, it drifted {rate:+.0f} counts/s"))
+    # compared in SimHub's numbers: REVERSE_MOTOR1 mirrors motor 1 (the readings above are its pot's own numbers)
+    rev1 = bool(board.get("reverse_motor1"))
+    sdir = {k: ev[0][0] * (-1 if (k == 1 and rev1) else 1) for k, ev in sink.items() if len({e[0] for e in ev}) == 1}
+    mirrored = (" Motor 1 is mirrored in the firmware (REVERSE_MOTOR1), so its pot numbers are turned round into "
+                "SimHub's numbers here." if rev1 and 1 in sdir else "")
+    knob = lambda k: ("to the LEFT (motor 1 is mirrored: that is higher numbers for SimHub)" if (k == 1 and rev1)
+                      else "to the right (higher numbers)")
+    answered = {k for k, (a, _) in seen.items() if a in ("up", "down")}
+    if len(set(sdir.values())) == 2 and not set(sdir) <= answered:
+        hi = sorted(k for k, s in sdir.items() if s > 0)
+        lo = sorted(k for k, s in sdir.items() if s < 0)
+        why = "; ".join(f"motor {k}: " + ", ".join(e[1] for e in sink[k]) for k in sorted(sdir))
+        rev1t = (" (or set REVERSE_MOTOR1 in the firmware, which mirrors motor 1)" if hi[0] == 1 and not rev1 else
+                 " (or build the firmware without REVERSE_MOTOR1)" if hi[0] == 1 else "")
+        add("warn", f"Motor {', '.join(map(str, hi))} and motor {', '.join(map(str, lo))} seem to run opposite ways "
+            f"for higher numbers",
+            f"Under the seat's weight a corner goes down more easily than up: it sinks while its motor is off or "
+            f"weak, and needs less drive going down. Motor {', '.join(map(str, hi))} goes that way towards HIGHER "
+            f"numbers, motor {', '.join(map(str, lo))} towards LOWER numbers ({why}). So higher numbers seem to move "
+            f"motor {', '.join(map(str, hi))}'s corner DOWN and motor {', '.join(map(str, lo))}'s UP - SimHub expects "
+            f"every lift to rise for higher numbers. If so, one side moves the wrong way in games (heave turns into "
+            f"roll), unless SimHub inverts that output." + mirrored,
+            f"Check it with the seat empty: Motors view, drag motor {hi[0]}'s knob {knob(hi[0])}. If "
+            f"its corner goes DOWN, tick Invert on motor {hi[0]}'s output in SimHub{rev1t}, or swap BOTH its two "
+            f"motor wires and its pot's two outer wires. Then run the full check and answer which way it went.",
+            code="lift_dirs_differ")
+    elif sdir and all(s > 0 for s in sdir.values()) and not set(sdir) <= answered and len(sdir) >= 2:
+        add("info", "Higher numbers seem to move the seat DOWN",
+            "Every lift goes down more easily towards higher numbers (it sank that way, or needed less drive)." + mirrored,
+            "Fine if SimHub's outputs are inverted for that; otherwise the whole motion is upside down - check by "
+            "dragging a motor's knob to the right (higher numbers) with the seat empty.", code="all_down_sink")
     if not any(f["level"] in ("fail", "warn") for f in F):
         add("ok", "No problems found in the data", "If something still feels wrong, describe it in the box and run "
             "the full check - and send the file to whoever helps you.", code="none")
@@ -6547,7 +6703,7 @@ class FirmwareUpdate:
                                 "0.4.0 or newer. Update it once over USB: " + WIFI_MODULE_STEPS)
         else:
             v["problem"] = ("The board runs firmware " + (v["fw"] or "older than 1.7") + ", which can't be updated from "
-                            "the page. Flash SMC3_R4_v1.9.3.ino over USB with the Arduino IDE once - from then on "
+                            "the page. Flash SMC3_R4_v1.9.4.ino over USB with the Arduino IDE once - from then on "
                             "updates can come from here.")
         if self.bind in ("127.0.0.1", "localhost", "::1"):
             v["capable"] = False
@@ -7035,6 +7191,612 @@ ASSETS = {
 }
 
 
+# the pot noise filter drawing in Help (docs/img/pot-filter.svg)
+ASSETS["pot-filter.svg"] = base64.b64decode(
+    "PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAxMjgwIDEwNjAiIHdpZHRoPSIxMjgwIiBoZWlnaHQ9IjEw"
+    "NjAiIGZvbnQtZmFtaWx5PSJJbnRlciwgJ1NlZ29lIFVJJywgSGVsdmV0aWNhLCBBcmlhbCwgc2Fucy1zZXJpZiI+CjxkZWZzPjxsaW5lYXJHcmFkaWVu"
+    "dCBpZD0icGNiVCIgeDE9IjAiIHkxPSIwIiB4Mj0iMCIgeTI9IjEiPjxzdG9wIG9mZnNldD0iMCIgc3RvcC1jb2xvcj0iIzA3OWFhMiIvPjxzdG9wIG9m"
+    "ZnNldD0iMSIgc3RvcC1jb2xvcj0iIzA0N2E4MiIvPjwvbGluZWFyR3JhZGllbnQ+PGxpbmVhckdyYWRpZW50IGlkPSJwY2JCIiB4MT0iMCIgeTE9IjAi"
+    "IHgyPSIwIiB5Mj0iMSI+PHN0b3Agb2Zmc2V0PSIwIiBzdG9wLWNvbG9yPSIjMjQ2OGM0Ii8+PHN0b3Agb2Zmc2V0PSIxIiBzdG9wLWNvbG9yPSIjMWE0"
+    "ZjlhIi8+PC9saW5lYXJHcmFkaWVudD48bGluZWFyR3JhZGllbnQgaWQ9Im1ldGFsIiB4MT0iMCIgeTE9IjAiIHgyPSIxIiB5Mj0iMCI+PHN0b3Agb2Zm"
+    "c2V0PSIwIiBzdG9wLWNvbG9yPSIjOWFhM2FkIi8+PHN0b3Agb2Zmc2V0PSIuNSIgc3RvcC1jb2xvcj0iI2U0ZThlYyIvPjxzdG9wIG9mZnNldD0iMSIg"
+    "c3RvcC1jb2xvcj0iIzlhYTNhZCIvPjwvbGluZWFyR3JhZGllbnQ+PGxpbmVhckdyYWRpZW50IGlkPSJzZW5zIiB4MT0iMCIgeTE9IjAiIHgyPSIwIiB5"
+    "Mj0iMSI+PHN0b3Agb2Zmc2V0PSIwIiBzdG9wLWNvbG9yPSIjM2EzZjQ3Ii8+PHN0b3Agb2Zmc2V0PSIxIiBzdG9wLWNvbG9yPSIjMTYxOTFkIi8+PC9s"
+    "aW5lYXJHcmFkaWVudD48ZmlsdGVyIGlkPSJzaCIgeD0iLTEwJSIgeT0iLTEwJSIgd2lkdGg9IjEzMCUiIGhlaWdodD0iMTMwJSI+PGZlRHJvcFNoYWRv"
+    "dyBkeD0iMCIgZHk9IjMiIHN0ZERldmlhdGlvbj0iNCIgZmxvb2QtY29sb3I9IiMwMDAiIGZsb29kLW9wYWNpdHk9Ii4yMiIvPjwvZmlsdGVyPjwvZGVm"
+    "cz4KPHJlY3Qgd2lkdGg9IjEyODAiIGhlaWdodD0iMTA2MCIgZmlsbD0iI2ZmZmZmZiIvPgo8dGV4dCB4PSI0MC4wIiB5PSI0Ni4wIiBmb250LXNpemU9"
+    "IjI1IiBmb250LXdlaWdodD0iNzAwIiBmaWxsPSIjMGYxYjJkIiB0ZXh0LWFuY2hvcj0ic3RhcnQiID5Qb3Qgbm9pc2UgZmlsdGVyOiB0aHJlZSBzbWFs"
+    "bCBwYXJ0cyBwZXIgcG90LCBhdCB0aGUgQXJkdWlubzwvdGV4dD4KPHRleHQgeD0iNDAuMCIgeT0iNzIuMCIgZm9udC1zaXplPSIxNCIgZm9udC13ZWln"
+    "aHQ9IjQwMCIgZmlsbD0iIzRhNWE3MCIgdGV4dC1hbmNob3I9InN0YXJ0IiA+RHJhd24gZm9yIG1vdG9yIDEgKEEwKS4gTW90b3IgMiBvbiBBMSBhbmQg"
+    "bW90b3IgMyBvbiBBMiBnZXQgdGhlIHNhbWUuIFN3aXRjaCB0aGUgbW90b3IgcG93ZXIgb2ZmIGFuZCB1bnBsdWcgdGhlIFVTQiBjYWJsZSB3aGlsZSB5"
+    "b3Ugd2lyZS48L3RleHQ+CjxyZWN0IHg9IjQwIiB5PSIxMDAiIHdpZHRoPSI3NDAiIGhlaWdodD0iMzMwIiByeD0iMTQiIGZpbGw9IiNmNmY5ZmMiIHN0"
+    "cm9rZT0iI2Q1ZGRlNiIgc3Ryb2tlLXdpZHRoPSIxLjUiLz4KPHRleHQgeD0iNjAuMCIgeT0iMTMwLjAiIGZvbnQtc2l6ZT0iMTUiIGZvbnQtd2VpZ2h0"
+    "PSI3MDAiIGZpbGw9IiMwZjFiMmQiIHRleHQtYW5jaG9yPSJzdGFydCIgPlRoZSBjaXJjdWl0PC90ZXh0Pgo8dGV4dCB4PSI2MC4wIiB5PSIxNTAuMCIg"
+    "Zm9udC1zaXplPSIxMiIgZm9udC13ZWlnaHQ9IjQwMCIgZmlsbD0iIzRhNWE3MCIgdGV4dC1hbmNob3I9InN0YXJ0IiA+b25lIHBlciBwb3Q8L3RleHQ+"
+    "CjxyZWN0IHg9IjQzMCIgeT0iMTk3IiB3aWR0aD0iMjMwIiBoZWlnaHQ9IjIxMCIgcng9IjEwIiBmaWxsPSIjZTNmNGYyIiBzdHJva2U9IiM5ZmQzY2Yi"
+    "IHN0cm9rZS1kYXNoYXJyYXk9IjUgNCIvPgo8dGV4dCB4PSI1NDUuMCIgeT0iMjE1LjAiIGZvbnQtc2l6ZT0iMTEuNSIgZm9udC13ZWlnaHQ9IjYwMCIg"
+    "ZmlsbD0iIzBiNmU2ZSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgPm9uIHRoZSBwZXJmYm9hcmQsIG5leHQgdG8gdGhlIEFyZHVpbm88L3RleHQ+CjxyZWN0"
+    "IHg9IjI1MCIgeT0iMTUzIiB3aWR0aD0iMTQwIiBoZWlnaHQ9IjI2NCIgcng9IjE4IiBmaWxsPSJub25lIiBzdHJva2U9IiM4Yjk0OWUiIHN0cm9rZS13"
+    "aWR0aD0iMS42IiBzdHJva2UtZGFzaGFycmF5PSI3IDUiLz4KPHRleHQgeD0iMzIwLjAiIHk9IjE0NS4wIiBmb250LXNpemU9IjExLjUiIGZvbnQtd2Vp"
+    "Z2h0PSI2MDAiIGZpbGw9IiM0YTVhNzAiIHRleHQtYW5jaG9yPSJtaWRkbGUiID5zaGllbGRlZCBjYWJsZTwvdGV4dD4KPHBhdGggZD0iTTE1MCwxNzUg"
+    "TDcwMCwxNzUiIHN0cm9rZT0iI2Q2MzMyYiIgc3Ryb2tlLXdpZHRoPSIyLjYiIGZpbGw9Im5vbmUiLz4KPHBhdGggZD0iTTE1MCwzOTUgTDcwMCwzOTUi"
+    "IHN0cm9rZT0iIzFiMWIxYiIgc3Ryb2tlLXdpZHRoPSIyLjYiIGZpbGw9Im5vbmUiLz4KPHBvbHlsaW5lIHBvaW50cz0iMTUwLDE3NSAxNTAsMjEwIDE2"
+    "MiwyMTcuNSAxMzgsMjMyLjUgMTYyLDI0Ny41IDEzOCwyNjIuNSAxNjIsMjc3LjUgMTM4LDI5Mi41IDE2MiwzMDcuNSAxMzgsMzIyLjUgMTUwLDM0NSAx"
+    "NTAsMzk1IiBmaWxsPSJub25lIiBzdHJva2U9IiMwZjFiMmQiIHN0cm9rZS13aWR0aD0iMi40IiBzdHJva2UtbGluZWpvaW49InJvdW5kIi8+CjxwYXRo"
+    "IGQ9Ik0yMTUsMjg1IEwxNzIsMjg1IiBzdHJva2U9IiNlOWE4MDAiIHN0cm9rZS13aWR0aD0iMi42Ii8+CjxwYXRoIGQ9Ik0xNzAsMjg1IGwxMSwtNiBs"
+    "MCwxMiB6IiBmaWxsPSIjMGYxYjJkIi8+Cjx0ZXh0IHg9IjEwMC4wIiB5PSIyNjguMCIgZm9udC1zaXplPSIxMi41IiBmb250LXdlaWdodD0iNzAwIiBm"
+    "aWxsPSIjMGYxYjJkIiB0ZXh0LWFuY2hvcj0iZW5kIiA+cG90PC90ZXh0Pgo8dGV4dCB4PSIxMDAuMCIgeT0iMjg0LjAiIGZvbnQtc2l6ZT0iMTEuNSIg"
+    "Zm9udC13ZWlnaHQ9IjQwMCIgZmlsbD0iIzRhNWE3MCIgdGV4dC1hbmNob3I9ImVuZCIgPm9uIHRoZTwvdGV4dD4KPHRleHQgeD0iMTAwLjAiIHk9IjI5"
+    "OS4wIiBmb250LXNpemU9IjExLjUiIGZvbnQtd2VpZ2h0PSI0MDAiIGZpbGw9IiM0YTVhNzAiIHRleHQtYW5jaG9yPSJlbmQiID5tb3RvcjwvdGV4dD4K"
+    "PHRleHQgeD0iMTU4LjAiIHk9IjE2Ny4wIiBmb250LXNpemU9IjEwLjUiIGZvbnQtd2VpZ2h0PSI0MDAiIGZpbGw9IiM0YTVhNzAiIHRleHQtYW5jaG9y"
+    "PSJzdGFydCIgPmx1ZyAxPC90ZXh0Pgo8dGV4dCB4PSIxNTguMCIgeT0iNDExLjAiIGZvbnQtc2l6ZT0iMTAuNSIgZm9udC13ZWlnaHQ9IjQwMCIgZmls"
+    "bD0iIzRhNWE3MCIgdGV4dC1hbmNob3I9InN0YXJ0IiA+bHVnIDM8L3RleHQ+Cjx0ZXh0IHg9IjE4NC4wIiB5PSIzMDMuMCIgZm9udC1zaXplPSIxMC41"
+    "IiBmb250LXdlaWdodD0iNDAwIiBmaWxsPSIjNGE1YTcwIiB0ZXh0LWFuY2hvcj0ic3RhcnQiID5sdWcgMjwvdGV4dD4KPHRleHQgeD0iMTg0LjAiIHk9"
+    "IjMxNi4wIiBmb250LXNpemU9IjEwLjUiIGZvbnQtd2VpZ2h0PSI0MDAiIGZpbGw9IiM0YTVhNzAiIHRleHQtYW5jaG9yPSJzdGFydCIgPih3aXBlcik8"
+    "L3RleHQ+CjxwYXRoIGQ9Ik0yMTUsMjg1IEw0NjAsMjg1IiBzdHJva2U9IiNlOWE4MDAiIHN0cm9rZS13aWR0aD0iMi42Ii8+Cjxwb2x5bGluZSBwb2lu"
+    "dHM9IjQ2MCwyODUgNDc0LDI3NSA0ODYsMjk1IDQ5OCwyNzUgNTEwLDI5NSA1MjIsMjc1IDUzNCwyOTUgNTQ4LDI4NSIgZmlsbD0ibm9uZSIgc3Ryb2tl"
+    "PSIjMGYxYjJkIiBzdHJva2Utd2lkdGg9IjIuNCIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCIvPgo8dGV4dCB4PSI1MDQuMCIgeT0iMjY1LjAiIGZvbnQt"
+    "c2l6ZT0iMTMiIGZvbnQtd2VpZ2h0PSI3MDAiIGZpbGw9IiMwZjFiMmQiIHRleHQtYW5jaG9yPSJtaWRkbGUiID5SMSAgMSBrzqk8L3RleHQ+CjxwYXRo"
+    "IGQ9Ik01NDgsMjg1IEw3MDAsMjg1IiBzdHJva2U9IiMwZjFiMmQiIHN0cm9rZS13aWR0aD0iMi42Ii8+CjxjaXJjbGUgY3g9IjU4NSIgY3k9IjI4NSIg"
+    "cj0iNC4yIiBmaWxsPSIjMGYxYjJkIi8+CjxjaXJjbGUgY3g9IjYzNSIgY3k9IjI4NSIgcj0iNC4yIiBmaWxsPSIjMGYxYjJkIi8+CjxwYXRoIGQ9Ik01"
+    "ODUsMjg1IEw1ODUsMzI1IE01NjUsMzI1IEw2MDUsMzI1IE01NjUsMzM1IEw2MDUsMzM1IE01ODUsMzM1IEw1ODUsMzk1IiBzdHJva2U9IiMwZjFiMmQi"
+    "IHN0cm9rZS13aWR0aD0iMi40IiBmaWxsPSJub25lIi8+CjxjaXJjbGUgY3g9IjU4NSIgY3k9IjM5NSIgcj0iNC4yIiBmaWxsPSIjMGYxYjJkIi8+Cjx0"
+    "ZXh0IHg9IjU3Mi4wIiB5PSIzNjcuMCIgZm9udC1zaXplPSIxMyIgZm9udC13ZWlnaHQ9IjcwMCIgZmlsbD0iIzBmMWIyZCIgdGV4dC1hbmNob3I9ImVu"
+    "ZCIgPkMxPC90ZXh0Pgo8dGV4dCB4PSI1NzIuMCIgeT0iMzgyLjAiIGZvbnQtc2l6ZT0iMTIiIGZvbnQtd2VpZ2h0PSI2MDAiIGZpbGw9IiMwZjFiMmQi"
+    "IHRleHQtYW5jaG9yPSJlbmQiID4xMDAgbkY8L3RleHQ+Cjxwb2x5bGluZSBwb2ludHM9IjYzNSwyODUgNjM1LDMwNyA2NDUsMzEyIDYyNSwzMjIgNjQ1"
+    "LDMzMiA2MjUsMzQyIDY0NSwzNTIgNjI1LDM2MiA2MzUsMzY3IDYzNSwzOTUiIGZpbGw9Im5vbmUiIHN0cm9rZT0iIzBmMWIyZCIgc3Ryb2tlLXdpZHRo"
+    "PSIyLjQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiLz4KPGNpcmNsZSBjeD0iNjM1IiBjeT0iMzk1IiByPSI0LjIiIGZpbGw9IiMwZjFiMmQiLz4KPHRl"
+    "eHQgeD0iNjUwLjAiIHk9IjMzMy4wIiBmb250LXNpemU9IjEzIiBmb250LXdlaWdodD0iNzAwIiBmaWxsPSIjMGYxYjJkIiB0ZXh0LWFuY2hvcj0ic3Rh"
+    "cnQiID5SMjwvdGV4dD4KPHRleHQgeD0iNjUwLjAiIHk9IjM0OC4wIiBmb250LXNpemU9IjEyIiBmb250LXdlaWdodD0iNjAwIiBmaWxsPSIjMGYxYjJk"
+    "IiB0ZXh0LWFuY2hvcj0ic3RhcnQiID4xIE3OqTwvdGV4dD4KPHBhdGggZD0iTTM5MiwzNjUgTDQxMCwzNjUgTDQxMCwzOTUiIHN0cm9rZT0iIzlhYTNh"
+    "ZCIgc3Ryb2tlLXdpZHRoPSIyLjQiIGZpbGw9Im5vbmUiIHN0cm9rZS1kYXNoYXJyYXk9IjAiLz4KPGNpcmNsZSBjeD0iNDEwIiBjeT0iMzk1IiByPSI0"
+    "LjIiIGZpbGw9IiMwZjFiMmQiLz4KPHRleHQgeD0iNDE2LjAiIHk9IjM2OS4wIiBmb250LXNpemU9IjEwLjUiIGZvbnQtd2VpZ2h0PSI2MDAiIGZpbGw9"
+    "IiM0YTVhNzAiIHRleHQtYW5jaG9yPSJzdGFydCIgPnNoaWVsZDwvdGV4dD4KPGNpcmNsZSBjeD0iNzA2IiBjeT0iMTc1IiByPSI2IiBmaWxsPSIjZmZm"
+    "ZmZmIiBzdHJva2U9IiNkNjMzMmIiIHN0cm9rZS13aWR0aD0iMi40Ii8+Cjx0ZXh0IHg9IjcxOC4wIiB5PSIxNzkuNSIgZm9udC1zaXplPSIxMyIgZm9u"
+    "dC13ZWlnaHQ9IjcwMCIgZmlsbD0iIzBmMWIyZCIgdGV4dC1hbmNob3I9InN0YXJ0IiA+NVY8L3RleHQ+CjxjaXJjbGUgY3g9IjcwNiIgY3k9IjI4NSIg"
+    "cj0iNiIgZmlsbD0iI2ZmZmZmZiIgc3Ryb2tlPSIjMGYxYjJkIiBzdHJva2Utd2lkdGg9IjIuNCIvPgo8dGV4dCB4PSI3MTguMCIgeT0iMjg5LjUiIGZv"
+    "bnQtc2l6ZT0iMTMiIGZvbnQtd2VpZ2h0PSI3MDAiIGZpbGw9IiMwZjFiMmQiIHRleHQtYW5jaG9yPSJzdGFydCIgPkEwPC90ZXh0Pgo8Y2lyY2xlIGN4"
+    "PSI3MDYiIGN5PSIzOTUiIHI9IjYiIGZpbGw9IiNmZmZmZmYiIHN0cm9rZT0iIzFiMWIxYiIgc3Ryb2tlLXdpZHRoPSIyLjQiLz4KPHRleHQgeD0iNzE4"
+    "LjAiIHk9IjM5OS41IiBmb250LXNpemU9IjEzIiBmb250LXdlaWdodD0iNzAwIiBmaWxsPSIjMGYxYjJkIiB0ZXh0LWFuY2hvcj0ic3RhcnQiID5HTkQ8"
+    "L3RleHQ+CjxnIHRyYW5zZm9ybT0idHJhbnNsYXRlKDAsLTcwKSI+CjxnIGZpbHRlcj0idXJsKCNzaCkiPjxyZWN0IHg9IjgyMCIgeT0iMTgwIiB3aWR0"
+    "aD0iNDIwIiBoZWlnaHQ9IjMyNyIgcng9IjExIiBmaWxsPSJ1cmwoI3BjYlQpIiBzdHJva2U9IiMwMzVlNjQiIHN0cm9rZS13aWR0aD0iMiIvPjwvZz4K"
+    "PGNpcmNsZSBjeD0iOTA1LjciIGN5PSIxOTUuMyIgcj0iNyIgZmlsbD0iI2ZmZmZmZiIgc3Ryb2tlPSIjMDM1ZTY0IiBzdHJva2Utd2lkdGg9IjEuNSIv"
+    "Pgo8Y2lyY2xlIGN4PSI5MTMuNyIgY3k9IjQ5MC40IiByPSI3IiBmaWxsPSIjZmZmZmZmIiBzdHJva2U9IiMwMzVlNjQiIHN0cm9rZS13aWR0aD0iMS41"
+    "Ii8+CjxjaXJjbGUgY3g9IjEyMjQuNyIgY3k9IjIyNi41IiByPSI3IiBmaWxsPSIjZmZmZmZmIiBzdHJva2U9IiMwMzVlNjQiIHN0cm9rZS13aWR0aD0i"
+    "MS41Ii8+CjxjaXJjbGUgY3g9IjEyMjQuNyIgY3k9IjM5Ny4zIiByPSI3IiBmaWxsPSIjZmZmZmZmIiBzdHJva2U9IiMwMzVlNjQiIHN0cm9rZS13aWR0"
+    "aD0iMS41Ii8+CjxyZWN0IHg9IjgwNiIgeT0iMjIwIiB3aWR0aD0iMzQiIGhlaWdodD0iNDQiIHJ4PSI2IiBmaWxsPSJ1cmwoI21ldGFsKSIgc3Ryb2tl"
+    "PSIjNmQ3NjgwIi8+Cjx0ZXh0IHg9Ijg0Ni4wIiB5PSIyNDYuMCIgZm9udC1zaXplPSIxMCIgZm9udC13ZWlnaHQ9IjcwMCIgZmlsbD0iI2U2ZmJmYyIg"
+    "dGV4dC1hbmNob3I9InN0YXJ0IiA+VVNCLUM8L3RleHQ+CjxyZWN0IHg9IjgwMiIgeT0iNDAzIiB3aWR0aD0iNTYiIGhlaWdodD0iNjQiIHJ4PSI1IiBm"
+    "aWxsPSIjMTYxOTFkIi8+CjxjaXJjbGUgY3g9IjgzMCIgY3k9IjQzNSIgcj0iMTIiIGZpbGw9IiMyYjMwMzYiLz4KPHJlY3QgeD0iOTYwIiB5PSIzMDIi"
+    "IHdpZHRoPSIxNTAiIGhlaWdodD0iMTA2IiByeD0iNSIgZmlsbD0iIzA0NjY2YyIvPgo8cmVjdCB4PSI5NzAiIHk9IjMxMiIgd2lkdGg9IjYiIGhlaWdo"
+    "dD0iNCIgcng9IjEiIGZpbGw9IiNkOWYzZjQiIG9wYWNpdHk9IjAuNTUiLz4KPHJlY3QgeD0iOTgxIiB5PSIzMTIiIHdpZHRoPSI2IiBoZWlnaHQ9IjQi"
+    "IHJ4PSIxIiBmaWxsPSIjZDlmM2Y0IiBvcGFjaXR5PSIwLjU1Ii8+CjxyZWN0IHg9Ijk5MiIgeT0iMzEyIiB3aWR0aD0iNiIgaGVpZ2h0PSI0IiByeD0i"
+    "MSIgZmlsbD0iI2Q5ZjNmNCIgb3BhY2l0eT0iMC41NSIvPgo8cmVjdCB4PSIxMDAzIiB5PSIzMTIiIHdpZHRoPSI2IiBoZWlnaHQ9IjQiIHJ4PSIxIiBm"
+    "aWxsPSIjZDlmM2Y0IiBvcGFjaXR5PSIwLjU1Ii8+CjxyZWN0IHg9IjEwMTQiIHk9IjMxMiIgd2lkdGg9IjYiIGhlaWdodD0iNCIgcng9IjEiIGZpbGw9"
+    "IiNkOWYzZjQiIG9wYWNpdHk9IjAuNTUiLz4KPHJlY3QgeD0iMTAyNSIgeT0iMzEyIiB3aWR0aD0iNiIgaGVpZ2h0PSI0IiByeD0iMSIgZmlsbD0iI2Q5"
+    "ZjNmNCIgb3BhY2l0eT0iMC41NSIvPgo8cmVjdCB4PSIxMDM2IiB5PSIzMTIiIHdpZHRoPSI2IiBoZWlnaHQ9IjQiIHJ4PSIxIiBmaWxsPSIjZDlmM2Y0"
+    "IiBvcGFjaXR5PSIwLjU1Ii8+CjxyZWN0IHg9IjEwNDciIHk9IjMxMiIgd2lkdGg9IjYiIGhlaWdodD0iNCIgcng9IjEiIGZpbGw9IiNkOWYzZjQiIG9w"
+    "YWNpdHk9IjAuNTUiLz4KPHJlY3QgeD0iMTA1OCIgeT0iMzEyIiB3aWR0aD0iNiIgaGVpZ2h0PSI0IiByeD0iMSIgZmlsbD0iI2Q5ZjNmNCIgb3BhY2l0"
+    "eT0iMC41NSIvPgo8cmVjdCB4PSIxMDY5IiB5PSIzMTIiIHdpZHRoPSI2IiBoZWlnaHQ9IjQiIHJ4PSIxIiBmaWxsPSIjZDlmM2Y0IiBvcGFjaXR5PSIw"
+    "LjU1Ii8+CjxyZWN0IHg9IjEwODAiIHk9IjMxMiIgd2lkdGg9IjYiIGhlaWdodD0iNCIgcng9IjEiIGZpbGw9IiNkOWYzZjQiIG9wYWNpdHk9IjAuNTUi"
+    "Lz4KPHJlY3QgeD0iMTA5MSIgeT0iMzEyIiB3aWR0aD0iNiIgaGVpZ2h0PSI0IiByeD0iMSIgZmlsbD0iI2Q5ZjNmNCIgb3BhY2l0eT0iMC41NSIvPgo8"
+    "cmVjdCB4PSI5NzAiIHk9IjMyMyIgd2lkdGg9IjYiIGhlaWdodD0iNCIgcng9IjEiIGZpbGw9IiNkOWYzZjQiIG9wYWNpdHk9IjAuNTUiLz4KPHJlY3Qg"
+    "eD0iOTgxIiB5PSIzMjMiIHdpZHRoPSI2IiBoZWlnaHQ9IjQiIHJ4PSIxIiBmaWxsPSIjZDlmM2Y0IiBvcGFjaXR5PSIwLjU1Ii8+CjxyZWN0IHg9Ijk5"
+    "MiIgeT0iMzIzIiB3aWR0aD0iNiIgaGVpZ2h0PSI0IiByeD0iMSIgZmlsbD0iI2Q5ZjNmNCIgb3BhY2l0eT0iMC41NSIvPgo8cmVjdCB4PSIxMDAzIiB5"
+    "PSIzMjMiIHdpZHRoPSI2IiBoZWlnaHQ9IjQiIHJ4PSIxIiBmaWxsPSIjZDlmM2Y0IiBvcGFjaXR5PSIwLjU1Ii8+CjxyZWN0IHg9IjEwMTQiIHk9IjMy"
+    "MyIgd2lkdGg9IjYiIGhlaWdodD0iNCIgcng9IjEiIGZpbGw9IiNkOWYzZjQiIG9wYWNpdHk9IjAuNTUiLz4KPHJlY3QgeD0iMTAyNSIgeT0iMzIzIiB3"
+    "aWR0aD0iNiIgaGVpZ2h0PSI0IiByeD0iMSIgZmlsbD0iI2Q5ZjNmNCIgb3BhY2l0eT0iMC41NSIvPgo8cmVjdCB4PSIxMDM2IiB5PSIzMjMiIHdpZHRo"
+    "PSI2IiBoZWlnaHQ9IjQiIHJ4PSIxIiBmaWxsPSIjZDlmM2Y0IiBvcGFjaXR5PSIwLjU1Ii8+CjxyZWN0IHg9IjEwNDciIHk9IjMyMyIgd2lkdGg9IjYi"
+    "IGhlaWdodD0iNCIgcng9IjEiIGZpbGw9IiNkOWYzZjQiIG9wYWNpdHk9IjAuNTUiLz4KPHJlY3QgeD0iMTA1OCIgeT0iMzIzIiB3aWR0aD0iNiIgaGVp"
+    "Z2h0PSI0IiByeD0iMSIgZmlsbD0iI2Q5ZjNmNCIgb3BhY2l0eT0iMC41NSIvPgo8cmVjdCB4PSIxMDY5IiB5PSIzMjMiIHdpZHRoPSI2IiBoZWlnaHQ9"
+    "IjQiIHJ4PSIxIiBmaWxsPSIjZDlmM2Y0IiBvcGFjaXR5PSIwLjU1Ii8+CjxyZWN0IHg9IjEwODAiIHk9IjMyMyIgd2lkdGg9IjYiIGhlaWdodD0iNCIg"
+    "cng9IjEiIGZpbGw9IiNkOWYzZjQiIG9wYWNpdHk9IjAuNTUiLz4KPHJlY3QgeD0iMTA5MSIgeT0iMzIzIiB3aWR0aD0iNiIgaGVpZ2h0PSI0IiByeD0i"
+    "MSIgZmlsbD0iI2Q5ZjNmNCIgb3BhY2l0eT0iMC41NSIvPgo8cmVjdCB4PSI5NzAiIHk9IjMzNCIgd2lkdGg9IjYiIGhlaWdodD0iNCIgcng9IjEiIGZp"
+    "bGw9IiNkOWYzZjQiIG9wYWNpdHk9IjAuNTUiLz4KPHJlY3QgeD0iOTgxIiB5PSIzMzQiIHdpZHRoPSI2IiBoZWlnaHQ9IjQiIHJ4PSIxIiBmaWxsPSIj"
+    "ZDlmM2Y0IiBvcGFjaXR5PSIwLjU1Ii8+CjxyZWN0IHg9Ijk5MiIgeT0iMzM0IiB3aWR0aD0iNiIgaGVpZ2h0PSI0IiByeD0iMSIgZmlsbD0iI2Q5ZjNm"
+    "NCIgb3BhY2l0eT0iMC41NSIvPgo8cmVjdCB4PSIxMDAzIiB5PSIzMzQiIHdpZHRoPSI2IiBoZWlnaHQ9IjQiIHJ4PSIxIiBmaWxsPSIjZmY1YTRhIiBv"
+    "cGFjaXR5PSIxIi8+CjxyZWN0IHg9IjEwMTQiIHk9IjMzNCIgd2lkdGg9IjYiIGhlaWdodD0iNCIgcng9IjEiIGZpbGw9IiNkOWYzZjQiIG9wYWNpdHk9"
+    "IjAuNTUiLz4KPHJlY3QgeD0iMTAyNSIgeT0iMzM0IiB3aWR0aD0iNiIgaGVpZ2h0PSI0IiByeD0iMSIgZmlsbD0iI2Q5ZjNmNCIgb3BhY2l0eT0iMC41"
+    "NSIvPgo8cmVjdCB4PSIxMDM2IiB5PSIzMzQiIHdpZHRoPSI2IiBoZWlnaHQ9IjQiIHJ4PSIxIiBmaWxsPSIjZDlmM2Y0IiBvcGFjaXR5PSIwLjU1Ii8+"
+    "CjxyZWN0IHg9IjEwNDciIHk9IjMzNCIgd2lkdGg9IjYiIGhlaWdodD0iNCIgcng9IjEiIGZpbGw9IiNkOWYzZjQiIG9wYWNpdHk9IjAuNTUiLz4KPHJl"
+    "Y3QgeD0iMTA1OCIgeT0iMzM0IiB3aWR0aD0iNiIgaGVpZ2h0PSI0IiByeD0iMSIgZmlsbD0iI2ZmNWE0YSIgb3BhY2l0eT0iMSIvPgo8cmVjdCB4PSIx"
+    "MDY5IiB5PSIzMzQiIHdpZHRoPSI2IiBoZWlnaHQ9IjQiIHJ4PSIxIiBmaWxsPSIjZDlmM2Y0IiBvcGFjaXR5PSIwLjU1Ii8+CjxyZWN0IHg9IjEwODAi"
+    "IHk9IjMzNCIgd2lkdGg9IjYiIGhlaWdodD0iNCIgcng9IjEiIGZpbGw9IiNkOWYzZjQiIG9wYWNpdHk9IjAuNTUiLz4KPHJlY3QgeD0iMTA5MSIgeT0i"
+    "MzM0IiB3aWR0aD0iNiIgaGVpZ2h0PSI0IiByeD0iMSIgZmlsbD0iI2Q5ZjNmNCIgb3BhY2l0eT0iMC41NSIvPgo8cmVjdCB4PSI5NzAiIHk9IjM0NSIg"
+    "d2lkdGg9IjYiIGhlaWdodD0iNCIgcng9IjEiIGZpbGw9IiNkOWYzZjQiIG9wYWNpdHk9IjAuNTUiLz4KPHJlY3QgeD0iOTgxIiB5PSIzNDUiIHdpZHRo"
+    "PSI2IiBoZWlnaHQ9IjQiIHJ4PSIxIiBmaWxsPSIjZDlmM2Y0IiBvcGFjaXR5PSIwLjU1Ii8+CjxyZWN0IHg9Ijk5MiIgeT0iMzQ1IiB3aWR0aD0iNiIg"
+    "aGVpZ2h0PSI0IiByeD0iMSIgZmlsbD0iI2Q5ZjNmNCIgb3BhY2l0eT0iMC41NSIvPgo8cmVjdCB4PSIxMDAzIiB5PSIzNDUiIHdpZHRoPSI2IiBoZWln"
+    "aHQ9IjQiIHJ4PSIxIiBmaWxsPSIjZmY1YTRhIiBvcGFjaXR5PSIxIi8+CjxyZWN0IHg9IjEwMTQiIHk9IjM0NSIgd2lkdGg9IjYiIGhlaWdodD0iNCIg"
+    "cng9IjEiIGZpbGw9IiNkOWYzZjQiIG9wYWNpdHk9IjAuNTUiLz4KPHJlY3QgeD0iMTAyNSIgeT0iMzQ1IiB3aWR0aD0iNiIgaGVpZ2h0PSI0IiByeD0i"
+    "MSIgZmlsbD0iI2Q5ZjNmNCIgb3BhY2l0eT0iMC41NSIvPgo8cmVjdCB4PSIxMDM2IiB5PSIzNDUiIHdpZHRoPSI2IiBoZWlnaHQ9IjQiIHJ4PSIxIiBm"
+    "aWxsPSIjZDlmM2Y0IiBvcGFjaXR5PSIwLjU1Ii8+CjxyZWN0IHg9IjEwNDciIHk9IjM0NSIgd2lkdGg9IjYiIGhlaWdodD0iNCIgcng9IjEiIGZpbGw9"
+    "IiNkOWYzZjQiIG9wYWNpdHk9IjAuNTUiLz4KPHJlY3QgeD0iMTA1OCIgeT0iMzQ1IiB3aWR0aD0iNiIgaGVpZ2h0PSI0IiByeD0iMSIgZmlsbD0iI2Zm"
+    "NWE0YSIgb3BhY2l0eT0iMSIvPgo8cmVjdCB4PSIxMDY5IiB5PSIzNDUiIHdpZHRoPSI2IiBoZWlnaHQ9IjQiIHJ4PSIxIiBmaWxsPSIjZDlmM2Y0IiBv"
+    "cGFjaXR5PSIwLjU1Ii8+CjxyZWN0IHg9IjEwODAiIHk9IjM0NSIgd2lkdGg9IjYiIGhlaWdodD0iNCIgcng9IjEiIGZpbGw9IiNkOWYzZjQiIG9wYWNp"
+    "dHk9IjAuNTUiLz4KPHJlY3QgeD0iMTA5MSIgeT0iMzQ1IiB3aWR0aD0iNiIgaGVpZ2h0PSI0IiByeD0iMSIgZmlsbD0iI2Q5ZjNmNCIgb3BhY2l0eT0i"
+    "MC41NSIvPgo8cmVjdCB4PSI5NzAiIHk9IjM1NiIgd2lkdGg9IjYiIGhlaWdodD0iNCIgcng9IjEiIGZpbGw9IiNkOWYzZjQiIG9wYWNpdHk9IjAuNTUi"
+    "Lz4KPHJlY3QgeD0iOTgxIiB5PSIzNTYiIHdpZHRoPSI2IiBoZWlnaHQ9IjQiIHJ4PSIxIiBmaWxsPSIjZDlmM2Y0IiBvcGFjaXR5PSIwLjU1Ii8+Cjxy"
+    "ZWN0IHg9Ijk5MiIgeT0iMzU2IiB3aWR0aD0iNiIgaGVpZ2h0PSI0IiByeD0iMSIgZmlsbD0iI2Q5ZjNmNCIgb3BhY2l0eT0iMC41NSIvPgo8cmVjdCB4"
+    "PSIxMDAzIiB5PSIzNTYiIHdpZHRoPSI2IiBoZWlnaHQ9IjQiIHJ4PSIxIiBmaWxsPSIjZmY1YTRhIiBvcGFjaXR5PSIxIi8+CjxyZWN0IHg9IjEwMTQi"
+    "IHk9IjM1NiIgd2lkdGg9IjYiIGhlaWdodD0iNCIgcng9IjEiIGZpbGw9IiNkOWYzZjQiIG9wYWNpdHk9IjAuNTUiLz4KPHJlY3QgeD0iMTAyNSIgeT0i"
+    "MzU2IiB3aWR0aD0iNiIgaGVpZ2h0PSI0IiByeD0iMSIgZmlsbD0iI2Q5ZjNmNCIgb3BhY2l0eT0iMC41NSIvPgo8cmVjdCB4PSIxMDM2IiB5PSIzNTYi"
+    "IHdpZHRoPSI2IiBoZWlnaHQ9IjQiIHJ4PSIxIiBmaWxsPSIjZDlmM2Y0IiBvcGFjaXR5PSIwLjU1Ii8+CjxyZWN0IHg9IjEwNDciIHk9IjM1NiIgd2lk"
+    "dGg9IjYiIGhlaWdodD0iNCIgcng9IjEiIGZpbGw9IiNkOWYzZjQiIG9wYWNpdHk9IjAuNTUiLz4KPHJlY3QgeD0iMTA1OCIgeT0iMzU2IiB3aWR0aD0i"
+    "NiIgaGVpZ2h0PSI0IiByeD0iMSIgZmlsbD0iI2ZmNWE0YSIgb3BhY2l0eT0iMSIvPgo8cmVjdCB4PSIxMDY5IiB5PSIzNTYiIHdpZHRoPSI2IiBoZWln"
+    "aHQ9IjQiIHJ4PSIxIiBmaWxsPSIjZDlmM2Y0IiBvcGFjaXR5PSIwLjU1Ii8+CjxyZWN0IHg9IjEwODAiIHk9IjM1NiIgd2lkdGg9IjYiIGhlaWdodD0i"
+    "NCIgcng9IjEiIGZpbGw9IiNkOWYzZjQiIG9wYWNpdHk9IjAuNTUiLz4KPHJlY3QgeD0iMTA5MSIgeT0iMzU2IiB3aWR0aD0iNiIgaGVpZ2h0PSI0IiBy"
+    "eD0iMSIgZmlsbD0iI2Q5ZjNmNCIgb3BhY2l0eT0iMC41NSIvPgo8cmVjdCB4PSI5NzAiIHk9IjM2NyIgd2lkdGg9IjYiIGhlaWdodD0iNCIgcng9IjEi"
+    "IGZpbGw9IiNkOWYzZjQiIG9wYWNpdHk9IjAuNTUiLz4KPHJlY3QgeD0iOTgxIiB5PSIzNjciIHdpZHRoPSI2IiBoZWlnaHQ9IjQiIHJ4PSIxIiBmaWxs"
+    "PSIjZDlmM2Y0IiBvcGFjaXR5PSIwLjU1Ii8+CjxyZWN0IHg9Ijk5MiIgeT0iMzY3IiB3aWR0aD0iNiIgaGVpZ2h0PSI0IiByeD0iMSIgZmlsbD0iI2Q5"
+    "ZjNmNCIgb3BhY2l0eT0iMC41NSIvPgo8cmVjdCB4PSIxMDAzIiB5PSIzNjciIHdpZHRoPSI2IiBoZWlnaHQ9IjQiIHJ4PSIxIiBmaWxsPSIjZmY1YTRh"
+    "IiBvcGFjaXR5PSIxIi8+CjxyZWN0IHg9IjEwMTQiIHk9IjM2NyIgd2lkdGg9IjYiIGhlaWdodD0iNCIgcng9IjEiIGZpbGw9IiNkOWYzZjQiIG9wYWNp"
+    "dHk9IjAuNTUiLz4KPHJlY3QgeD0iMTAyNSIgeT0iMzY3IiB3aWR0aD0iNiIgaGVpZ2h0PSI0IiByeD0iMSIgZmlsbD0iI2Q5ZjNmNCIgb3BhY2l0eT0i"
+    "MC41NSIvPgo8cmVjdCB4PSIxMDM2IiB5PSIzNjciIHdpZHRoPSI2IiBoZWlnaHQ9IjQiIHJ4PSIxIiBmaWxsPSIjZDlmM2Y0IiBvcGFjaXR5PSIwLjU1"
+    "Ii8+CjxyZWN0IHg9IjEwNDciIHk9IjM2NyIgd2lkdGg9IjYiIGhlaWdodD0iNCIgcng9IjEiIGZpbGw9IiNkOWYzZjQiIG9wYWNpdHk9IjAuNTUiLz4K"
+    "PHJlY3QgeD0iMTA1OCIgeT0iMzY3IiB3aWR0aD0iNiIgaGVpZ2h0PSI0IiByeD0iMSIgZmlsbD0iI2ZmNWE0YSIgb3BhY2l0eT0iMSIvPgo8cmVjdCB4"
+    "PSIxMDY5IiB5PSIzNjciIHdpZHRoPSI2IiBoZWlnaHQ9IjQiIHJ4PSIxIiBmaWxsPSIjZDlmM2Y0IiBvcGFjaXR5PSIwLjU1Ii8+CjxyZWN0IHg9IjEw"
+    "ODAiIHk9IjM2NyIgd2lkdGg9IjYiIGhlaWdodD0iNCIgcng9IjEiIGZpbGw9IiNkOWYzZjQiIG9wYWNpdHk9IjAuNTUiLz4KPHJlY3QgeD0iMTA5MSIg"
+    "eT0iMzY3IiB3aWR0aD0iNiIgaGVpZ2h0PSI0IiByeD0iMSIgZmlsbD0iI2Q5ZjNmNCIgb3BhY2l0eT0iMC41NSIvPgo8cmVjdCB4PSI5NzAiIHk9IjM3"
+    "OCIgd2lkdGg9IjYiIGhlaWdodD0iNCIgcng9IjEiIGZpbGw9IiNkOWYzZjQiIG9wYWNpdHk9IjAuNTUiLz4KPHJlY3QgeD0iOTgxIiB5PSIzNzgiIHdp"
+    "ZHRoPSI2IiBoZWlnaHQ9IjQiIHJ4PSIxIiBmaWxsPSIjZDlmM2Y0IiBvcGFjaXR5PSIwLjU1Ii8+CjxyZWN0IHg9Ijk5MiIgeT0iMzc4IiB3aWR0aD0i"
+    "NiIgaGVpZ2h0PSI0IiByeD0iMSIgZmlsbD0iI2Q5ZjNmNCIgb3BhY2l0eT0iMC41NSIvPgo8cmVjdCB4PSIxMDAzIiB5PSIzNzgiIHdpZHRoPSI2IiBo"
+    "ZWlnaHQ9IjQiIHJ4PSIxIiBmaWxsPSIjZmY1YTRhIiBvcGFjaXR5PSIxIi8+CjxyZWN0IHg9IjEwMTQiIHk9IjM3OCIgd2lkdGg9IjYiIGhlaWdodD0i"
+    "NCIgcng9IjEiIGZpbGw9IiNkOWYzZjQiIG9wYWNpdHk9IjAuNTUiLz4KPHJlY3QgeD0iMTAyNSIgeT0iMzc4IiB3aWR0aD0iNiIgaGVpZ2h0PSI0IiBy"
+    "eD0iMSIgZmlsbD0iI2Q5ZjNmNCIgb3BhY2l0eT0iMC41NSIvPgo8cmVjdCB4PSIxMDM2IiB5PSIzNzgiIHdpZHRoPSI2IiBoZWlnaHQ9IjQiIHJ4PSIx"
+    "IiBmaWxsPSIjZDlmM2Y0IiBvcGFjaXR5PSIwLjU1Ii8+CjxyZWN0IHg9IjEwNDciIHk9IjM3OCIgd2lkdGg9IjYiIGhlaWdodD0iNCIgcng9IjEiIGZp"
+    "bGw9IiNkOWYzZjQiIG9wYWNpdHk9IjAuNTUiLz4KPHJlY3QgeD0iMTA1OCIgeT0iMzc4IiB3aWR0aD0iNiIgaGVpZ2h0PSI0IiByeD0iMSIgZmlsbD0i"
+    "I2ZmNWE0YSIgb3BhY2l0eT0iMSIvPgo8cmVjdCB4PSIxMDY5IiB5PSIzNzgiIHdpZHRoPSI2IiBoZWlnaHQ9IjQiIHJ4PSIxIiBmaWxsPSIjZDlmM2Y0"
+    "IiBvcGFjaXR5PSIwLjU1Ii8+CjxyZWN0IHg9IjEwODAiIHk9IjM3OCIgd2lkdGg9IjYiIGhlaWdodD0iNCIgcng9IjEiIGZpbGw9IiNkOWYzZjQiIG9w"
+    "YWNpdHk9IjAuNTUiLz4KPHJlY3QgeD0iMTA5MSIgeT0iMzc4IiB3aWR0aD0iNiIgaGVpZ2h0PSI0IiByeD0iMSIgZmlsbD0iI2Q5ZjNmNCIgb3BhY2l0"
+    "eT0iMC41NSIvPgo8cmVjdCB4PSI5NzAiIHk9IjM4OSIgd2lkdGg9IjYiIGhlaWdodD0iNCIgcng9IjEiIGZpbGw9IiNkOWYzZjQiIG9wYWNpdHk9IjAu"
+    "NTUiLz4KPHJlY3QgeD0iOTgxIiB5PSIzODkiIHdpZHRoPSI2IiBoZWlnaHQ9IjQiIHJ4PSIxIiBmaWxsPSIjZDlmM2Y0IiBvcGFjaXR5PSIwLjU1Ii8+"
+    "CjxyZWN0IHg9Ijk5MiIgeT0iMzg5IiB3aWR0aD0iNiIgaGVpZ2h0PSI0IiByeD0iMSIgZmlsbD0iI2Q5ZjNmNCIgb3BhY2l0eT0iMC41NSIvPgo8cmVj"
+    "dCB4PSIxMDAzIiB5PSIzODkiIHdpZHRoPSI2IiBoZWlnaHQ9IjQiIHJ4PSIxIiBmaWxsPSIjZDlmM2Y0IiBvcGFjaXR5PSIwLjU1Ii8+CjxyZWN0IHg9"
+    "IjEwMTQiIHk9IjM4OSIgd2lkdGg9IjYiIGhlaWdodD0iNCIgcng9IjEiIGZpbGw9IiNkOWYzZjQiIG9wYWNpdHk9IjAuNTUiLz4KPHJlY3QgeD0iMTAy"
+    "NSIgeT0iMzg5IiB3aWR0aD0iNiIgaGVpZ2h0PSI0IiByeD0iMSIgZmlsbD0iI2Q5ZjNmNCIgb3BhY2l0eT0iMC41NSIvPgo8cmVjdCB4PSIxMDM2IiB5"
+    "PSIzODkiIHdpZHRoPSI2IiBoZWlnaHQ9IjQiIHJ4PSIxIiBmaWxsPSIjZDlmM2Y0IiBvcGFjaXR5PSIwLjU1Ii8+CjxyZWN0IHg9IjEwNDciIHk9IjM4"
+    "OSIgd2lkdGg9IjYiIGhlaWdodD0iNCIgcng9IjEiIGZpbGw9IiNkOWYzZjQiIG9wYWNpdHk9IjAuNTUiLz4KPHJlY3QgeD0iMTA1OCIgeT0iMzg5IiB3"
+    "aWR0aD0iNiIgaGVpZ2h0PSI0IiByeD0iMSIgZmlsbD0iI2Q5ZjNmNCIgb3BhY2l0eT0iMC41NSIvPgo8cmVjdCB4PSIxMDY5IiB5PSIzODkiIHdpZHRo"
+    "PSI2IiBoZWlnaHQ9IjQiIHJ4PSIxIiBmaWxsPSIjZDlmM2Y0IiBvcGFjaXR5PSIwLjU1Ii8+CjxyZWN0IHg9IjEwODAiIHk9IjM4OSIgd2lkdGg9IjYi"
+    "IGhlaWdodD0iNCIgcng9IjEiIGZpbGw9IiNkOWYzZjQiIG9wYWNpdHk9IjAuNTUiLz4KPHJlY3QgeD0iMTA5MSIgeT0iMzg5IiB3aWR0aD0iNiIgaGVp"
+    "Z2h0PSI0IiByeD0iMSIgZmlsbD0iI2Q5ZjNmNCIgb3BhY2l0eT0iMC41NSIvPgo8cmVjdCB4PSIxMTMyIiB5PSIzMDAiIHdpZHRoPSI4NCIgaGVpZ2h0"
+    "PSI2MiIgcng9IjQiIGZpbGw9InVybCgjbWV0YWwpIiBzdHJva2U9IiM2ZDc2ODAiLz4KPHRleHQgeD0iMTE3NC4wIiB5PSIzMzYuMCIgZm9udC1zaXpl"
+    "PSIxMCIgZm9udC13ZWlnaHQ9IjcwMCIgZmlsbD0iIzNiNDQ1MCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgPkVTUDMyLVMzPC90ZXh0Pgo8cmVjdCB4PSIx"
+    "MTUwIiB5PSIzNzIiIHdpZHRoPSI0NiIgaGVpZ2h0PSI0NiIgcng9IjMiIGZpbGw9IiMxYjFlMjIiLz4KPHRleHQgeD0iMTE3My4wIiB5PSIzOTkuMCIg"
+    "Zm9udC1zaXplPSI4LjUiIGZvbnQtd2VpZ2h0PSI3MDAiIGZpbGw9IiNjZmQ1ZGIiIHRleHQtYW5jaG9yPSJtaWRkbGUiID5SQTRNMTwvdGV4dD4KPHJl"
+    "Y3QgeD0iMTA5MC45IiB5PSIxODUiIHdpZHRoPSIxMjYuOSIgaGVpZ2h0PSIxOCIgcng9IjIiIGZpbGw9IiMxNTE3MWEiLz4KPHJlY3QgeD0iOTI2LjEi"
+    "IHk9IjE4NSIgd2lkdGg9IjE1OC4wIiBoZWlnaHQ9IjE4IiByeD0iMiIgZmlsbD0iIzE1MTcxYSIvPgo8cmVjdCB4PSI5ODIuMSIgeT0iNDg0IiB3aWR0"
+    "aD0iMTI2LjkiIGhlaWdodD0iMTgiIHJ4PSIyIiBmaWxsPSIjMTUxNzFhIi8+CjxyZWN0IHg9IjExMjIuMCIgeT0iNDg0IiB3aWR0aD0iOTUuOCIgaGVp"
+    "Z2h0PSIxOCIgcng9IjIiIGZpbGw9IiMxNTE3MWEiLz4KPHJlY3QgeD0iMTIwNS4zIiB5PSIxOTAuNSIgd2lkdGg9IjciIGhlaWdodD0iNyIgZmlsbD0i"
+    "I2Q0YjA0YSIvPgo8dGV4dCB4PSIxMjEyLjMiIHk9IjIxMC4wIiBmb250LXNpemU9IjEwIiBmb250LXdlaWdodD0iNDAwIiBmaWxsPSIjZmZmZmZmIiB0"
+    "ZXh0LWFuY2hvcj0iZW5kIiB0cmFuc2Zvcm09InJvdGF0ZSgtOTAgMTIxMi4zIDIxMCkiPlJY4peAMDwvdGV4dD4KPHJlY3QgeD0iMTE4OS43IiB5PSIx"
+    "OTAuNSIgd2lkdGg9IjciIGhlaWdodD0iNyIgZmlsbD0iI2Q0YjA0YSIvPgo8dGV4dCB4PSIxMTk2LjciIHk9IjIxMC4wIiBmb250LXNpemU9IjEwIiBm"
+    "b250LXdlaWdodD0iNDAwIiBmaWxsPSIjZmZmZmZmIiB0ZXh0LWFuY2hvcj0iZW5kIiB0cmFuc2Zvcm09InJvdGF0ZSgtOTAgMTE5Ni43IDIxMCkiPlRY"
+    "4pa2MTwvdGV4dD4KPHJlY3QgeD0iMTE3NC4yIiB5PSIxOTAuNSIgd2lkdGg9IjciIGhlaWdodD0iNyIgZmlsbD0iI2Q0YjA0YSIvPgo8dGV4dCB4PSIx"
+    "MTgxLjIiIHk9IjIxMC4wIiBmb250LXNpemU9IjEwIiBmb250LXdlaWdodD0iNDAwIiBmaWxsPSIjOWZkOWRjIiB0ZXh0LWFuY2hvcj0iZW5kIiB0cmFu"
+    "c2Zvcm09InJvdGF0ZSgtOTAgMTE4MS4yIDIxMCkiPjI8L3RleHQ+CjxyZWN0IHg9IjExNTguNiIgeT0iMTkwLjUiIHdpZHRoPSI3IiBoZWlnaHQ9Ijci"
+    "IGZpbGw9IiNkNGIwNGEiLz4KPHRleHQgeD0iMTE2NS42IiB5PSIyMTAuMCIgZm9udC1zaXplPSIxMCIgZm9udC13ZWlnaHQ9IjQwMCIgZmlsbD0iIzlm"
+    "ZDlkYyIgdGV4dC1hbmNob3I9ImVuZCIgdHJhbnNmb3JtPSJyb3RhdGUoLTkwIDExNjUuNiAyMTApIj4zPC90ZXh0Pgo8cmVjdCB4PSIxMTQzLjEiIHk9"
+    "IjE5MC41IiB3aWR0aD0iNyIgaGVpZ2h0PSI3IiBmaWxsPSIjZDRiMDRhIi8+Cjx0ZXh0IHg9IjExNTAuMSIgeT0iMjEwLjAiIGZvbnQtc2l6ZT0iMTAi"
+    "IGZvbnQtd2VpZ2h0PSI0MDAiIGZpbGw9IiM5ZmQ5ZGMiIHRleHQtYW5jaG9yPSJlbmQiIHRyYW5zZm9ybT0icm90YXRlKC05MCAxMTUwLjEgMjEwKSI+"
+    "NDwvdGV4dD4KPHJlY3QgeD0iMTEyNy41IiB5PSIxOTAuNSIgd2lkdGg9IjciIGhlaWdodD0iNyIgZmlsbD0iI2Q0YjA0YSIvPgo8dGV4dCB4PSIxMTM0"
+    "LjUiIHk9IjIxMC4wIiBmb250LXNpemU9IjEwIiBmb250LXdlaWdodD0iNDAwIiBmaWxsPSIjOWZkOWRjIiB0ZXh0LWFuY2hvcj0iZW5kIiB0cmFuc2Zv"
+    "cm09InJvdGF0ZSgtOTAgMTEzNC41IDIxMCkiPjU8L3RleHQ+CjxyZWN0IHg9IjExMTIuMCIgeT0iMTkwLjUiIHdpZHRoPSI3IiBoZWlnaHQ9IjciIGZp"
+    "bGw9IiNkNGIwNGEiLz4KPHRleHQgeD0iMTExOS4wIiB5PSIyMTAuMCIgZm9udC1zaXplPSIxMCIgZm9udC13ZWlnaHQ9IjQwMCIgZmlsbD0iIzlmZDlk"
+    "YyIgdGV4dC1hbmNob3I9ImVuZCIgdHJhbnNmb3JtPSJyb3RhdGUoLTkwIDExMTkuMCAyMTApIj42PC90ZXh0Pgo8cmVjdCB4PSIxMDk2LjQiIHk9IjE5"
+    "MC41IiB3aWR0aD0iNyIgaGVpZ2h0PSI3IiBmaWxsPSIjZDRiMDRhIi8+Cjx0ZXh0IHg9IjExMDMuNCIgeT0iMjEwLjAiIGZvbnQtc2l6ZT0iMTAiIGZv"
+    "bnQtd2VpZ2h0PSI0MDAiIGZpbGw9IiM5ZmQ5ZGMiIHRleHQtYW5jaG9yPSJlbmQiIHRyYW5zZm9ybT0icm90YXRlKC05MCAxMTAzLjQgMjEwKSI+Nzwv"
+    "dGV4dD4KPHJlY3QgeD0iMTA3MS41IiB5PSIxOTAuNSIgd2lkdGg9IjciIGhlaWdodD0iNyIgZmlsbD0iI2Q0YjA0YSIvPgo8dGV4dCB4PSIxMDc4LjUi"
+    "IHk9IjIxMC4wIiBmb250LXNpemU9IjEwIiBmb250LXdlaWdodD0iNDAwIiBmaWxsPSIjZmZmZmZmIiB0ZXh0LWFuY2hvcj0iZW5kIiB0cmFuc2Zvcm09"
+    "InJvdGF0ZSgtOTAgMTA3OC41IDIxMCkiPjg8L3RleHQ+CjxyZWN0IHg9IjEwNTYuMCIgeT0iMTkwLjUiIHdpZHRoPSI3IiBoZWlnaHQ9IjciIGZpbGw9"
+    "IiNkNGIwNGEiLz4KPHRleHQgeD0iMTA2My4wIiB5PSIyMTAuMCIgZm9udC1zaXplPSIxMCIgZm9udC13ZWlnaHQ9IjQwMCIgZmlsbD0iIzlmZDlkYyIg"
+    "dGV4dC1hbmNob3I9ImVuZCIgdHJhbnNmb3JtPSJyb3RhdGUoLTkwIDEwNjMuMCAyMTApIj45PC90ZXh0Pgo8cmVjdCB4PSIxMDQwLjQiIHk9IjE5MC41"
+    "IiB3aWR0aD0iNyIgaGVpZ2h0PSI3IiBmaWxsPSIjZDRiMDRhIi8+Cjx0ZXh0IHg9IjEwNDcuNCIgeT0iMjEwLjAiIGZvbnQtc2l6ZT0iMTAiIGZvbnQt"
+    "d2VpZ2h0PSI0MDAiIGZpbGw9IiM5ZmQ5ZGMiIHRleHQtYW5jaG9yPSJlbmQiIHRyYW5zZm9ybT0icm90YXRlKC05MCAxMDQ3LjQgMjEwKSI+MTA8L3Rl"
+    "eHQ+CjxyZWN0IHg9IjEwMjQuOSIgeT0iMTkwLjUiIHdpZHRoPSI3IiBoZWlnaHQ9IjciIGZpbGw9IiNkNGIwNGEiLz4KPHRleHQgeD0iMTAzMS45IiB5"
+    "PSIyMTAuMCIgZm9udC1zaXplPSIxMCIgZm9udC13ZWlnaHQ9IjQwMCIgZmlsbD0iIzlmZDlkYyIgdGV4dC1hbmNob3I9ImVuZCIgdHJhbnNmb3JtPSJy"
+    "b3RhdGUoLTkwIDEwMzEuOSAyMTApIj4xMTwvdGV4dD4KPHJlY3QgeD0iMTAwOS4zIiB5PSIxOTAuNSIgd2lkdGg9IjciIGhlaWdodD0iNyIgZmlsbD0i"
+    "I2Q0YjA0YSIvPgo8dGV4dCB4PSIxMDE2LjMiIHk9IjIxMC4wIiBmb250LXNpemU9IjEwIiBmb250LXdlaWdodD0iNDAwIiBmaWxsPSIjZmZmZmZmIiB0"
+    "ZXh0LWFuY2hvcj0iZW5kIiB0cmFuc2Zvcm09InJvdGF0ZSgtOTAgMTAxNi4zIDIxMCkiPjEyPC90ZXh0Pgo8cmVjdCB4PSI5OTMuOCIgeT0iMTkwLjUi"
+    "IHdpZHRoPSI3IiBoZWlnaHQ9IjciIGZpbGw9IiNkNGIwNGEiLz4KPHRleHQgeD0iMTAwMC44IiB5PSIyMTAuMCIgZm9udC1zaXplPSIxMCIgZm9udC13"
+    "ZWlnaHQ9IjQwMCIgZmlsbD0iI2ZmZmZmZiIgdGV4dC1hbmNob3I9ImVuZCIgdHJhbnNmb3JtPSJyb3RhdGUoLTkwIDEwMDAuOCAyMTApIj4xMzwvdGV4"
+    "dD4KPHJlY3QgeD0iOTc4LjIiIHk9IjE5MC41IiB3aWR0aD0iNyIgaGVpZ2h0PSI3IiBmaWxsPSIjZDRiMDRhIi8+Cjx0ZXh0IHg9Ijk4NS4yIiB5PSIy"
+    "MTAuMCIgZm9udC1zaXplPSIxMCIgZm9udC13ZWlnaHQ9IjQwMCIgZmlsbD0iI2ZmZmZmZiIgdGV4dC1hbmNob3I9ImVuZCIgdHJhbnNmb3JtPSJyb3Rh"
+    "dGUoLTkwIDk4NS4yIDIxMCkiPkdORDwvdGV4dD4KPHJlY3QgeD0iOTYyLjciIHk9IjE5MC41IiB3aWR0aD0iNyIgaGVpZ2h0PSI3IiBmaWxsPSIjZDRi"
+    "MDRhIi8+Cjx0ZXh0IHg9Ijk2OS43IiB5PSIyMTAuMCIgZm9udC1zaXplPSIxMCIgZm9udC13ZWlnaHQ9IjQwMCIgZmlsbD0iI2ZmZmZmZiIgdGV4dC1h"
+    "bmNob3I9ImVuZCIgdHJhbnNmb3JtPSJyb3RhdGUoLTkwIDk2OS43IDIxMCkiPkFSRUY8L3RleHQ+CjxyZWN0IHg9Ijk0Ny4xIiB5PSIxOTAuNSIgd2lk"
+    "dGg9IjciIGhlaWdodD0iNyIgZmlsbD0iI2Q0YjA0YSIvPgo8dGV4dCB4PSI5NTQuMSIgeT0iMjEwLjAiIGZvbnQtc2l6ZT0iMTAiIGZvbnQtd2VpZ2h0"
+    "PSI0MDAiIGZpbGw9IiNmZmZmZmYiIHRleHQtYW5jaG9yPSJlbmQiIHRyYW5zZm9ybT0icm90YXRlKC05MCA5NTQuMSAyMTApIj5TREE8L3RleHQ+Cjxy"
+    "ZWN0IHg9IjkzMS42IiB5PSIxOTAuNSIgd2lkdGg9IjciIGhlaWdodD0iNyIgZmlsbD0iI2Q0YjA0YSIvPgo8dGV4dCB4PSI5MzguNiIgeT0iMjEwLjAi"
+    "IGZvbnQtc2l6ZT0iMTAiIGZvbnQtd2VpZ2h0PSI0MDAiIGZpbGw9IiNmZmZmZmYiIHRleHQtYW5jaG9yPSJlbmQiIHRyYW5zZm9ybT0icm90YXRlKC05"
+    "MCA5MzguNiAyMTApIj5TQ0w8L3RleHQ+CjxyZWN0IHg9Ijk4Ny42IiB5PSI0ODkuNSIgd2lkdGg9IjciIGhlaWdodD0iNyIgZmlsbD0iI2Q0YjA0YSIv"
+    "Pgo8dGV4dCB4PSI5OTQuNiIgeT0iNDc3LjAiIGZvbnQtc2l6ZT0iMTAiIGZvbnQtd2VpZ2h0PSI0MDAiIGZpbGw9IiNmZmZmZmYiIHRleHQtYW5jaG9y"
+    "PSJzdGFydCIgdHJhbnNmb3JtPSJyb3RhdGUoLTkwIDk5NC42IDQ3NykiPkJPT1Q8L3RleHQ+CjxyZWN0IHg9IjEwMDMuMSIgeT0iNDg5LjUiIHdpZHRo"
+    "PSI3IiBoZWlnaHQ9IjciIGZpbGw9IiNkNGIwNGEiLz4KPHRleHQgeD0iMTAxMC4xIiB5PSI0NzcuMCIgZm9udC1zaXplPSIxMCIgZm9udC13ZWlnaHQ9"
+    "IjQwMCIgZmlsbD0iI2ZmZmZmZiIgdGV4dC1hbmNob3I9InN0YXJ0IiB0cmFuc2Zvcm09InJvdGF0ZSgtOTAgMTAxMC4xIDQ3NykiPklPUkVGPC90ZXh0"
+    "Pgo8cmVjdCB4PSIxMDE4LjciIHk9IjQ4OS41IiB3aWR0aD0iNyIgaGVpZ2h0PSI3IiBmaWxsPSIjZDRiMDRhIi8+Cjx0ZXh0IHg9IjEwMjUuNyIgeT0i"
+    "NDc3LjAiIGZvbnQtc2l6ZT0iMTAiIGZvbnQtd2VpZ2h0PSI0MDAiIGZpbGw9IiNmZmZmZmYiIHRleHQtYW5jaG9yPSJzdGFydCIgdHJhbnNmb3JtPSJy"
+    "b3RhdGUoLTkwIDEwMjUuNyA0NzcpIj5SRVNFVDwvdGV4dD4KPHJlY3QgeD0iMTAzNC4yIiB5PSI0ODkuNSIgd2lkdGg9IjciIGhlaWdodD0iNyIgZmls"
+    "bD0iI2Q0YjA0YSIvPgo8dGV4dCB4PSIxMDQxLjIiIHk9IjQ3Ny4wIiBmb250LXNpemU9IjEwIiBmb250LXdlaWdodD0iNDAwIiBmaWxsPSIjZmZmZmZm"
+    "IiB0ZXh0LWFuY2hvcj0ic3RhcnQiIHRyYW5zZm9ybT0icm90YXRlKC05MCAxMDQxLjIgNDc3KSI+M1YzPC90ZXh0Pgo8cmVjdCB4PSIxMDQ5LjgiIHk9"
+    "IjQ4OS41IiB3aWR0aD0iNyIgaGVpZ2h0PSI3IiBmaWxsPSIjZDRiMDRhIi8+Cjx0ZXh0IHg9IjEwNTYuOCIgeT0iNDc3LjAiIGZvbnQtc2l6ZT0iMTAi"
+    "IGZvbnQtd2VpZ2h0PSI3MDAiIGZpbGw9IiNmZmU2ODAiIHRleHQtYW5jaG9yPSJzdGFydCIgdHJhbnNmb3JtPSJyb3RhdGUoLTkwIDEwNTYuOCA0Nzcp"
+    "Ij41VjwvdGV4dD4KPHJlY3QgeD0iMTA2NS4zIiB5PSI0ODkuNSIgd2lkdGg9IjciIGhlaWdodD0iNyIgZmlsbD0iI2Q0YjA0YSIvPgo8dGV4dCB4PSIx"
+    "MDcyLjMiIHk9IjQ3Ny4wIiBmb250LXNpemU9IjEwIiBmb250LXdlaWdodD0iNzAwIiBmaWxsPSIjZmZlNjgwIiB0ZXh0LWFuY2hvcj0ic3RhcnQiIHRy"
+    "YW5zZm9ybT0icm90YXRlKC05MCAxMDcyLjMgNDc3KSI+R05EPC90ZXh0Pgo8cmVjdCB4PSIxMDgwLjkiIHk9IjQ4OS41IiB3aWR0aD0iNyIgaGVpZ2h0"
+    "PSI3IiBmaWxsPSIjZDRiMDRhIi8+Cjx0ZXh0IHg9IjEwODcuOSIgeT0iNDc3LjAiIGZvbnQtc2l6ZT0iMTAiIGZvbnQtd2VpZ2h0PSI0MDAiIGZpbGw9"
+    "IiNmZmZmZmYiIHRleHQtYW5jaG9yPSJzdGFydCIgdHJhbnNmb3JtPSJyb3RhdGUoLTkwIDEwODcuOSA0NzcpIj5HTkQ8L3RleHQ+CjxyZWN0IHg9IjEw"
+    "OTYuNCIgeT0iNDg5LjUiIHdpZHRoPSI3IiBoZWlnaHQ9IjciIGZpbGw9IiNkNGIwNGEiLz4KPHRleHQgeD0iMTEwMy40IiB5PSI0NzcuMCIgZm9udC1z"
+    "aXplPSIxMCIgZm9udC13ZWlnaHQ9IjQwMCIgZmlsbD0iI2ZmZmZmZiIgdGV4dC1hbmNob3I9InN0YXJ0IiB0cmFuc2Zvcm09InJvdGF0ZSgtOTAgMTEw"
+    "My40IDQ3NykiPlZJTjwvdGV4dD4KPHJlY3QgeD0iMTEyNy41IiB5PSI0ODkuNSIgd2lkdGg9IjciIGhlaWdodD0iNyIgZmlsbD0iI2Q0YjA0YSIvPgo8"
+    "dGV4dCB4PSIxMTM0LjUiIHk9IjQ3Ny4wIiBmb250LXNpemU9IjEwIiBmb250LXdlaWdodD0iNzAwIiBmaWxsPSIjZmZlNjgwIiB0ZXh0LWFuY2hvcj0i"
+    "c3RhcnQiIHRyYW5zZm9ybT0icm90YXRlKC05MCAxMTM0LjUgNDc3KSI+QTA8L3RleHQ+CjxyZWN0IHg9IjExNDMuMSIgeT0iNDg5LjUiIHdpZHRoPSI3"
+    "IiBoZWlnaHQ9IjciIGZpbGw9IiNkNGIwNGEiLz4KPHRleHQgeD0iMTE1MC4xIiB5PSI0NzcuMCIgZm9udC1zaXplPSIxMCIgZm9udC13ZWlnaHQ9IjQw"
+    "MCIgZmlsbD0iIzlmZDlkYyIgdGV4dC1hbmNob3I9InN0YXJ0IiB0cmFuc2Zvcm09InJvdGF0ZSgtOTAgMTE1MC4xIDQ3NykiPkExPC90ZXh0Pgo8cmVj"
+    "dCB4PSIxMTU4LjYiIHk9IjQ4OS41IiB3aWR0aD0iNyIgaGVpZ2h0PSI3IiBmaWxsPSIjZDRiMDRhIi8+Cjx0ZXh0IHg9IjExNjUuNiIgeT0iNDc3LjAi"
+    "IGZvbnQtc2l6ZT0iMTAiIGZvbnQtd2VpZ2h0PSI0MDAiIGZpbGw9IiM5ZmQ5ZGMiIHRleHQtYW5jaG9yPSJzdGFydCIgdHJhbnNmb3JtPSJyb3RhdGUo"
+    "LTkwIDExNjUuNiA0NzcpIj5BMjwvdGV4dD4KPHJlY3QgeD0iMTE3NC4yIiB5PSI0ODkuNSIgd2lkdGg9IjciIGhlaWdodD0iNyIgZmlsbD0iI2Q0YjA0"
+    "YSIvPgo8dGV4dCB4PSIxMTgxLjIiIHk9IjQ3Ny4wIiBmb250LXNpemU9IjEwIiBmb250LXdlaWdodD0iNDAwIiBmaWxsPSIjZmZmZmZmIiB0ZXh0LWFu"
+    "Y2hvcj0ic3RhcnQiIHRyYW5zZm9ybT0icm90YXRlKC05MCAxMTgxLjIgNDc3KSI+QTM8L3RleHQ+CjxyZWN0IHg9IjExODkuNyIgeT0iNDg5LjUiIHdp"
+    "ZHRoPSI3IiBoZWlnaHQ9IjciIGZpbGw9IiNkNGIwNGEiLz4KPHRleHQgeD0iMTE5Ni43IiB5PSI0NzcuMCIgZm9udC1zaXplPSIxMCIgZm9udC13ZWln"
+    "aHQ9IjQwMCIgZmlsbD0iI2ZmZmZmZiIgdGV4dC1hbmNob3I9InN0YXJ0IiB0cmFuc2Zvcm09InJvdGF0ZSgtOTAgMTE5Ni43IDQ3NykiPkE0PC90ZXh0"
+    "Pgo8cmVjdCB4PSIxMjA1LjMiIHk9IjQ4OS41IiB3aWR0aD0iNyIgaGVpZ2h0PSI3IiBmaWxsPSIjZDRiMDRhIi8+Cjx0ZXh0IHg9IjEyMTIuMyIgeT0i"
+    "NDc3LjAiIGZvbnQtc2l6ZT0iMTAiIGZvbnQtd2VpZ2h0PSI0MDAiIGZpbGw9IiNmZmZmZmYiIHRleHQtYW5jaG9yPSJzdGFydCIgdHJhbnNmb3JtPSJy"
+    "b3RhdGUoLTkwIDEyMTIuMyA0NzcpIj5BNTwvdGV4dD4KPHRleHQgeD0iMTEzOC44IiB5PSIyNzIuMCIgZm9udC1zaXplPSIxMCIgZm9udC13ZWlnaHQ9"
+    "IjQwMCIgZmlsbD0iIzlmZDlkYyIgdGV4dC1hbmNob3I9Im1pZGRsZSIgPm1vdG9yIGRpcmVjdGlvbjwvdGV4dD4KPHRleHQgeD0iMTA0My45IiB5PSIy"
+    "NzIuMCIgZm9udC1zaXplPSIxMCIgZm9udC13ZWlnaHQ9IjQwMCIgZmlsbD0iIzlmZDlkYyIgdGV4dC1hbmNob3I9Im1pZGRsZSIgPlBXTTwvdGV4dD4K"
+    "PHRleHQgeD0iMTE0Ni42IiB5PSI0MzcuMCIgZm9udC1zaXplPSIxMCIgZm9udC13ZWlnaHQ9IjQwMCIgZmlsbD0iIzlmZDlkYyIgdGV4dC1hbmNob3I9"
+    "Im1pZGRsZSIgPnBvdHM8L3RleHQ+CjwvZz4KPGNpcmNsZSBjeD0iMTA1My4zIiBjeT0iNDIzIiByPSI4LjUiIGZpbGw9Im5vbmUiIHN0cm9rZT0iI2Zm"
+    "ZTY4MCIgc3Ryb2tlLXdpZHRoPSIyLjIiLz4KPGNpcmNsZSBjeD0iMTA2OC44IiBjeT0iNDIzIiByPSI4LjUiIGZpbGw9Im5vbmUiIHN0cm9rZT0iI2Zm"
+    "ZTY4MCIgc3Ryb2tlLXdpZHRoPSIyLjIiLz4KPGNpcmNsZSBjeD0iMTEzMS4wIiBjeT0iNDIzIiByPSI4LjUiIGZpbGw9Im5vbmUiIHN0cm9rZT0iI2Zm"
+    "ZTY4MCIgc3Ryb2tlLXdpZHRoPSIyLjIiLz4KPHRleHQgeD0iMTAzMC4wIiB5PSI5Mi4wIiBmb250LXNpemU9IjE0IiBmb250LXdlaWdodD0iNzAwIiBm"
+    "aWxsPSIjMGYxYjJkIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiA+QXJkdWlubyBVTk8gUjQgV2lGaSwgdG9wIHZpZXc8L3RleHQ+CjxnIGZpbHRlcj0idXJs"
+    "KCNzaCkiPjxjaXJjbGUgY3g9IjExOCIgY3k9IjYwMCIgcj0iNjAiIGZpbGw9InVybCgjc2VucykiIHN0cm9rZT0iIzBiMGQxMCIgc3Ryb2tlLXdpZHRo"
+    "PSIyIi8+PC9nPgo8Y2lyY2xlIGN4PSIxMTgiIGN5PSI2MDAiIHI9IjI0IiBmaWxsPSJ1cmwoI21ldGFsKSIgc3Ryb2tlPSIjNmQ3NjgwIiBzdHJva2Ut"
+    "d2lkdGg9IjEuNSIvPgo8cmVjdCB4PSIxMDgiIHk9IjU3NiIgd2lkdGg9IjIwIiBoZWlnaHQ9IjYiIGZpbGw9IiM2ZDc2ODAiLz4KPHJlY3QgeD0iMTcy"
+    "IiB5PSI1NjQiIHdpZHRoPSIyNiIgaGVpZ2h0PSIxMiIgcng9IjMiIGZpbGw9InVybCgjbWV0YWwpIiBzdHJva2U9IiM2ZDc2ODAiLz4KPGNpcmNsZSBj"
+    "eD0iMTkwIiBjeT0iNTcwIiByPSIzIiBmaWxsPSIjZmZmZmZmIiBzdHJva2U9IiM2ZDc2ODAiLz4KPHJlY3QgeD0iMTcyIiB5PSI1OTQiIHdpZHRoPSIy"
+    "NiIgaGVpZ2h0PSIxMiIgcng9IjMiIGZpbGw9InVybCgjbWV0YWwpIiBzdHJva2U9IiM2ZDc2ODAiLz4KPGNpcmNsZSBjeD0iMTkwIiBjeT0iNjAwIiBy"
+    "PSIzIiBmaWxsPSIjZmZmZmZmIiBzdHJva2U9IiM2ZDc2ODAiLz4KPHJlY3QgeD0iMTcyIiB5PSI2MjQiIHdpZHRoPSIyNiIgaGVpZ2h0PSIxMiIgcng9"
+    "IjMiIGZpbGw9InVybCgjbWV0YWwpIiBzdHJva2U9IiM2ZDc2ODAiLz4KPGNpcmNsZSBjeD0iMTkwIiBjeT0iNjMwIiByPSIzIiBmaWxsPSIjZmZmZmZm"
+    "IiBzdHJva2U9IiM2ZDc2ODAiLz4KPHRleHQgeD0iNDAuMCIgeT0iNTE4LjAiIGZvbnQtc2l6ZT0iMTMiIGZvbnQtd2VpZ2h0PSI3MDAiIGZpbGw9IiMw"
+    "ZjFiMmQiIHRleHQtYW5jaG9yPSJzdGFydCIgPkZlZWRiYWNrIHBvdCBvbiB0aGUgbW90b3I8L3RleHQ+Cjx0ZXh0IHg9IjQwLjAiIHk9IjY4NC4wIiBm"
+    "b250LXNpemU9IjExLjUiIGZvbnQtd2VpZ2h0PSI0MDAiIGZpbGw9IiM0YTVhNzAiIHRleHQtYW5jaG9yPSJzdGFydCIgPk91dGVyIGx1Z3MgMSBhbmQg"
+    "MzogNVYgYW5kIEdORDwvdGV4dD4KPHRleHQgeD0iNDAuMCIgeT0iNzAwLjAiIGZvbnQtc2l6ZT0iMTEuNSIgZm9udC13ZWlnaHQ9IjQwMCIgZmlsbD0i"
+    "IzRhNWE3MCIgdGV4dC1hbmNob3I9InN0YXJ0IiA+KGtlZXAgdGhlbSB0aGUgd2F5IHJvdW5kIHRoZXkgYXJlKS48L3RleHQ+Cjx0ZXh0IHg9IjQwLjAi"
+    "IHk9IjcxNi4wIiBmb250LXNpemU9IjExLjUiIGZvbnQtd2VpZ2h0PSI0MDAiIGZpbGw9IiM0YTVhNzAiIHRleHQtYW5jaG9yPSJzdGFydCIgPk1pZGRs"
+    "ZSBsdWcgMjogdGhlIHdpcGVyLjwvdGV4dD4KPHBhdGggZD0iTTI2OCw2MDAgTDUyMCw2MDAiIHN0cm9rZT0iIzViNjQ3MCIgc3Ryb2tlLXdpZHRoPSIz"
+    "NCIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIi8+CjxwYXRoIGQ9Ik0yNjgsNTkxIEw1MjAsNTkxIiBzdHJva2U9IiM3YTgzOGYiIHN0cm9rZS13aWR0aD0i"
+    "NSIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIiBvcGFjaXR5PSIuNiIvPgo8dGV4dCB4PSIzOTQuMCIgeT0iNjA1LjAiIGZvbnQtc2l6ZT0iMTIiIGZvbnQt"
+    "d2VpZ2h0PSI3MDAiIGZpbGw9IiNmZmZmZmYiIHRleHQtYW5jaG9yPSJtaWRkbGUiID5zaGllbGRlZCAzLWNvcmUgY2FibGU8L3RleHQ+Cjx0ZXh0IHg9"
+    "IjM5NC4wIiB5PSI2NDIuMCIgZm9udC1zaXplPSIxMS41IiBmb250LXdlaWdodD0iNDAwIiBmaWxsPSIjNGE1YTcwIiB0ZXh0LWFuY2hvcj0ibWlkZGxl"
+    "IiA+c2NyZWVuIChmb2lsIG9yIGJyYWlkKSArIGRyYWluIHdpcmUgaW5zaWRlPC90ZXh0Pgo8cGF0aCBkPSJNMTk4LDU3MCBDMjMyLDU3MCAyMzYsNTky"
+    "IDI2Miw1OTIiIGZpbGw9Im5vbmUiIHN0cm9rZT0iIzAwMDAwMDU1IiBzdHJva2Utd2lkdGg9IjYuNCIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIiBzdHJv"
+    "a2UtbGluZWpvaW49InJvdW5kIi8+CjxwYXRoIGQ9Ik0xOTgsNTcwIEMyMzIsNTcwIDIzNiw1OTIgMjYyLDU5MiIgZmlsbD0ibm9uZSIgc3Ryb2tlPSIj"
+    "ZDYzMzJiIiBzdHJva2Utd2lkdGg9IjQuMiIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIiBzdHJva2UtbGluZWpvaW49InJvdW5kIi8+CjxwYXRoIGQ9Ik0x"
+    "OTgsNjAwIEwyNjIsNjAwIiBmaWxsPSJub25lIiBzdHJva2U9IiMwMDAwMDA1NSIgc3Ryb2tlLXdpZHRoPSI2LjQiIHN0cm9rZS1saW5lY2FwPSJyb3Vu"
+    "ZCIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCIvPgo8cGF0aCBkPSJNMTk4LDYwMCBMMjYyLDYwMCIgZmlsbD0ibm9uZSIgc3Ryb2tlPSIjZTlhODAwIiBz"
+    "dHJva2Utd2lkdGg9IjQuMiIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIiBzdHJva2UtbGluZWpvaW49InJvdW5kIi8+CjxwYXRoIGQ9Ik0xOTgsNjMwIEMy"
+    "MzIsNjMwIDIzNiw2MDggMjYyLDYwOCIgZmlsbD0ibm9uZSIgc3Ryb2tlPSIjMDAwMDAwNTUiIHN0cm9rZS13aWR0aD0iNi40IiBzdHJva2UtbGluZWNh"
+    "cD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiLz4KPHBhdGggZD0iTTE5OCw2MzAgQzIzMiw2MzAgMjM2LDYwOCAyNjIsNjA4IiBmaWxsPSJu"
+    "b25lIiBzdHJva2U9IiMxYjFiMWIiIHN0cm9rZS13aWR0aD0iNC4yIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQi"
+    "Lz4KPHRleHQgeD0iMjY2LjAiIHk9IjUzOC4wIiBmb250LXNpemU9IjExLjUiIGZvbnQtd2VpZ2h0PSI2MDAiIGZpbGw9IiNhMTI2MWYiIHRleHQtYW5j"
+    "aG9yPSJzdGFydCIgPnNoaWVsZDogY3V0IGJhY2sgYW5kIHRhcGVkLDwvdGV4dD4KPHRleHQgeD0iMjY2LjAiIHk9IjU1My4wIiBmb250LXNpemU9IjEx"
+    "LjUiIGZvbnQtd2VpZ2h0PSI2MDAiIGZpbGw9IiNhMTI2MWYiIHRleHQtYW5jaG9yPSJzdGFydCIgPm5vdCBjb25uZWN0ZWQgYXQgdGhlIHBvdCBlbmQ8"
+    "L3RleHQ+CjxwYXRoIGQ9Ik0yNzgsNTYwIEwyNzQsNTgwIiBzdHJva2U9IiNhMTI2MWYiIHN0cm9rZS13aWR0aD0iMS41IiBmaWxsPSJub25lIiBtYXJr"
+    "ZXItZW5kPSJub25lIi8+CjxnIGZpbHRlcj0idXJsKCNzaCkiPjxyZWN0IHg9IjYwMCIgeT0iNDk1IiB3aWR0aD0iMjYwIiBoZWlnaHQ9IjE5NSIgcng9"
+    "IjgiIGZpbGw9IiNlOWQ2YTUiIHN0cm9rZT0iI2E4OGE0YyIgc3Ryb2tlLXdpZHRoPSIxLjUiLz48L2c+CjxjaXJjbGUgY3g9IjYxMiIgY3k9IjUwNyIg"
+    "cj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjYyNSIgY3k9IjUwNyIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9"
+    "IjYzOCIgY3k9IjUwNyIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjY1MSIgY3k9IjUwNyIgcj0iMS44IiBmaWxsPSIjYmY5ZjVl"
+    "Ii8+CjxjaXJjbGUgY3g9IjY2NCIgY3k9IjUwNyIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjY3NyIgY3k9IjUwNyIgcj0iMS44"
+    "IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjY5MCIgY3k9IjUwNyIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjcwMyIg"
+    "Y3k9IjUwNyIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjcxNiIgY3k9IjUwNyIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+Cjxj"
+    "aXJjbGUgY3g9IjcyOSIgY3k9IjUwNyIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijc0MiIgY3k9IjUwNyIgcj0iMS44IiBmaWxs"
+    "PSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijc1NSIgY3k9IjUwNyIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijc2OCIgY3k9IjUw"
+    "NyIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijc4MSIgY3k9IjUwNyIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUg"
+    "Y3g9Ijc5NCIgY3k9IjUwNyIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjgwNyIgY3k9IjUwNyIgcj0iMS44IiBmaWxsPSIjYmY5"
+    "ZjVlIi8+CjxjaXJjbGUgY3g9IjgyMCIgY3k9IjUwNyIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjgzMyIgY3k9IjUwNyIgcj0i"
+    "MS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijg0NiIgY3k9IjUwNyIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjYx"
+    "MiIgY3k9IjUyMCIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjYyNSIgY3k9IjUyMCIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+"
+    "CjxjaXJjbGUgY3g9IjYzOCIgY3k9IjUyMCIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjY1MSIgY3k9IjUyMCIgcj0iMS44IiBm"
+    "aWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjY2NCIgY3k9IjUyMCIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjY3NyIgY3k9"
+    "IjUyMCIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjY5MCIgY3k9IjUyMCIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJj"
+    "bGUgY3g9IjcwMyIgY3k9IjUyMCIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjcxNiIgY3k9IjUyMCIgcj0iMS44IiBmaWxsPSIj"
+    "YmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjcyOSIgY3k9IjUyMCIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijc0MiIgY3k9IjUyMCIg"
+    "cj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijc1NSIgY3k9IjUyMCIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9"
+    "Ijc2OCIgY3k9IjUyMCIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijc4MSIgY3k9IjUyMCIgcj0iMS44IiBmaWxsPSIjYmY5ZjVl"
+    "Ii8+CjxjaXJjbGUgY3g9Ijc5NCIgY3k9IjUyMCIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjgwNyIgY3k9IjUyMCIgcj0iMS44"
+    "IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjgyMCIgY3k9IjUyMCIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjgzMyIg"
+    "Y3k9IjUyMCIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijg0NiIgY3k9IjUyMCIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+Cjxj"
+    "aXJjbGUgY3g9IjYxMiIgY3k9IjUzMyIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjYyNSIgY3k9IjUzMyIgcj0iMS44IiBmaWxs"
+    "PSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjYzOCIgY3k9IjUzMyIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjY1MSIgY3k9IjUz"
+    "MyIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjY2NCIgY3k9IjUzMyIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUg"
+    "Y3g9IjY3NyIgY3k9IjUzMyIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjY5MCIgY3k9IjUzMyIgcj0iMS44IiBmaWxsPSIjYmY5"
+    "ZjVlIi8+CjxjaXJjbGUgY3g9IjcwMyIgY3k9IjUzMyIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjcxNiIgY3k9IjUzMyIgcj0i"
+    "MS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjcyOSIgY3k9IjUzMyIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijc0"
+    "MiIgY3k9IjUzMyIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijc1NSIgY3k9IjUzMyIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+"
+    "CjxjaXJjbGUgY3g9Ijc2OCIgY3k9IjUzMyIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijc4MSIgY3k9IjUzMyIgcj0iMS44IiBm"
+    "aWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijc5NCIgY3k9IjUzMyIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjgwNyIgY3k9"
+    "IjUzMyIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjgyMCIgY3k9IjUzMyIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJj"
+    "bGUgY3g9IjgzMyIgY3k9IjUzMyIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijg0NiIgY3k9IjUzMyIgcj0iMS44IiBmaWxsPSIj"
+    "YmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjYxMiIgY3k9IjU0NiIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjYyNSIgY3k9IjU0NiIg"
+    "cj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjYzOCIgY3k9IjU0NiIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9"
+    "IjY1MSIgY3k9IjU0NiIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjY2NCIgY3k9IjU0NiIgcj0iMS44IiBmaWxsPSIjYmY5ZjVl"
+    "Ii8+CjxjaXJjbGUgY3g9IjY3NyIgY3k9IjU0NiIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjY5MCIgY3k9IjU0NiIgcj0iMS44"
+    "IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjcwMyIgY3k9IjU0NiIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjcxNiIg"
+    "Y3k9IjU0NiIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjcyOSIgY3k9IjU0NiIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+Cjxj"
+    "aXJjbGUgY3g9Ijc0MiIgY3k9IjU0NiIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijc1NSIgY3k9IjU0NiIgcj0iMS44IiBmaWxs"
+    "PSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijc2OCIgY3k9IjU0NiIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijc4MSIgY3k9IjU0"
+    "NiIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijc5NCIgY3k9IjU0NiIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUg"
+    "Y3g9IjgwNyIgY3k9IjU0NiIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjgyMCIgY3k9IjU0NiIgcj0iMS44IiBmaWxsPSIjYmY5"
+    "ZjVlIi8+CjxjaXJjbGUgY3g9IjgzMyIgY3k9IjU0NiIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijg0NiIgY3k9IjU0NiIgcj0i"
+    "MS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjYxMiIgY3k9IjU1OSIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjYy"
+    "NSIgY3k9IjU1OSIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjYzOCIgY3k9IjU1OSIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+"
+    "CjxjaXJjbGUgY3g9IjY1MSIgY3k9IjU1OSIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjY2NCIgY3k9IjU1OSIgcj0iMS44IiBm"
+    "aWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjY3NyIgY3k9IjU1OSIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjY5MCIgY3k9"
+    "IjU1OSIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjcwMyIgY3k9IjU1OSIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJj"
+    "bGUgY3g9IjcxNiIgY3k9IjU1OSIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjcyOSIgY3k9IjU1OSIgcj0iMS44IiBmaWxsPSIj"
+    "YmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijc0MiIgY3k9IjU1OSIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijc1NSIgY3k9IjU1OSIg"
+    "cj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijc2OCIgY3k9IjU1OSIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9"
+    "Ijc4MSIgY3k9IjU1OSIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijc5NCIgY3k9IjU1OSIgcj0iMS44IiBmaWxsPSIjYmY5ZjVl"
+    "Ii8+CjxjaXJjbGUgY3g9IjgwNyIgY3k9IjU1OSIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjgyMCIgY3k9IjU1OSIgcj0iMS44"
+    "IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjgzMyIgY3k9IjU1OSIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijg0NiIg"
+    "Y3k9IjU1OSIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjYxMiIgY3k9IjU3MiIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+Cjxj"
+    "aXJjbGUgY3g9IjYyNSIgY3k9IjU3MiIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjYzOCIgY3k9IjU3MiIgcj0iMS44IiBmaWxs"
+    "PSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjY1MSIgY3k9IjU3MiIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjY2NCIgY3k9IjU3"
+    "MiIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjY3NyIgY3k9IjU3MiIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUg"
+    "Y3g9IjY5MCIgY3k9IjU3MiIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjcwMyIgY3k9IjU3MiIgcj0iMS44IiBmaWxsPSIjYmY5"
+    "ZjVlIi8+CjxjaXJjbGUgY3g9IjcxNiIgY3k9IjU3MiIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjcyOSIgY3k9IjU3MiIgcj0i"
+    "MS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijc0MiIgY3k9IjU3MiIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijc1"
+    "NSIgY3k9IjU3MiIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijc2OCIgY3k9IjU3MiIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+"
+    "CjxjaXJjbGUgY3g9Ijc4MSIgY3k9IjU3MiIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijc5NCIgY3k9IjU3MiIgcj0iMS44IiBm"
+    "aWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjgwNyIgY3k9IjU3MiIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjgyMCIgY3k9"
+    "IjU3MiIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjgzMyIgY3k9IjU3MiIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJj"
+    "bGUgY3g9Ijg0NiIgY3k9IjU3MiIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjYxMiIgY3k9IjU4NSIgcj0iMS44IiBmaWxsPSIj"
+    "YmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjYyNSIgY3k9IjU4NSIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjYzOCIgY3k9IjU4NSIg"
+    "cj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjY1MSIgY3k9IjU4NSIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9"
+    "IjY2NCIgY3k9IjU4NSIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjY3NyIgY3k9IjU4NSIgcj0iMS44IiBmaWxsPSIjYmY5ZjVl"
+    "Ii8+CjxjaXJjbGUgY3g9IjY5MCIgY3k9IjU4NSIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjcwMyIgY3k9IjU4NSIgcj0iMS44"
+    "IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjcxNiIgY3k9IjU4NSIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjcyOSIg"
+    "Y3k9IjU4NSIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijc0MiIgY3k9IjU4NSIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+Cjxj"
+    "aXJjbGUgY3g9Ijc1NSIgY3k9IjU4NSIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijc2OCIgY3k9IjU4NSIgcj0iMS44IiBmaWxs"
+    "PSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijc4MSIgY3k9IjU4NSIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijc5NCIgY3k9IjU4"
+    "NSIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjgwNyIgY3k9IjU4NSIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUg"
+    "Y3g9IjgyMCIgY3k9IjU4NSIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjgzMyIgY3k9IjU4NSIgcj0iMS44IiBmaWxsPSIjYmY5"
+    "ZjVlIi8+CjxjaXJjbGUgY3g9Ijg0NiIgY3k9IjU4NSIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjYxMiIgY3k9IjU5OCIgcj0i"
+    "MS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjYyNSIgY3k9IjU5OCIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjYz"
+    "OCIgY3k9IjU5OCIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjY1MSIgY3k9IjU5OCIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+"
+    "CjxjaXJjbGUgY3g9IjY2NCIgY3k9IjU5OCIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjY3NyIgY3k9IjU5OCIgcj0iMS44IiBm"
+    "aWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjY5MCIgY3k9IjU5OCIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjcwMyIgY3k9"
+    "IjU5OCIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjcxNiIgY3k9IjU5OCIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJj"
+    "bGUgY3g9IjcyOSIgY3k9IjU5OCIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijc0MiIgY3k9IjU5OCIgcj0iMS44IiBmaWxsPSIj"
+    "YmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijc1NSIgY3k9IjU5OCIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijc2OCIgY3k9IjU5OCIg"
+    "cj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijc4MSIgY3k9IjU5OCIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9"
+    "Ijc5NCIgY3k9IjU5OCIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjgwNyIgY3k9IjU5OCIgcj0iMS44IiBmaWxsPSIjYmY5ZjVl"
+    "Ii8+CjxjaXJjbGUgY3g9IjgyMCIgY3k9IjU5OCIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjgzMyIgY3k9IjU5OCIgcj0iMS44"
+    "IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijg0NiIgY3k9IjU5OCIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjYxMiIg"
+    "Y3k9IjYxMSIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjYyNSIgY3k9IjYxMSIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+Cjxj"
+    "aXJjbGUgY3g9IjYzOCIgY3k9IjYxMSIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjY1MSIgY3k9IjYxMSIgcj0iMS44IiBmaWxs"
+    "PSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjY2NCIgY3k9IjYxMSIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjY3NyIgY3k9IjYx"
+    "MSIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjY5MCIgY3k9IjYxMSIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUg"
+    "Y3g9IjcwMyIgY3k9IjYxMSIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjcxNiIgY3k9IjYxMSIgcj0iMS44IiBmaWxsPSIjYmY5"
+    "ZjVlIi8+CjxjaXJjbGUgY3g9IjcyOSIgY3k9IjYxMSIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijc0MiIgY3k9IjYxMSIgcj0i"
+    "MS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijc1NSIgY3k9IjYxMSIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijc2"
+    "OCIgY3k9IjYxMSIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijc4MSIgY3k9IjYxMSIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+"
+    "CjxjaXJjbGUgY3g9Ijc5NCIgY3k9IjYxMSIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjgwNyIgY3k9IjYxMSIgcj0iMS44IiBm"
+    "aWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjgyMCIgY3k9IjYxMSIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjgzMyIgY3k9"
+    "IjYxMSIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijg0NiIgY3k9IjYxMSIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJj"
+    "bGUgY3g9IjYxMiIgY3k9IjYyNCIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjYyNSIgY3k9IjYyNCIgcj0iMS44IiBmaWxsPSIj"
+    "YmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjYzOCIgY3k9IjYyNCIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjY1MSIgY3k9IjYyNCIg"
+    "cj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjY2NCIgY3k9IjYyNCIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9"
+    "IjY3NyIgY3k9IjYyNCIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjY5MCIgY3k9IjYyNCIgcj0iMS44IiBmaWxsPSIjYmY5ZjVl"
+    "Ii8+CjxjaXJjbGUgY3g9IjcwMyIgY3k9IjYyNCIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjcxNiIgY3k9IjYyNCIgcj0iMS44"
+    "IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjcyOSIgY3k9IjYyNCIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijc0MiIg"
+    "Y3k9IjYyNCIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijc1NSIgY3k9IjYyNCIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+Cjxj"
+    "aXJjbGUgY3g9Ijc2OCIgY3k9IjYyNCIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijc4MSIgY3k9IjYyNCIgcj0iMS44IiBmaWxs"
+    "PSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijc5NCIgY3k9IjYyNCIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjgwNyIgY3k9IjYy"
+    "NCIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjgyMCIgY3k9IjYyNCIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUg"
+    "Y3g9IjgzMyIgY3k9IjYyNCIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijg0NiIgY3k9IjYyNCIgcj0iMS44IiBmaWxsPSIjYmY5"
+    "ZjVlIi8+CjxjaXJjbGUgY3g9IjYxMiIgY3k9IjYzNyIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjYyNSIgY3k9IjYzNyIgcj0i"
+    "MS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjYzOCIgY3k9IjYzNyIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjY1"
+    "MSIgY3k9IjYzNyIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjY2NCIgY3k9IjYzNyIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+"
+    "CjxjaXJjbGUgY3g9IjY3NyIgY3k9IjYzNyIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjY5MCIgY3k9IjYzNyIgcj0iMS44IiBm"
+    "aWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjcwMyIgY3k9IjYzNyIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjcxNiIgY3k9"
+    "IjYzNyIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjcyOSIgY3k9IjYzNyIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJj"
+    "bGUgY3g9Ijc0MiIgY3k9IjYzNyIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijc1NSIgY3k9IjYzNyIgcj0iMS44IiBmaWxsPSIj"
+    "YmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijc2OCIgY3k9IjYzNyIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijc4MSIgY3k9IjYzNyIg"
+    "cj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijc5NCIgY3k9IjYzNyIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9"
+    "IjgwNyIgY3k9IjYzNyIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjgyMCIgY3k9IjYzNyIgcj0iMS44IiBmaWxsPSIjYmY5ZjVl"
+    "Ii8+CjxjaXJjbGUgY3g9IjgzMyIgY3k9IjYzNyIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijg0NiIgY3k9IjYzNyIgcj0iMS44"
+    "IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjYxMiIgY3k9IjY1MCIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjYyNSIg"
+    "Y3k9IjY1MCIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjYzOCIgY3k9IjY1MCIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+Cjxj"
+    "aXJjbGUgY3g9IjY1MSIgY3k9IjY1MCIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjY2NCIgY3k9IjY1MCIgcj0iMS44IiBmaWxs"
+    "PSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjY3NyIgY3k9IjY1MCIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjY5MCIgY3k9IjY1"
+    "MCIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjcwMyIgY3k9IjY1MCIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUg"
+    "Y3g9IjcxNiIgY3k9IjY1MCIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjcyOSIgY3k9IjY1MCIgcj0iMS44IiBmaWxsPSIjYmY5"
+    "ZjVlIi8+CjxjaXJjbGUgY3g9Ijc0MiIgY3k9IjY1MCIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijc1NSIgY3k9IjY1MCIgcj0i"
+    "MS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijc2OCIgY3k9IjY1MCIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijc4"
+    "MSIgY3k9IjY1MCIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijc5NCIgY3k9IjY1MCIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+"
+    "CjxjaXJjbGUgY3g9IjgwNyIgY3k9IjY1MCIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjgyMCIgY3k9IjY1MCIgcj0iMS44IiBm"
+    "aWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjgzMyIgY3k9IjY1MCIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijg0NiIgY3k9"
+    "IjY1MCIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjYxMiIgY3k9IjY2MyIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJj"
+    "bGUgY3g9IjYyNSIgY3k9IjY2MyIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjYzOCIgY3k9IjY2MyIgcj0iMS44IiBmaWxsPSIj"
+    "YmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjY1MSIgY3k9IjY2MyIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjY2NCIgY3k9IjY2MyIg"
+    "cj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjY3NyIgY3k9IjY2MyIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9"
+    "IjY5MCIgY3k9IjY2MyIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjcwMyIgY3k9IjY2MyIgcj0iMS44IiBmaWxsPSIjYmY5ZjVl"
+    "Ii8+CjxjaXJjbGUgY3g9IjcxNiIgY3k9IjY2MyIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjcyOSIgY3k9IjY2MyIgcj0iMS44"
+    "IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijc0MiIgY3k9IjY2MyIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijc1NSIg"
+    "Y3k9IjY2MyIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijc2OCIgY3k9IjY2MyIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+Cjxj"
+    "aXJjbGUgY3g9Ijc4MSIgY3k9IjY2MyIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijc5NCIgY3k9IjY2MyIgcj0iMS44IiBmaWxs"
+    "PSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjgwNyIgY3k9IjY2MyIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjgyMCIgY3k9IjY2"
+    "MyIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjgzMyIgY3k9IjY2MyIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUg"
+    "Y3g9Ijg0NiIgY3k9IjY2MyIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjYxMiIgY3k9IjY3NiIgcj0iMS44IiBmaWxsPSIjYmY5"
+    "ZjVlIi8+CjxjaXJjbGUgY3g9IjYyNSIgY3k9IjY3NiIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjYzOCIgY3k9IjY3NiIgcj0i"
+    "MS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjY1MSIgY3k9IjY3NiIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjY2"
+    "NCIgY3k9IjY3NiIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjY3NyIgY3k9IjY3NiIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+"
+    "CjxjaXJjbGUgY3g9IjY5MCIgY3k9IjY3NiIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjcwMyIgY3k9IjY3NiIgcj0iMS44IiBm"
+    "aWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjcxNiIgY3k9IjY3NiIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjcyOSIgY3k9"
+    "IjY3NiIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijc0MiIgY3k9IjY3NiIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJj"
+    "bGUgY3g9Ijc1NSIgY3k9IjY3NiIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijc2OCIgY3k9IjY3NiIgcj0iMS44IiBmaWxsPSIj"
+    "YmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijc4MSIgY3k9IjY3NiIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9Ijc5NCIgY3k9IjY3NiIg"
+    "cj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjgwNyIgY3k9IjY3NiIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9"
+    "IjgyMCIgY3k9IjY3NiIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxjaXJjbGUgY3g9IjgzMyIgY3k9IjY3NiIgcj0iMS44IiBmaWxsPSIjYmY5ZjVl"
+    "Ii8+CjxjaXJjbGUgY3g9Ijg0NiIgY3k9IjY3NiIgcj0iMS44IiBmaWxsPSIjYmY5ZjVlIi8+CjxyZWN0IHg9IjYwOCIgeT0iNTEyIiB3aWR0aD0iMjgi"
+    "IGhlaWdodD0iMTU2IiByeD0iMyIgZmlsbD0iIzJmOGY0ZSIgc3Ryb2tlPSIjMWY2YjM4Ii8+CjxjaXJjbGUgY3g9IjYyMiIgY3k9IjUzMCIgcj0iNyIg"
+    "ZmlsbD0idXJsKCNtZXRhbCkiIHN0cm9rZT0iIzVhNjE2YiIvPgo8cGF0aCBkPSJNNjE3LDUzMCBMNjI3LDUzMCIgc3Ryb2tlPSIjM2I0NDUwIiBzdHJv"
+    "a2Utd2lkdGg9IjIiLz4KPGNpcmNsZSBjeD0iNjIyIiBjeT0iNTgwIiByPSI3IiBmaWxsPSJ1cmwoI21ldGFsKSIgc3Ryb2tlPSIjNWE2MTZiIi8+Cjxw"
+    "YXRoIGQ9Ik02MTcsNTgwIEw2MjcsNTgwIiBzdHJva2U9IiMzYjQ0NTAiIHN0cm9rZS13aWR0aD0iMiIvPgo8Y2lyY2xlIGN4PSI2MjIiIGN5PSI2NTAi"
+    "IHI9IjciIGZpbGw9InVybCgjbWV0YWwpIiBzdHJva2U9IiM1YTYxNmIiLz4KPHBhdGggZD0iTTYxNyw2NTAgTDYyNyw2NTAiIHN0cm9rZT0iIzNiNDQ1"
+    "MCIgc3Ryb2tlLXdpZHRoPSIyIi8+CjxwYXRoIGQ9Ik02MzAsNTMwIEw4NjAsNTMwIiBzdHJva2U9IiNkNjMzMmIiIHN0cm9rZS13aWR0aD0iMyIvPgo8"
+    "cGF0aCBkPSJNNjMwLDU4MCBMODYwLDU4MCIgc3Ryb2tlPSIjMWIxYjFiIiBzdHJva2Utd2lkdGg9IjMiLz4KPHBhdGggZD0iTTYzMCw2NTAgTDY2MCw2"
+    "NTAiIHN0cm9rZT0iI2U5YTgwMCIgc3Ryb2tlLXdpZHRoPSIzIi8+CjxsaW5lIHgxPSI2NjAiIHkxPSI2NTAiIHgyPSI3MzAiIHkyPSI2NTAiIHN0cm9r"
+    "ZT0iIzhiOTQ5ZSIgc3Ryb2tlLXdpZHRoPSIyLjQiLz4KPHJlY3QgeD0iNjc3LjAiIHk9IjY0My41IiB3aWR0aD0iMzYiIGhlaWdodD0iMTMiIHJ4PSI2"
+    "IiBmaWxsPSIjZTNjZmEyIiBzdHJva2U9IiM5Yzg2NTYiLz4KPHJlY3QgeD0iNjg0LjAiIHk9IjY0NC4wIiB3aWR0aD0iMy40IiBoZWlnaHQ9IjEyIiBm"
+    "aWxsPSIjN2E0YTFkIi8+CjxyZWN0IHg9IjY5MC41IiB5PSI2NDQuMCIgd2lkdGg9IjMuNCIgaGVpZ2h0PSIxMiIgZmlsbD0iIzFiMWIxYiIvPgo8cmVj"
+    "dCB4PSI2OTcuMCIgeT0iNjQ0LjAiIHdpZHRoPSIzLjQiIGhlaWdodD0iMTIiIGZpbGw9IiNkNjMzMmIiLz4KPHJlY3QgeD0iNzA3LjUiIHk9IjY0NC4w"
+    "IiB3aWR0aD0iMy40IiBoZWlnaHQ9IjEyIiBmaWxsPSIjYzlhMjI3Ii8+CjxwYXRoIGQ9Ik03MzAsNjUwIEw4NjAsNjUwIiBzdHJva2U9IiMwZjFiMmQi"
+    "IHN0cm9rZS13aWR0aD0iMyIvPgo8bGluZSB4MT0iNzYwIiB5MT0iNTgwIiB4Mj0iNzYwIiB5Mj0iNjUwIiBzdHJva2U9IiM4Yjk0OWUiIHN0cm9rZS13"
+    "aWR0aD0iMi40Ii8+CjxlbGxpcHNlIGN4PSI3NjAiIGN5PSI2MTUuMCIgcng9IjEyIiByeT0iMTEiIGZpbGw9IiNmMGEyM2EiIHN0cm9rZT0iI2I4NmQx"
+    "MiIgc3Ryb2tlLXdpZHRoPSIxLjUiLz4KPHRleHQgeD0iNzYwLjAiIHk9IjYxOC4yIiBmb250LXNpemU9IjguNSIgZm9udC13ZWlnaHQ9IjcwMCIgZmls"
+    "bD0iIzVhMzIwNiIgdGV4dC1hbmNob3I9Im1pZGRsZSIgPjEwNDwvdGV4dD4KPGxpbmUgeDE9IjgxMCIgeTE9IjU4MCIgeDI9IjgxMCIgeTI9IjY1MCIg"
+    "c3Ryb2tlPSIjOGI5NDllIiBzdHJva2Utd2lkdGg9IjIuNCIvPgo8cmVjdCB4PSI4MDMuNSIgeT0iNTk3LjAiIHdpZHRoPSIxMyIgaGVpZ2h0PSIzNiIg"
+    "cng9IjYiIGZpbGw9IiNlM2NmYTIiIHN0cm9rZT0iIzljODY1NiIvPgo8cmVjdCB4PSI4MDQuMCIgeT0iNjA0LjAiIHdpZHRoPSIxMiIgaGVpZ2h0PSIz"
+    "LjQiIGZpbGw9IiM3YTRhMWQiLz4KPHJlY3QgeD0iODA0LjAiIHk9IjYxMC41IiB3aWR0aD0iMTIiIGhlaWdodD0iMy40IiBmaWxsPSIjMWIxYjFiIi8+"
+    "CjxyZWN0IHg9IjgwNC4wIiB5PSI2MTcuMCIgd2lkdGg9IjEyIiBoZWlnaHQ9IjMuNCIgZmlsbD0iIzIzOWEzYiIvPgo8cmVjdCB4PSI4MDQuMCIgeT0i"
+    "NjI3LjUiIHdpZHRoPSIxMiIgaGVpZ2h0PSIzLjQiIGZpbGw9IiNjOWEyMjciLz4KPGNpcmNsZSBjeD0iNzYwIiBjeT0iNjUwIiByPSI0IiBmaWxsPSIj"
+    "MGYxYjJkIi8+CjxjaXJjbGUgY3g9Ijc2MCIgY3k9IjU4MCIgcj0iNCIgZmlsbD0iIzBmMWIyZCIvPgo8Y2lyY2xlIGN4PSI4MTAiIGN5PSI2NTAiIHI9"
+    "IjQiIGZpbGw9IiMwZjFiMmQiLz4KPGNpcmNsZSBjeD0iODEwIiBjeT0iNTgwIiByPSI0IiBmaWxsPSIjMGYxYjJkIi8+CjxyZWN0IHg9IjY2My4wIiB5"
+    "PSI2NjYuNSIgd2lkdGg9IjY0LjAiIGhlaWdodD0iMTcuNSIgcng9IjQiIGZpbGw9IiNmZmZmZmYiIG9wYWNpdHk9Ii44NSIvPgo8dGV4dCB4PSI2OTUu"
+    "MCIgeT0iNjc4LjAiIGZvbnQtc2l6ZT0iMTIuNSIgZm9udC13ZWlnaHQ9IjcwMCIgZmlsbD0iIzBmMWIyZCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgPlIx"
+    "ICAxIGvOqTwvdGV4dD4KPHJlY3QgeD0iNzIzLjgiIHk9IjU1Ny4wIiB3aWR0aD0iNjguNSIgaGVpZ2h0PSIxNy4wIiByeD0iNCIgZmlsbD0iI2ZmZmZm"
+    "ZiIgb3BhY2l0eT0iLjg1Ii8+Cjx0ZXh0IHg9Ijc1OC4wIiB5PSI1NjguMCIgZm9udC1zaXplPSIxMiIgZm9udC13ZWlnaHQ9IjcwMCIgZmlsbD0iIzBm"
+    "MWIyZCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgPkMxIDEwMCBuRjwvdGV4dD4KPHJlY3QgeD0iODIwLjAiIHk9IjYwNi4wIiB3aWR0aD0iNTUuMCIgaGVp"
+    "Z2h0PSIxNy4wIiByeD0iNCIgZmlsbD0iI2ZmZmZmZiIgb3BhY2l0eT0iLjg1Ii8+Cjx0ZXh0IHg9IjgyNC4wIiB5PSI2MTcuMCIgZm9udC1zaXplPSIx"
+    "MiIgZm9udC13ZWlnaHQ9IjcwMCIgZmlsbD0iIzBmMWIyZCIgdGV4dC1hbmNob3I9InN0YXJ0IiA+UjIgMSBNzqk8L3RleHQ+CjxyZWN0IHg9IjY1MS4x"
+    "IiB5PSI2MjcuNSIgd2lkdGg9Ijg3LjgiIGhlaWdodD0iMTQuNSIgcng9IjQiIGZpbGw9IiNmZmZmZmYiIG9wYWNpdHk9Ii44NSIvPgo8dGV4dCB4PSI2"
+    "OTUuMCIgeT0iNjM2LjAiIGZvbnQtc2l6ZT0iOS41IiBmb250LXdlaWdodD0iNDAwIiBmaWxsPSIjNmI1YTMyIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiA+"
+    "YnJvd24gYmxhY2sgcmVkPC90ZXh0Pgo8cmVjdCB4PSI4MjAuMCIgeT0iNjIzLjUiIHdpZHRoPSI5OC40IiBoZWlnaHQ9IjE0LjUiIHJ4PSI0IiBmaWxs"
+    "PSIjZmZmZmZmIiBvcGFjaXR5PSIuODUiLz4KPHRleHQgeD0iODI0LjAiIHk9IjYzMi4wIiBmb250LXNpemU9IjkuNSIgZm9udC13ZWlnaHQ9IjQwMCIg"
+    "ZmlsbD0iIzZiNWEzMiIgdGV4dC1hbmNob3I9InN0YXJ0IiA+YnJvd24gYmxhY2sgZ3JlZW48L3RleHQ+Cjx0ZXh0IHg9IjczMC4wIiB5PSI3MTIuMCIg"
+    "Zm9udC1zaXplPSIxMiIgZm9udC13ZWlnaHQ9IjYwMCIgZmlsbD0iIzJiM2E0ZSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgPnBlcmZib2FyZCwgb3IgYSBz"
+    "Y3Jldy10ZXJtaW5hbCBwcm90byBzaGllbGQ8L3RleHQ+Cjx0ZXh0IHg9IjczMC4wIiB5PSI3MjguMCIgZm9udC1zaXplPSIxMS41IiBmb250LXdlaWdo"
+    "dD0iNDAwIiBmaWxsPSIjNGE1YTcwIiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiA+b24gdGhlIEFyZHVpbm8gLSBrZWVwIHRoZXNlIHBhcnRzIGNsb3NlIHRv"
+    "IHRoZSBwaW5zPC90ZXh0Pgo8cGF0aCBkPSJNNTI2LjAsNTkwLjAgTDU0Ni4wLDU5MC4wIFE1NTYuMCw1OTAuMCA1NTYuMCw1ODAuMCBMNTU2LjAsNTQw"
+    "LjAgUTU1Ni4wLDUzMC4wIDU2Ni4wLDUzMC4wIEw2MTYuMCw1MzAuMCIgZmlsbD0ibm9uZSIgc3Ryb2tlPSIjMDAwMDAwNTUiIHN0cm9rZS13aWR0aD0i"
+    "Ni40IiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiLz4KPHBhdGggZD0iTTUyNi4wLDU5MC4wIEw1NDYuMCw1OTAu"
+    "MCBRNTU2LjAsNTkwLjAgNTU2LjAsNTgwLjAgTDU1Ni4wLDU0MC4wIFE1NTYuMCw1MzAuMCA1NjYuMCw1MzAuMCBMNjE2LjAsNTMwLjAiIGZpbGw9Im5v"
+    "bmUiIHN0cm9rZT0iI2Q2MzMyYiIgc3Ryb2tlLXdpZHRoPSI0LjIiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCIv"
+    "Pgo8cGF0aCBkPSJNNTI2LjAsNTk4LjAgTDU2MC4wLDU5OC4wIFE1NjguMCw1OTguMCA1NjguMCw1OTAuMCBMNTY4LjAsNTg4LjAgUTU2OC4wLDU4MC4w"
+    "IDU3Ni4wLDU4MC4wIEw2MTYuMCw1ODAuMCIgZmlsbD0ibm9uZSIgc3Ryb2tlPSIjMDAwMDAwNTUiIHN0cm9rZS13aWR0aD0iNi40IiBzdHJva2UtbGlu"
+    "ZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiLz4KPHBhdGggZD0iTTUyNi4wLDU5OC4wIEw1NjAuMCw1OTguMCBRNTY4LjAsNTk4LjAg"
+    "NTY4LjAsNTkwLjAgTDU2OC4wLDU4OC4wIFE1NjguMCw1ODAuMCA1NzYuMCw1ODAuMCBMNjE2LjAsNTgwLjAiIGZpbGw9Im5vbmUiIHN0cm9rZT0iIzFi"
+    "MWIxYiIgc3Ryb2tlLXdpZHRoPSI0LjIiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCIvPgo8cGF0aCBkPSJNNTI0"
+    "LjAsNjA1LjAgTDU2OS4wLDYwNS4wIFE1NzUuMCw2MDUuMCA1NzUuMCw1OTkuMCBMNTc1LjAsNTkxLjAgUTU3NS4wLDU4NS4wIDU4MS4wLDU4NC45IEw2"
+    "MTYuMCw1ODQuMCIgZmlsbD0ibm9uZSIgc3Ryb2tlPSIjMDAwMDAwNTUiIHN0cm9rZS13aWR0aD0iNC44MDAwMDAwMDAwMDAwMDEiIHN0cm9rZS1saW5l"
+    "Y2FwPSJyb3VuZCIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCIvPgo8cGF0aCBkPSJNNTI0LjAsNjA1LjAgTDU2OS4wLDYwNS4wIFE1NzUuMCw2MDUuMCA1"
+    "NzUuMCw1OTkuMCBMNTc1LjAsNTkxLjAgUTU3NS4wLDU4NS4wIDU4MS4wLDU4NC45IEw2MTYuMCw1ODQuMCIgZmlsbD0ibm9uZSIgc3Ryb2tlPSIjOWFh"
+    "M2FkIiBzdHJva2Utd2lkdGg9IjIuNiIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIiBzdHJva2UtbGluZWpvaW49InJvdW5kIi8+CjxwYXRoIGQ9Ik01MjYu"
+    "MCw2MTIuMCBMNTc0LjAsNjEyLjAgUTU4NC4wLDYxMi4wIDU4NC4wLDYyMi4wIEw1ODQuMCw2NDAuMCBRNTg0LjAsNjUwLjAgNTk0LjAsNjUwLjAgTDYx"
+    "Ni4wLDY1MC4wIiBmaWxsPSJub25lIiBzdHJva2U9IiMwMDAwMDA1NSIgc3Ryb2tlLXdpZHRoPSI2LjQiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIgc3Ry"
+    "b2tlLWxpbmVqb2luPSJyb3VuZCIvPgo8cGF0aCBkPSJNNTI2LjAsNjEyLjAgTDU3NC4wLDYxMi4wIFE1ODQuMCw2MTIuMCA1ODQuMCw2MjIuMCBMNTg0"
+    "LjAsNjQwLjAgUTU4NC4wLDY1MC4wIDU5NC4wLDY1MC4wIEw2MTYuMCw2NTAuMCIgZmlsbD0ibm9uZSIgc3Ryb2tlPSIjZTlhODAwIiBzdHJva2Utd2lk"
+    "dGg9IjQuMiIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIiBzdHJva2UtbGluZWpvaW49InJvdW5kIi8+Cjx0ZXh0IHg9IjQ3MC4wIiB5PSI2NjQuMCIgZm9u"
+    "dC1zaXplPSIxMSIgZm9udC13ZWlnaHQ9IjcwMCIgZmlsbD0iIzRhNWE3MCIgdGV4dC1hbmNob3I9InN0YXJ0IiA+ZHJhaW4gd2lyZSAoYmFyZSk6PC90"
+    "ZXh0Pgo8dGV4dCB4PSI0NzAuMCIgeT0iNjc4LjAiIGZvbnQtc2l6ZT0iMTEiIGZvbnQtd2VpZ2h0PSI3MDAiIGZpbGw9IiM0YTVhNzAiIHRleHQtYW5j"
+    "aG9yPSJzdGFydCIgPm9uIHRoZSBHTkQgc2NyZXcgdG9vPC90ZXh0Pgo8cGF0aCBkPSJNODYwLjAsNTMwLjAgTDEwNDEuMyw1MzAuMCBRMTA1My4zLDUz"
+    "MC4wIDEwNTMuMyw1MTguMCBMMTA1My4zLDQyMy4wIiBmaWxsPSJub25lIiBzdHJva2U9IiMwMDAwMDA1NSIgc3Ryb2tlLXdpZHRoPSI2LjQiIHN0cm9r"
+    "ZS1saW5lY2FwPSJyb3VuZCIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCIvPgo8cGF0aCBkPSJNODYwLjAsNTMwLjAgTDEwNDEuMyw1MzAuMCBRMTA1My4z"
+    "LDUzMC4wIDEwNTMuMyw1MTguMCBMMTA1My4zLDQyMy4wIiBmaWxsPSJub25lIiBzdHJva2U9IiNkNjMzMmIiIHN0cm9rZS13aWR0aD0iNC4yIiBzdHJv"
+    "a2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiLz4KPHBhdGggZD0iTTg2MC4wLDU4MC4wIEwxMDU2LjgsNTgwLjAgUTEwNjgu"
+    "OCw1ODAuMCAxMDY4LjgsNTY4LjAgTDEwNjguOCw0MjMuMCIgZmlsbD0ibm9uZSIgc3Ryb2tlPSIjMDAwMDAwNTUiIHN0cm9rZS13aWR0aD0iNi40IiBz"
+    "dHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiLz4KPHBhdGggZD0iTTg2MC4wLDU4MC4wIEwxMDU2LjgsNTgwLjAgUTEw"
+    "NjguOCw1ODAuMCAxMDY4LjgsNTY4LjAgTDEwNjguOCw0MjMuMCIgZmlsbD0ibm9uZSIgc3Ryb2tlPSIjMWIxYjFiIiBzdHJva2Utd2lkdGg9IjQuMiIg"
+    "c3Ryb2tlLWxpbmVjYXA9InJvdW5kIiBzdHJva2UtbGluZWpvaW49InJvdW5kIi8+CjxwYXRoIGQ9Ik04NjAuMCw2NTAuMCBMMTExOS4wLDY1MC4wIFEx"
+    "MTMxLjAsNjUwLjAgMTEzMS4wLDYzOC4wIEwxMTMxLjAsNDIzLjAiIGZpbGw9Im5vbmUiIHN0cm9rZT0iIzAwMDAwMDU1IiBzdHJva2Utd2lkdGg9IjYu"
+    "NCIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIiBzdHJva2UtbGluZWpvaW49InJvdW5kIi8+CjxwYXRoIGQ9Ik04NjAuMCw2NTAuMCBMMTExOS4wLDY1MC4w"
+    "IFExMTMxLjAsNjUwLjAgMTEzMS4wLDYzOC4wIEwxMTMxLjAsNDIzLjAiIGZpbGw9Im5vbmUiIHN0cm9rZT0iI2U5YTgwMCIgc3Ryb2tlLXdpZHRoPSI0"
+    "LjIiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCIvPgo8cmVjdCB4PSI5OTEuMyIgeT0iNDYwLjAiIHdpZHRoPSI0"
+    "NC4wIiBoZWlnaHQ9IjIwIiByeD0iMTAiIGZpbGw9IiNmZmZmZmYiIHN0cm9rZT0iI2Q2MzMyYiIgc3Ryb2tlLXdpZHRoPSIyIi8+Cjx0ZXh0IHg9IjEw"
+    "MTMuMyIgeT0iNDc0LjUiIGZvbnQtc2l6ZT0iMTIiIGZvbnQtd2VpZ2h0PSI3MDAiIGZpbGw9IiMwZjFiMmQiIHRleHQtYW5jaG9yPSJtaWRkbGUiID41"
+    "VjwvdGV4dD4KPHJlY3QgeD0iMTAzOS44IiB5PSI0ODguMCIgd2lkdGg9IjU0LjAiIGhlaWdodD0iMjAiIHJ4PSIxMCIgZmlsbD0iI2ZmZmZmZiIgc3Ry"
+    "b2tlPSIjMWIxYjFiIiBzdHJva2Utd2lkdGg9IjIiLz4KPHRleHQgeD0iMTA2Ni44IiB5PSI1MDIuNSIgZm9udC1zaXplPSIxMiIgZm9udC13ZWlnaHQ9"
+    "IjcwMCIgZmlsbD0iIzBmMWIyZCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgPkdORDwvdGV4dD4KPHJlY3QgeD0iMTA3OC4wIiB5PSI0NjAuMCIgd2lkdGg9"
+    "IjEwNi4wIiBoZWlnaHQ9IjIwIiByeD0iMTAiIGZpbGw9IiNmZmZmZmYiIHN0cm9rZT0iI2U5YTgwMCIgc3Ryb2tlLXdpZHRoPSIyIi8+Cjx0ZXh0IHg9"
+    "IjExMzEuMCIgeT0iNDc0LjUiIGZvbnQtc2l6ZT0iMTIiIGZvbnQtd2VpZ2h0PSI3MDAiIGZpbGw9IiMwZjFiMmQiIHRleHQtYW5jaG9yPSJtaWRkbGUi"
+    "ID5BMCAobW90b3IgMSk8L3RleHQ+Cjx0ZXh0IHg9IjExNTMuMCIgeT0iNTIwLjAiIGZvbnQtc2l6ZT0iMTIiIGZvbnQtd2VpZ2h0PSI2MDAiIGZpbGw9"
+    "IiMyYjNhNGUiIHRleHQtYW5jaG9yPSJzdGFydCIgPm1vdG9yIDI6IEExPC90ZXh0Pgo8dGV4dCB4PSIxMTUzLjAiIHk9IjUzNi4wIiBmb250LXNpemU9"
+    "IjEyIiBmb250LXdlaWdodD0iNjAwIiBmaWxsPSIjMmIzYTRlIiB0ZXh0LWFuY2hvcj0ic3RhcnQiID5tb3RvciAzOiBBMjwvdGV4dD4KPHRleHQgeD0i"
+    "MTE1My4wIiB5PSI1NTIuMCIgZm9udC1zaXplPSIxMS41IiBmb250LXdlaWdodD0iNDAwIiBmaWxsPSIjNGE1YTcwIiB0ZXh0LWFuY2hvcj0ic3RhcnQi"
+    "ID4oc2FtZSBmaWx0ZXIpPC90ZXh0Pgo8dGV4dCB4PSIxMTUzLjAiIHk9IjU4NC4wIiBmb250LXNpemU9IjExLjUiIGZvbnQtd2VpZ2h0PSI0MDAiIGZp"
+    "bGw9IiM0YTVhNzAiIHRleHQtYW5jaG9yPSJzdGFydCIgPkFsbCB0aHJlZSBwb3RzIHNoYXJlPC90ZXh0Pgo8dGV4dCB4PSIxMTUzLjAiIHk9IjU5OS4w"
+    "IiBmb250LXNpemU9IjExLjUiIGZvbnQtd2VpZ2h0PSI0MDAiIGZpbGw9IiM0YTVhNzAiIHRleHQtYW5jaG9yPSJzdGFydCIgPjVWIGFuZCBHTkQ6IHVz"
+    "ZSB0aGU8L3RleHQ+Cjx0ZXh0IHg9IjExNTMuMCIgeT0iNjE0LjAiIGZvbnQtc2l6ZT0iMTEuNSIgZm9udC13ZWlnaHQ9IjQwMCIgZmlsbD0iIzRhNWE3"
+    "MCIgdGV4dC1hbmNob3I9InN0YXJ0IiA+Ym9hcmQncyByYWlscy48L3RleHQ+CjxsaW5lIHgxPSI0MCIgeTE9Ijc0MiIgeDI9IjEyNDAiIHkyPSI3NDIi"
+    "IHN0cm9rZT0iI2Q1ZGRlNiIgc3Ryb2tlLXdpZHRoPSIxLjUiLz4KPHRleHQgeD0iNDAuMCIgeT0iNzcyLjAiIGZvbnQtc2l6ZT0iMTUiIGZvbnQtd2Vp"
+    "Z2h0PSI3MDAiIGZpbGw9IiMwZjFiMmQiIHRleHQtYW5jaG9yPSJzdGFydCIgPlBhcnRzIGZvciB0aHJlZSBwb3RzPC90ZXh0Pgo8Y2lyY2xlIGN4PSI0"
+    "NCIgY3k9Ijc5NiIgcj0iMyIgZmlsbD0iIzdiOGE5YyIvPgo8dGV4dCB4PSI1Ni4wIiB5PSI4MDAuMCIgZm9udC1zaXplPSIxMi41IiBmb250LXdlaWdo"
+    "dD0iNDAwIiBmaWxsPSIjMmIzYTRlIiB0ZXh0LWFuY2hvcj0ic3RhcnQiID4zIMOXIHJlc2lzdG9yIDEga86pLCDCvCBXIChSMSk8L3RleHQ+CjxjaXJj"
+    "bGUgY3g9IjQ0IiBjeT0iODE4LjUiIHI9IjMiIGZpbGw9IiM3YjhhOWMiLz4KPHRleHQgeD0iNTYuMCIgeT0iODIyLjUiIGZvbnQtc2l6ZT0iMTIuNSIg"
+    "Zm9udC13ZWlnaHQ9IjQwMCIgZmlsbD0iIzJiM2E0ZSIgdGV4dC1hbmNob3I9InN0YXJ0IiA+MyDDlyBjZXJhbWljIGNhcGFjaXRvciAxMDAgbkYsIDUw"
+    "IFYsIFg3UiAtPC90ZXh0Pgo8dGV4dCB4PSI1Ni4wIiB5PSI4NDAuMCIgZm9udC1zaXplPSIxMi41IiBmb250LXdlaWdodD0iNDAwIiBmaWxsPSIjMmIz"
+    "YTRlIiB0ZXh0LWFuY2hvcj0ic3RhcnQiID5tYXJrZWQgMTA0IChDMSk8L3RleHQ+CjxjaXJjbGUgY3g9IjQ0IiBjeT0iODU4LjUiIHI9IjMiIGZpbGw9"
+    "IiM3YjhhOWMiLz4KPHRleHQgeD0iNTYuMCIgeT0iODYyLjUiIGZvbnQtc2l6ZT0iMTIuNSIgZm9udC13ZWlnaHQ9IjQwMCIgZmlsbD0iIzJiM2E0ZSIg"
+    "dGV4dC1hbmNob3I9InN0YXJ0IiA+MyDDlyByZXNpc3RvciAxIE3OqSwgwrwgVyAoUjIpPC90ZXh0Pgo8Y2lyY2xlIGN4PSI0NCIgY3k9Ijg4MS4wIiBy"
+    "PSIzIiBmaWxsPSIjN2I4YTljIi8+Cjx0ZXh0IHg9IjU2LjAiIHk9Ijg4NS4wIiBmb250LXNpemU9IjEyLjUiIGZvbnQtd2VpZ2h0PSI0MDAiIGZpbGw9"
+    "IiMyYjNhNGUiIHRleHQtYW5jaG9yPSJzdGFydCIgPjEgw5cgcGVyZmJvYXJkLCBvciBhIHNjcmV3LXRlcm1pbmFsIHByb3RvPC90ZXh0Pgo8dGV4dCB4"
+    "PSI1Ni4wIiB5PSI5MDIuNSIgZm9udC1zaXplPSIxMi41IiBmb250LXdlaWdodD0iNDAwIiBmaWxsPSIjMmIzYTRlIiB0ZXh0LWFuY2hvcj0ic3RhcnQi"
+    "ID5zaGllbGQgZm9yIHRoZSBVTk88L3RleHQ+CjxjaXJjbGUgY3g9IjQ0IiBjeT0iOTIxLjAiIHI9IjMiIGZpbGw9IiM3YjhhOWMiLz4KPHRleHQgeD0i"
+    "NTYuMCIgeT0iOTI1LjAiIGZvbnQtc2l6ZT0iMTIuNSIgZm9udC13ZWlnaHQ9IjQwMCIgZmlsbD0iIzJiM2E0ZSIgdGV4dC1hbmNob3I9InN0YXJ0IiA+"
+    "My1jb3JlIHNoaWVsZGVkIGNhYmxlIGZvciBlYWNoIHBvdCBydW4sIGFib3V0PC90ZXh0Pgo8dGV4dCB4PSI1Ni4wIiB5PSI5NDIuNSIgZm9udC1zaXpl"
+    "PSIxMi41IiBmb250LXdlaWdodD0iNDAwIiBmaWxsPSIjMmIzYTRlIiB0ZXh0LWFuY2hvcj0ic3RhcnQiID4wLjI1IG1twrIgKDIyLTI0IEFXRyksIHdp"
+    "dGggZm9pbCBvciBicmFpZCBhbmQgYTwvdGV4dD4KPHRleHQgeD0iNTYuMCIgeT0iOTYwLjAiIGZvbnQtc2l6ZT0iMTIuNSIgZm9udC13ZWlnaHQ9IjQw"
+    "MCIgZmlsbD0iIzJiM2E0ZSIgdGV4dC1hbmNob3I9InN0YXJ0IiA+ZHJhaW4gd2lyZTwvdGV4dD4KPGNpcmNsZSBjeD0iNDQiIGN5PSI5NzguNSIgcj0i"
+    "MyIgZmlsbD0iIzdiOGE5YyIvPgo8dGV4dCB4PSI1Ni4wIiB5PSI5ODIuNSIgZm9udC1zaXplPSIxMi41IiBmb250LXdlaWdodD0iNDAwIiBmaWxsPSIj"
+    "MmIzYTRlIiB0ZXh0LWFuY2hvcj0ic3RhcnQiID5PcHRpb25hbDogY2xpcC1vbiBmZXJyaXRlIGNvcmVzIGZvciB0aGUgbW90b3I8L3RleHQ+Cjx0ZXh0"
+    "IHg9IjU2LjAiIHk9IjEwMDAuMCIgZm9udC1zaXplPSIxMi41IiBmb250LXdlaWdodD0iNDAwIiBmaWxsPSIjMmIzYTRlIiB0ZXh0LWFuY2hvcj0ic3Rh"
+    "cnQiID5jYWJsZXMsIG5lYXIgdGhlIElCVC0yIGJvYXJkczwvdGV4dD4KPHRleHQgeD0iNDU1LjAiIHk9Ijc3Mi4wIiBmb250LXNpemU9IjE1IiBmb250"
+    "LXdlaWdodD0iNzAwIiBmaWxsPSIjMGYxYjJkIiB0ZXh0LWFuY2hvcj0ic3RhcnQiID5XaGF0IHRoZSBwYXJ0cyBkbzwvdGV4dD4KPGNpcmNsZSBjeD0i"
+    "NDU5IiBjeT0iNzk2IiByPSIzIiBmaWxsPSIjN2I4YTljIi8+Cjx0ZXh0IHg9IjQ3MS4wIiB5PSI4MDAuMCIgZm9udC1zaXplPSIxMi41IiBmb250LXdl"
+    "aWdodD0iNDAwIiBmaWxsPSIjMmIzYTRlIiB0ZXh0LWFuY2hvcj0ic3RhcnQiID5SMSArIEMxIHNtb290aCB0aGUgcmVhZGluZyBvdmVyIDAuMSBtczog"
+    "dGhlIHNwaWtlczwvdGV4dD4KPHRleHQgeD0iNDcxLjAiIHk9IjgxNy41IiBmb250LXNpemU9IjEyLjUiIGZvbnQtd2VpZ2h0PSI0MDAiIGZpbGw9IiMy"
+    "YjNhNGUiIHRleHQtYW5jaG9yPSJzdGFydCIgPnRoZSAyNSBrSHogbW90b3IgUFdNIHB1dHMgb24gdGhlIHBvdCB3aXJlIGdvLCB0aGU8L3RleHQ+Cjx0"
+    "ZXh0IHg9IjQ3MS4wIiB5PSI4MzUuMCIgZm9udC1zaXplPSIxMi41IiBmb250LXdlaWdodD0iNDAwIiBmaWxsPSIjMmIzYTRlIiB0ZXh0LWFuY2hvcj0i"
+    "c3RhcnQiID5tb3RvcidzIG93biBtb3ZlbWVudCBwYXNzZXMgdW50b3VjaGVkLjwvdGV4dD4KPGNpcmNsZSBjeD0iNDU5IiBjeT0iODUzLjUiIHI9IjMi"
+    "IGZpbGw9IiM3YjhhOWMiLz4KPHRleHQgeD0iNDcxLjAiIHk9Ijg1Ny41IiBmb250LXNpemU9IjEyLjUiIGZvbnQtd2VpZ2h0PSI0MDAiIGZpbGw9IiMy"
+    "YjNhNGUiIHRleHQtYW5jaG9yPSJzdGFydCIgPlIyIG1ha2VzIGEgYnJva2VuIHdpcGVyIHdpcmUgcmVhZCAwLCBzbyB0aGUgc2FmZXR5PC90ZXh0Pgo8"
+    "dGV4dCB4PSI0NzEuMCIgeT0iODc1LjAiIGZvbnQtc2l6ZT0iMTIuNSIgZm9udC13ZWlnaHQ9IjQwMCIgZmlsbD0iIzJiM2E0ZSIgdGV4dC1hbmNob3I9"
+    "InN0YXJ0IiA+Y3V0b2ZmIHN0aWxsIHRyaXBzIC0gd2l0aG91dCBpdCB0aGUgY2FwYWNpdG9yPC90ZXh0Pgo8dGV4dCB4PSI0NzEuMCIgeT0iODkyLjUi"
+    "IGZvbnQtc2l6ZT0iMTIuNSIgZm9udC13ZWlnaHQ9IjQwMCIgZmlsbD0iIzJiM2E0ZSIgdGV4dC1hbmNob3I9InN0YXJ0IiA+d291bGQgaG9sZCB0aGUg"
+    "bGFzdCBwb3NpdGlvbi48L3RleHQ+CjxjaXJjbGUgY3g9IjQ1OSIgY3k9IjkxMS4wIiByPSIzIiBmaWxsPSIjN2I4YTljIi8+Cjx0ZXh0IHg9IjQ3MS4w"
+    "IiB5PSI5MTUuMCIgZm9udC1zaXplPSIxMi41IiBmb250LXdlaWdodD0iNDAwIiBmaWxsPSIjMmIzYTRlIiB0ZXh0LWFuY2hvcj0ic3RhcnQiID5UaGUg"
+    "c2hpZWxkIGNhdGNoZXMgdGhlIG5vaXNlIGFuZCB0YWtlcyBpdCB0byBHTkQgLTwvdGV4dD4KPHRleHQgeD0iNDcxLjAiIHk9IjkzMi41IiBmb250LXNp"
+    "emU9IjEyLjUiIGZvbnQtd2VpZ2h0PSI0MDAiIGZpbGw9IiMyYjNhNGUiIHRleHQtYW5jaG9yPSJzdGFydCIgPmF0IHRoZSBBcmR1aW5vIGVuZCBvbmx5"
+    "LjwvdGV4dD4KPGNpcmNsZSBjeD0iNDU5IiBjeT0iOTUxLjAiIHI9IjMiIGZpbGw9IiM3YjhhOWMiLz4KPHRleHQgeD0iNDcxLjAiIHk9Ijk1NS4wIiBm"
+    "b250LXNpemU9IjEyLjUiIGZvbnQtd2VpZ2h0PSI2MDAiIGZpbGw9IiNhMTI2MWYiIHRleHQtYW5jaG9yPSJzdGFydCIgPktlZXAgQzEgYXQgMSDCtUYg"
+    "b3IgbGVzczogYSBiaWdnZXIgb25lIGRlbGF5cyB0aGU8L3RleHQ+Cjx0ZXh0IHg9IjQ3MS4wIiB5PSI5NzIuNSIgZm9udC1zaXplPSIxMi41IiBmb250"
+    "LXdlaWdodD0iNjAwIiBmaWxsPSIjYTEyNjFmIiB0ZXh0LWFuY2hvcj0ic3RhcnQiID5yZWFkaW5nIGFuZCB0aGUgbW90b3JzIHN0YXJ0IHRvIGh1bnQu"
+    "PC90ZXh0Pgo8dGV4dCB4PSI4ODAuMCIgeT0iNzcyLjAiIGZvbnQtc2l6ZT0iMTUiIGZvbnQtd2VpZ2h0PSI3MDAiIGZpbGw9IiMwZjFiMmQiIHRleHQt"
+    "YW5jaG9yPSJzdGFydCIgPldpcmluZyBydWxlcyAoZnJlZSk8L3RleHQ+CjxjaXJjbGUgY3g9Ijg4NCIgY3k9Ijc5NiIgcj0iMyIgZmlsbD0iIzdiOGE5"
+    "YyIvPgo8dGV4dCB4PSI4OTYuMCIgeT0iODAwLjAiIGZvbnQtc2l6ZT0iMTIuNSIgZm9udC13ZWlnaHQ9IjQwMCIgZmlsbD0iIzJiM2E0ZSIgdGV4dC1h"
+    "bmNob3I9InN0YXJ0IiA+UG90IEdORCBnb2VzIHN0cmFpZ2h0IHRvIGFuIEFyZHVpbm8gR05EIHBpbiAtPC90ZXh0Pgo8dGV4dCB4PSI4OTYuMCIgeT0i"
+    "ODE3LjUiIGZvbnQtc2l6ZT0iMTIuNSIgZm9udC13ZWlnaHQ9IjQwMCIgZmlsbD0iIzJiM2E0ZSIgdGV4dC1hbmNob3I9InN0YXJ0IiA+bm90IHRvIHRo"
+    "ZSBJQlQtMiBvciB0aGUgbW90b3Igc3VwcGx5LjwvdGV4dD4KPGNpcmNsZSBjeD0iODg0IiBjeT0iODM2LjAiIHI9IjMiIGZpbGw9IiM3YjhhOWMiLz4K"
+    "PHRleHQgeD0iODk2LjAiIHk9Ijg0MC4wIiBmb250LXNpemU9IjEyLjUiIGZvbnQtd2VpZ2h0PSI0MDAiIGZpbGw9IiMyYjNhNGUiIHRleHQtYW5jaG9y"
+    "PSJzdGFydCIgPlBvdCBjYWJsZXMgNSBjbSBvciBtb3JlIGZyb20gdGhlIG1vdG9yIGNhYmxlczs8L3RleHQ+Cjx0ZXh0IHg9Ijg5Ni4wIiB5PSI4NTcu"
+    "NSIgZm9udC1zaXplPSIxMi41IiBmb250LXdlaWdodD0iNDAwIiBmaWxsPSIjMmIzYTRlIiB0ZXh0LWFuY2hvcj0ic3RhcnQiID5jcm9zcyB0aGVtIGF0"
+    "IHJpZ2h0IGFuZ2xlcy48L3RleHQ+CjxjaXJjbGUgY3g9Ijg4NCIgY3k9Ijg3Ni4wIiByPSIzIiBmaWxsPSIjN2I4YTljIi8+Cjx0ZXh0IHg9Ijg5Ni4w"
+    "IiB5PSI4ODAuMCIgZm9udC1zaXplPSIxMi41IiBmb250LXdlaWdodD0iNDAwIiBmaWxsPSIjMmIzYTRlIiB0ZXh0LWFuY2hvcj0ic3RhcnQiID5Ud2lz"
+    "dCBlYWNoIG1vdG9yJ3MgdHdvIHdpcmVzIHRvZ2V0aGVyLjwvdGV4dD4KPGNpcmNsZSBjeD0iODg0IiBjeT0iODk4LjUiIHI9IjMiIGZpbGw9IiM3Yjhh"
+    "OWMiLz4KPHRleHQgeD0iODk2LjAiIHk9IjkwMi41IiBmb250LXNpemU9IjEyLjUiIGZvbnQtd2VpZ2h0PSI0MDAiIGZpbGw9IiMyYjNhNGUiIHRleHQt"
+    "YW5jaG9yPSJzdGFydCIgPlN0aWxsIGdsaXRjaGluZz8gVGhlIHBvdCBpcyBsb3NpbmcgY29udGFjdDwvdGV4dD4KPHRleHQgeD0iODk2LjAiIHk9Ijky"
+    "MC4wIiBmb250LXNpemU9IjEyLjUiIGZvbnQtd2VpZ2h0PSI0MDAiIGZpbGw9IiMyYjNhNGUiIHRleHQtYW5jaG9yPSJzdGFydCIgPih3ZWFyKTogZml0"
+    "IGEgY29uZHVjdGl2ZS1wbGFzdGljIHBvdCAoZS5nLjwvdGV4dD4KPHRleHQgeD0iODk2LjAiIHk9IjkzNy41IiBmb250LXNpemU9IjEyLjUiIGZvbnQt"
+    "d2VpZ2h0PSI0MDAiIGZpbGw9IiMyYjNhNGUiIHRleHQtYW5jaG9yPSJzdGFydCIgPkJvdXJucyA2NjM5Uy0xLTEwMywgMTAga86pKSBvciBhIGNvbnRh"
+    "Y3RsZXNzIEhhbGw8L3RleHQ+Cjx0ZXh0IHg9Ijg5Ni4wIiB5PSI5NTUuMCIgZm9udC1zaXplPSIxMi41IiBmb250LXdlaWdodD0iNDAwIiBmaWxsPSIj"
+    "MmIzYTRlIiB0ZXh0LWFuY2hvcj0ic3RhcnQiID5zZW5zb3IgKGUuZy4gVFQgRWxlY3Ryb25pY3MgNjEyN1YxQTE4MEwuNUZTKS48L3RleHQ+Cjx0ZXh0"
+    "IHg9IjQwLjAiIHk9IjEwMzQuMCIgZm9udC1zaXplPSIxNCIgZm9udC13ZWlnaHQ9IjcwMCIgZmlsbD0iIzBiNmU2ZSIgdGV4dC1hbmNob3I9InN0YXJ0"
+    "IiA+VGhlbiBpbiB0aGUgcGFnZTogRGlhZ25vc3RpY3MgLSB0aGUgcG90IGdsaXRjaCBjb3VudCBkcm9wcyB0byBuZWFyIDAuIEZpcm13YXJlIDEuOS40"
+    "IGFsc28gaG9sZHMgc2luZ2xlIGdsaXRjaGVzIGJhY2sgaW4gc29mdHdhcmUuPC90ZXh0Pgo8L3N2Zz4=")
 ASSETS["favicon.svg"] = base64.b64decode(
     "PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA2NCA2NCI+CiA8cmVjdCB3aWR0aD0iNjQiIGhlaWdodD0iNjQiIHJ4PSIxNCIgZmlsbD0iIzBiMTQyMiIvPgogPHJlY3QgeD0iMTcuNSIgeT0iNi41IiB3aWR0aD0iMTEiIGhlaWdodD0iOCIgcng9IjMuNSIgdHJhbnNmb3JtPSJyb3RhdGUoMTAgMjMgMTAuNSkiIGZpbGw9IiMyYjg2ZmYiLz4KIDxwYXRoIGQ9Ik0xOC42IDE3LjRoOS4yYzEuNiAwIDIuNyAxLjQgMi41IDNMMjguNCAzNGgxMy44YzMuNCAwIDUuOCAyLjQgNS44IDUuNHYxLjhjMCAxLjUtMS4yIDIuOC0yLjggMi44SDE3LjRjLTIuOCAwLTQuOS0yLjUtNC41LTUuM2wzLjMtMTguOGMuMy0xLjQgMS4xLTIuNSAyLjQtMi41eiIgZmlsbD0iIzJiODZmZiIvPgogPHBhdGggZD0iTTQ3IDEzLjVsNS41IDMuNk00OC44IDguM2w3LjQgNC44IiBzdHJva2U9IiMyYjg2ZmYiIHN0cm9rZS13aWR0aD0iMi44IiBzdHJva2UtbGluZWNhcD0icm91bmQiIGZpbGw9Im5vbmUiIG9wYWNpdHk9Ii43Ii8+CiA8Y2lyY2xlIGN4PSIxOSIgY3k9IjUzLjUiIHI9IjQuNCIgZmlsbD0iIzJiODZmZiIvPjxjaXJjbGUgY3g9IjMyIiBjeT0iNTMuNSIgcj0iNC40IiBmaWxsPSIjZjc5NDFkIi8+PGNpcmNsZSBjeD0iNDUiIGN5PSI1My41IiByPSI0LjQiIGZpbGw9IiMyYmQ0NGYiLz4KPC9zdmc+Cg==")
 ASSETS["favicon-32.png"] = base64.b64decode(
@@ -7349,6 +8111,11 @@ pre.log{background:var(--chart);border:1px solid var(--line);border-radius:7px;h
 .tchart{border:1px solid var(--line);border-radius:8px;background:var(--chart);padding:7px 10px 4px;position:relative;min-width:0}
 .tchart h5{margin:0 0 2px;font-size:12.5px;font-weight:600;color:var(--dim)}
 .tchart svg{width:100%;height:160px;display:block}
+.tchart h5{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.swtabs{display:inline-flex;border:1px solid var(--line-2);border-radius:6px;overflow:hidden}
+.swt{border:0;background:transparent;color:var(--dim);font-size:12px;padding:2px 8px;cursor:pointer;border-left:1px solid var(--line-2)}
+.swt:first-child{border-left:0}.swt.on{background:color-mix(in srgb,var(--blue) 22%,transparent);color:var(--text)}
+.swpk{font-weight:400;font-size:12px;margin-left:auto}
 .ttip{position:absolute;pointer-events:none;background:var(--tip);border:1px solid var(--tip-line);color:var(--tip-text);border-radius:6px;padding:6px 9px;font:12px/1.45 var(--mono);white-space:nowrap;z-index:5;box-shadow:0 4px 14px rgba(0,0,0,.35)}
 .tempty{color:var(--dim);font-size:13px;padding:16px 4px;text-align:center}
 main[data-view=autotune] .tune .tcd{display:none!important}
@@ -8058,7 +8825,7 @@ details.oks .flist{margin-top:6px}
   <div class="cols">
    <div><h3>Every control explains itself</h3><p>Hold the mouse over any setting, button, legend entry or status item for a short note on what it does on the rig, what too low and too high feel like, and where to start.</p>
     <h3>Tuning by hand</h3><ol><li>Stop SimHub's motion output.</li><li>Set Ki 0, Kd 0, PWMmin 10-15, dead zone 2-4 and press Apply.</li><li>Run a Square test on one motor and raise Kp until the green line just stops overshooting the blue one.</li><li>Add a little Ki (5-20) only if the seat settles short of the target.</li><li>Save to EEPROM.</li></ol></div>
-   <div><h3>Auto-tune</h3><p>Measures pot noise (dead zone) and friction (PWMmin), then the motor's top speed each way with one quick move. Every test after that is a <b>gradual move</b> at 60% of the slower way's top speed - a move the motor can follow, like a game's - in <b>both directions</b> (up and down for a lift, left and right for the rear slide), and each direction is judged on its own: how far the motor trails the move (lag), overshoot, settling, how far short it stops, ringing and how much of PWMmax it takes. Kp rises until the motor follows within the style's lag target both ways, or until it starts to overshoot; small sharp steps (kerb-sized) check it stays calm; Ki and Kd are added only if they help. The board has one set of values per motor, so the worse direction decides. The <b>Auto-tune live</b> gauges show each test: the needles are the two directions, the coloured band says what's good. With the seat empty and your weight entered, it allows for you (stricter overshoot, stiffer, a little Ki); <b>Check</b> with you in the seat then tests the values with your weight. With the motion sensor it also watches the seat. It stops by itself and restores the previous settings if SimHub moves the rig or anything looks wrong; Stop, Space or Esc stops it at once. Nothing is saved until you press Save to EEPROM. Every limit allows for the pot's noise, and a motor is only called wired backwards when it goes the wrong way <b>both</b> ways. If it does stop for safety, that motor is switched off with its previous settings back: fix the cause, then Enable Motors.</p>
+   <div><h3>Auto-tune</h3><p>Measures pot noise (dead zone) and friction (PWMmin), then the motor's top speed each way with one quick move. Every test after that is a <b>gradual move</b> at 60% of the slower way's top speed - a move the motor can follow, like a game's - in <b>both directions</b>, out and back from where the seat starts the way you'd move a knob on the dashboard (up, back, down, back for a lift; right, back, left, back for the rear slide), and each direction is judged on its own: how far the motor trails the move (lag), overshoot, settling, how far short it stops, ringing and how much of PWMmax it takes. Kp rises until the motor follows within the style's lag target both ways, or until it starts to overshoot; small sharp steps (kerb-sized) check it stays calm; Ki and Kd are added only if they help. The board has one set of values per motor, so the worse direction decides. The <b>Auto-tune live</b> gauges show each test: the needles are the two directions, the coloured band says what's good. The sweep charts scale to the results; the tabs switch the second chart between overshoot, off by and settle time. With the seat empty and your weight entered, it allows for you (stricter overshoot, stiffer, a little Ki); <b>Check</b> with you in the seat then tests the values with your weight. With the motion sensor it also watches the seat. It stops by itself and restores the previous settings if SimHub moves the rig or anything looks wrong; Stop, Space or Esc stops it at once. Nothing is saved until you press Save to EEPROM. Every limit allows for the pot's noise, and a motor is only called wired backwards when it goes the wrong way <b>both</b> ways. If it does stop for safety, that motor is switched off with its previous settings back: fix the cause, then Enable Motors.</p>
     <h3>Profiles and recommendations</h3><p>Save the settings that suit a car or game under a name and load them later. The recommendations (circuit, rally, flight, space, trucks) adjust your own tuned settings for that kind of sim and list the SimHub settings that matter most for it. Loading applies live; save to EEPROM to make it the power-on default.</p>
     <h3>Backups</h3><p>Every Save to EEPROM, and every bigger change, keeps a copy on the NAS (EEPROM section). Switch back to any of them live, or switch and save in one go.</p></div>
    <div><h3>Motor names and the rig</h3><p>Settings, Motor names: call the motors Front left, Front right, Traction loss (or anything you like). The names appear everywhere in the page and in diagnostics files; the number stays alongside because the wiring, SimHub and the LED matrix use numbers. The same card says what <b>motor 3</b> does: on a <b>traction-loss</b> rig motors 1 and 2 lift the front corners and motor 3, mounted horizontally, swings the rear left and right about a pivot at the front; on a <b>three-lift</b> rig it lifts the rear. Seat setup, the full check, auto-tune and the 3D view follow that.</p>
@@ -8083,7 +8850,8 @@ details.oks .flist{margin-top:6px}
      <tr><td>E0</td><td><code>ERROR E0 WIFI MODULE</code> - the board's WiFi chip doesn't answer.</td><td>Unplug the board for 10 s. Update the UNO R4 WiFi's radio firmware (Arduino IDE: Tools, Firmware Updater). SimHub over USB keeps working.</td></tr>
     </table><p class="muted" style="font-size:12.5px">Firmware 1.7 and older show dots along the bottom row and "E" plus motor numbers instead.</p>
     <h3>Motion sensor</h3><p>A WitMotion WT901C on the seat, wired to the board through a MAX3232 RS-232-to-TTL module: sensor TX (yellow) to the module's RS-232 RX, its TTL TX to <b>D0</b>; the board's <b>D1</b> to the module's TTL RX, its RS-232 TX to the sensor's RX (green), so this page can set the sensor up. Sensor and module from <b>5V</b> and <b>GND</b>. A -232 sensor must not go to D0/D1 directly - RS-232 levels damage the board. Then Settings, Motion sensor: switch it on, check the mounting, <b>Set up the sensor</b> (100 Hz with gyro and acceleration), and run Seat setup. You get a Seat angle chart (real degrees), the 3D view, the seat's own movement in auto-tune and the full check (bounce, play, degrees per count), the seat horizon on the matrix, and tilt limits for each direction.</p></div>
- 
+
+  <div class="hwide" id="help-potfilter"><h3>Pot noise filter</h3><p>The board counts pot glitches: readings that jump further in 1/4 ms than any motor can move (Diagnostics shows them). Most come from the motor PWM getting into the pot wires. Three small parts per pot at the Arduino stop that: <b>1 kΩ</b> in the wiper wire, <b>100 nF</b> from the A pin to GND, <b>1 MΩ</b> from the A pin to GND (so a broken wiper wire still trips the cutoff). Use shielded cable, with the shield on GND at the Arduino end only, run the pot GND straight to an Arduino GND pin and keep pot cables away from motor cables. Firmware 1.9.4 also holds single glitches back in software. If a pot still glitches it is losing contact (wear): a conductive-plastic pot or a contactless Hall sensor fixes that.</p><p><a href="/img/pot-filter.svg" target="_blank" rel="noopener"><img src="/img/pot-filter.svg" alt="Pot noise filter: R1 1 kΩ in the wiper wire, C1 100 nF and R2 1 MΩ from the A pin to GND, shielded cable" style="width:100%;max-width:1100px;border-radius:10px;border:1px solid var(--line)"></a></p></div>
  </section>
 </main>
 </div>
@@ -8775,7 +9543,7 @@ async function tuneRevert(){await post('/tune/revert');readParams();}
 
 // the result: what changed, each direction's final figures, notes - or the check's verdict
 function dirRows(D,dirs,small,pm){const f=(v,d,u)=>v==null?'-':(+v).toFixed(d)+u;
- let h='<table class="tdirs"><tr><th></th><th>lag</th><th>overshoot</th><th>settle</th><th>off by</th><th>drive</th><th title="small ±15 steps: overshoot · off by">small</th></tr>';
+ let h='<table class="tdirs"><tr><th></th><th>lag</th><th>overshoot</th><th>settle</th><th>off by</th><th>drive</th><th title="small ±30 steps: overshoot · off by">small</th></tr>';
  for(const d of D){const r=dirs[d.k]||{},q=(small||{})[d.k]||{};
   h+=`<tr><td><span class="${d.cls}">${d.sym}</span> ${esc(d.name)}</td><td>${f(r.lag_ms,0,' ms')}</td><td>${f(r.os,0,'%')}</td><td>${f(r.settle,0,' ms')}</td><td>${f(r.sse,1,'')}</td><td>${r.drive!=null&&pm?Math.round(100*r.drive/pm)+'%':'-'}</td><td>${q.os!=null?f(q.os,0,'%')+' · '+f(q.sse,1,''):'-'}</td></tr>`;}
  return h+'</table>';}
@@ -8847,14 +9615,16 @@ function gaugeHtml(g,D){const cx=70,cy=64,R=57,r=47,P=(f,rr)=>[(cx-rr*Math.cos(M
   `<div class="gv">${fmt(worst)}<small> ${g.u}</small></div><div class="gs ${st}">${esc(word)}</div>`+
   `<div class="gd">${D.map((d,i)=>`<span><span class="${d.cls}">${d.sym}</span> ${fmt(vals[i])}</span>`).join('')}</div></div>`;}
 function niceMax(v){const e=Math.pow(10,Math.floor(Math.log10(v))),m=v/e;return [1,1.2,1.5,2,2.5,3,4,5,6,8,10].find(x=>x>=m-1e-9)*e;}
-function sweepSvg(rows,key,D,target,chosen){const W=330,H=160,L=36,R=12,T=14,B=26,n=rows.length,pw=W-L-R,ph=H-T-B;
+function sweepSvg(rows,key,D,target,chosen,floor){const W=330,H=160,L=36,R=12,T=14,B=26,n=rows.length,pw=W-L-R,ph=H-T-B;
  const vals=rows.flatMap(r=>D.map(d=>r[d.k]?r[d.k][key]:null)).filter(v=>v!=null);
- const ymax=niceMax(Math.max(1,...vals,target*1.25)),X=i=>L+pw*(i+.5)/n,Y=v=>T+ph*(1-Math.min(v,ymax)/ymax);
+ // 2.6: the scale fits the figures (a target far above them no longer squashes them flat - it is named instead)
+ const ymax=niceMax(Math.max(floor||1,...vals.map(v=>v*1.2))),X=i=>L+pw*(i+.5)/n,Y=v=>T+ph*(1-Math.min(v,ymax)/ymax);
  let sv='';
  for(const t of [0,ymax/2,ymax]){const y=Y(t).toFixed(1);sv+=`<line x1="${L}" x2="${W-R}" y1="${y}" y2="${y}" stroke="var(--grid)" stroke-width="1"/><text x="${L-5}" y="${+y+3.5}" font-size="10" fill="var(--axis)" text-anchor="end" style="font-variant-numeric:tabular-nums">${+t.toFixed(1)}</text>`;}
  const ci=rows.findIndex(r=>r.kp===chosen);
  if(ci>=0){const cw=pw/n;sv+=`<rect x="${(X(ci)-cw/2).toFixed(1)}" y="${T-2}" width="${cw.toFixed(1)}" height="${ph+2}" fill="var(--blue)" opacity=".13" rx="3"/><text x="${X(ci).toFixed(1)}" y="${T-4}" font-size="9.5" fill="var(--text)" text-anchor="middle">chosen</text>`;}
- if(target){const y=Y(target).toFixed(1);sv+=`<line x1="${L}" x2="${W-R}" y1="${y}" y2="${y}" stroke="var(--dim)" stroke-width="1" stroke-dasharray="4 3"/><text x="${W-R}" y="${+y-3}" font-size="9.5" fill="var(--dim)" text-anchor="end">target ${target}</text>`;}
+ if(target&&target<=ymax){const y=Y(target).toFixed(1);sv+=`<line x1="${L}" x2="${W-R}" y1="${y}" y2="${y}" stroke="var(--dim)" stroke-width="1" stroke-dasharray="4 3"/><text x="${W-R}" y="${+y-3}" font-size="9.5" fill="var(--dim)" text-anchor="end">target ${target}</text>`;}
+ else if(target){sv+=`<text x="${W-R}" y="${T+8}" font-size="9.5" fill="var(--dim)" text-anchor="end">limit ${target} - above the chart</text>`;}
  const ends=[];
  D.forEach(d=>{let seg=[],paths=[];rows.forEach((r,i)=>{const v=r[d.k]?r[d.k][key]:null;if(v==null){if(seg.length)paths.push(seg);seg=[];}else seg.push([X(i),Y(v)]);});if(seg.length)paths.push(seg);
   paths.forEach(p=>{if(p.length>1)sv+=`<polyline class="${d.cls}" points="${p.map(q=>q.map(z=>z.toFixed(1)).join(',')).join(' ')}" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>`;});
@@ -8864,6 +9634,8 @@ function sweepSvg(rows,key,D,target,chosen){const W=330,H=160,L=36,R=12,T=14,B=2
  sv+=`<text x="${W-R}" y="${H-2}" font-size="9.5" fill="var(--axis)" text-anchor="end">Kp</text>`;
  const cw=pw/n;rows.forEach((r,i)=>{sv+=`<rect class="hit" data-i="${i}" x="${(X(i)-cw/2).toFixed(1)}" y="${T}" width="${cw.toFixed(1)}" height="${ph}" fill="transparent"/>`;});
  return `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="${esc(key)} for each Kp tried">${sv}</svg>`;}
+const SWM={os:{t:'Overshoot',u:'%',tg:T=>T.os,fl:2,f:1},sse:{t:'Off by',u:'counts',tg:T=>T.sse,fl:2,f:1},settle:{t:'Settle',u:'ms',tg:T=>T.settle,fl:50,f:0}};
+function swMetric(k){tlRender.metric=k;try{localStorage.setItem('smc3_swm',k)}catch(e){}tlRender.k=null;if(tuneLast)tlRender(tuneLast);}
 function sweepTip(r,D,lt){const f=(x,d,u)=>x==null?'-':(+x).toFixed(d)+u;
  return `<b>Kp ${r.kp}</b> ${r.good?'<span class="gs good">✓ calm</span>':'<span class="gs bad">✕ not chosen: too lively or too far off</span>'}`+D.map(d=>{const q=r[d.k]||{};
   return `<br><span class="${d.cls}">${d.sym}</span> ${esc(d.name)}: lag ${f(q.lag_ms,0,' ms')}, over ${f(q.os,0,'%')}, settle ${f(q.settle,0,' ms')}, off by ${f(q.sse,1,'')}`+(q.behind?', falls behind':'');}).join('');}
@@ -8888,8 +9660,11 @@ function tlRender(s){const lv=s.live||{},key=JSON.stringify([s.state,s.mode,s.mo
  h+='</div>';
  const sw=lv.sweep||[];
  if(sw.length){const T=lv.targets||{};
-  h+=`<div class="tcharts"><div class="tchart" data-c="lag_ms"><h5>Lag behind the test move (ms), each Kp tried</h5>${sweepSvg(sw,'lag_ms',D,T.lag_ms,lv.chosen)}</div>`+
-     `<div class="tchart" data-c="os"><h5>Overshoot (%), each Kp tried</h5>${sweepSvg(sw,'os',D,T.os,lv.chosen)}</div></div>`;}
+  if(!tlRender.metric){try{tlRender.metric=localStorage.getItem('smc3_swm')}catch(e){}}if(!SWM[tlRender.metric])tlRender.metric='os';
+  const mk=tlRender.metric,M=SWM[mk],peak=Math.max(0,...sw.flatMap(r=>D.map(d=>r[d.k]&&r[d.k][mk]!=null?r[d.k][mk]:0))),tg=M.tg(T);
+  const tabs=Object.keys(SWM).map(k=>`<button class="swt${k===mk?' on':''}" onclick="swMetric('${k}')">${SWM[k].t}</button>`).join('');
+  h+=`<div class="tcharts"><div class="tchart" data-c="lag_ms"><h5>Lag behind the test move (ms), each Kp tried</h5>${sweepSvg(sw,'lag_ms',D,T.lag_ms,lv.chosen,20)}</div>`+
+     `<div class="tchart" data-c="${mk}"><h5><span class="swtabs">${tabs}</span><span class="muted swpk">peak ${peak.toFixed(M.f)} ${M.u}${tg?' · limit '+tg+' '+M.u:''}</span></h5>${sweepSvg(sw,mk,D,tg,lv.chosen,M.fl)}</div></div>`;}
  $('tl_body').innerHTML=h;
  $('tl_body').querySelectorAll('.tchart').forEach(c=>{const tip=document.createElement('div');tip.className='ttip';tip.hidden=true;c.appendChild(tip);
   c.querySelectorAll('.hit').forEach(el=>{const show=()=>{const r=sw[+el.dataset.i];tip.innerHTML=sweepTip(r,D);tip.hidden=false;const cb=c.getBoundingClientRect(),eb=el.getBoundingClientRect();
