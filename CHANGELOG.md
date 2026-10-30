@@ -3,6 +3,23 @@
 `smc3_scope` (the page) and `SMC3_R4` (the firmware) are versioned separately. The page works with older
 firmware too; the notes say which firmware a feature needs.
 
+## Page 2.6.1 (firmware 1.9.4, unchanged)
+
+After the first run of 2.6 on a real rig, which settled for Kp 134 and Ki 70:
+
+- **"Falls behind"** is judged where the goal moves at full speed, and only with the drive at PWMmax. 2.5 compared the
+  motor's speed in the last quarter of the move with the goal's average speed; on 2.6's shorter moves that quarter is
+  all easing-out, where the goal itself slows down, so most Kp values were flagged and the sweep fell back to the
+  highest unflagged one (Kp 149 x 90%), although Kp 251 already met the lag target both ways.
+- **Ki** stops once a step no longer brings the leftover error down by a count - it's at the floor the dead zone and
+  the pot noise set - and the smallest Ki within a count of the best is kept. 2.6 kept the last Ki it tried: Ki 70,
+  for 2 counts less error than Ki 5 and 25 points more overshoot on small steps.
+- **Your answer against the weight.** Diagnostics warns, and auto-tune's log says, when your answer to the full
+  check's question disagrees with how that corner sinks: you saw it go up for higher numbers, but it goes towards
+  higher numbers more easily (it sank that way while switched off, and needs less drive that way).
+
+Update: the page only.
+
 ## Page 2.6 and firmware 1.9.4
 
 - **Auto-tune moves out and back from where the seat starts**, the way you move a knob on the dashboard: up by the

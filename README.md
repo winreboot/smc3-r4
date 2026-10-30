@@ -342,7 +342,8 @@ way is stopped at once and left off.
 It also notes which way each lift's numbers run when its corner **sinks** under the seat's weight (drifting while
 its motor is off, or sinking at low drive). Until you answer the question, auto-tune goes by that for up and down,
 and the results warn when the two front lifts seem to run opposite ways (also when one needs clearly less drive one
-way - the weight helps it down) - one of them would then move the wrong way in games.
+way - the weight helps it down) - one of them would then move the wrong way in games. It also says when your answer
+disagrees with how a corner sinks, so you can look again.
 
 | Before it starts | "Watch now", then the question |
 |---|---|

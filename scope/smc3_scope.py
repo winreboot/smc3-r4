@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-smc3_scope v2.6 - live scope, tuner and auto-tuner for the SMC3_R4 motion controller (Arduino UNO R4 WiFi).
+smc3_scope v2.6.1 - live scope, tuner and auto-tuner for the SMC3_R4 motion controller (Arduino UNO R4 WiFi).
 
 Connects to the board's TCP telemetry port, keeps a rolling buffer of samples and serves a web page with live
 charts, a parameter editor (sends ordinary SMC3 commands back to the board), test signals and a per-motor
@@ -12,6 +12,14 @@ Every option can also come from the environment (Docker): SMC3_HOST, SMC3_PORT, 
 SMC3_DATA_DIR.  Settings changed in the page (board address, theme, auto-find) are saved to
 <data dir>/config.json and survive restarts and upgrades.  Standard-library Python 3.8+ only.
 
+v2.6.1: auto-tune on a real rig (the first run of 2.6) settled for a soft Kp and far too much Ki. "Falls behind" is
+        judged where the goal moves at full speed and only with the drive at PWMmax - 2.5's test (the last quarter of
+        the move) is all easing-out on 2.6's shorter moves, so it flagged most Kp values and the sweep fell back to Kp
+        149 x 90% although Kp 251 met the lag target both ways. Ki stops once a step no longer brings the leftover error
+        down by a count (it's at the floor the dead zone and pot noise set), and the smallest Ki within a count of the
+        best is kept (it went to Ki 70 for 2 counts less error and 25 points more overshoot on small steps). Diagnostics
+        warns, and auto-tune's log says, when your answer to the full check's question disagrees with how that corner
+        sinks under the seat's weight.
 v2.6: auto-tune moves out and back from the start position, the way you move a knob on the dashboard: up (or right) by
       the test travel, back to the start, down (left), back to the start - so the seat never goes further than that from
       where it was, each direction is tested going away from the start and coming back, and a test no longer starts by
@@ -28,7 +36,7 @@ v2.6: auto-tune moves out and back from the start position, the way you move a k
       there. Diagnostics reports the board's own firmware version (1.9.3 showed as 1.9.2). Sweep moves hold up to 2 s on
       a slow motor (1.3 s cut a slow motor's sweep short at Kp 40), a motor still creeping in isn't called too lively,
       and the wrong-way stop needs it to last 150 ms longer, so a cluster of glitchy readings can't fake it. Simulator:
-      firmware 1.9.4 with its filter, also after an update from the page (--no-potfilter for 1.9.3), --sag-high.
+      firmware 1.9.4 with its filter, also after an update from the page (--no-potfilter for 1.9.3), --sag- high.
 v2.5: auto-tune tests each direction on its own (up and down for a lift, left and right for the rear slide) and
       reports both; after measuring the motor's top speed each way (one quick move), every test is a gradual move at
       60% of the slower way's top speed, so the motor can follow it and Kp is judged on how closely it follows (2.4.1
@@ -108,7 +116,7 @@ v1.4: settings dialog (board address, port, find-board scan, auto-find), day/nig
       fixed a thread race that made the page flash "not reachable".
 """
 
-VERSION = "2.6"
+VERSION = "2.6.1"
 
 import argparse
 import base64
@@ -979,17 +987,25 @@ def analyze_move(samples, m, t_old, pwmmin, pwmmax, window_ms, noise=0.0, after_
     if not v or v < 5:
         v = abs(t_new - t_old) / max(1.0, dur) * 1000.0
     drives = [min(pwmmax, abs(s["m"][m]["p"]) + pwmmin) for s, _ in cruise]
-    # falls behind: towards the end of the ramp the motor moves clearly slower than the goal (out of drive, or far
-    # too soft), so the gap keeps growing - judged on the medians of the first and last few readings of the last
-    # quarter, so pot noise can't fake it
+    # falls behind: out of drive, the motor can't keep up with the goal, so the gap keeps growing. Judged where the
+    # goal still moves at (nearly) full speed - the motor's speed against the goal's over that same stretch, on the
+    # medians of a few readings at each end so pot noise can't fake it - and only with the drive at or near PWMmax
+    # there. (2.5 compared the motor's speed in the last quarter of the ramp with the goal's average speed: with 2.6's
+    # shorter moves that last quarter is all easing-out, where the goal itself slows down, so it flagged most tests.)
     behind = False
-    late = [(s["ms"], f) for s, f in zip(ramp, fr) if s["ms"] - t0 >= 0.75 * dur]
-    if len(late) >= 6 and lag_end is not None and v:
-        k = max(3, len(late) // 3)
-        dt = (statistics.median(x[0] for x in late[-k:]) - statistics.median(x[0] for x in late[:k])) / 1000.0
-        if dt > 0:
-            v_end = (statistics.median(x[1] for x in late[-k:]) - statistics.median(x[1] for x in late[:k])) * sgn / dt
-            behind = v_end < 0.85 * v and lag_end > max(6.0, 3.0 * noise, 0.05 * size)
+    gs = [s["m"][m]["g"] for s in ramp]
+    mss = [s["ms"] for s in ramp]
+    fast = [i for i in range(2, len(ramp) - 2) if mss[i + 2] > mss[i - 2]
+            and (gs[i + 2] - gs[i - 2]) * sgn / (mss[i + 2] - mss[i - 2]) * 1000.0 >= 0.8 * v]
+    if len(fast) >= 6 and lag_end is not None and v:
+        i0, i1 = fast[0], fast[-1]
+        dt = (mss[i1] - mss[i0]) / 1000.0
+        if dt >= 0.06:
+            vm = (statistics.median(fr[max(i0, i1 - 2):i1 + 1]) - statistics.median(fr[i0:i0 + 3])) * sgn / dt
+            vg = (gs[i1] - gs[i0]) * sgn / dt
+            sat_fast = _mean([1.0 if abs(ramp[i]["m"][m]["p"]) + pwmmin >= 0.95 * pwmmax else 0.0 for i in fast])
+            behind = (vg > 0 and vm < 0.85 * vg and sat_fast >= 0.5
+                      and lag_end > max(6.0, 3.0 * noise, 0.05 * size))
     if started_off:
         lag = lag_end = None
         behind = False
@@ -1740,6 +1756,13 @@ class Tuner:
                     ("higher" if self.dn[1] == "down" else "lower") + " numbers under the seat's weight"
                     if (b.cfg.get("lift_sink") or {}).get(str(n)) else
                     " - assumed, as SimHub expects; the Diagnostics full check asks which way the seat really goes"))
+            ans = (b.cfg.get("lift_dir") or {}).get(str(n))
+            snk = (b.cfg.get("lift_sink") or {}).get(str(n))
+            if ans in (1, -1, "1", "-1") and snk in (1, -1, "1", "-1") and int(ans) == int(snk):
+                # 2.6: the answer says higher numbers lift this corner, but it sank towards higher numbers
+                how += (f" (your answer in the full check) - but in that check this corner sank towards "
+                        f"{'higher' if int(snk) > 0 else 'lower'} numbers when its motor was switched off, which "
+                        f"would make higher numbers DOWN. Worth a look: drag its knob with the seat empty")
             self.say(f"Directions: {self.dn[1]} = higher counts" +
                      (" (motor 1 is mirrored in the firmware)" if self.rev else "") + how + ".")
         elif self.dn[1] in ("right", "left"):
@@ -2038,6 +2061,7 @@ class Tuner:
         for_rider = fr > 0 and not need
         if do_ki and (need or for_rider):
             best = None
+            tried = []                     # (ki, big, small) of every calm step (page 2.6)
             steps = KI_STEPS if need else KI_STEPS[:2]
             for i, ki in enumerate(steps):
                 self.progress = 77 + 2 * i
@@ -2054,8 +2078,21 @@ class Tuner:
                     self.say("Ki starts causing overshoot - stopping.")
                     break
                 best = (ki, big, small)
+                tried.append(best)
                 if need and max(big["sse"], small["sse"]) <= tol:
                     break
+                # 2.6: stop once a step of Ki no longer brings the error down by a count - it's at the floor the
+                # dead zone and the pot noise set, and more Ki only adds overshoot
+                if need and len(tried) >= 2:
+                    e1, e2 = (max(x[1]["sse"], x[2]["sse"]) for x in tried[-2:])
+                    if e1 - e2 < max(1.0, 0.15 * e1):
+                        self.say(f"Ki {ki} hardly helps any more ({e1:.1f} -> {e2:.1f} counts) - stopping.")
+                        break
+            if need and tried:
+                # the smallest Ki within a count (or 15%) of the best leftover error: (2.5 kept the last one tried,
+                # which on a real rig went up to Ki 70 for 2 counts less error and 25 points more overshoot)
+                e_min = min(max(x[1]["sse"], x[2]["sse"]) for x in tried)
+                best = next(x for x in tried if max(x[1]["sse"], x[2]["sse"]) <= e_min + max(1.0, 0.15 * e_min))
             if need and best and max(best[1]["sse"], best[2]["sse"]) < sse0 * 0.7:
                 p["ki"], r_base, r_small = best
             elif for_rider and best:
@@ -5358,6 +5395,24 @@ def analyze(rep):
     knob = lambda k: ("to the LEFT (motor 1 is mirrored: that is higher numbers for SimHub)" if (k == 1 and rev1)
                       else "to the right (higher numbers)")
     answered = {k for k, (a, _) in seen.items() if a in ("up", "down")}
+    for k in sorted(sdir):
+        a_ = (seen.get(k) or ("", ""))[0]
+        if a_ not in ("up", "down") or (k == 1 and rev1):
+            continue
+        if (1 if a_ == "up" else -1) == sdir[k]:
+            # 2.6: the answer says higher numbers lift this corner, but under the seat's weight it goes the
+            # other way more easily - one of the two is wrong, and if it's the answer the motion is upside down
+            why_ = ", ".join(e[1] for e in sink[k])
+            add("warn", f"Motor {k}: you saw it go {a_.upper()} for higher numbers, but its weight says otherwise",
+                f"Under the seat's weight a corner goes down more easily than up. This one goes towards "
+                f"{'HIGHER' if sdir[k] > 0 else 'LOWER'} numbers more easily ({why_}) - that would make higher numbers "
+                f"move it {'DOWN' if sdir[k] > 0 else 'UP'}. Either the answer was for another corner or direction, or "
+                f"something other than the seat's weight loads it (a spring, a strut, the linkage geometry).",
+                f"With the seat empty: Motors view, drag motor {k}'s knob to the right (higher numbers) and watch its "
+                f"corner. Then press Disable Motors for two seconds, watch which way it settles, and Enable Motors again "
+                f"(it creeps back). If it goes down for higher numbers, tick Invert on its output in SimHub and run the "
+                f"full check again.",
+                k, "dir_vs_weight")
     if len(set(sdir.values())) == 2 and not set(sdir) <= answered:
         hi = sorted(k for k, s in sdir.items() if s > 0)
         lo = sorted(k for k, s in sdir.items() if s < 0)
