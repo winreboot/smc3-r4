@@ -3,6 +3,26 @@
 `smc3_scope` (the page) and `SMC3_R4` (the firmware) are versioned separately. The page works with older
 firmware too; the notes say which firmware a feature needs.
 
+## Page 2.7.2 (firmware 1.9.4, unchanged)
+
+Auto-tune and the full check cope with WiFi stalls. The UNO R4 WiFi's WiFi module now and then blocks the board's loop
+for a second or more: no readings arrive, and the page's targets wait and then reach the board in a burst. On a real
+rig that stopped auto-tune of the rear slide twice in a row ("Couldn't see the move in the telemetry", then
+"Something else is moving motor 3 (SimHub?)") and put WiFi delays into some of the measured lags.
+
+- **A spoiled test move is done again** (up to three times): readings missing during it, readings that stop short of
+  the present, targets that reached the board bunched up (so the gradual move was really a jump), or the motor setting
+  off the wrong way right after such a hiccup. The log says "WiFi hiccup during that move (...) - doing it again". Only
+  a link that keeps stalling stops auto-tune, with a message that says so.
+- **Its own late targets aren't SimHub**: targets the page sent in the last 15 s count as its own (2.7.1 allowed
+  2 s). The same in the full check, and the watcher no longer reports "SimHub driving" right after auto-tune ends.
+- **SimHub waits** while auto-tune or the full check moves a motor (firmware 1.9: `[kH]`, as in Seat setup and Move
+  motors), so SimHub's motion output can't get in the way.
+- Simulator: `--stalls SEC` blocks the simulated board's loop for 0.6-2.5 s about every SEC seconds. Smoke test case
+  14 tunes the rear slide through such stalls.
+
+Update: in the page - Settings, Updates, Update page.
+
 ## Page 2.7.1 (firmware 1.9.4, unchanged)
 
 - **Help, Wiring the whole rig**: one drawing of the board, the three IBT-2 bridges (RPWM, LPWM, R_EN + L_EN, VCC,

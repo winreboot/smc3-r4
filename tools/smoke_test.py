@@ -29,6 +29,9 @@ Smoke test: start simulated rigs and the page, run diagnostics, check the result
    what it found and changes nothing.
 12. Auto-tune moves out and back from the start position (page 2.6): during the Kp sweep the seat first goes up from
    where it started, back, then down, and never further than the test travel from the start.
+14. WiFi stalls (page 2.7.2): with the simulated board's loop blocking for 0.6-2.5 s now and then, auto-tune of the
+   rear slide repeats the test moves the stalls spoiled and finishes - no false "something else is moving it" or
+   "couldn't see the move" stop.
 13. Updates from GitHub (page 2.7), against a stand-in for GitHub's API: the check finds the newer page and firmware,
    the header knows, Update downloads, checks and restarts into the new page (kept in <data>/updates), a restart of
    the started file hands over to it, and Go back to built-in returns to the started file and stays there.
@@ -350,6 +353,23 @@ try:
     check(first_off > c0 and max(ts) - c0 <= 102 and c0 - min(ts) <= 102 and max(ts) - c0 >= 60 and c0 - min(ts) >= 60,
           f"auto-tune goes up first and stays within the test travel of the start "
           f"(start {c0}, first move to {first_off}, range {min(ts)}-{max(ts)})")
+
+    # 14. WiFi stalls (page 2.7.2): auto-tune repeats the test moves a stall spoiled instead of stopping
+    sim14, scope14, base14 = start(4724, 8724, "--stalls", "15")
+    procs += [sim14, scope14]
+    post(base14, "/tune/start", {"motor": 2, "amp": 100, "style": "normal", "friction": False, "ki": False,
+                                 "kd": False})
+    t0 = time.time()
+    st = get(base14, "/tune/status")
+    while time.time() - t0 < 420 and st["state"] == "running":
+        time.sleep(1)
+        st = get(base14, "/tune/status")
+    lines = st.get("log") or []
+    text14 = "\n".join(lines)
+    check(st["state"] == "done", f"auto-tune with WiFi stalls finishes ({st['state']}: {(lines or [''])[-1][-120:]}; "
+          f"{text14.count('WiFi hiccup')} moves repeated)")
+    check("Something else" not in text14 and "Couldn't see the move" not in text14,
+          "... and no false 'something else is moving it' / 'couldn't see the move' stop")
 
     # 13. updates from GitHub (page 2.7), against a stand-in for GitHub's API
     for p in procs:

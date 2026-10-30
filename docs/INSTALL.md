@@ -266,6 +266,7 @@ whenever you change them there; otherwise what you set in the page stays.
 | Port already in use | The page then takes the next free port and says which in its window; or choose one, e.g. `--web 8199` (Docker: `-p 8199:8199 -e SMC3_WEB_PORT=8199`). |
 | `docker pull` asks for a login | The package isn't public yet - the repository owner makes it public once (see below). |
 | Firmware update from the page can't start | The page must be reachable from the board: `--bind 0.0.0.0`, firewall open, and in Docker the same port number on both sides. The board's WiFi module needs firmware 0.4.0 or newer. |
+| Auto-tune says "WiFi hiccup during that move - doing it again", or stops with "The WiFi link to the board kept stalling" | The board's WiFi drops out for a second or more now and then. Put the board closer to the router (or an access point), keep the 2.4 GHz channel clear, and update the board's WiFi module (Arduino IDE, Tools, Firmware Updater). A few repeated moves are harmless. |
 | Updates: "Couldn't reach GitHub" | This machine (in Docker: the container) needs internet access to `api.github.com` and GitHub's download servers. The rest of the page works without it. |
 | `python` / `py` not found (Windows) | Re-run the Python installer and tick **Add python.exe to PATH**, or use the full path to `python.exe`. |
 

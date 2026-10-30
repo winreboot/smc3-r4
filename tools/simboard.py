@@ -115,6 +115,9 @@ ap.add_argument("--tl-left", action="store_true")
 ap.add_argument("--load", type=float, default=0.0,
                 help="a rider of this many kg: the lifts need more drive going up and less going down, every motor "
                      "carries more weight (slower to start and stop), the rear slide more friction")
+ap.add_argument("--stalls", type=float, default=0.0,
+                help="WiFi stalls (page 2.7.2): about every SEC seconds the board's loop blocks for 0.6-2.5 s - no "
+                     "telemetry (the readings in between are lost) and the page's commands wait, then arrive in a burst")
 ap.add_argument("--vmax", type=float, default=2200.0, help="counts/s at full drive (default 2200; ~1000 is a slow rig)")
 ap.add_argument("--no-potfilter", action="store_true", help="firmware 1.9.3: no pot glitch filter (the PID sees every glitch)")
 ap.add_argument("--tuned", action="store_true", help="start with sane settings (Kp 250, Ki 0, Kd 0, PWMmin 30, dead zone 2)")
@@ -712,6 +715,18 @@ def sim_loop():
         else: nxt = time.time()
 
 
+STALL = {"until": 0.0, "n": 0}
+
+
+def stall_maker():
+    """--stalls: the R4's WiFi module now and then blocks the board's loop for a second or two."""
+    rnd = random.Random(7)
+    while args.stalls:
+        time.sleep(rnd.uniform(0.5, 1.5) * args.stalls)
+        STALL["until"] = time.time() + rnd.uniform(0.6, 2.5)
+        STALL["n"] += 1
+
+
 def fake_simhub():
     """Like SimHub's SMC3 output over USB: all three targets, ~200 updates/s, gentle road-like motion."""
     global last_target_t
@@ -1056,6 +1071,8 @@ def client(conn):
         time.sleep(0.02)
         if conn not in clients:
             return
+        if time.time() < STALL["until"]:          # --stalls: the loop is blocked - nothing read, nothing sent
+            continue
         try:
             d = conn.recv(4096)
             if d == b"": return
@@ -1095,6 +1112,7 @@ def client(conn):
 boot(cold=True)
 threading.Thread(target=sim_loop, daemon=True).start()
 threading.Thread(target=fake_simhub, daemon=True).start()
+threading.Thread(target=stall_maker, daemon=True).start()
 srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 srv.bind((args.bind, args.port)); srv.listen(4)
 print("simboard on", args.bind, args.port, vars(args), flush=True)

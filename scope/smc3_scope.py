@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-smc3_scope v2.7.1 - live scope, tuner and auto-tuner for the SMC3_R4 motion controller (Arduino UNO R4 WiFi).
+smc3_scope v2.7.2 - live scope, tuner and auto-tuner for the SMC3_R4 motion controller (Arduino UNO R4 WiFi).
 
 Connects to the board's TCP telemetry port, keeps a rolling buffer of samples and serves a web page with live
 charts, a parameter editor (sends ordinary SMC3 commands back to the board), test signals and a per-motor
@@ -12,6 +12,13 @@ Every option can also come from the environment (Docker): SMC3_HOST, SMC3_PORT, 
 SMC3_DATA_DIR.  Settings changed in the page (board address, theme, auto-find) are saved to
 <data dir>/config.json and survive restarts and upgrades.  Standard-library Python 3.8+ only.
 
+v2.7.2: auto-tune and the full check cope with WiFi stalls (the R4's WiFi module blocks the board's loop for a second
+        or more now and then): a test move the stall spoiled - readings missing, or targets that reached the board
+        bunched up so the ramp was really a jump - is done again (up to three times) instead of stopping auto-tune
+        with "couldn't see the move" or measuring the WiFi's delay as the motor's lag; targets the page sent in the
+        last 15 s count as its own (2.7.1 allowed 2 s, so targets delivered late looked like SimHub: "something else
+        is moving motor 3"); and on firmware 1.9 SimHub's positions wait while auto-tune or the full check moves a
+        motor ([kH], as in Seat setup), so SimHub can't get in the way at all. Simulator: --stalls SEC.
 v2.7.1: Help has a drawing of the whole rig's wiring (the board, three IBT-2 bridges, motors with pots, the motion
         sensor, the motor supply) and the motion sensor's own drawing. A newer page or firmware on GitHub shows as a
         balloon on the header's Settings button (it leads to Settings, Updates); the header shows the page's version
@@ -133,7 +140,7 @@ v1.4: settings dialog (board address, port, find-board scan, auto-find), day/nig
       fixed a thread race that made the page flash "not reachable".
 """
 
-VERSION = "2.7.1"
+VERSION = "2.7.2"
 
 import argparse
 import base64
@@ -303,6 +310,7 @@ class Board:
         self.cfg = cfg
         self.sock = None
         self.stopped = False
+        self.page_hold_at = 0.0          # when auto-tune / the full check last renewed [kH] (page 2.7.2)
         self.connected = False
         self.lock = threading.Lock()
         self.slock = threading.Lock()
@@ -397,6 +405,20 @@ class Board:
 
     def seat_cmd(self, a, b):
         return self.send(b"[k" + bytes([a & 0xFF, b & 0xFF]) + b"]")
+
+    def hold_page(self):
+        """Auto-tune and the full check (page 2.7.2, firmware 1.9+): SimHub's position commands wait while they move
+        a motor, as during Seat setup and Move motors - [kH 30] (3 s), renewed every second while they run."""
+        now = time.time()
+        if self.fwnum() >= 19 and now - self.page_hold_at >= 1.0:
+            self.seat_cmd(ord("H"), 30)
+            self.page_hold_at = now
+
+    def release_page(self):
+        if self.page_hold_at:
+            self.page_hold_at = 0.0
+            if self.connected and self.fwnum() >= 19:
+                self.seat_cmd(ord("H"), 0)
 
     def cmd_pair(self, code, a, b):
         a = max(0, min(255, int(a))); b = max(0, min(255, int(b)))
@@ -1139,7 +1161,7 @@ class Tuner:
         self.orig_motor = None
         self.abort_flag = False
         self.applied = False
-        self.recent = collections.deque(maxlen=400)
+        self.recent = collections.deque(maxlen=1500)   # (time, target) sent - 15 s and more (see _check)
         self.hist = collections.deque(maxlen=200)
         self.cur = 512
         self.last_cmd = 0.0
@@ -1164,6 +1186,7 @@ class Tuner:
         self.quiet_until = 0.0                   # the wrong-way watch rests until then (getting into the seat)
         self.away_since = None                   # board ms when the wrong-way watch first saw "moving away" (2.6)
         self.cur_p = None                        # the motor's values (check mode: what to keep)
+        self.link_trouble_at = 0.0               # when a test move last had to be repeated (WiFi, page 2.7.2)
 
     # ---- public ----
     def running(self):
@@ -1323,6 +1346,7 @@ class Tuner:
     def wait(self, sec):
         end = time.time() + sec
         while True:
+            self.board.hold_page()                         # SimHub waits while auto-tune runs (firmware 1.9)
             self._check()
             if time.time() - self.last_cmd > 0.8:          # keep-alive: holds full power on firmware 1.4
                 self.set_target(self.cur)
@@ -1341,7 +1365,10 @@ class Tuner:
             return
         self.chk_seq = new[-1]["seq"]
         now = time.time()
-        allowed = {v for t, v in self.recent if now - t < 2.0} | {self.cur}
+        # Targets this page sent in the last 15 s count as its own: when the board's WiFi module stalls, the page's
+        # targets wait and then arrive in a burst, so the board can show one sent seconds ago (2.7.1 allowed 2 s and
+        # took that for SimHub). On firmware 1.9 SimHub is held back during the run anyway ([kH], hold_page).
+        allowed = {v for t, v in self.recent if now - t < 15.0} | {self.cur}
         lo_ok, hi_ok = self.lo - 25, self.hi + 25
         for s in new:
             mm = s["m"][m]
@@ -1444,11 +1471,66 @@ class Tuner:
 
     def _move(self, x, hold, p, ramp=True):
         """One test move to x: along a ramp at the measured test speed (ramp=True), or a jump of the target (small
-        road-sized moves, and the top-speed check)."""
+        road-sized moves, and the top-speed check). A move the WiFi spoiled - the telemetry stopped for a moment, or
+        the targets arrived bunched up, so the ramp wasn't the ramp - goes back to where it started and is done again
+        (up to three times), instead of stopping auto-tune or measuring a lag that was the WiFi's (page 2.7.2)."""
         t_old = self._t()
+        for attempt in range(4):
+            r, why = self._move_once(x, hold, p, ramp, t_old)
+            if not why:
+                return r
+            if attempt == 3:
+                raise TuneAbort(f"The WiFi link to the board kept stalling during the test moves ({why}). Put the "
+                                f"board closer to the WiFi router (or an access point), or update the board's WiFi "
+                                f"module (Arduino IDE, Tools, Firmware Updater), then try again.")
+            self.link_trouble_at = time.time()
+            self.say(f"WiFi hiccup during that move ({why}) - doing it again.")
+            if self.events:
+                self.events.add("tune", f"Auto-tune repeated a test move of motor {self.motor + 1}: {why}.", quiet=True)
+            if ramp and self.ramp_v:
+                self._ramp_move(t_old, self.ramp_v)
+            else:
+                self.set_target(t_old)
+            self.wait(max(0.8, hold))
+            self._settle(t_old, 3.0)              # back where it started, and at rest, before it goes again
+
+    def _link_trouble(self, got, seq0, t_old, x, page_ms, elapsed_ms):
+        """Why a test move's telemetry can't be trusted, or None: a gap in the board's readings, readings that stop
+        short of now (a stall still going on), or (a ramp) targets that reached the board far faster or slower than
+        the page sent them."""
+        before = [s for s in got if s["seq"] <= seq0][-1:]       # the last reading before the move was sent
+        after = [s for s in got if s["seq"] > seq0]
+        if len(after) < 10:
+            return "no telemetry arrived"
+        seen = before + after
+        gap = max((b["ms"] - a["ms"] for a, b in zip(seen, seen[1:])), default=0)
+        if gap > 400:                          # (a few hundred ms now and then is normal and harmless)
+            return f"the board's readings stopped for {gap / 1000:.1f} s"
+        short = elapsed_ms - (after[-1]["ms"] - seen[0]["ms"])
+        if short > 500:
+            return f"the board's readings stopped {short / 1000:.1f} s ago"
+        m = self.motor
+        i0 = next((i for i, s in enumerate(after) if s["m"][m]["t"] != t_old), None)
+        if i0 is not None and after[i0]["ms"] - seen[0]["ms"] > 400:
+            return f"the move reached the board {(after[i0]['ms'] - seen[0]['ms']) / 1000:.1f} s late"
+        if page_ms:
+            i1 = next((i for i, s in enumerate(after) if s["m"][m]["t"] == x and i0 is not None and i >= i0), None)
+            if i0 is None or i1 is None:
+                return "the move's targets didn't show up in the telemetry"
+            board_ms = after[i1]["ms"] - after[i0]["ms"]
+            if board_ms < 0.5 * page_ms - 40 or board_ms > page_ms + 500:
+                return (f"the targets reached the board bunched up: a {page_ms / 1000:.2f} s ramp took "
+                        f"{board_ms / 1000:.2f} s there")
+        return None
+
+    def _move_once(self, x, hold, p, ramp, t_old):
         seq0 = self.board.seq
+        t_begin = time.time()
+        page_ms = None
         if ramp and self.ramp_v:
+            t0 = time.time()
             self._ramp_move(x, self.ramp_v)
+            page_ms = (time.time() - t0) * 1000.0
         else:
             self.set_target(x)
         self.wait(hold)
@@ -1456,9 +1538,14 @@ class Tuner:
         # from 30 readings before the move on: where it starts is the median of 15 readings at rest (2.4.1 had only
         # the 2-4 that arrived before the target first changed, and a cluster of glitches could be most of them)
         got = despike(self.board.since(seq0 - 30), self.motor)
+        why = self._link_trouble(got, seq0, t_old, x, page_ms if page_ms and page_ms > 150 else None,
+                                 (time.time() - t_begin) * 1000.0)
+        if why:
+            self.link_trouble_at = time.time()
+            return None, why
         r = analyze_move(got, self.motor, t_old, p["pwmmin"], p["pwmmax"], hold * 1000 - 100, self.noise_sd, seq0)
         if r is None:
-            raise TuneAbort("Couldn't see the move in the telemetry (WiFi too slow?). Try again.")
+            return None, "the move didn't show up in the telemetry"
         seat = seat_step(self.board.since(seq0 - 20), self.motor, t_old,      # motion sensor: what the seat did
                          yaw=self.motor == tl_motor(self.board.cfg),         # (traction loss: how it turned)
                          whole=bool(ramp and self.ramp_v))                   # a gradual move: all of it
@@ -1466,9 +1553,12 @@ class Tuner:
             r.update(seat_os=seat["overshoot"], seat_osc=seat["ringing"], seat_deg=seat["deg"],
                      seat_dpc=seat.get("deg_per_count"))
         if r["wrong"]:
+            if time.time() - self.link_trouble_at < 10.0:
+                # right after a WiFi hiccup the motor can still be on its way back from the move before
+                return None, "it set off the wrong way - probably still moving back after the last hiccup"
             raise TuneAbort(f"Motor {self.motor + 1} moved the wrong way. The motor or the pot is wired "
                             f"backwards.", "unsafe")
-        return r
+        return r, None
 
     def _hold(self):
         """How long a sweep test move holds at its end: 1.3 s, longer for a slow motor (down to 2.0 s at test moves of
@@ -1726,6 +1816,10 @@ class Tuner:
                 pass
         finally:
             self.stage, self.countdown = "", None
+            try:
+                self.board.release_page()                # SimHub may move the seat again
+            except Exception:
+                pass
             try:
                 self._log_end(final)
             except Exception:
@@ -3173,7 +3267,7 @@ class Monitor:
         if (g.mode != "off" and g.motor == m) or (t.running() and t.motor == m) or (d is not None and d.moving()) or \
                 (self.seat_setup is not None and self.seat_setup.state != "idle") or \
                 (self.manual is not None and self.manual.active):
-            self.busy_until[m] = now + 3.0
+            self.busy_until[m] = now + 8.0             # its last targets can arrive late after a WiFi stall (2.7.2)
         return now < self.busy_until[m]
 
     def _sample(self, s, now):
@@ -3617,7 +3711,7 @@ class MotionCheck:
         nz = noise[m] if noise and noise[m] is not None else None
         self.nz = max(0.3, nz) if nz is not None else 0.5   # this motor's pot noise (1 sigma) - limits scale with it
         self.cur = None
-        self.recent = collections.deque(maxlen=300)
+        self.recent = collections.deque(maxlen=1500)   # (time, target) sent: 15 s and more (see check)
         self.last_cmd = 0.0
         self.chk_seq = board.seq
         self.interf = 0
@@ -3729,7 +3823,9 @@ class MotionCheck:
             return
         self.chk_seq = new[-1]["seq"]
         now = time.time()
-        allowed = {v for t, v in self.recent if now - t < 2.0} | ({self.cur} if self.cur is not None else set())
+        self.b.hold_page()                     # SimHub waits while the full check moves a motor (firmware 1.9)
+        # targets the check sent in the last 15 s are its own: a WiFi stall delivers them late, in a burst (2.7.2)
+        allowed = {v for t, v in self.recent if now - t < 15.0} | ({self.cur} if self.cur is not None else set())
         lo_ok, hi_ok = self.lo - 25, self.hi + 25
         for s in new:
             mm = s["m"][m]
@@ -3833,7 +3929,8 @@ class MotionCheck:
             time.sleep(0.05)
             fs = med(self.m)
             st = self.b.latest() or s0
-            if st["m"][self.m]["t"] != t_self:
+            if st["m"][self.m]["t"] != t_self and \
+                    st["m"][self.m]["t"] not in {v for t, v in self.recent if time.time() - t < 15.0}:
                 raise CheckStop("simhub", "Something else is sending positions (SimHub?). Stop SimHub's motion "
                                 "output and run the check again.")
             if abs(fs - t_self) > abs(f_self0 - t_self) + 30:
@@ -4390,6 +4487,10 @@ class Diagnostics:
         finally:
             self.motor = None
             self.prompt = None
+            try:
+                self.board.release_page()              # SimHub may move the seat again
+            except Exception:
+                pass
 
     def _sleep(self, sec):
         end = time.time() + sec
