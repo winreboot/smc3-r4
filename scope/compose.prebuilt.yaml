@@ -1,0 +1,27 @@
+# smc3-scope from the ready-made image - nothing to build. Start with:
+#     docker compose -f compose.prebuilt.yaml up -d
+# Update later with:
+#     docker compose -f compose.prebuilt.yaml pull && docker compose -f compose.prebuilt.yaml up -d
+# Page: http://<this machine's IP>:8198
+#
+# Settings made in the page (board address, theme, motors in use, motor names), profiles, backups and
+# diagnostics are kept in the data folder below - by default ./data next to this file. To keep them somewhere
+# else (e.g. on a Synology NAS), start with   SMC3_DATA=/volume1/docker/smc3-scope-data docker compose -f compose.prebuilt.yaml up -d
+# and create that folder first (Synology's Docker doesn't create it by itself).
+
+name: smc3-scope
+
+services:
+  smc3-scope:
+    image: ghcr.io/winreboot/smc3-scope:latest   # or pin a version, e.g. :2.6.2
+    container_name: smc3-scope
+    restart: unless-stopped
+    environment:
+      SMC3_HOST: ""                  # the board's IP (it scrolls across the LED matrix at power-up) - or set it in the page
+      SMC3_PORT: "4210"              # TELEMETRY_PORT in SMC3_R4.ino
+      SMC3_WEB_PORT: "8198"
+    ports:
+      - "8198:8198"                  # host port : container port - keep both equal to SMC3_WEB_PORT
+                                     # (the board fetches firmware updates from this port, so leave it reachable)
+    volumes:
+      - ${SMC3_DATA:-./data}:/data

@@ -1,0 +1,71 @@
+name: docker-image
+
+# Builds the page (scope/) as a ready-made Docker image for every release tag and puts it on the GitHub Container
+# Registry:  ghcr.io/<owner>/smc3-scope:latest  (and :2.6.2, :2.6 ...)  for PCs and NAS (amd64), Raspberry Pi 4/5
+# and ARM NAS (arm64), and older 32-bit Raspberry Pi OS (arm/v7). Run it by hand from the Actions tab if needed.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  image:
+    name: Build and publish ghcr.io/${{ github.repository_owner }}/smc3-scope
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Image name (lower case, as the registry wants it)
+        id: name
+        run: echo "image=ghcr.io/$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')/smc3-scope" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to the GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tags and labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.name.outputs.image }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=ref,event=branch
+          labels: |
+            org.opencontainers.image.title=smc3-scope
+            org.opencontainers.image.description=Dashboard, tuning, auto-tune and diagnostics page for SMC3_R4 motion rigs
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+
+      - name: Build and push (amd64, arm64, arm/v7)
+        uses: docker/build-push-action@v6
+        with:
+          context: scope
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: How to run it
+        run: |
+          {
+            echo "### Image published"
+            echo ""
+            echo '```'
+            echo "docker run -d --name smc3-scope --restart unless-stopped -p 8198:8198 -e SMC3_WEB_PORT=8198 -v smc3-scope-data:/data ${{ steps.name.outputs.image }}:latest"
+            echo '```'
+            echo "Tags: ${{ steps.meta.outputs.version }}"
+            echo ""
+            echo "First image of this repository? Make the package public once, so docker pull works without a login:"
+            echo "your profile, Packages, smc3-scope, Package settings, Change visibility, Public."
+          } >> "$GITHUB_STEP_SUMMARY"

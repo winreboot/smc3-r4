@@ -9,7 +9,15 @@ so the page works on a network without internet access.
 
 ## Running it
 
-**Docker** (recommended for a NAS or home server):
+Step by step for Windows, Mac, Linux, Raspberry Pi, Docker and Synology: [docs/INSTALL.md](../docs/INSTALL.md).
+
+**Docker, ready-made image** (`ghcr.io/winreboot/smc3-scope`, built for every release; amd64, arm64, arm/v7):
+
+```sh
+docker compose -f compose.prebuilt.yaml up -d     # from this folder
+```
+
+**Docker, built here** (recommended for a NAS or home server if you change the code):
 
 ```sh
 docker compose up -d --build        # from this folder

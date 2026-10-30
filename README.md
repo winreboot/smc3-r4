@@ -34,10 +34,10 @@ the same time. You can open it from any browser, including your phone.
 | Folder | What it is |
 |---|---|
 | [`firmware/SMC3_R4`](firmware/SMC3_R4) | Firmware for the **Arduino UNO R4 WiFi**. It speaks the SMC3 v0.70 protocol, so SimHub, SimTools, FlyPT Mover and SMC3Utils work unchanged. It adds a 4 kHz control loop, 14-bit pot readings, quiet 25 kHz PWM, target smoothing, a fixed PID, WiFi telemetry at 100 samples a second, an LED matrix that shows live motor bars and problems in words, a level trim with travel limits and end stops for each motor, a soft start, firmware updates over WiFi from the page, and an optional WT901C motion sensor with tilt limits for each direction. |
-| [`scope/`](scope) | `smc3_scope.py`: the page server. It's one file using only the Python standard library, with a Dockerfile and compose file for a NAS or any PC. |
+| [`scope/`](scope) | `smc3_scope.py`: the page server. It's one file using only the Python standard library, with a Dockerfile and compose files for a NAS or any PC. A ready-made Docker image is on `ghcr.io/winreboot/smc3-scope`; step by step for Windows, Mac, Linux, Raspberry Pi, Docker and Synology: [docs/INSTALL.md](docs/INSTALL.md). |
 | [`tools/simboard.py`](tools/simboard.py) | A simulated rig. You can try everything without hardware, and inject faults (reversed motor, swapped wiring, glitchy pot and more). |
 | [`firmware/SMC3_smooth`](firmware/SMC3_smooth) | The original SMC3 for the **UNO R3**, with target smoothing and the PID fixes, for anyone staying on an R3. |
-| [`docs/`](docs) | Screenshots, the [protocol](docs/PROTOCOL.md), the [diagnostics](docs/DIAGNOSTICS.md) file format and an [example diagnostics file](docs/examples/diagnostics-full-check.json). |
+| [`docs/`](docs) | [Install step by step](docs/INSTALL.md), screenshots, the [protocol](docs/PROTOCOL.md), the [diagnostics](docs/DIAGNOSTICS.md) file format and an [example diagnostics file](docs/examples/diagnostics-full-check.json). |
 
 > ⚠️ **A motion rig can hurt you.** It moves a person with motors strong enough to lift them. Test with the seat
 > empty, keep hands and feet clear, and keep a hand near the motor power switch whenever you test, tune or flash
@@ -462,31 +462,31 @@ Your SMC3Utils settings stay in EEPROM in the same layout. If the board had none
 
 ### 2. Run the page
 
-**With Docker** (a NAS or any PC):
+Step by step for Windows, Mac, Linux, Raspberry Pi, Docker and Synology: **[docs/INSTALL.md](docs/INSTALL.md)**.
+In short:
+
+**Docker, ready-made image** (a NAS or any PC; amd64, arm64 and arm/v7):
 
 ```sh
-git clone https://github.com/winreboot/smc3-r4.git
-cd smc3-r4/scope
-docker compose up -d --build
+docker run -d --name smc3-scope --restart unless-stopped -p 8198:8198 -e SMC3_WEB_PORT=8198 -v smc3-scope-data:/data ghcr.io/winreboot/smc3-scope:latest
 ```
+
+Or with Compose, from [scope/compose.prebuilt.yaml](scope/compose.prebuilt.yaml): `docker compose -f
+compose.prebuilt.yaml up -d`. To build the image yourself instead: `git clone
+https://github.com/winreboot/smc3-r4.git`, `cd smc3-r4/scope`, `docker compose up -d --build`.
 
 Then open `http://<that machine's IP>:8198`, go to **Settings** and enter the board's address (or press **Find
-board on network**). Settings, profiles, backups and diagnostics are kept in `scope/data`. To keep them elsewhere,
-for example on a Synology NAS, run:
+board on network**).
+
+**Without Docker** (Python 3.8 or newer, nothing to install): download `smc3_scope_v<version>.py` from the
+[latest release](https://github.com/winreboot/smc3-r4/releases/latest) and run
 
 ```sh
-mkdir -p /volume1/docker/smc3-scope-data
-SMC3_DATA=/volume1/docker/smc3-scope-data docker compose up -d --build
+python3 smc3_scope_v2.6.2.py --host 192.168.1.50 --bind 0.0.0.0 --web 8198
 ```
 
-**Without Docker** (Python 3.8 or newer, nothing to install):
-
-```sh
-python3 scope/smc3_scope.py --host 192.168.1.50 --bind 0.0.0.0 --web 8198
-```
-
-`--bind 0.0.0.0` makes the page reachable from other devices; without it, the page is on this machine only - and
-the board can't fetch firmware updates from it.
+(`py` instead of `python3` on Windows). `--bind 0.0.0.0` makes the page reachable from other devices; without it,
+the page is on this machine only - and the board can't fetch firmware updates from it.
 
 ### 3. SimHub
 

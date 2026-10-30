@@ -3,6 +3,18 @@
 `smc3_scope` (the page) and `SMC3_R4` (the firmware) are versioned separately. The page works with older
 firmware too; the notes say which firmware a feature needs.
 
+## Page 2.6.2 (firmware 1.9.4, unchanged)
+
+Nothing changes in what the page does. New:
+
+- **[docs/INSTALL.md](docs/INSTALL.md): running the page step by step** - Windows (with starting at login), Mac,
+  Linux and Raspberry Pi (with a systemd service), Docker, Synology Container Manager, building the image yourself,
+  every option, and what to check when something doesn't work.
+- **A ready-made Docker image**, `ghcr.io/winreboot/smc3-scope`, for amd64 (PCs, most NAS), arm64 (Raspberry Pi 4/5,
+  ARM NAS) and arm/v7 (32-bit Raspberry Pi OS). The `docker-image` workflow builds it for every release tag (`latest`,
+  the version and the minor version). [scope/compose.prebuilt.yaml](scope/compose.prebuilt.yaml) runs it without
+  building anything.
+
 ## Page 2.6.1 (firmware 1.9.4, unchanged)
 
 After the first run of 2.6 on a real rig, which settled for Kp 134 and Ki 70:

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-smc3_scope v2.6.1 - live scope, tuner and auto-tuner for the SMC3_R4 motion controller (Arduino UNO R4 WiFi).
+smc3_scope v2.6.2 - live scope, tuner and auto-tuner for the SMC3_R4 motion controller (Arduino UNO R4 WiFi).
 
 Connects to the board's TCP telemetry port, keeps a rolling buffer of samples and serves a web page with live
 charts, a parameter editor (sends ordinary SMC3 commands back to the board), test signals and a per-motor
@@ -12,6 +12,10 @@ Every option can also come from the environment (Docker): SMC3_HOST, SMC3_PORT, 
 SMC3_DATA_DIR.  Settings changed in the page (board address, theme, auto-find) are saved to
 <data dir>/config.json and survive restarts and upgrades.  Standard-library Python 3.8+ only.
 
+v2.6.2: nothing changes in what the page does. A step-by-step install guide (docs/INSTALL.md) for Windows, Mac, Linux,
+        Raspberry Pi, Docker and Synology Container Manager, and a ready-made Docker image (ghcr.io/<owner>/smc3-scope,
+        for amd64, arm64 and arm/v7) that GitHub Actions builds for every release tag; scope/compose.prebuilt.yaml uses
+        it.
 v2.6.1: auto-tune on a real rig (the first run of 2.6) settled for a soft Kp and far too much Ki. "Falls behind" is
         judged where the goal moves at full speed and only with the drive at PWMmax - 2.5's test (the last quarter of
         the move) is all easing-out on 2.6's shorter moves, so it flagged most Kp values and the sweep fell back to Kp
@@ -116,7 +120,7 @@ v1.4: settings dialog (board address, port, find-board scan, auto-find), day/nig
       fixed a thread race that made the page flash "not reachable".
 """
 
-VERSION = "2.6.1"
+VERSION = "2.6.2"
 
 import argparse
 import base64
