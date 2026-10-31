@@ -3,6 +3,19 @@
 `smc3_scope` (the page) and `SMC3_R4` (the firmware) are versioned separately. The page works with older
 firmware too; the notes say which firmware a feature needs.
 
+## Page 2.8.1 (firmware 1.9.5, unchanged)
+
+- **A WiFi / USB switch at the top of the page.** The bridge now keeps running when you go back to WiFi: it lets go of
+  the COM port, so SimHub can have it, and waits. Flip the switch to USB (SimHub closed) and it opens the port and links
+  again; if the port is still in use the switch says so. With no bridge running, flipping it shows the line to start
+  one. `standby` (or `SMC3_STANDBY=1`, `--standby` for the Python bridge) starts the bridge waiting, e.g. with Windows.
+- **The firmware version stays right** when you switch between WiFi and the cable: it showed "1.9.2" (a guess from the
+  diagnostics frame) until the new connection's own version text arrived, or for good when that answer got lost. Now it
+  shows the version the board last reported meanwhile, and the page asks again if the answer doesn't come.
+
+Update: Settings, Updates, **Update page**. Then start the bridge once more (Win+R, the same line): that loads the new
+bridge.
+
 ## Page 2.8 (firmware 1.9.5)
 
 **The USB cable for calibration.** The UNO R4 WiFi's WiFi module now and then holds the board's loop up for a second

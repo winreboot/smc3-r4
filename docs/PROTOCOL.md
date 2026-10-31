@@ -102,10 +102,16 @@ Content-Length: 0
 The page answers `200` and from then on the connection carries the board's bytes both ways, unchanged (TCP_NODELAY on
 both ends). The page sends `[kU1]` every second over it. Other answers, as plain text with the reason: `409` wait and
 try again (auto-tune, the full check, Seat setup or a firmware update is running, or another bridge is linked), `403`
-the page is set to WiFi only, `410` the page won't take this bridge again (Back to WiFi was pressed, or the board
-can't do page mode - older than 1.9.5 - or didn't answer). When the link ends the bridge sends `[kU0]` to the board
+the page is set to WiFi only (2.8.1: the bridge then waits), `410` the page won't take this bridge again (the board
+can't do page mode - older than 1.9.5 - or didn't answer; 2.8 also after Back to WiFi). When the link ends the bridge sends `[kU0]` to the board
 and links again after 3 s (so a page restart doesn't end it); the page goes back to WiFi by itself. As the page sends
 `[kU1]` every second, a bridge that hears nothing from it for 6 s takes the link for dead and links again.
+
+Page 2.8.1: when a link ends the bridge asks the page `POST /usb/standby` (same headers, JSON body `{"msg": "why the port
+can't be opened, or empty"}`), answer `{"want": bool, "allowed": bool, "stop": null | "reason"}`. While `want` is false
+it closes the port and asks again every second; when the header's switch asks for the cable (`POST /usb/want
+{"on": true}`, which answers `need_bridge` when no bridge has asked in the last 4 s) it opens the port and links. `stop`
+ends the bridge with that reason. A bridge started by hand links at once; with `standby` it starts waiting.
 
 The Windows bridge is a PowerShell script the page serves at `/usb-bridge.ps1` with its own address filled in
 (`?dl=1` to download it); the page file itself is the bridge on any OS with `--usb-bridge PORT --page URL`.

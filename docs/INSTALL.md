@@ -255,8 +255,9 @@ or more; on the cable nothing waits. Only with SimHub closed: one program at a t
    A window opens: the bridge finds the board's COM port (it asks if there are several) and links it to the page.
    It uses Windows PowerShell - nothing to install - and connects out to the page, so no firewall question.
 3. The page switches over by itself: the header says **USB cable**. Calibrate as usual.
-4. Close the bridge window (or press **Back to WiFi** in the page). The board and the page go back to WiFi by
-   themselves. Start SimHub again.
+4. When you're done, flip the switch at the top of the page to **WiFi** and start SimHub again. The bridge lets go of
+   the port and waits in its window (minimised is fine); next time close SimHub and flip the switch to **USB** - no
+   need to go back to Win+R. Closing the bridge window ends it.
 
 The page can be anywhere on your network (the NAS, a Raspberry Pi): only the bridge runs on the PC with the cable.
 **Download the bridge (.ps1)** on the same card gives you the script as a file to keep on that PC (right-click, Run
@@ -266,6 +267,11 @@ file is the bridge too:
     python3 smc3_scope_v2.8.py --usb-bridge /dev/ttyACM0 --page http://192.168.1.20:8198
 
 **Settings, USB cable** can also turn bridges away (WiFi only). Firmware updates from the page still go over WiFi.
+
+To have the bridge waiting from the moment Windows starts, make a shortcut in the Startup folder (Win+R,
+`shell:startup`) with this target (your page's address), and the switch works whenever you want it:
+
+    powershell -WindowStyle Minimized -NoProfile -ExecutionPolicy Bypass -Command "$env:SMC3_STANDBY='1'; irm http://192.168.1.20:8198/usb-bridge.ps1 | iex"
 
 ---
 
@@ -300,6 +306,7 @@ whenever you change them there; otherwise what you set in the page stays.
 | USB bridge: "COM5 is in use or missing" | Close SimHub (and SMC3Utils, the Arduino IDE's Serial Monitor) - only one program can have the port. Check the board is plugged into this PC. |
 | USB bridge: "needs firmware 1.9.5 or newer" | The board answers on the cable but its firmware can't send the page's data over USB. Install SMC3_R4 1.9.5 (Settings, Firmware update, or the Arduino IDE), then run the bridge again. |
 | USB bridge: "Can't reach the page" | Use the page's plain `http://` address as in your browser (not https or a reverse proxy). The page must listen on the network (`--bind 0.0.0.0`; the Docker image does). |
+| The switch stays orange ("switching") | The bridge can't open the port: hover over the switch - usually SimHub (or SMC3Utils, the Serial Monitor) still has it. Close it; the bridge links by itself. Flip back to WiFi to cancel. |
 | USB bridge: "Waiting: Auto-tune is running ..." | The bridge links as soon as auto-tune, the full check, Seat setup or a firmware update has finished - switching mid-way would spoil it. |
 | Updates: "Couldn't reach GitHub" | This machine (in Docker: the container) needs internet access to `api.github.com` and GitHub's download servers. The rest of the page works without it. |
 | `python` / `py` not found (Windows) | Re-run the Python installer and tick **Add python.exe to PATH**, or use the full path to `python.exe`. |

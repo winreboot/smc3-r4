@@ -105,6 +105,8 @@ bytes both ways), the page drops its WiFi connection and uses the cable until th
 second so the board streams over USB and leaves WiFi alone. Windows: the page serves a PowerShell bridge at
 `/usb-bridge.ps1` with its own address in it (Settings, USB cable shows the line for Win+R). Anywhere else:
 `smc3_scope.py --usb-bridge PORT --page http://<page>:<port>` (pyserial if installed; Linux and macOS work without).
+From 2.8.1 the bridge keeps running when the page goes back to WiFi: it closes the port and asks the page every second
+(`POST /usb/standby`) until the header's WiFi / USB switch asks for the cable again (`--standby` starts it that way).
 Details in [docs/PROTOCOL.md](../docs/PROTOCOL.md#the-usb-bridge-page-28).
 
 ## Security

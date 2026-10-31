@@ -133,6 +133,7 @@ ap.add_argument("--tuned", action="store_true", help="start with sane settings (
 ap.add_argument("--usb", default="", help="the board's USB port as a pseudo-terminal, linked at this path (page 2.8)")
 ap.add_argument("--fw194", action="store_true", help="firmware 1.9.4: no USB page mode")
 ap.add_argument("--usb-reset", type=float, default=0.0, help="opening the USB port restarts the board, silent SEC s")
+ap.add_argument("--usb-drop-rdu", type=int, default=0, help="test: the first N [rdu] over USB go unanswered (page 2.8.1)")
 args = ap.parse_args()
 
 PID_HZ, SUB = 4000, 40
@@ -1178,6 +1179,9 @@ def usb_cmd(c, a, b, out):
                 clients.clear()
         return
     if USBP["on"]:                                # the page's command, as over WiFi
+        if c == "r" and a == ord("d") and b == ord("u") and USBP.get("rdu_dropped", 0) < args.usb_drop_rdu:
+            USBP["rdu_dropped"] = USBP.get("rdu_dropped", 0) + 1
+            return                                # --usb-drop-rdu: this answer gets lost
         handle_cmd(c, a, b, out, USB_CL)
         return
     with lock:                                    # SimHub / SMC3Utils

@@ -17,8 +17,8 @@ The page lets you:
 - **move each motor by dragging its slider**, or send the whole seat back to center with one button;
 - find out why when something goes wrong, and where the rig struggles under load;
 - **update the firmware over WiFi**: pick the `.bin` from the Arduino IDE and press Install;
-- **calibrate over the USB cable** instead of WiFi, with SimHub closed: one line pasted into Win+R on the sim PC, and
-  the page talks to the board without WiFi's hiccups.
+- **calibrate over the USB cable** instead of WiFi, with SimHub closed: one line pasted into Win+R on the sim PC, then
+  a WiFi / USB switch at the top of the page, and the page talks to the board without WiFi's hiccups.
 
 It knows two kinds of rig: **two front lifts plus a traction-loss motor** (motors 1 and 2 lift the front corners,
 motor 3 is mounted horizontally and swings the rear left and right about a pivot at the front - the default), and

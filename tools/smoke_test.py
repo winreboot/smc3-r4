@@ -37,8 +37,8 @@ Smoke test: start simulated rigs and the page, run diagnostics, check the result
    the started file hands over to it, and Go back to built-in returns to the started file and stays there.
 15. The USB cable (page 2.8, firmware 1.9.5): the simulated board's USB port is a pseudo-terminal; the page's own
    bridge (--usb-bridge) links it to the page, which takes over from WiFi: telemetry over USB, the quick check runs
-   there and the report says so, firmware updates are refused on the cable, a second bridge waits, Back to WiFi stops
-   the bridge and the page is on WiFi again. With firmware 1.9.4 the page notices the board can't stream over USB and
+   there and the report says so, firmware updates are refused on the cable, Back to WiFi puts the page on WiFi while the
+   bridge waits with the port closed, and the header's switch (2.8.1) has it link again. With firmware 1.9.4 the page notices the board can't stream over USB and
    the bridge stops, saying 1.9.5 is needed. (POSIX only.)
 Case 10 also checks firmware 1.9.4's pot glitch filter (simulated): the board counts the glitches, the live data stays
 clean, so the finding is a warning that names the filter, and the report shows the board's own version (1.9.5).
@@ -413,9 +413,14 @@ try:
             fwb = get(base15, "/fw/status")["board"]
             check(not fwb["capable"] and "USB cable" in (fwb["problem"] or ""), "firmware update refused on the cable")
             r = post(base15, "/usb/drop")
-            br.wait(15)
-            check(r["ok"] and br.returncode == 2 and usb_wait(base15, "wifi") is not None,
-                  "Back to WiFi: the bridge stops, the page is on WiFi again")
+            check(r["ok"] and usb_wait(base15, "wifi") is not None and br.poll() is None,
+                  "Back to WiFi: the page is on WiFi again, the bridge waits with the port closed")
+            time.sleep(2.5)
+            r = post(base15, "/usb/want", {"on": True})
+            check(r["ok"] and usb_wait(base15, "usb") is not None,
+                  "the header's switch to USB: the waiting bridge links again (page 2.8.1)")
+            check(get(base15, "/data?since=0")["fw"] == "1.9.5", "the firmware version stays 1.9.5 across the switches")
+            br.terminate()
 
     # 13. updates from GitHub (page 2.7), against a stand-in for GitHub's API
     for p in procs:
