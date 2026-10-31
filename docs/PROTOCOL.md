@@ -105,7 +105,17 @@ try again (auto-tune, the full check, Seat setup or a firmware update is running
 the page is set to WiFi only (2.8.1: the bridge then waits), `410` the page won't take this bridge again (the board
 can't do page mode - older than 1.9.5 - or didn't answer; 2.8 also after Back to WiFi). When the link ends the bridge sends `[kU0]` to the board
 and links again after 3 s (so a page restart doesn't end it); the page goes back to WiFi by itself. As the page sends
-`[kU1]` every second, a bridge that hears nothing from it for 6 s takes the link for dead and links again.
+`[kU1]` every second, a bridge that hears nothing from it for 10 s (6 s before 2.8.2) takes the link for dead and links again.
+
+Page 2.8.2:
+- **The bridge checks the board first.** Right after it opens the port the bridge sends `[rd!]` and sends the result
+  with the link request: `X-SMC3-Probe: ok <firmware number> | bytes <n> | none`.
+- **A pulled cable.** When the cable comes out mid-link, the bridge closes the network link and the port. It then
+  tries to open the port again every 2 s and asks the page meanwhile, so it lets go when the switch goes back to WiFi.
+- **The page out of reach.** While the bridge holds the port without a link (the page unreachable, or `409`) it asks
+  the page too, and it lets go after a minute without an answer.
+- **A link that ends because the bridge went quiet.** The bridge is cut off, with no close: the page keeps `want` for
+  70 s instead of 6 s, so the bridge links again when it can reach the page.
 
 Page 2.8.1: when a link ends the bridge asks the page `POST /usb/standby` (same headers, JSON body `{"msg": "why the port
 can't be opened, or empty"}`), answer `{"want": bool, "allowed": bool, "stop": null | "reason"}`. While `want` is false

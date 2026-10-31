@@ -77,6 +77,8 @@ The USB port (page 2.8, firmware 1.9.5 USB page mode; the simulator says 1.9.5 u
   --fw194              firmware 1.9.4: no USB page mode ([kU] is ignored, USB only answers SMC3 commands)
   --usb-reset SEC      opening the USB port resets the board (as some USB-serial boards do): it restarts when the
                        first bytes arrive and doesn't answer for SEC seconds (WiFi joining in setup())
+  --usb-unplug AT,FOR  test (page 2.8.2): AT s after the page first uses the cable, the cable is pulled (the port
+                       goes away) for FOR s, then it is back as a new port
 """
 import argparse, math, os, random, re, select, socket, struct, threading, time, urllib.request, zlib
 
@@ -134,6 +136,8 @@ ap.add_argument("--usb", default="", help="the board's USB port as a pseudo-term
 ap.add_argument("--fw194", action="store_true", help="firmware 1.9.4: no USB page mode")
 ap.add_argument("--usb-reset", type=float, default=0.0, help="opening the USB port restarts the board, silent SEC s")
 ap.add_argument("--usb-drop-rdu", type=int, default=0, help="test: the first N [rdu] over USB go unanswered (page 2.8.1)")
+ap.add_argument("--usb-mute", action="store_true", help="test: nothing the board sends over USB reaches the PC")
+ap.add_argument("--usb-unplug", default="", help="test AT,FOR: AT s after the page first uses the cable, pull it for FOR s")
 args = ap.parse_args()
 
 PID_HZ, SUB = 4000, 40
@@ -1138,7 +1142,7 @@ USB_CL = {"extras": False, "peer": "", "usb": True}
 
 def usb_write(data):
     fd = USBP["fd"]
-    if fd is None or not data:
+    if fd is None or not data or args.usb_mute:
         return
     view = memoryview(data)
     end = time.time() + 0.5
@@ -1210,8 +1214,8 @@ def usb_page_end():
         USB_CL["extras"] = False
 
 
-def usb_port():
-    """--usb: the board's USB serial port (a pseudo-terminal)."""
+def usb_plug():
+    """The board's USB port appears (a new pseudo-terminal, linked at --usb)."""
     import tty
     master, slave = os.openpty()
     tty.setraw(slave)                             # no echo, no line editing - as a real serial port
@@ -1224,10 +1228,35 @@ def usb_port():
         pass
     os.symlink(name, args.usb)
     print("simboard USB port", args.usb, "->", name, flush=True)
+    return master, slave
+
+
+def usb_port():
+    """--usb: the board's USB serial port (a pseudo-terminal)."""
+    master, slave = usb_plug()
+    unplug = [float(x) for x in args.usb_unplug.split(",")] if args.usb_unplug else None
+    first_on = None
     buf = b""
     last_send = time.time()
     booting_until = None
     while True:
+        if unplug and USBP["starts"] and first_on is None:
+            first_on = time.time()
+        if unplug and first_on is not None and time.time() - first_on >= unplug[0]:
+            print("simboard USB cable pulled", flush=True)   # --usb-unplug: the port goes away (reads on it fail)
+            USBP["fd"] = None
+            usb_page_end()
+            for fd in (master, slave):
+                try: os.close(fd)
+                except OSError: pass
+            try: os.unlink(args.usb)
+            except OSError: pass
+            time.sleep(unplug[1])
+            unplug = None
+            buf = b""
+            master, slave = usb_plug()
+            print("simboard USB cable back", flush=True)
+            continue
         r, _, _ = select.select([master], [], [], 0.01)
         if r:
             try:

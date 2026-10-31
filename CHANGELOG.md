@@ -3,6 +3,30 @@
 `smc3_scope` (the page) and `SMC3_R4` (the firmware) are versioned separately. The page works with older
 firmware too; the notes say which firmware a feature needs.
 
+## Page 2.8.2 (firmware 1.9.5, unchanged)
+
+- **The Windows USB bridge gets the board's data.** On a real PC nothing came back from the board (the bridge showed
+  "board -> page 0 kB" and the page gave up with "The board didn't answer on COM4 in 45 s"): the bridge waited on an
+  asynchronous read of the COM port that never completed there. It now reads whatever bytes are waiting, about every
+  10 ms.
+- When the bridge opens the port it asks the board for its firmware number and says what it found: "The board answers
+  on COM4 (firmware 1.9.x)" or "No answer from the board on COM4". The page's message says so too.
+- 2.8.1's bridge re-sent the page's first bytes over and over (one line lost in a rewrite), so it never noticed the page
+  going back to WiFi. Fixed.
+- The bridge holds up better:
+  - Pulling the USB cable no longer stops it: it waits and links again when the cable is back.
+  - A click in its window no longer freezes the link (the old console's QuickEdit "Select" is off while it runs).
+  - A board that stops taking bytes can't hang it any more.
+  - "COM4 is in use" now shows only when the port really is in use. Otherwise it says what Windows says, e.g. that the
+    port doesn't exist.
+  - It lets go of the port when the switch goes back to WiFi while it is still trying to reach the page, and after a
+    minute without any word from the page.
+  - The page may now be quiet for 10 s (was 6 s) before the bridge drops the link.
+- After a network outage during a USB link, the switch stays on USB for a minute (it went back to WiFi after 6 s), so
+  the bridge links again by itself once the network is back.
+
+Update: Settings, Updates, **Update page**, then start the bridge once more (the same Win+R line).
+
 ## Page 2.8.1 (firmware 1.9.5, unchanged)
 
 - **A WiFi / USB switch at the top of the page.** The bridge now keeps running when you go back to WiFi: it lets go of

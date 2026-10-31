@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-smc3_scope v2.8.1 - live scope, tuner and auto-tuner for the SMC3_R4 motion controller (Arduino UNO R4 WiFi).
+smc3_scope v2.8.2 - live scope, tuner and auto-tuner for the SMC3_R4 motion controller (Arduino UNO R4 WiFi).
 
 Connects to the board's TCP telemetry port, keeps a rolling buffer of samples and serves a web page with live
 charts, a parameter editor (sends ordinary SMC3 commands back to the board), test signals and a per-motor
@@ -17,6 +17,16 @@ Every option can also come from the environment (Docker): SMC3_HOST, SMC3_PORT, 
 SMC3_DATA_DIR.  Settings changed in the page (board address, theme, auto-find) are saved to
 <data dir>/config.json and survive restarts and upgrades.  Standard-library Python 3.8+ only.
 
+v2.8.2: the Windows (PowerShell) bridge got nothing back from the board on a real PC (board -> page 0 kB, then "the
+        board didn't answer on COM4 in 45 s"): it waited on an asynchronous read of the COM port that never completed.
+        It now reads whatever bytes are waiting, about every 10 ms, and checks the board when it opens the port ([rd!]
+        - "The board answers on COM4 (firmware 1.9.x)" or "No answer"), which it passes on to the page
+        (X-SMC3-Probe). 2.8.1's bridge also re-sent the page's first bytes over and over (one line lost); fixed.
+        Both bridges also survive a pulled cable (they reopen the port), let go of the port when the switch goes
+        back to WiFi while they're still trying to reach the page or after a minute with no word from it, and
+        allow 10 s (was 6) of quiet from the page. The PowerShell bridge also turns QuickEdit off, has write
+        timeouts, and says "in use" only when it is. A link that ended because the bridge went quiet (network
+        down, no close) keeps the switch on USB for 70 s (was 6 s), so the bridge links again when it's back.
 v2.8.1: a WiFi / USB switch in the header. The bridge no longer stops when the page goes back to WiFi: it lets go of
         the port (SimHub can have it) and waits, asking the page every second (POST /usb/standby); flipping the
         switch to USB has it open the port and link again, and if the port is busy it says so on the switch. With no
@@ -167,7 +177,7 @@ v1.4: settings dialog (board address, port, find-board scan, auto-find), day/nig
       fixed a thread race that made the page flash "not reachable".
 """
 
-VERSION = "2.8.1"
+VERSION = "2.8.2"
 
 import argparse
 import base64
@@ -376,6 +386,7 @@ class Board:
         self.pending_restore = None          # auto-tune's settings to send again once the board is back (2.8)
         self.usb_want = False                # 2.8.1: the header's switch is on USB (a waiting bridge takes it up)
         self.usb_want_at = 0.0
+        self.usb_want_grace = 6.0            # 2.8.2: 70 s after a link that went quiet (network down, no close)
         self.standby = None                  # 2.8.1: a bridge waiting with the port closed: id, computer, port, msg, seen
 
     def start(self):
@@ -596,7 +607,8 @@ class Board:
         """The switch's position: on (USB) while linked, or while asked for and a bridge is there to take it up."""
         if self.link == "usb" and self.usb:
             return True
-        if self.usb_want and not self.bridge_waiting() and not self.usb_pending and time.time() - self.usb_want_at > 6:
+        if (self.usb_want and not self.bridge_waiting() and not self.usb_pending
+                and time.time() - self.usb_want_at > self.usb_want_grace):
             self.usb_want = False                        # nobody took it up (the bridge window was closed)
         return self.usb_want
 
@@ -692,6 +704,8 @@ class Board:
         elif age > 45:
             why = (f"The board didn't answer on {u.get('port') or 'that port'} in 45 s. Is it the Arduino's port? "
                    "(Run the bridge again: it lists the ports it can see when there are several.)")
+            if u.get("probe") == "none":
+                why += " The bridge got no answer either when it opened the port: nothing comes back from the board over USB."
             self._ev("link", "USB cable: " + why, quiet=False)
             self.detach_usb(why, refuse=True)
 
@@ -770,6 +784,7 @@ class Board:
                     u = self.usb
                     if u and u["tel_at"] and quiet > 5:
                         u["end"] = "The board stopped sending over the cable for 5 s."
+                        u["quiet_end"] = True            # (2.8.2: the bridge may be cut off - it gets a minute)
                         self._drop()
                 elif quiet > 5:
                     log("board stopped sending - reconnecting")
@@ -804,7 +819,8 @@ class Board:
             u, usb = self.usb, self.link == "usb"
             self.link, self.usb = "wifi", None
         if usb and u:                                    # page 2.8: the USB link ended - back to WiFi
-            self.usb_want_at = time.time()               # (2.8.1: the bridge has a few seconds to link again)
+            self.usb_want_at = time.time()               # (2.8.1: the bridge has a few seconds to link again;
+            self.usb_want_grace = 70.0 if u.get("quiet_end") else 6.0   # 2.8.2: a minute when the network went quiet)
             why = u.get("end") or "The link ended."
             self.usb_last = {"computer": u.get("computer"), "port": u.get("port"), "since": u.get("since"),
                              "until": time.time(), "why": why}
@@ -8162,6 +8178,32 @@ function Smc3-Say([string]$text, [string]$colour) {
     Write-Host $text -ForegroundColor $colour
 }
 
+function Smc3-NoQuickEdit {
+    # 2.8.2: a click in the old console window starts "Select" (QuickEdit) and freezes the script until Esc - the
+    # link would drop. Turns QuickEdit off for this window; returns the mode to put back, or $null.
+    try {
+        if (-not ('Smc3.Con' -as [type])) {
+            Add-Type -Namespace Smc3 -Name Con -MemberDefinition @'
+[DllImport("kernel32.dll")] public static extern IntPtr GetStdHandle(int h);
+[DllImport("kernel32.dll")] public static extern bool GetConsoleMode(IntPtr h, out uint m);
+[DllImport("kernel32.dll")] public static extern bool SetConsoleMode(IntPtr h, uint m);
+'@
+        }
+        $h = [Smc3.Con]::GetStdHandle(-10)
+        $m = [uint32]0
+        if (-not [Smc3.Con]::GetConsoleMode($h, [ref]$m)) { return $null }
+        $nm = [int64]$m -bor 0x80                  # ENABLE_EXTENDED_FLAGS (needed for the change to stick)
+        if ($nm -band 0x40) { $nm = $nm - 0x40 }   # ENABLE_QUICK_EDIT_MODE off
+        if ([Smc3.Con]::SetConsoleMode($h, [uint32]$nm)) { return $m }
+    } catch { }
+    return $null
+}
+
+function Smc3-PutQuickEdit($mode) {
+    if ($null -eq $mode) { return }
+    try { [void][Smc3.Con]::SetConsoleMode([Smc3.Con]::GetStdHandle(-10), [uint32]$mode) } catch { }
+}
+
 function Smc3-Ports {
     $list = @()
     try {
@@ -8192,6 +8234,29 @@ function Smc3-Head($ns) {
     return $head.ToString()
 }
 
+function Smc3-Probe($sp) {
+    # 2.8.2: asks the board for its firmware number ([rd!]) right after the port opens - "ok 19", or "none" when
+    # nothing at all comes back over USB (then the page can't work over the cable either)
+    try { $sp.DiscardInBuffer() } catch { }
+    $sp.Write([byte[]](0x5B, 0x72, 0x64, 0x21, 0x5D), 0, 5)
+    $got = New-Object System.Collections.Generic.List[byte]
+    $t0 = Get-Date
+    while (((Get-Date) - $t0).TotalMilliseconds -lt 2000) {
+        $k = $sp.BytesToRead
+        if ($k -gt 0) {
+            $b = New-Object byte[] $k
+            $n = $sp.Read($b, 0, $k)
+            for ($j = 0; $j -lt $n; $j++) { $got.Add($b[$j]) }
+            for ($j = 0; $j + 4 -lt $got.Count; $j++) {
+                if ($got[$j] -eq 0x5B -and $got[$j + 1] -eq 0x21 -and $got[$j + 4] -eq 0x5D) { return ('ok ' + $got[$j + 3]) }
+            }
+        }
+        Start-Sleep -Milliseconds 30
+    }
+    if ($got.Count -gt 0) { return ('bytes ' + $got.Count) }
+    return 'none'
+}
+
 function Smc3-Ask($base, $hdr, [string]$msg) {
     # asks the page whether it wants the cable now (and tells it why the port can't be opened); $null = no answer
     try {
@@ -8199,6 +8264,16 @@ function Smc3-Ask($base, $hdr, [string]$msg) {
         return Invoke-RestMethod -Uri ($base + '/usb/standby') -Method Post -Headers $hdr -Body $body `
                                  -ContentType 'application/json' -TimeoutSec 5
     } catch { return $null }
+}
+
+function Smc3-Keep($base, $hdr, [string]$msg, [bool]$viaPage) {
+    # 2.8.2: while the bridge holds the port (or keeps trying to) without a link: 'keep' at it, 'free' the port
+    # (the switch at the top of the page went back to WiFi), or 'away' (the page doesn't answer)
+    $r = Smc3-Ask $base $hdr $msg
+    if ($null -eq $r) { return 'away' }
+    if ($r.stop) { throw [string]$r.stop }
+    if ($viaPage -and -not $r.want) { return 'free' }
+    return 'keep'
 }
 
 function Smc3-Bridge {
@@ -8227,6 +8302,8 @@ function Smc3-Bridge {
             $smc3Port = (Read-Host 'Which one is the board (e.g. COM5)').Trim().ToUpper()
         }
     }
+    if ($smc3Port -match '^\d+$') { $smc3Port = 'COM' + $smc3Port }
+    if ($smc3Port -notmatch '^COM\d+$') { throw ('"' + $smc3Port + '" is not a COM port (e.g. COM5).') }
 
     $id = [guid]::NewGuid().ToString('N').Substring(0, 12)
     $hdr = @{ 'X-SMC3' = '1'; 'X-SMC3-Bridge' = $id; 'X-SMC3-Computer' = [string]$env:COMPUTERNAME;
@@ -8234,10 +8311,10 @@ function Smc3-Bridge {
     $kuOff = [byte[]](0x5B, 0x6B, 0x55, 0x00, 0x5D)
     $bufS = New-Object byte[] 4096
     $bufN = New-Object byte[] 4096
-    $sp = $null; $ss = $null; $tS = $null
+    $sp = $null; $tcp = $null
     $want = -not $smc3Standby                  # started by hand: link at once
-    $viaPage = $false                          # ... or because the page's switch asked for it
-    $busy = ''; $said = ''
+    $viaPage = $false                          # ... or because the page's switch asked for it (or it has linked)
+    $busy = ''; $said = ''; $probe = ''; $away = $null
     Smc3-Say ('Board: ' + $smc3Port + ' at 500000 baud.   Page: ' + $uri.Authority) Gray
     try {
         while ($true) {
@@ -8255,36 +8332,77 @@ function Smc3-Bridge {
                 }
                 if ($r.stop) { throw [string]$r.stop }
                 if (-not $r.want) { if ($said -eq 'nopage') { $said = '' }; Start-Sleep -Seconds 1; continue }
-                $want = $true; $viaPage = $true; $said = ''
+                $want = $true; $viaPage = $true; $said = ''; $away = $null
             }
             if ($null -eq $sp) {
                 $p = New-Object System.IO.Ports.SerialPort -ArgumentList $smc3Port, 500000, ([System.IO.Ports.Parity]::None), 8, ([System.IO.Ports.StopBits]::One)
                 $p.Handshake = [System.IO.Ports.Handshake]::None
                 $p.ReadBufferSize = 65536
+                $p.WriteTimeout = 2000                 # 2.8.2: a board that stops taking bytes can't hang the bridge
                 $p.DtrEnable = $true
                 $p.RtsEnable = $true
-                try { $p.Open(); $sp = $p; $ss = $sp.BaseStream; $tS = $null; $busy = '' }
+                try {
+                    $p.Open(); $sp = $p; $busy = ''; $probe = ''
+                    # (.NET Framework: pulling the cable while the port is open can crash PowerShell from a finalizer)
+                    try { [GC]::SuppressFinalize($sp.BaseStream) } catch { }
+                }
                 catch {
-                    $busy = $smc3Port + ' is in use - close SimHub (or SMC3Utils, the Arduino IDE''s Serial Monitor).'
-                    if ($said -ne 'busy') { Smc3-Say ('Waiting: ' + $busy + ' It links as soon as the port is free.') Yellow; $said = 'busy' }
-                    $r = Smc3-Ask $base $hdr $busy
-                    if ($r -and $r.stop) { throw [string]$r.stop }
-                    if ($viaPage -and $r -and -not $r.want) { $want = $false }    # the switch went back to WiFi
+                    $e = $_.Exception.GetBaseException()
+                    if ($e -is [System.UnauthorizedAccessException]) {
+                        $busy = $smc3Port + ' is in use - close SimHub (or SMC3Utils, the Arduino IDE''s Serial Monitor).'
+                        $tag = 'busy'; $tail = ' It links as soon as the port is free.'
+                    } else {                           # 2.8.2: not there (unplugged?) - say what Windows says
+                        $busy = 'Can''t open ' + $smc3Port + ': ' + $e.Message.Trim() + ' Is the board plugged in?'
+                        $tag = 'gone'; $tail = ' Trying again every 2 s ...'
+                    }
+                    if ($said -ne $tag) { Smc3-Say ('Waiting: ' + $busy + $tail) Yellow; $said = $tag }
+                    if ((Smc3-Keep $base $hdr $busy $viaPage) -eq 'free') {
+                        $want = $false; $viaPage = $false; $said = ''               # the switch went back to WiFi
+                        continue
+                    }
                     Start-Sleep -Seconds 2; continue
                 }
+            }
+            if (-not $probe) {
+                try { $probe = Smc3-Probe $sp }
+                catch {
+                    Smc3-Say ('The USB port stopped working (cable unplugged?): ' + $_.Exception.GetBaseException().Message) Yellow
+                    try { $sp.Close() } catch { }
+                    $sp = $null; $said = ''
+                    if ((Smc3-Keep $base $hdr '' $viaPage) -eq 'free') { $want = $false; $viaPage = $false }
+                    Start-Sleep -Seconds 2; continue
+                }
+                if ($probe -like 'ok *') {
+                    $fwn = [int]($probe.Substring(3))
+                    Smc3-Say ('The board answers on ' + $smc3Port + ' (firmware ' + [int][math]::Floor($fwn / 10) + '.' + ($fwn % 10) + '.x).') Green
+                } elseif ($probe -like 'bytes *') {
+                    Smc3-Say ('Something answers on ' + $smc3Port + ', but not like the board - is it the Arduino''s port?') Yellow
+                } else {
+                    Smc3-Say ('No answer from the board on ' + $smc3Port + ': nothing comes back over USB. Is it the Arduino''s port, and is SimHub (or the Serial Monitor) really closed?') Yellow
+                }
+            }
+            if ($away -and ((Get-Date) - $away).TotalSeconds -gt 60) {
+                # 2.8.2: no word from the page for a minute while holding the port - let SimHub have it again
+                try { $sp.Close() } catch { }
+                $sp = $null; $want = $false; $viaPage = $false; $said = ''; $away = $null
+                Smc3-Say ('No word from the page for a minute - letting go of ' + $smc3Port + '.') Yellow
+                continue
             }
             $tcp = New-Object System.Net.Sockets.TcpClient
             $tcp.NoDelay = $true
             try { $tcp.Connect($uri.Host, $uri.Port) }
             catch {
                 Smc3-Say ('Can''t reach the page at ' + $uri.Authority + ' - trying again in 5 s (is the address right?)') Yellow
-                $tcp.Close(); Start-Sleep -Seconds 5; continue
+                $tcp.Close(); $tcp = $null
+                if (-not $away) { $away = Get-Date }
+                Start-Sleep -Seconds 5; continue
             }
             $ns = $tcp.GetStream()
             $ns.ReadTimeout = 15000
+            $ns.WriteTimeout = 5000                    # 2.8.2
             $req = "POST /usb/link HTTP/1.1`r`nHost: " + $uri.Authority + "`r`nX-SMC3: 1`r`nX-SMC3-Bridge: " + $id +
                    "`r`nX-SMC3-Computer: " + $env:COMPUTERNAME + "`r`nX-SMC3-Port: " + $smc3Port +
-                   "`r`nX-SMC3-Bridge-Version: ps-__VERSION__`r`nContent-Length: 0`r`n`r`n"
+                   "`r`nX-SMC3-Bridge-Version: ps-__VERSION__`r`nX-SMC3-Probe: " + $probe + "`r`nContent-Length: 0`r`n`r`n"
             $rb = [System.Text.Encoding]::ASCII.GetBytes($req)
             $head = ''
             try {
@@ -8293,8 +8411,11 @@ function Smc3-Bridge {
             }
             catch {
                 Smc3-Say ('No answer from the page (' + $_.Exception.GetBaseException().Message + ') - trying again in 5 s') Yellow
-                $tcp.Close(); Start-Sleep -Seconds 5; continue
+                $tcp.Close(); $tcp = $null
+                if (-not $away) { $away = Get-Date }
+                Start-Sleep -Seconds 5; continue
             }
+            $away = $null
             $code = 0
             if ($head -match '^HTTP/\S+ (\d+)') { $code = [int]$Matches[1] }
             $run = ''
@@ -8302,13 +8423,23 @@ function Smc3-Bridge {
             if ($code -ne 200) {
                 $msg = ''
                 try { $msg = (New-Object System.IO.StreamReader($ns, [System.Text.Encoding]::UTF8)).ReadToEnd().Trim() } catch { }
-                $tcp.Close()
+                $tcp.Close(); $tcp = $null
                 if (-not $msg) { $msg = 'The page answered ' + $code + '.' }
-                if ($code -eq 409) { Smc3-Say ('Waiting: ' + $msg + ' (trying again in 5 s)') Yellow; Start-Sleep -Seconds 5; continue }
+                if ($code -eq 409) {
+                    Smc3-Say ('Waiting: ' + $msg + ' (trying again in 5 s)') Yellow
+                    $keep = Smc3-Keep $base $hdr '' $viaPage    # 2.8.2: let go if the switch went back to WiFi meanwhile
+                    if ($keep -eq 'free') {
+                        try { $sp.Close() } catch { }
+                        $sp = $null; $want = $false; $viaPage = $false; $said = ''
+                        continue
+                    }
+                    if ($keep -eq 'away' -and -not $away) { $away = Get-Date }
+                    Start-Sleep -Seconds 5; continue
+                }
                 if ($code -eq 403) {                   # the page is set to WiFi only: let go of the port and wait
                     Smc3-Say $msg Yellow
                     try { $sp.Close() } catch { }
-                    $sp = $null; $ss = $null; $tS = $null; $want = $false; $said = ''
+                    $sp = $null; $want = $false; $viaPage = $false; $said = ''
                     continue
                 }
                 throw $msg
@@ -8317,28 +8448,38 @@ function Smc3-Bridge {
             Smc3-Say ''
             Smc3-Say 'LINKED: the page now talks to the board over this USB cable (no WiFi).' Green
             Smc3-Say 'Calibrate in the page. When you are done, flip the switch at the top of the page to WiFi (or close this window), then start SimHub.' Green
-            if ($null -eq $tS) { $tS = $ss.ReadAsync($bufS, 0, $bufS.Length) }
+            # 2.8.2: the page's side waits on the network (wakes at once when the page sends); the board's side is read
+            # whenever bytes are waiting (checked about every 10 ms) - an asynchronous read of the COM port never
+            # completed on some PCs, so nothing came back from the board
+            $viaPage = $true                           # (2.8.2: from now on the page's switch decides)
             $tN = $ns.ReadAsync($bufN, 0, $bufN.Length)
-            $up = 0; $down = 0; $since = Get-Date; $shown = Get-Date; $heard = Get-Date; $why = ''
+            $up = 0; $down = 0; $since = Get-Date; $shown = Get-Date; $heard = Get-Date; $why = ''; $usbLost = $false
             while ($true) {
-                $i = [System.Threading.Tasks.Task]::WaitAny([System.Threading.Tasks.Task[]]@($tS, $tN), 500)
-                if ($i -eq 0) {
-                    $n = 0
-                    try { $n = $tS.Result } catch { throw ('The USB port stopped working (cable unplugged?): ' + $_.Exception.GetBaseException().Message) }
-                    if ($n -le 0) { throw 'The USB port closed.' }
-                    try { $ns.Write($bufS, 0, $n) } catch { $why = 'The connection to the page dropped.'; $tS = $ss.ReadAsync($bufS, 0, $bufS.Length); break }
-                    $up += $n
-                    $tS = $ss.ReadAsync($bufS, 0, $bufS.Length)
-                } elseif ($i -eq 1) {
+                $done = $false
+                try { $done = $tN.Wait(10) } catch { $done = $true }
+                if ($done) {
                     $n = 0
                     try { $n = $tN.Result } catch { $n = -1 }
                     if ($n -le 0) { $why = 'The page ended the link.'; break }
-                    $ss.Write($bufN, 0, $n)
+                    try { $sp.Write($bufN, 0, $n) }
+                    catch { $why = 'The USB port stopped working (cable unplugged?): ' + $_.Exception.GetBaseException().Message; $usbLost = $true; break }
                     $down += $n
                     $heard = Get-Date
+                    $tN = $ns.ReadAsync($bufN, 0, $bufN.Length)
+                }
+                $n = 0
+                try {
+                    $k = $sp.BytesToRead
+                    if ($k -gt 0) { $n = $sp.Read($bufS, 0, [Math]::Min($k, $bufS.Length)) }
+                }
+                catch { $why = 'The USB port stopped working (cable unplugged?): ' + $_.Exception.GetBaseException().Message; $usbLost = $true; break }
+                if ($n -gt 0) {
+                    try { $ns.Write($bufS, 0, $n) } catch { $why = 'The connection to the page dropped.'; break }
+                    $up += $n
                 }
                 $now = Get-Date
-                if (($now - $heard).TotalSeconds -gt 6) { $why = 'The page went quiet for 6 s (network down, or the NAS off?).'; break }
+                # (the page sends [kU1] every second; 10 s leaves room for a page busy with a WiFi reconnect)
+                if (($now - $heard).TotalSeconds -gt 10) { $why = 'The page went quiet for 10 s (network down, or the NAS off?).'; break }
                 if (($now - $shown).TotalSeconds -ge 2) {
                     $shown = $now
                     $t = [int]($now - $since).TotalSeconds
@@ -8346,38 +8487,49 @@ function Smc3-Bridge {
                 }
             }
             Write-Host ''
-            try { $ss.Write($kuOff, 0, $kuOff.Length) } catch { }
-            $tcp.Close()
+            if (-not $usbLost) { try { $sp.Write($kuOff, 0, $kuOff.Length) } catch { } }
+            try { $tcp.Close() } catch { }
+            $tcp = $null
             Smc3-Say $why Yellow
+            if ($usbLost) {
+                # 2.8.2: let go of the dead port and open it again when the board is back (plug the cable in again)
+                try { $sp.Close() } catch { }
+                $sp = $null; $said = ''
+                Start-Sleep -Seconds 2
+                continue
+            }
             Start-Sleep -Milliseconds 500
             $r = Smc3-Ask $base $hdr ''
             if ($null -eq $r) {                        # the page went away (restarting?): keep the port a minute
                 Smc3-Say 'The page doesn''t answer - linking again as soon as it does ...' Yellow
                 $until = (Get-Date).AddSeconds(60)
                 while ($null -eq $r -and (Get-Date) -lt $until) { Start-Sleep -Seconds 2; $r = Smc3-Ask $base $hdr '' }
-                if ($r -and -not $r.stop) { Smc3-Say 'Linking again ...' Yellow; continue }
             }
             if ($r -and $r.stop) { throw [string]$r.stop }
             if ($r -and ($r.want -or ($run -and $r.run -and $r.run -ne $run))) {
                 # dropped, but the page still wants the cable - or it has restarted meanwhile: link again
+                # (2.8.2: back after a network blip with the switch on WiFi meanwhile = let go, as below)
                 Smc3-Say 'Linking again ...' Yellow
                 continue
             }
             try { $sp.Close() } catch { }
-            $sp = $null; $ss = $null; $tS = $null; $want = $false; $viaPage = $false; $said = ''
+            $sp = $null; $want = $false; $viaPage = $false; $said = ''
             if ($r) { Smc3-Say 'The page is back on WiFi.' Yellow } else { Smc3-Say 'The page is still away - letting go of the port.' Yellow }
         }
     }
     finally {
         if ($sp) {
-            try { $ss.Write($kuOff, 0, $kuOff.Length) } catch { }
+            try { $sp.Write($kuOff, 0, $kuOff.Length) } catch { }
             try { $sp.Close() } catch { }
         }
+        if ($tcp) { try { $tcp.Close() } catch { } }   # 2.8.2: the page sees "bridge closed" at once
     }
 }
 
+$smc3Mode = Smc3-NoQuickEdit
 try { Smc3-Bridge }
 catch { Write-Host ''; Smc3-Say ('Stopped: ' + $_.Exception.Message) Red }
+finally { Smc3-PutQuickEdit $smc3Mode }       # (also after Ctrl+C, for a console that stays open)
 Read-Host 'Press Enter to close this window' | Out-Null
 """
 
@@ -8539,6 +8691,8 @@ def _bridge_link(ser, page, port_name, bid, say):
     count = {"up": 0, "down": 0, "heard": time.time()}
     s.settimeout(0.5)
 
+    usb_lost = [False]
+
     def page_to_board():
         try:
             while not stop.is_set():
@@ -8548,7 +8702,12 @@ def _bridge_link(ser, page, port_name, bid, say):
                     continue
                 if not d:
                     break
-                ser.write(d)
+                try:
+                    ser.write(d)
+                except OSError as e:                     # 2.8.2: the USB side, not the network
+                    why[0] = f"The USB port stopped working (cable unplugged?): {e}"
+                    usb_lost[0] = True
+                    break
                 count["down"] += len(d)
                 count["heard"] = time.time()
         except OSError as e:
@@ -8561,7 +8720,12 @@ def _bridge_link(ser, page, port_name, bid, say):
     t0 = shown = time.time()
     try:
         while not stop.is_set():
-            d = ser.read()
+            try:
+                d = ser.read()
+            except OSError as e:
+                why[0] = f"The USB port stopped working (cable unplugged?): {e}"
+                usb_lost[0] = True
+                break
             if d:
                 try:
                     s.sendall(d)
@@ -8570,9 +8734,9 @@ def _bridge_link(ser, page, port_name, bid, say):
                     break
                 count["up"] += len(d)
             now = time.time()
-            if now - count["heard"] > 6.0:                 # the page sends [kU1] every second
-                why[0] = "The page went quiet for 6 s (network down, or the page's machine off?)."
-                break
+            if now - count["heard"] > 10.0:                # the page sends [kU1] every second (2.8.2: 10 s leaves
+                why[0] = "The page went quiet for 10 s (network down, or the page's machine off?)."   # room for a
+                break                                      # page busy with a WiFi reconnect)
             if now - shown >= 2.0 and sys.stdout.isatty():
                 shown = now
                 sec = int(now - t0)
@@ -8588,7 +8752,7 @@ def _bridge_link(ser, page, port_name, bid, say):
         t.join(1.0)
         if sys.stdout.isatty():
             sys.stdout.write("\n")
-    return "again", why[0]
+    return ("usb" if usb_lost[0] else "again"), why[0]
 
 
 def _ask_page(page, bid, port_name, msg=""):
@@ -8627,13 +8791,19 @@ def usb_bridge_main(port_name, page, quiet=False, standby=False):
     except (ValueError, OSError, AttributeError):
         pass
     ser = None
-    want, via_page, busy, said = not standby, False, "", ""
+    want, via_page, busy, said, away = not standby, False, "", "", 0.0
 
     def once(key, msg):
         nonlocal said
         if said != key:
             say(msg)
             said = key
+
+    def let_go():
+        nonlocal ser, want, via_page, said, away
+        if ser is not None:
+            ser.close()
+        ser, want, via_page, said, away = None, False, False, "", 0.0
     try:
         while True:
             if not want:                             # waiting, port closed, until the page's switch asks for it
@@ -8651,27 +8821,51 @@ def usb_bridge_main(port_name, page, quiet=False, standby=False):
                         said = ""
                     time.sleep(1)
                     continue
-                want, via_page, said = True, True, ""
+                want, via_page, said, away = True, True, "", 0.0
             if ser is None:
                 try:
                     ser = _SerialPort(port_name)
                     busy = ""
                 except OSError as e:
+                    in_use = "busy" in str(e).lower() or "denied" in str(e).lower() or "in use" in str(e).lower()
                     busy = (f"{port_name} is in use - close SimHub (or SMC3Utils, the Arduino IDE's Serial Monitor)."
-                            if "busy" in str(e).lower() or "denied" in str(e).lower() or "in use" in str(e).lower()
-                            else f"{port_name} can't be opened ({e}).")
-                    once("busy", f"Waiting: {busy} It links as soon as the port is free.")
+                            if in_use else f"{port_name} can't be opened ({e}) - is the board plugged in?")
+                    once("busy" if in_use else "gone", f"Waiting: {busy} "
+                         + ("It links as soon as the port is free." if in_use else "Trying again every 2 s ..."))
                     r = _ask_page(page, bid, port_name, busy)
                     if r and r.get("stop"):
                         raise SystemExit(r["stop"])
                     if via_page and r is not None and not r.get("want"):
-                        want = False                 # the switch went back to WiFi
+                        let_go()                     # the switch went back to WiFi
+                        continue
                     time.sleep(2)
                     continue
+            if away and time.time() - away > 60:     # 2.8.2: no word from the page for a minute while holding the
+                say(f"No word from the page for a minute - letting go of {port_name}.")    # port: SimHub can have it
+                let_go()
+                continue
             kind, why = _bridge_link(ser, page, port_name, bid, say)
             if kind == "wait":
                 say(f"Waiting: {why} (trying again in 5 s)")
+                r = _ask_page(page, bid, port_name)  # 2.8.2: let go if the switch went back to WiFi meanwhile
+                if r and r.get("stop"):
+                    raise SystemExit(r["stop"])
+                if r is None:
+                    away = away or time.time()
+                else:
+                    away = 0.0
+                    if via_page and not r.get("want"):
+                        let_go()
+                        continue
                 time.sleep(5)
+                continue
+            away = 0.0
+            via_page = True                          # (2.8.2: it has linked - from now on the page's switch decides)
+            if kind == "usb":                        # 2.8.2: the cable came out - open the port again when it's back
+                say(why)
+                ser.close()
+                ser, said = None, ""
+                time.sleep(2)
                 continue
             try:
                 ser.write(USB_KU_OFF)
@@ -8687,9 +8881,6 @@ def usb_bridge_main(port_name, page, quiet=False, standby=False):
                     while r is None and time.time() < end:
                         time.sleep(2)
                         r = _ask_page(page, bid, port_name)
-                    if r is not None and not r.get("stop"):
-                        say("Linking again ...")
-                        continue
                 if r and r.get("stop"):
                     raise SystemExit(r["stop"])
                 run = getattr(_bridge_link, "run", "")
@@ -13751,7 +13942,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         info = {"id": _clean_hdr(h.get("X-SMC3-Bridge"), 40), "computer": _clean_hdr(h.get("X-SMC3-Computer")),
                 "port": _clean_hdr(h.get("X-SMC3-Port"), 40), "version": _clean_hdr(h.get("X-SMC3-Bridge-Version"), 30),
-                "from": self.client_address[0]}
+                "probe": _clean_hdr(h.get("X-SMC3-Probe"), 20), "from": self.client_address[0]}
         b = self.board
         why, code = None, 409
         u = b.usb
@@ -13785,8 +13976,10 @@ class Handler(BaseHTTPRequestHandler):
             pass
         sock.settimeout(1.0)
         self.events.add("link", f"A USB bridge linked: {info['computer'] or '?'} ({info['from']}), "
-                        f"{info['port'] or '?'}, bridge {info['version'] or '?'}.", quiet=True)
-        b.usb_want, b.usb_want_at = True, time.time()    # (a bridge just started, or the switch asked for it)
+                        f"{info['port'] or '?'}, bridge {info['version'] or '?'}"
+                        + (f", board check when it opened the port: {info['probe']}" if info["probe"] else "") + ".",
+                        quiet=True)
+        b.usb_want, b.usb_want_at, b.usb_want_grace = True, time.time(), 6.0    # (a bridge just started, or the switch asked for it)
         b.attach_usb(sock, info).wait()
 
     def do_POST(self):
@@ -13847,7 +14040,7 @@ class Handler(BaseHTTPRequestHandler):
                 elif why:
                     self._json({"ok": False, "error": why, **self._usb_status()})
                 else:
-                    b.usb_want, b.usb_want_at = True, time.time()
+                    b.usb_want, b.usb_want_at, b.usb_want_grace = True, time.time(), 6.0
                     self.events.add("link", "Switched to the USB cable in the page.", quiet=True)
                     self._json({"ok": True, **self._usb_status()})
                 return
