@@ -69,12 +69,15 @@ updates, 1.9.1 soft start only, 1.9 neither), with the soft start - and remember
                        older = refused)
   --ota-fail WHAT      crc = the file arrives damaged, flash = the WiFi module can't program the board
 
-The USB port (page 2.8, firmware 1.9.5 USB page mode; the simulator says 1.9.5 unless an older version is asked for):
+The USB port (page 2.8, firmware 1.9.5 USB page mode; the simulator says 1.9.6 unless an older version is asked for):
   --usb PATH           the board's USB serial port, as a pseudo-terminal: PATH becomes a link to it (open it like
                        COM5 - with smc3_scope.py --usb-bridge PATH --page ...). Over it the board speaks SMC3 as to
                        SimHub; after [kU1] (every second, or it ends after 5 s) it streams telemetry there instead and
                        stops serving WiFi, as 1.9.5 does
   --fw194              firmware 1.9.4: no USB page mode ([kU] is ignored, USB only answers SMC3 commands)
+  --fw195              firmware 1.9.5 (the default is 1.9.6)
+  --usb-lose-ku        every [kU1] over USB arrives damaged (counted as thrown-away bytes), as 1.9.5 could lose
+                       them: the board answers but never switches to the cable (page 2.8.3)
   --usb-reset SEC      opening the USB port resets the board (as some USB-serial boards do): it restarts when the
                        first bytes arrive and doesn't answer for SEC seconds (WiFi joining in setup())
   --usb-unplug AT,FOR  test (page 2.8.2): AT s after the page first uses the cable, the cable is pulled (the port
@@ -134,6 +137,9 @@ ap.add_argument("--no-potfilter", action="store_true", help="firmware 1.9.3: no 
 ap.add_argument("--tuned", action="store_true", help="start with sane settings (Kp 250, Ki 0, Kd 0, PWMmin 30, dead zone 2)")
 ap.add_argument("--usb", default="", help="the board's USB port as a pseudo-terminal, linked at this path (page 2.8)")
 ap.add_argument("--fw194", action="store_true", help="firmware 1.9.4: no USB page mode")
+ap.add_argument("--fw195", action="store_true", help="firmware 1.9.5 (the default is 1.9.6, page 2.8.3)")
+ap.add_argument("--usb-lose-ku", action="store_true",
+                help="test (page 2.8.3): every [kU1] over USB arrives damaged, as 1.9.5 could lose them")
 ap.add_argument("--usb-reset", type=float, default=0.0, help="opening the USB port restarts the board, silent SEC s")
 ap.add_argument("--usb-drop-rdu", type=int, default=0, help="test: the first N [rdu] over USB go unanswered (page 2.8.1)")
 ap.add_argument("--usb-mute", action="store_true", help="test: nothing the board sends over USB reaches the PC")
@@ -177,7 +183,8 @@ for st_ in args.start:
     m_, pot_ = st_.split(":")
     START[int(m_) - 1] = float(pot_)
 FW = {"ver": ("1.9" if args.old19 else ("1.9.1" if args.fw191 else ("1.9.3" if args.no_potfilter else
-       ("1.9.4" if args.fw194 else "1.9.5")))) if args.fw >= 19 else f"{args.fw // 10}.{args.fw % 10}"}
+       ("1.9.4" if args.fw194 else ("1.9.5" if args.fw195 else "1.9.6"))))) if args.fw >= 19
+      else f"{args.fw // 10}.{args.fw % 10}"}
 
 
 def _vt(v):
@@ -1161,6 +1168,10 @@ def usb_cmd(c, a, b, out):
     global last_target_t
     now = time.time()
     if c == "k" and a == ord("U"):
+        if args.usb_lose_ku and b not in (0, ord("0")):
+            with lock:
+                usb["bad"] += 5                   # --usb-lose-ku: it arrived damaged, as 1.9.5 could lose bytes
+            return
         if not usbpage_fw():
             with lock:
                 usb["ok"] += 1; usb["last"] = now; last_target_t = now

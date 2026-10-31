@@ -1,6 +1,6 @@
-# SMC3 R4 USB bridge (smc3_scope 2.8.2): lets the smc3_scope page talk to the board over the USB cable instead
+# SMC3 R4 USB bridge (smc3_scope 2.8.3): lets the smc3_scope page talk to the board over the USB cable instead
 # of WiFi - for calibration (auto-tune, the full check, Seat setup) with SimHub closed. Windows PowerShell 5.1 or
-# PowerShell 7, nothing to install. Needs firmware 1.9.5 or newer on the board.
+# PowerShell 7, nothing to install. Needs firmware 1.9.5 or newer on the board (1.9.6 recommended).
 #   From the page: Settings, USB cable - press Win+R and paste the line shown there.
 #   As a file:     powershell -NoProfile -ExecutionPolicy Bypass -File smc3-usb-bridge.ps1 [http://<page>:<port>] [COMx] [standby]
 # It links at once. When the page's switch goes back to WiFi it lets go of the port (SimHub can have it) and waits:
@@ -83,12 +83,20 @@ function Smc3-Head($ns) {
 
 function Smc3-Probe($sp) {
     # 2.8.2: asks the board for its firmware number ([rd!]) right after the port opens - "ok 19", or "none" when
-    # nothing at all comes back over USB (then the page can't work over the cable either)
+    # nothing at all comes back over USB (then the page can't work over the cable either). 2.8.3: up to 6 times -
+    # one answer can get lost while Windows sets the port up (the USB chip clears what it holds each time)
+    Start-Sleep -Milliseconds 250
     try { $sp.DiscardInBuffer() } catch { }
-    $sp.Write([byte[]](0x5B, 0x72, 0x64, 0x21, 0x5D), 0, 5)
     $got = New-Object System.Collections.Generic.List[byte]
     $t0 = Get-Date
-    while (((Get-Date) - $t0).TotalMilliseconds -lt 2000) {
+    $asked = 0
+    $tAsk = [DateTime]::MinValue
+    while (((Get-Date) - $t0).TotalMilliseconds -lt 2500) {
+        if ($asked -lt 6 -and ((Get-Date) - $tAsk).TotalMilliseconds -ge 350) {
+            $sp.Write([byte[]](0x5B, 0x72, 0x64, 0x21, 0x5D), 0, 5)
+            $asked++
+            $tAsk = Get-Date
+        }
         $k = $sp.BytesToRead
         if ($k -gt 0) {
             $b = New-Object byte[] $k
@@ -154,7 +162,7 @@ function Smc3-Bridge {
 
     $id = [guid]::NewGuid().ToString('N').Substring(0, 12)
     $hdr = @{ 'X-SMC3' = '1'; 'X-SMC3-Bridge' = $id; 'X-SMC3-Computer' = [string]$env:COMPUTERNAME;
-              'X-SMC3-Port' = $smc3Port; 'X-SMC3-Bridge-Version' = 'ps-2.8.2' }
+              'X-SMC3-Port' = $smc3Port; 'X-SMC3-Bridge-Version' = 'ps-2.8.3' }
     $kuOff = [byte[]](0x5B, 0x6B, 0x55, 0x00, 0x5D)
     $bufS = New-Object byte[] 4096
     $bufN = New-Object byte[] 4096
@@ -249,7 +257,7 @@ function Smc3-Bridge {
             $ns.WriteTimeout = 5000                    # 2.8.2
             $req = "POST /usb/link HTTP/1.1`r`nHost: " + $uri.Authority + "`r`nX-SMC3: 1`r`nX-SMC3-Bridge: " + $id +
                    "`r`nX-SMC3-Computer: " + $env:COMPUTERNAME + "`r`nX-SMC3-Port: " + $smc3Port +
-                   "`r`nX-SMC3-Bridge-Version: ps-2.8.2`r`nX-SMC3-Probe: " + $probe + "`r`nContent-Length: 0`r`n`r`n"
+                   "`r`nX-SMC3-Bridge-Version: ps-2.8.3`r`nX-SMC3-Probe: " + $probe + "`r`nContent-Length: 0`r`n`r`n"
             $rb = [System.Text.Encoding]::ASCII.GetBytes($req)
             $head = ''
             try {

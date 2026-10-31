@@ -3,6 +3,32 @@
 `smc3_scope` (the page) and `SMC3_R4` (the firmware) are versioned separately. The page works with older
 firmware too; the notes say which firmware a feature needs.
 
+## Page 2.8.3, firmware 1.9.6
+
+- **Firmware 1.9.6: no more lost bytes on the USB port.**
+  - The RA4M1's USB serial port has no receive FIFO: one byte waits while the next comes in, 20 µs at 500000 baud.
+  - The 4 kHz motor (PID) interrupt kept the receive interrupt waiting longer than that, so bytes arriving in a burst
+    were lost. Now and then that hit one of SimHub's position commands.
+  - It hit the page's commands over the USB cable often enough that the board dropped out of page mode. The page's
+    events said "... bytes of unreadable data arrived on the USB port"; auto-tune couldn't read the motor settings.
+  - The receive interrupts of the USB port and of the motion sensor's port now come before the PID interrupt. Nothing
+    else changed.
+- **The page no longer calls a 1.9.5 board "1.9.4 or older".** When the board answers over the cable but doesn't switch
+  over to it, the page waits longer, then says the commands arrive damaged and that 1.9.6 fixes it.
+- The page repeats "stay on the cable" (`[kU1]`) twice a second, so one damaged copy doesn't end the link.
+- When the bridge opens the port it now asks for the firmware number up to 6 times. The first answer could get lost
+  while Windows sets the port up.
+- **"No answer from the board" and a USB chip older than 0.6.0:** the page now says to update the board's USB chip
+  with Arduino's standalone updater. The IDE's Firmware Updater can't do it in that state, because it needs those
+  answers itself. That update fixed a board that sent nothing back over USB. Steps:
+  [INSTALL, USB cable](docs/INSTALL.md#usb-cable-for-calibration).
+- Diagnostics: a finding recommends 1.9.6 for boards on 1.9.2-1.9.5.
+- Simulator: `--fw195`, and `--usb-lose-ku` (every `[kU1]` arrives damaged).
+
+Update the firmware first. Either upload `SMC3_R4_v1.9.6.ino` with the Arduino IDE, or use **Sketch, Export Compiled
+Binary** and install the `.bin` in Settings, Firmware update. A build with the placeholder WiFi details uses the ones
+the board remembers. Then update the page (Settings, Updates, **Update page**) and start the bridge once more.
+
 ## Page 2.8.2 (firmware 1.9.5, unchanged)
 
 - **The Windows USB bridge gets the board's data.** On a real PC nothing came back from the board (the bridge showed

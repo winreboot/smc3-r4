@@ -41,9 +41,18 @@
 // Pots: wiper must stay within 0-5 V (the R4 is a 5 V board, so existing wiring is fine).
 //****************************************************************************************************************
 
-#define FW_VERSION     "1.9.5"         // shown in the USB boot banner; [ver] still answers 70 for SMC3Utils
+#define FW_VERSION     "1.9.6"         // shown in the USB boot banner; [ver] still answers 70 for SMC3Utils
 #define FW_VERSION_NUM 19              // reported by [rd!] so smc3_scope can check what it is talking to (1.9.x = 19)
 #define FW_CAPS        "SMC3CAPS:ota1,wifimem1,usbpage1"   // 1.9.2: what this build can do - smc3_scope looks for it in a .bin
+
+// v1.9.6 changes: no more lost bytes on the USB port.  On the RA4M1 the USB port (Serial, SCI9) and the motion
+//                sensor's port (Serial1, SCI2) have no receive FIFO: one byte waits in the receive register while
+//                the next comes in - 20 us at 500000 baud.  The 4 kHz PID interrupt (priority 6, its three
+//                analogRead()s take up to ~100 us) kept the core's receive interrupt (priority 12) waiting longer
+//                than that, so bytes in a burst were lost: now and then one of SimHub's position frames, and often
+//                enough the page's commands over the USB cable that its page mode dropped out ("456 bytes of
+//                unreadable data").  Their receive and receive-error interrupts now come before the PID interrupt
+//                (SERIAL_RX_IRQ_PRIORITY 4); each takes a few microseconds.  Nothing else changed.
 
 // v1.9.5 changes: the page can talk over the USB cable instead of WiFi, for calibration with SimHub closed.  [kU1]
 //                over USB switches the USB port to "page mode" for USB_PAGE_TIMEOUT_MS (5 s); the page repeats it
@@ -237,6 +246,7 @@
 
 #define PID_RATE_HZ      4000      // PROCESS_PERIOD_uS 250 in the original
 #define PID_IRQ_PRIORITY 6         // lower number = higher priority; matrix refresh uses the default 12
+#define SERIAL_RX_IRQ_PRIORITY 4   // 1.9.6: the serial ports' receive interrupts come first (no FIFO - see v1.9.6)
 #define ADC_BITS         14
 #define POS_SHIFT        (ADC_BITS - 10)   // 4 fractional bits on top of the SMC3 0-1023 scale ("Q4")
 #define PWM_FRAC         POS_SHIFT         // PID output also carries 4 fractional bits
@@ -1044,6 +1054,22 @@ void PidIsr(timer_callback_args_t *p_args)
     if (dt > IsrCyclesMax) { IsrCyclesMax = dt; }
 }
 
+// 1.9.6: the receive and receive-error interrupts of the USB port (SCI9) and the motion sensor's port (SCI2) get a
+// higher priority than the PID interrupt - their receive register holds one byte, so they can't wait for it (see
+// v1.9.6).  The core links its interrupts to the 32 ICU slots when a port begins, so this runs after each begin().
+void RaiseSerialRxPriority()
+{
+    for (uint32_t i = 0; i < BSP_ICU_VECTOR_MAX_ENTRIES; i++)
+    {
+        uint32_t ev = R_ICU->IELSR[i] & R_ICU_IELSR_IELS_Msk;
+        if (ev == (uint32_t)ELC_EVENT_SCI9_RXI || ev == (uint32_t)ELC_EVENT_SCI9_ERI ||
+            ev == (uint32_t)ELC_EVENT_SCI2_RXI || ev == (uint32_t)ELC_EVENT_SCI2_ERI)
+        {
+            NVIC_SetPriority((IRQn_Type)i, SERIAL_RX_IRQ_PRIORITY);
+        }
+    }
+}
+
 bool StartPidTimer()
 {
     uint8_t type = GPT_TIMER;
@@ -1755,6 +1781,7 @@ void ImuSetBaud(uint8_t idx)
     ImuBaudIdx = idx % IMU_NBAUDS;
     Serial1.end();
     Serial1.begin(ImuBauds[ImuBaudIdx]);
+    RaiseSerialRxPriority();                     // 1.9.6
     ImuBaudSince = millis();
 }
 
@@ -2993,6 +3020,7 @@ void setup()
 #endif
 
     Serial.begin(500000);
+    RaiseSerialRxPriority();                     // 1.9.6: before the PID interrupt starts - see v1.9.6
 
 #ifdef DWT
     // cycle counter for ISR load measurement
@@ -3020,6 +3048,7 @@ void setup()
     ReadSoftStart();                            // 1.9.1: soft-start speed
 #if IMU_PORT
     Serial1.begin(ImuBauds[ImuBaudIdx]);        // the baud rate that worked last time (9600 if never)
+    RaiseSerialRxPriority();                     // 1.9.6
     ImuBaudSince = millis();
 #endif
     ApplyPwmFrequencies();

@@ -26,7 +26,7 @@ motor 3 is mounted horizontally and swings the rear left and right about a pivot
 
 SimHub keeps driving the rig over USB exactly as before. The page talks to the board over WiFi, so both run at
 the same time. You can open it from any browser, including your phone. For calibration with SimHub closed, the page
-can use the USB cable instead (page 2.8, firmware 1.9.5): see [USB cable for calibration](docs/INSTALL.md#usb-cable-for-calibration).
+can use the USB cable instead (page 2.8, firmware 1.9.5; 1.9.6 recommended): see [USB cable for calibration](docs/INSTALL.md#usb-cable-for-calibration).
 
 ![Dashboard: three motors moving under SimHub, motor 2 selected](docs/img/dashboard.png)
 
@@ -588,7 +588,8 @@ noise. To see what the diagnostics find, add a fault:
   - 1.9.2: firmware updates from the page, and the board remembers its WiFi;
   - 1.9.3: the same, and it compiles in the Arduino IDE (1.9.2 didn't);
   - 1.9.4: a pot glitch filter - a reading too far from the last one to be the motor is held back for up to 10 ms;
-  - 1.9.5: USB page mode - the page can use the USB cable instead of WiFi (calibration with SimHub closed).
+  - 1.9.5: USB page mode - the page can use the USB cable instead of WiFi (calibration with SimHub closed);
+  - 1.9.6: no more lost bytes on the USB port (the serial receive interrupts come before the PID interrupt).
 
   See the [CHANGELOG](CHANGELOG.md).
 - New commands are documented in [docs/PROTOCOL.md](docs/PROTOCOL.md). They go over WiFi; USB stays plain SMC3

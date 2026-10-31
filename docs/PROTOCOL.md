@@ -43,7 +43,7 @@ are two separate bytes. The same commands work over USB (SimHub, SMC3Utils) and 
 | `[kf=]` | 1.9 | Seat set-up field f = value register. f = 16 × motor (0-2) + 0 level trim (counts, −300…300), 1 travel low, 2 travel high, 3 end stop low, 4 end stop high (pot counts 0-1023); f = 64 + d: tilt limit × 10 for d = 0 roll + (right side down), 1 roll −, 2 pitch + (front up), 3 pitch − (0 = none); f = 80 / 81: the sensor's level roll / pitch (raw × 100, saved at once); f = 82 (1.9.1): soft-start speed in counts/s, 0 = off (saved at once in EEPROM 105-107). |
 | `[kSV]` `[kRL]` `[kCL]` | 1.9 | Save the seat set-up (EEPROM 66-104; `[sav]` saves it too) / reload the saved one / clear it (no trim, no travel limits or end stops; tilt limits stay) until saved or restarted. |
 | `[kHn]` | 1.9 | The page holds the seat for n × 100 ms: position commands from USB (SimHub) are counted but ignored meanwhile. n = 0 gives the seat back at once. Seat setup refreshes it every second, and so does page 2.4 while you move the motors from the page (a motor card's knob, Return to center). |
-| `[kU1]` `[kU0]` | 1.9.5 | USB only: USB page mode on for the next 5 s (the page repeats it every second) / off now - see [USB page mode](#usb-page-mode-firmware-195). Any non-zero byte (1 or '1') switches it on. Ignored during a firmware update. |
+| `[kU1]` `[kU0]` | 1.9.5 | USB only: USB page mode on for the next 5 s (the page repeats it twice a second since 2.8.3, every second before) / off now - see [USB page mode](#usb-page-mode-firmware-195). Any non-zero byte (1 or '1') switches it on. Ignored during a firmware update. |
 | `[xe1]` `[xe0]` | 1.9 | The page only (WiFi, or USB in page mode): send an "SM3X" frame (the sensor's acceleration and gyro) after every telemetry burst / stop. Off for every new connection. |
 | `[uP=]` `[uT=]` `[uI=]` `[uJ=]` | 1.9.2 | WiFi only. Firmware update: the value register is the page's web port / the file's number / the page's address bytes 1-2 / 3-4 (0 = the address the page connects from). The board fetches `http://<address>:<port>/ota/<number as 4 hex digits>.ota`. |
 | `[uGO]` `[uOK]` | 1.9.2 | WiFi only. Start the firmware update (below) / clear a finished or failed one. |
@@ -69,9 +69,11 @@ telemetry alone doesn't.
 
 ### USB page mode (firmware 1.9.5)
 
+Firmware 1.9.6: the USB port's receive interrupt comes before the PID interrupt - 1.9.5 lost bytes in a burst now and then (the port has no receive FIFO), often enough that page mode could drop out. Same protocol.
+
 For calibration with SimHub closed the page can talk to the board over the USB cable instead of WiFi - the WiFi
 module's round-trips block the board's loop now and then (a second or more), which delays the page's commands and
-its telemetry. `[kU1]` over USB switches the USB port to page mode for 5 s; the page repeats it every second, and
+its telemetry. `[kU1]` over USB switches the USB port to page mode for 5 s; the page repeats it twice a second (2.8.3; every second before), and
 `[kU0]` (or 5 s without `[kU1]`) ends it. While it is on:
 
 * the telemetry ("SM3T", and "SM3X" after `[xe1]`) goes out over USB instead of WiFi, at the same rate, and `[rdd]`
@@ -100,12 +102,12 @@ Content-Length: 0
 ```
 
 The page answers `200` and from then on the connection carries the board's bytes both ways, unchanged (TCP_NODELAY on
-both ends). The page sends `[kU1]` every second over it. Other answers, as plain text with the reason: `409` wait and
+both ends). The page sends `[kU1]` over it twice a second (every second before 2.8.3). Other answers, as plain text with the reason: `409` wait and
 try again (auto-tune, the full check, Seat setup or a firmware update is running, or another bridge is linked), `403`
 the page is set to WiFi only (2.8.1: the bridge then waits), `410` the page won't take this bridge again (the board
 can't do page mode - older than 1.9.5 - or didn't answer; 2.8 also after Back to WiFi). When the link ends the bridge sends `[kU0]` to the board
 and links again after 3 s (so a page restart doesn't end it); the page goes back to WiFi by itself. As the page sends
-`[kU1]` every second, a bridge that hears nothing from it for 10 s (6 s before 2.8.2) takes the link for dead and links again.
+`[kU1]` at least every second, a bridge that hears nothing from it for 10 s (6 s before 2.8.2) takes the link for dead and links again.
 
 Page 2.8.2:
 - **The bridge checks the board first.** Right after it opens the port the bridge sends `[rd!]` and sends the result

@@ -41,7 +41,7 @@ Smoke test: start simulated rigs and the page, run diagnostics, check the result
    bridge waits with the port closed, and the header's switch (2.8.1) has it link again. With firmware 1.9.4 the page notices the board can't stream over USB and
    the bridge stops, saying 1.9.5 is needed. (POSIX only.)
 Case 10 also checks firmware 1.9.4's pot glitch filter (simulated): the board counts the glitches, the live data stays
-clean, so the finding is a warning that names the filter, and the report shows the board's own version (1.9.5).
+clean, so the finding is a warning that names the filter, and the report shows the board's own version (1.9.6).
 """
 import hashlib, json, os, subprocess, sys, tempfile, threading, time, urllib.request as u
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -300,7 +300,7 @@ try:
           f"glitchy pot on firmware 1.9.4+: a warning that names both filters "
           f"({[(f['level'], f['detail'][-90:]) for f in gl]})")
     fwtxt = (get(base10, "/diag/file?name=" + s["result"]["name"]).get("board") or {}).get("firmware")
-    check(fwtxt == "1.9.5", f"the report shows the board's own firmware version ({fwtxt})")
+    check(fwtxt == "1.9.6", f"the report shows the board's own firmware version ({fwtxt})")
     time.sleep(2)
     t = get(base10, "/data?since=0")["samples"][-1]["m"][1]["t"]
     for k in range(4):
@@ -419,7 +419,7 @@ try:
             r = post(base15, "/usb/want", {"on": True})
             check(r["ok"] and usb_wait(base15, "usb") is not None,
                   "the header's switch to USB: the waiting bridge links again (page 2.8.1)")
-            check(get(base15, "/data?since=0")["fw"] == "1.9.5", "the firmware version stays 1.9.5 across the switches")
+            check(get(base15, "/data?since=0")["fw"] == "1.9.6", "the firmware version stays 1.9.6 across the switches")
             br.terminate()
 
     # 13. updates from GitHub (page 2.7), against a stand-in for GitHub's API

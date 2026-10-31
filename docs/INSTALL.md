@@ -242,7 +242,7 @@ It needs this machine to reach `api.github.com` and GitHub's download servers. U
 
 ## USB cable for calibration
 
-From page 2.8 with firmware 1.9.5 on the board, the page can talk to the board over its USB cable instead of WiFi -
+From page 2.8 with firmware 1.9.5 on the board (1.9.6 recommended), the page can talk to the board over its USB cable instead of WiFi -
 for auto-tune, the full check and Seat setup. The board's WiFi module now and then holds the board up for a second
 or more; on the cable nothing waits. Only with SimHub closed: one program at a time can have the USB port.
 
@@ -260,6 +260,30 @@ or more; on the cable nothing waits. Only with SimHub closed: one program at a t
    need to go back to Win+R. Closing the bridge window ends it.
 
 The page can be anywhere on your network (the NAS, a Raspberry Pi): only the bridge runs on the PC with the cable.
+
+**Firmware 1.9.6.** 1.9.5 loses a byte on the USB port now and then while it controls the motors - often enough that
+the page's commands over the cable arrive damaged and the link drops out after a while (the page's events say
+"... bytes of unreadable data arrived on the USB port"). 1.9.6 fixes that; install it before using the cable.
+
+**Nothing comes back from the board?** If the bridge says "No answer from the board on COM4: nothing comes back over
+USB" (and the page later "The board didn't answer on COM4 in 45 s"), the board's own USB chip (an ESP32-S3) isn't
+passing the board's answers on to the PC. On a board whose USB chip ran firmware older than 0.6.0, updating that chip
+fixed it. The Arduino IDE's Firmware Updater can't do it in this state (it needs those answers itself), but Arduino's
+standalone updater can - it talks to the USB chip alone and leaves the sketch, its settings and the WiFi details as
+they are:
+
+1. Switch the rig's motor power off; close SimHub, the Arduino IDE and the bridge.
+2. Download `unor4wifi-update-windows.zip` from the latest release at
+   [github.com/arduino/uno-r4-wifi-usb-bridge/releases](https://github.com/arduino/uno-r4-wifi-usb-bridge/releases),
+   extract it and run `update.bat` (Windows may ask: More info, Run anyway). Pick the "USB Serial Device" port; when
+   it asks to remember the port, either answer is fine. Wait until the bar is full.
+3. Unplug the USB cable **and the board's power adapter** for 10 s (the adapter keeps the USB chip running), then
+   plug both back in. Windows' Device Manager now shows the board's port with `REV_0006` (0.6.0) in its hardware ID.
+
+If `update.bat` says it can't put the board in ESP mode: unplug everything, connect the **GND** and **Download** pins
+on the 6-pin header next to the USB-C socket with a jumper wire, plug in the USB cable only, and in that folder run
+`bin\espflash write-bin -b 115200 0x0 (Get-Item .\firmware\UNOR4-WIFI-S3-*.bin).FullName` in PowerShell; then unplug,
+remove the jumper and plug everything back in.
 **Download the bridge (.ps1)** on the same card gives you the script as a file to keep on that PC (right-click, Run
 with PowerShell - it asks for the page's address). On macOS and Linux, or Windows with Python and pyserial, the page
 file is the bridge too:
@@ -304,7 +328,9 @@ whenever you change them there; otherwise what you set in the page stays.
 | Firmware update from the page can't start | The page must be reachable from the board: `--bind 0.0.0.0`, firewall open, and in Docker the same port number on both sides. The board's WiFi module needs firmware 0.4.0 or newer. |
 | Auto-tune says "WiFi hiccup during that move - doing it again", or stops with "The WiFi link to the board kept stalling" | The board's WiFi drops out for a second or more now and then. Put the board closer to the router (or an access point), keep the 2.4 GHz channel clear, and update the board's WiFi module (Arduino IDE, Tools, Firmware Updater). A few repeated moves are harmless. |
 | USB bridge: "COM5 is in use or missing" | Close SimHub (and SMC3Utils, the Arduino IDE's Serial Monitor) - only one program can have the port. Check the board is plugged into this PC. |
-| USB bridge: "needs firmware 1.9.5 or newer" | The board answers on the cable but its firmware can't send the page's data over USB. Install SMC3_R4 1.9.5 (Settings, Firmware update, or the Arduino IDE), then run the bridge again. |
+| USB bridge: "needs firmware 1.9.5 or newer" | The board answers on the cable but its firmware can't send the page's data over USB. Install SMC3_R4 1.9.6 (Settings, Firmware update, or the Arduino IDE), then run the bridge again. |
+| USB bridge: "the page's commands arrive damaged" | Firmware 1.9.5 loses bytes on the USB port: install 1.9.6 (above). |
+| USB bridge: "No answer from the board on COM4: nothing comes back over USB" | Update the board's USB chip with Arduino's standalone updater (above, "Nothing comes back from the board?"). |
 | USB bridge: "Can't reach the page" | Use the page's plain `http://` address as in your browser (not https or a reverse proxy). The page must listen on the network (`--bind 0.0.0.0`; the Docker image does). |
 | The switch stays orange ("switching") | The bridge can't open the port: hover over the switch - usually SimHub (or SMC3Utils, the Serial Monitor) still has it. Close it; the bridge links by itself. Flip back to WiFi to cancel. |
 | USB bridge: "Waiting: Auto-tune is running ..." | The bridge links as soon as auto-tune, the full check, Seat setup or a firmware update has finished - switching mid-way would spoil it. |

@@ -99,7 +99,7 @@ at once (`[kH 0]`). A dropped connection to the board, or anything else that mov
 
 ## The USB cable (2.8)
 
-With firmware 1.9.5 the page can reach the board over its USB cable instead of WiFi, for calibration with SimHub
+With firmware 1.9.5 (1.9.6 recommended) the page can reach the board over its USB cable instead of WiFi, for calibration with SimHub
 closed. A bridge on the PC with the cable connects out to the page (`POST /usb/link` on the web port, then the board's
 bytes both ways), the page drops its WiFi connection and uses the cable until the bridge ends; it sends `[kU1]` every
 second so the board streams over USB and leaves WiFi alone. Windows: the page serves a PowerShell bridge at

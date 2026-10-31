@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-smc3_scope v2.8.2 - live scope, tuner and auto-tuner for the SMC3_R4 motion controller (Arduino UNO R4 WiFi).
+smc3_scope v2.8.3 - live scope, tuner and auto-tuner for the SMC3_R4 motion controller (Arduino UNO R4 WiFi).
 
 Connects to the board's TCP telemetry port, keeps a rolling buffer of samples and serves a web page with live
 charts, a parameter editor (sends ordinary SMC3 commands back to the board), test signals and a per-motor
@@ -17,6 +17,15 @@ Every option can also come from the environment (Docker): SMC3_HOST, SMC3_PORT, 
 SMC3_DATA_DIR.  Settings changed in the page (board address, theme, auto-find) are saved to
 <data dir>/config.json and survive restarts and upgrades.  Standard-library Python 3.8+ only.
 
+v2.8.3: for firmware 1.9.6, which stops the board losing bytes on the USB port (its receive register holds one byte,
+        and the PID interrupt kept the receive interrupt waiting at 500000 baud - the page's commands over the cable
+        arrived damaged often enough that page mode dropped out). The page repeats [kU1] twice a second (was once)
+        and no longer calls a board that runs 1.9.5 "1.9.4 or older" when it answers but doesn't switch to the
+        cable: it waits longer and then says what happened (1.9.6 fixes it). The bridges ask the board for its
+        firmware number several times when they open the port (one question could get lost while Windows sets the
+        port up). When nothing at all comes back and the board's USB chip runs firmware older than 0.6.0, the page
+        says so: updating that chip (Arduino's standalone updater) fixed exactly that on a board that answered
+        nothing.
 v2.8.2: the Windows (PowerShell) bridge got nothing back from the board on a real PC (board -> page 0 kB, then "the
         board didn't answer on COM4 in 45 s"): it waited on an asynchronous read of the COM port that never completed.
         It now reads whatever bytes are waiting, about every 10 ms, and checks the board when it opens the port ([rd!]
@@ -177,7 +186,7 @@ v1.4: settings dialog (board address, port, find-board scan, auto-find), day/nig
       fixed a thread race that made the page flash "not reachable".
 """
 
-VERSION = "2.8.2"
+VERSION = "2.8.3"
 
 import argparse
 import base64
@@ -650,9 +659,10 @@ class Board:
         return True
 
     def _keepalive(self, now):
-        """[kU1] every second keeps the board in USB page mode (it ends 5 s after the last one)."""
+        """[kU1] keeps the board in USB page mode (it ends 5 s after the last one) - 2.8.3: twice a second (was once),
+        so a damaged one (firmware 1.9.5 loses bytes on the USB port now and then) doesn't end it."""
         u = self.usb
-        if u and now - u["ka_at"] >= 1.0:
+        if u and now - u["ka_at"] >= 0.5:
             u["ka_at"] = now
             self.send(b"[kU\x01]")
 
@@ -691,8 +701,21 @@ class Board:
             self.send(b"[rd!]")
         if self.reply_seq > u["reply0"] and not u.get("answer_at"):
             u["answer_at"] = now                         # the board answers (it may have been starting until now)
-        if age > 6 and u.get("answer_at") and now - u["answer_at"] > 3.5:
-            # it has answered for a while (and had [kU1] at least three times since), but sends no telemetry: it is
+        known = self.fw_known or self.fw_version
+        newfw = bool(known) and vkey(known) >= (1, 9, 5)
+        if newfw and age > 20 and u.get("answer_at") and now - u["answer_at"] > 15:
+            # 2.8.3: a board known to run 1.9.5+ that answers but doesn't stream: its [kU1]s get damaged on the way
+            # (1.9.5 loses bytes on the USB port while the PID interrupt runs) - give it longer, then say so
+            why = (f"The board (firmware {known}) answers on the cable but doesn't switch over to it: the page's "
+                   "commands arrive damaged. ")
+            why += ("Firmware 1.9.6 fixes that (1.9.5 loses bytes on the USB port while it controls the motors) - "
+                    "install it (Settings, Firmware update, or the Arduino IDE), then run the bridge again."
+                    if vkey(known) < (1, 9, 6) else
+                    "Is something else using the port, or the USB cable loose? Run the bridge again to retry.")
+            self._ev("link", "USB cable: " + why, quiet=False)
+            self.detach_usb(why, refuse=True)
+        elif not newfw and age > 6 and u.get("answer_at") and now - u["answer_at"] > 3.5:
+            # it has answered for a while (and had [kU1] at least six times since), but sends no telemetry: it is
             # older than 1.9.5
             fw = self.fwnum()
             old = "1.9.4 or older" if fw == 19 else (f"{fw // 10}.{fw % 10}" if fw else "an old one")
@@ -701,11 +724,17 @@ class Board:
                    "again.")
             self._ev("link", "USB cable: " + why, quiet=False)
             self.detach_usb(why, refuse=True)
-        elif age > 45:
+        elif age > 45 and not u.get("answer_at"):
             why = (f"The board didn't answer on {u.get('port') or 'that port'} in 45 s. Is it the Arduino's port? "
                    "(Run the bridge again: it lists the ports it can see when there are several.)")
             if u.get("probe") == "none":
                 why += " The bridge got no answer either when it opened the port: nothing comes back from the board over USB."
+                mod = ((self.diag or {}).get("wifi") or {})
+                if mod.get("module_fw_num") and mod["module_fw_num"] < 0x000600:
+                    why += (f" The board's USB chip runs firmware {mod.get('module_fw')}: updating it to 0.6.0 or newer "
+                            "(Arduino's standalone updater, unor4wifi-update-windows.zip - not the IDE's Firmware "
+                            "Updater, which needs these answers itself) fixed exactly this on a board that answered "
+                            "nothing. See the install guide, USB cable.")
             self._ev("link", "USB cable: " + why, quiet=False)
             self.detach_usb(why, refuse=True)
 
@@ -3876,8 +3905,12 @@ class Monitor:
         bad = d["usb_bad_bytes"] - prev["usb_bad_bytes"]
         if bad > 20 and now_minus(self.last_note.get(("usb_bad", None), 0.0)) > 300:
             self.last_note[("usb_bad", None)] = time.time()
+            old = vkey(self.board.fw_label() or "0") < (1, 9, 6) and self.board.fwnum() >= 19
             self.events.add("simhub", f"{bad} bytes of unreadable data arrived on the USB port in {dt:.0f} s "
-                            f"(another program on the COM port, or a wrong output format).", bad_bytes=bad)
+                            + ("(firmware 1.9.5 and older lose bytes on the USB port while they control the motors - "
+                               "1.9.6 fixes that; or another program on the COM port, or a wrong output format)."
+                               if old else "(another program on the COM port, or a wrong output format)."),
+                            bad_bytes=bad)
         if d["loop_max_us"] > 150000 and now_minus(self.last_note.get(("loop", None), 0.0)) > 600:
             self.last_note[("loop", None)] = time.time()
             self.events.add("board", f"The board's main loop was blocked for {d['loop_max_us'] / 1000:.0f} ms "
@@ -5318,7 +5351,7 @@ def analyze(rep):
                 why = (" This is the classic cause of sudden violent jerks: for a moment the controller thinks the motor "
                        "is somewhere else and drives hard.")
             fwfix = ("" if pot_filter_fw else " Firmware 1.9.4 also holds short glitches back from the motors (flash "
-                     "SMC3_R4_v1.9.5.ino" + (", or Settings, Firmware update" if upd_ok else " over USB")
+                     "SMC3_R4_v1.9.6.ino" + (", or Settings, Firmware update" if upd_ok else " over USB")
                      + ").")
             add(lvl, f"Motor {n}'s pot reading jumps (glitches)",
                 f"Readings that change faster than any motor can move: {gl_fw} counted by the board"
@@ -5498,11 +5531,11 @@ def analyze(rep):
                 "(soft start)", f"At {sst['rate']} counts/s after power-up or Enable Motors; normal once it has caught "
                 "up.", code="soft_creeping")
     elif board.get("seat_setup") is not None and board.get("wifi") is None:
-        add("info", "Firmware 1.9.5 adds a soft start, updates from this page, a pot glitch filter and the USB cable link",
+        add("info", "Firmware 1.9.6 adds a soft start, updates from this page, a pot glitch filter and the USB cable link",
             "With 1.9 the motors go straight to their positions at power-up - a seat that rode down while the rig "
-            "was off jumps back. 1.9.5 also lets you install later firmware from Settings, Firmware update, and "
-            "keeps pot glitches away from the motors.",
-            "Flash SMC3_R4_v1.9.5.ino over USB with the Arduino IDE.", code="soft_fw")
+            "was off jumps back. 1.9.6 also lets you install later firmware from Settings, Firmware update, keeps "
+            "pot glitches away from the motors and no longer loses bytes on the USB port.",
+            "Flash SMC3_R4_v1.9.6.ino over USB with the Arduino IDE.", code="soft_fw")
     # ---- firmware update over WiFi (firmware 1.9.2) ----
     wfi = board.get("wifi")
     fup = board.get("firmware_update") or {}
@@ -5532,9 +5565,22 @@ def analyze(rep):
                 "This build has no WiFi details of its own (or they didn't work), so it used the ones it last joined "
                 "with.", code="wifi_remembered")
     elif sst is not None:
-        add("info", "Firmware 1.9.5 can be updated from this page",
+        add("info", "Firmware 1.9.6 can be updated from this page",
             "Settings, Firmware update installs later firmware over WiFi - no USB cable, SimHub can stay open.",
-            "Flash SMC3_R4_v1.9.5.ino over USB once with the Arduino IDE.", code="update_fw")
+            "Flash SMC3_R4_v1.9.6.ino over USB once with the Arduino IDE.", code="update_fw")
+    # ---- page 2.8.3: firmware 1.9.6 stops bytes getting lost on the USB port ----
+    fwk = vkey(board.get("firmware"))
+    if (1, 9, 2) <= fwk < (1, 9, 6):
+        lost = (board.get("usb") or {}).get("bytes_thrown_away") or 0
+        add("info", "Firmware 1.9.6 stops bytes getting lost on the USB port",
+            "Older firmware loses a byte now and then when commands arrive over USB while it controls the motors "
+            "(the board's USB port holds one byte, and the motor loop kept it waiting at 500000 baud): now and then "
+            "one of SimHub's position commands, and often enough the page's commands over the USB cable that the "
+            "cable link drops out." + (f" The board has thrown away {lost} bytes since it started." if lost else ""),
+            "Upload SMC3_R4_v1.9.6.ino with the Arduino IDE" + (", or export its .bin (Sketch, Export Compiled Binary) "
+                                                                 "and install it in Settings, Firmware update."
+                                                                 if wfi is not None else "."),
+            code="usb_rx_fw")
     # ---- seat set-up (firmware 1.9) ----
     ss = board.get("seat_setup")
     if ss:
@@ -7199,7 +7245,7 @@ class FirmwareUpdate:
                                 "0.4.0 or newer. Update it once over USB: " + WIFI_MODULE_STEPS)
         else:
             v["problem"] = ("The board runs firmware " + (v["fw"] or "older than 1.7") + ", which can't be updated from "
-                            "the page. Flash SMC3_R4_v1.9.5.ino over USB with the Arduino IDE once - from then on "
+                            "the page. Flash SMC3_R4_v1.9.6.ino over USB with the Arduino IDE once - from then on "
                             "updates can come from here.")
         if self.bind in ("127.0.0.1", "localhost", "::1"):
             v["capable"] = False
@@ -8153,7 +8199,7 @@ def usb_bridge_ps1(page_url):
 
 USB_BRIDGE_PS1 = r"""# SMC3 R4 USB bridge (smc3_scope __VERSION__): lets the smc3_scope page talk to the board over the USB cable instead
 # of WiFi - for calibration (auto-tune, the full check, Seat setup) with SimHub closed. Windows PowerShell 5.1 or
-# PowerShell 7, nothing to install. Needs firmware 1.9.5 or newer on the board.
+# PowerShell 7, nothing to install. Needs firmware 1.9.5 or newer on the board (1.9.6 recommended).
 #   From the page: Settings, USB cable - press Win+R and paste the line shown there.
 #   As a file:     powershell -NoProfile -ExecutionPolicy Bypass -File smc3-usb-bridge.ps1 [http://<page>:<port>] [COMx] [standby]
 # It links at once. When the page's switch goes back to WiFi it lets go of the port (SimHub can have it) and waits:
@@ -8236,12 +8282,20 @@ function Smc3-Head($ns) {
 
 function Smc3-Probe($sp) {
     # 2.8.2: asks the board for its firmware number ([rd!]) right after the port opens - "ok 19", or "none" when
-    # nothing at all comes back over USB (then the page can't work over the cable either)
+    # nothing at all comes back over USB (then the page can't work over the cable either). 2.8.3: up to 6 times -
+    # one answer can get lost while Windows sets the port up (the USB chip clears what it holds each time)
+    Start-Sleep -Milliseconds 250
     try { $sp.DiscardInBuffer() } catch { }
-    $sp.Write([byte[]](0x5B, 0x72, 0x64, 0x21, 0x5D), 0, 5)
     $got = New-Object System.Collections.Generic.List[byte]
     $t0 = Get-Date
-    while (((Get-Date) - $t0).TotalMilliseconds -lt 2000) {
+    $asked = 0
+    $tAsk = [DateTime]::MinValue
+    while (((Get-Date) - $t0).TotalMilliseconds -lt 2500) {
+        if ($asked -lt 6 -and ((Get-Date) - $tAsk).TotalMilliseconds -ge 350) {
+            $sp.Write([byte[]](0x5B, 0x72, 0x64, 0x21, 0x5D), 0, 5)
+            $asked++
+            $tAsk = Get-Date
+        }
         $k = $sp.BytesToRead
         if ($k -gt 0) {
             $b = New-Object byte[] $k
@@ -11901,7 +11955,7 @@ details.oks .flist{margin-top:6px}
    </div>
    <div class="fwhow">
     <p class="note"><b>Why:</b> the board's WiFi module now and then holds the board up for a second or more. Then the page's moves lag, and auto-tune has to do a test move again. On the cable the board sends its live data over USB and makes no WiFi calls at all, so nothing waits.</p>
-    <p class="note">Needs firmware <b>1.9.5</b> or newer on the board, and works with SimHub closed only - one program at a time can have the USB port. The bridge connects out to this page (nothing listens on the PC, so its firewall doesn't ask) and needs nothing installed (Windows PowerShell). Firmware updates from the page still go over WiFi.</p>
+    <p class="note">Needs firmware <b>1.9.5</b> or newer on the board (<b>1.9.6</b> recommended: 1.9.5 loses bytes on the USB port now and then, often enough that the link can drop out), and works with SimHub closed only - one program at a time can have the USB port. The bridge connects out to this page (nothing listens on the PC, so its firewall doesn't ask) and needs nothing installed (Windows PowerShell). Firmware updates from the page still go over WiFi. If the bridge gets no answer at all from the board, update the board's USB chip to 0.6.0 or newer with Arduino's standalone updater (the install guide has the steps).</p>
     <p class="note">Mac or Linux (or Windows with Python and pyserial): <code id="usb_py"></code></p>
    </div>
   </div>
@@ -12026,7 +12080,7 @@ details.oks .flist{margin-top:6px}
     <h3>Diagnostics</h3><p>Settings section. <b>Quick check</b> reads the board and listens for a few seconds; <b>Full check</b> also moves each motor a little to see which way it goes, how much drive it needs, whether the wiring is swapped and how it answers a small step - and can ask you what you saw. Both make one file (saved on the NAS too) to download and give to whoever helps you. The page also watches while you drive and notes pot glitches, a motor moving the wrong way or stalling, hunting, cutoffs, the tilt limit and board restarts. It also keeps a <b>load map</b>: where each motor falls behind or runs at full power, each way across its travel - a quick check after a session names where the rig struggles (lifting a heavy driver, say). With the motion sensor, the full check also measures the seat itself: degrees per count, bounce and play in the linkage - for the traction-loss motor, how far the seat turns. For the rear slide it asks whether the rear went left or right.</p>
     <h3>Status bar</h3><p>LOW POWER means no position commands for 15 s, so the board runs at quarter drive until SimHub or this page sends targets again.</p>
     <h3>Firmware update (firmware 1.9.2)</h3><p>Settings, Firmware update installs new firmware over WiFi - no USB cable, and SimHub can stay open (with its motion output paused). In the Arduino IDE open the new .ino and use <b>Sketch, Export Compiled Binary</b>; choose that .bin on the page and press Install. The page checks the file (an SMC3_R4 build for the UNO R4 WiFi, and which version), the board switches the motors off, its WiFi module downloads and checks the file and installs it, and the page confirms the new version once the board is back. The board remembers the WiFi name and password it last joined with, so a build with the placeholders still connects. Needs the WiFi module's own firmware 0.4.0 or newer (0.5.0+ shows progress): Arduino IDE, Tools, Firmware Updater, with SimHub closed (it keeps the USB port busy) - and since that erases the sketch on the board, upload SMC3_R4 again over USB afterwards. The first install of it (SMC3_R4_v1.9.3.ino - 1.9.2 didn't compile in the Arduino IDE) goes over USB.</p>
-    <h3>USB cable for calibration (page 2.8, firmware 1.9.5)</h3><p>The board's WiFi module now and then holds the board up for a second or more, so the page's moves can lag and auto-tune redoes a test move. For calibration, link the page to the board over its USB cable instead: close SimHub, then on the PC with the cable press <b>Win+R</b> and paste the line from <b>Settings, USB cable</b>. That starts a small bridge (Windows PowerShell, nothing to install) which finds the board's COM port and links it to the page; the switch at the top of the page then shows <b>USB</b> and the board makes no WiFi calls at all. When you're done flip the switch to <b>WiFi</b> and start SimHub again: the bridge lets go of the port and waits, so from then on the switch moves between WiFi and the cable (close SimHub before flipping to USB). Closing the bridge window ends it. Settings, USB cable can also turn bridges away (WiFi only). Firmware updates from the page still go over WiFi.</p>
+    <h3>USB cable for calibration (page 2.8, firmware 1.9.5; 1.9.6 recommended)</h3><p>The board's WiFi module now and then holds the board up for a second or more, so the page's moves can lag and auto-tune redoes a test move. For calibration, link the page to the board over its USB cable instead: close SimHub, then on the PC with the cable press <b>Win+R</b> and paste the line from <b>Settings, USB cable</b>. That starts a small bridge (Windows PowerShell, nothing to install) which finds the board's COM port and links it to the page; the switch at the top of the page then shows <b>USB</b> and the board makes no WiFi calls at all. When you're done flip the switch to <b>WiFi</b> and start SimHub again: the bridge lets go of the port and waits, so from then on the switch moves between WiFi and the cable (close SimHub before flipping to USB). Closing the bridge window ends it. Settings, USB cable can also turn bridges away (WiFi only). Firmware updates from the page still go over WiFi.</p>
     <h3>Updates (page 2.7)</h3><p>Settings, Updates: the page asks GitHub twice a day (or when you press <b>Check now</b>) whether the newest release has a newer page or firmware, and says so in the header. <b>Update page</b> downloads the new page, checks it and restarts into it - the board isn't touched, and settings stay. The downloaded page is kept in the data folder (<code>updates</code>), so it is used again after a restart or a re-created Docker container, until a newer one comes, or a newer image or file is started. <b>Go back to built-in</b> undoes it. Firmware is only downloaded: flash the .ino with the Arduino IDE, or export the .bin and install it in Firmware update.</p>
     <h3>Soft start (firmware 1.9.1)</h3><p>After the rig has been off the seat may have ridden down a little. At power-up, and when you press Enable Motors, each motor creeps from wherever it is to its position (SimHub's centre at power-up) instead of jumping there - 60 counts/s by default, easing in and out. Once it has caught up everything runs normally. A seat that rode down past an end stop is allowed to come back (only going further out switches the motor off), the tilt limit waits, and the board keeps full power meanwhile. Settings, Loop, PWM &amp; smoothing: Soft start.</p></div>
    <div><h3>Seat setup (firmware 1.9)</h3><p>Levels the platform first and makes that SimHub's centre: the board adds a <b>level trim</b> to every position SimHub sends, so SimHub's middle (512) is the level seat - and the seat goes level at power-up. With the motion sensor it levels itself (each motor moves a little to learn how it tilts the seat, then the page moves them until the sensor reads level, choosing the level position nearest the middle of every motor); without it you nudge the motors with a spirit level on the seat. On a traction-loss rig only motors 1 and 2 level the seat; you <b>centre</b> motor 3, the rear slide, so the seat points straight ahead, and tell the page which way the rear went for +10.</p>
