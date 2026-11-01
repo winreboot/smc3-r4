@@ -268,6 +268,8 @@ stall to clear. What changes on the PC:
   On that setting the page clears a stall by itself: it has the board restart the WiFi chip (never while SimHub sends
   positions), the port comes back as after a replug and the link follows in about 10 s.
 
+![Settings, USB cable: the browser's own link, and who has the board's USB connector](img/usb-connector_v2.9.png)
+
 ### From the browser (page 2.9)
 
 In Chrome, Edge, Brave or Firefox 151+ on the PC the board is plugged into, the page opens the port itself (Web

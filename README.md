@@ -172,6 +172,10 @@ around its own centre - **Twist** moves the two front lifts opposite each other 
 up: the most twist), **Heave** the lifts together, **Corner** the front lifts opposite each other with the rear slide,
 **Wave** every motor in turn, a third of a cycle apart.
 
+![Test Signal with the Together list, and the Twist, Heave, Corner and Wave presets](docs/img/presets-together_v2.9.png)
+
+![Twist running: Left and Right move opposite each other and the seat rolls](docs/img/twist-dashboard_v2.9.png)
+
 ![Square test on motor 1](docs/img/test-tools.png)
 
 ### Auto-tune
@@ -225,6 +229,8 @@ wrong way one way only. If it does stop for safety, that motor is switched off w
 **Test together** (page 2.9) runs every motor in use with the values it has now: each alone, then all together,
 then twisted. It shows what moving together costs each one - more lag or running out of drive points to a shared
 supply that sags, more overshoot or ringing to a frame that flexes - and changes nothing.
+
+![Test together: each motor alone, all together, then twisted](docs/img/test-together_v2.9.png)
 
 A crackling pot (bursts of readings a few counts off, whatever the Kp) doesn't end the Kp sweep early (page 2.9): the
 hold is judged over most of a second with a median spread, against what the pot does at the gentlest Kps.
@@ -322,6 +328,8 @@ own firmware 0.4.0 or newer (Arduino IDE, Tools, Firmware Updater).
 **Restart** (page 2.9, firmware 2.0): the button next to Settings restarts the board as its RESET button does - the
 motors switch off first, and the page reconnects by itself. It is refused while SimHub sends positions, and while
 auto-tune, Seat setup or the full check runs.
+
+![The Restart button next to Settings, and what it asks first](docs/img/restart_v2.9.png)
 
 **Updates** (page 2.7): the page asks GitHub twice a day what the newest release has. When there's a newer page or
 firmware, a balloon on the header's **Settings** button says **Update**; it leads straight here. The header shows the
