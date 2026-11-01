@@ -34,12 +34,23 @@ What the R4 hardware adds:
   placeholders (or an old password) still connects.
 - **WiFi telemetry** at 100 samples a second to `smc3_scope`, plus live tuning and diagnostics. See
   [docs/PROTOCOL.md](../docs/PROTOCOL.md).
+- **Its own USB port** (2.0): the board's USB switch gives the connector to the main chip, so SimHub and the page talk
+  to it directly - no WiFi chip in between, so none of its USB stall and no lost bytes. It is a new COM port on the PC,
+  once. The page's Settings, USB cable can give the connector back to the WiFi chip, for good or
+  until the next reset.
 
 ### Flashing
 
 1. In the Arduino IDE, use Boards Manager to install **Arduino UNO R4 Boards**, then select **Arduino UNO R4 WiFi**.
 2. Open `SMC3_R4/SMC3_R4.ino` and set **`WIFI_SSID`** and **`WIFI_PASS`** (2.4 GHz only).
 3. Upload. The address scrolls across the matrix at power-up.
+
+**Uploading again once 2.0 runs.** 2.0 has the USB connector on the main chip, and the IDE uploads through the WiFi
+chip. Before an upload: in the page, Settings, USB cable, press **WiFi chip until the next reset** - or press the
+board's RESET twice, about a second apart (slower than the bootloader's own double-tap). The board's first COM port
+comes back; upload on it as always, and the new firmware takes its own port again. Updates from the page (below) need
+none of this. To keep the connector on the WiFi chip for good, press **WiFi chip (classic)** on the same card, or
+build with `#define USB_OWNER 0` (a saved setting wins).
 
 ### Updating from the page (1.9.2 and later)
 
@@ -57,7 +68,8 @@ its bootloader. The board restarts with the new firmware and the page checks the
 - It needs the WiFi module's own firmware **0.4.0 or newer**; 0.5.0 or newer also reports progress. Update it once
   with the Arduino IDE, Tools, Firmware Updater.
 - It is refused while anything is sent over USB in the last 3 s (SimHub, SMC3Utils): the WiFi module programs the
-  board over that same serial link.
+  board over that same serial link (2.0: SimHub uses the main chip's own port, but the rule stays - nothing may drive
+  the rig while it updates).
 - If the download or the check fails, the old firmware keeps running and the matrix scrolls
   `ERROR E7 UPDATE FAILED` until the page clears it. If programming itself fails half-way, the board waits in its
   bootloader (its LED pulses): press reset, or upload over USB.
@@ -82,6 +94,7 @@ its bootloader. The board restarts with the new firmware and the page checks the
 | `ENABLE_WIFI` | 1 | 0 = no networking: a plain, faster SMC3. |
 | `WIFI_SSID`, `WIFI_PASS`, `WIFI_HOSTNAME` | placeholders, `smc3-r4` | Your network. |
 | `TELEMETRY_PORT` | 4210 | TCP port the page connects to. |
+| `USB_OWNER` | 1 | 2.0: who has the USB connector on a board that has never been told (EEPROM 108-109 unset): 1 = the main chip's own port, 0 = the WiFi chip, as before 2.0. The page's Settings, USB cable sets it on the board. |
 | `WIFI_STATIC_IP` + `WIFI_IP`… | 0 | Use a fixed address instead of DHCP. |
 
 ### LED matrix
@@ -152,6 +165,9 @@ lapses by itself after 3 s if the page goes away). The commands are in [docs/PRO
 
 | Version | Change |
 |---|---|
+| 2.0 | **The USB connector is the main chip's** (tested as 2.0b1): the board's USB switch is set at boot and the core's own USB serial port (TinyUSB CDC, `SerialUSB`) is used, so SimHub and the page no longer go through the WiFi chip's bridge - its USB stall, the lost bytes and the chip restarts are out of the path. A new COM port ("UNO R4 WiFi"); the baud rate is ignored. USB writes never block when nothing reads the port. `[kO n]` (the page only): 0 WiFi chip (saved), 1 main chip (saved), 2 WiFi chip until the next reset; two RESET presses within 3 s do the same as 2. EEPROM 108-109; build flags bit 6 (main chip now) and bit 7 (saved). **`[kZ R]`** (tested as 2.0b2): the page's Restart button - motors off, then a reset as with the RESET button. `[kE1]` and `[kZ R]` are refused while SimHub sends positions (the last one less than 10 s ago); `[kE1]` also on the main chip's port. Includes 1.9.7 and 1.9.8. `FW_CAPS` `nativeusb1`, `reboot1`. Protocol for SimHub and SMC3Utils and every saved setting unchanged. |
+| 1.9.8 | Test build, in 2.0: the WiFi chip restart of 1.9.7 left the board off WiFi until RESET - the main chip kept its old link to the chip and the WiFiS3 library's "begun" state, so it never redid the start-up handshake and every `WiFi.begin()` blocked for 15 s and failed. Now the link is closed and the handshake redone before WiFi; after a request over USB WiFi waits up to 25 s for the cable. `[rdd]` frame version 6 reports how the last restart went. `FW_CAPS` `modreset2`. |
+| 1.9.7 | Test build, in 2.0: `[kE1]` (the page only) restarts the board's WiFi/USB chip, which clears its USB stall (the output dies after minutes of streaming; only re-enumerating clears it). At most once per 15 s. `FW_CAPS` `modreset1`. |
 | 1.9.6 | No more lost bytes on the USB port. The RA4M1's USB serial port (SCI9) and the motion sensor's (SCI2) have no receive FIFO: one byte waits while the next comes in (20 µs at 500000 baud), and the 4 kHz PID interrupt (priority 6, up to ~100 µs with its three `analogRead()`s) kept the core's receive interrupt (priority 12) waiting longer - now and then one of SimHub's position frames was lost, and the page's commands over the USB cable often enough that page mode dropped out. Their receive and receive-error interrupts now have priority 4. Nothing else changed. |
 | 1.9.5 | USB page mode, for calibration with SimHub closed: `[kU1]` over USB (repeated every second by the page; `[kU0]` or 5 s without it ends it) sends the telemetry, `[rdd]` and `[rdu]` over USB instead of WiFi, treats USB position commands as the page's (never held by `[kH]`, not counted as SimHub's) and makes no WiFi call at all meanwhile - the WiFi module's round-trips are what held the loop up now and then. Diagnostics flags bit 4; `FW_CAPS` `usbpage1`. SimHub on USB is unchanged; protocol, EEPROM and settings otherwise as in 1.9.4. `loop()` reads the clock again after parsing USB commands (a command stamped a millisecond after the loop's start made the comms timeout wrap for one pass). |
 | 1.9.4 | Pot glitch filter: a reading more than 16 counts from the last good one (no motor moves that far in 1/4 ms) is held back for up to 10 ms, so the PID no longer kicks the motor at every glitch. A change that lasts longer goes through, so a broken pot still trips the cutoff, at most 10 ms later. Diagnostics still counts every raw glitch; build flag bit 5 (`[rd!]`, diagnostics frame) says the filter is in. Protocol, EEPROM and settings as in 1.9.3. For the hardware side see the README's Pot noise filter. |

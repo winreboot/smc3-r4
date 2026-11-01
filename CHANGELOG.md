@@ -3,6 +3,77 @@
 `smc3_scope` (the page) and `SMC3_R4` (the firmware) are versioned separately. The page works with older
 firmware too; the notes say which firmware a feature needs.
 
+## Page 2.9, firmware 2.0
+
+Tested on a rig as seven page betas (2.9b1-2.9b7) and four firmware test builds (1.9.7, 1.9.8, 2.0b1, 2.0b2); all of
+them are in this release. **Nothing restarts the board, or either of its chips, while SimHub sends positions.** What
+went wrong on the way, and what was learnt from it: [docs/LESSONS-LEARNED.md](docs/LESSONS-LEARNED.md).
+
+- **Firmware 2.0: the board's USB port is the main chip's own.** The UNO R4 WiFi's USB connector normally belongs to
+  its WiFi chip (an ESP32-S3), which relays the bytes to the main chip over a serial link. Everything that went wrong
+  on the cable lived in that relay:
+  - its USB output dies after some minutes of streaming, while the PC's commands still arrive (a known problem of the
+    board; only a replug cleared it);
+  - bytes got lost (1.9.6 fixed the main chip's side of that);
+  - restarting the chip to clear the stall left the board off WiFi and silent until its RESET button was pressed
+    (1.9.7), and even after that was fixed (1.9.8) the chip sometimes didn't talk to the main chip again.
+
+  The board has a USB switch that the main chip controls. 2.0 flips it at boot: SimHub and the page talk to the main
+  chip directly, at full USB speed, with nothing in between. WiFi is unchanged.
+  - **A new COM port, once.** It has a new number (the browser's port list calls it UNO R4 WiFi). Point SimHub's SMC3 output at it (the
+    baud rate doesn't matter on this port).
+  - **Arduino IDE uploads** go through the WiFi chip: press **WiFi chip until the next reset** in Settings, USB cable
+    first, or press the board's RESET twice, about a second apart. After the upload the board is back on its own
+    port. Firmware updates from the page over WiFi need nothing.
+  - **WiFi chip (classic)** on the same card puts the connector back where it was, saved on the board. On that
+    setting the page clears the stall by having the board restart the WiFi chip (`[kE1]`); the board then re-opens
+    its link to the chip, redoes the start-up handshake and lets the cable come back before WiFi.
+  - Writes to the USB port never block when nothing reads it (the core's write waits for ever on a full buffer).
+  - Saved settings are kept; the connector's owner is new in EEPROM 108-109.
+- **The page opens the USB port itself** (Web Serial) in Chrome, Edge, Brave and Firefox 151+ on a desktop: flip the
+  switch at the top to **USB** and pick the Arduino once. No PowerShell window. Browsers allow it only on a secure
+  page - https, or localhost; Settings, USB cable shows the one-time step (a browser flag, or a port proxy to
+  localhost). The page remembers the port, links again by itself when the cable comes back, and reopens the port
+  after a silent drop. The bridges are still there for other browsers and other PCs.
+- **A Restart button** next to Settings: the motors switch off, the board restarts as with its RESET button, and the
+  page reconnects. Refused while SimHub sends positions, and while auto-tune, Seat setup or the full check runs.
+  Needs firmware 2.0.
+- **Test signals on several motors at once:** the Test Signal card's **Together** list, and the Presets **Twist** (the
+  front lifts opposite each other - one goes down while the other goes up), **Heave** (the lifts together),
+  **Corner** (twist plus the rear slide) and **Wave** (every motor a third of a cycle apart). Each motor moves around
+  its own centre. Only what the rig has the motors for is offered.
+- **Auto-tune, Test together:** every motor in use with the values it has now - each alone, then all together, then
+  twisted. It shows what moving together costs each motor: more lag or running out of drive points to a shared
+  supply that sags, more overshoot or ringing to a frame that flexes. It changes nothing.
+- **Auto-tune on a crackling pot.** On the rig the Kps came out far too low (the right motor 52 where it had been
+  252), with clean moves: the pot crackled - bursts of readings a few counts off, too small for the glitch filter -
+  and that read as a restless hold. Now:
+  - the hold noise is taken over the last 0.9 s (was 0.3 s), slow creep taken out, as a median spread: a burst
+    counts little, a motor that really hunts counts in full;
+  - the hold limits follow what the pot does at the sweep's first three, gentlest Kps (a single 3 s reading at rest
+    was 1.3 on one run and 2.7 an hour before);
+  - a restless hold with clean moves is checked against the last calm Kp before the sweep stops, and the stop says
+    "holding gets restless", not "too lively";
+  - the small-step check says why it cuts Kp, and stops cutting when a cut doesn't calm the hold;
+  - the buzz limit (PID output noise) is never raised; Ki 2 is tried when Ki 5 already overshoots.
+- **Version numbers.** A beta sorts before its release (2.9b1 < 2.9) and 2.0 before 2.0.1, in the page and in its
+  update check; the firmware check before an update reads a beta's version too. (The betas sorted 2.0 above 2.0.1,
+  so a 2.0 board would never have been offered 2.0.1.)
+- **Diagnostics:** who has the board's USB port; the board's own report on its last WiFi chip restart (classic
+  setting); a 1.9.7 board is told to update (that finding never showed in the betas).
+- The Python bridge says which firmware it found (it always said 1.9.x).
+- Simulator: `--fw20` (2.0), `--fw20-esp` (2.0, classic setting), `--fw20b1`, `--fw197`, `--fw197-stuck`,
+  `--usb-stall SEC`, `--usb-stall-now`, `--fric`, `--stick`, `--pot-crackle`, `--supply-sag`; `[kO n]`, `[kZ R]`.
+
+Update in this order:
+1. **Firmware:** with SimHub closed, upload `SMC3_R4_v2.0.ino` with the Arduino IDE on the port you use today, or
+   use **Sketch, Export Compiled Binary** and install the `.bin` in Settings, Firmware update. When 2.0 starts,
+   Windows plays its unplug and plug sounds and a new COM port appears.
+2. **SimHub:** choose the new COM port in its SMC3 output, once.
+3. **Page:** Settings, Updates, **Update page**.
+4. **Cable:** flip the switch at the top of the page to **USB** and pick the new port (or start the bridge once
+   more).
+
 ## Page 2.8.3, firmware 1.9.6
 
 - **Firmware 1.9.6: no more lost bytes on the USB port.**

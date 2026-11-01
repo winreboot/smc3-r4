@@ -29,7 +29,7 @@ are two separate bytes. The same commands work over USB (SimHub, SMC3Utils) and 
 | Command | Since | Meaning |
 |---|---|---|
 | `[rd$]` | 1.3 | Worst control-interrupt time in µs since the last read |
-| `[rd!]` | 1.4 | Build flags (bit0 REVERSE_MOTOR1; since 1.7 also bit1 MODE2, bit2 IMU, bit3 LED matrix, bit4 static IP; since 1.9.4 bit5 pot glitch filter) and firmware number (17 = 1.7) |
+| `[rd!]` | 1.4 | Build flags (bit0 REVERSE_MOTOR1; since 1.7 also bit1 MODE2, bit2 IMU, bit3 LED matrix, bit4 static IP; since 1.9.4 bit5 pot glitch filter; since 2.0 bit6 the main chip has the USB connector now, bit7 that is the saved setting) and firmware number (17 = 1.7, 20 = 2.0) |
 | `[dis]` `[di1]`–`[di3]` | 1.5 | Disable all motors or one (brake, stay off until enabled) |
 | `[fab]` / `[rdf]` | 1.6 | Smoothing shift a (0–8, time constant 2^a / 4 ms at Fpid/1) and max speed b × 100 counts/s (0 = off) / read them |
 | `[rdd]` | 1.7 | Diagnostics frame (below). WiFi only. Version 2 since 1.8. |
@@ -48,6 +48,9 @@ are two separate bytes. The same commands work over USB (SimHub, SMC3Utils) and 
 | `[uP=]` `[uT=]` `[uI=]` `[uJ=]` | 1.9.2 | WiFi only. Firmware update: the value register is the page's web port / the file's number / the page's address bytes 1-2 / 3-4 (0 = the address the page connects from). The board fetches `http://<address>:<port>/ota/<number as 4 hex digits>.ota`. |
 | `[uGO]` `[uOK]` | 1.9.2 | WiFi only. Start the firmware update (below) / clear a finished or failed one. |
 | `[rdu]` | 1.9.2 | The page only (WiFi; 1.9.5 also USB in page mode). One "SM3U" frame (below): the update's state and this firmware's version text. |
+| `[kE1]` | 1.9.7 | The page only (WiFi, or USB in page mode): restart the board's WiFi/USB chip (the ESP32-S3), which clears its USB stall - see [The board's own USB port](#the-boards-own-usb-port-firmware-20). At most once per 15 s. 2.0: refused while SimHub is sending positions (the last one less than 10 s ago) and on the main chip's own USB port. Any of 1 or '1'. |
+| `[kOn]` | 2.0 | The page only: who has the USB connector. n = 0 the WiFi chip (saved), 1 the main chip (saved), 2 the WiFi chip until the next reset (for an Arduino IDE upload). Bytes 0-2 or '0'-'2'. USB page mode ends at once; the PC sees the port go away and another one come. |
+| `[kZR]` | 2.0 | The page only: restart the board, as its RESET button does - the motors are switched off first and the page's connection closed. Refused while SimHub is sending positions (the last one less than 10 s ago) and during a firmware update. |
 
 ### Seat set-up (firmware 1.9)
 
@@ -88,6 +91,30 @@ Without `[kU1]` nothing changes: SimHub and SMC3Utils on USB work as before. The
 block) get bit4 = page mode on; `FW_CAPS` in the .bin says `usbpage1`. The USB port runs at 500000 baud (as SimHub
 opens it).
 
+### The board's own USB port (firmware 2.0)
+
+On the UNO R4 WiFi the USB connector normally goes to the WiFi chip (ESP32-S3), which bridges it to the main chip's
+UART at the host's baud rate. The board has a USB switch that the main chip controls (the core sets it for its HID
+libraries). Firmware 2.0 takes the connector at boot (`__USBStart()`, the core's TinyUSB CDC port `SerialUSB`): a
+new COM port on the PC, product "UNO R4 WiFi", the same vendor id. The baud rate is ignored. The protocol on it is
+the same as on the WiFi chip's port: SMC3 for SimHub and SMC3Utils, `[kU1]` page mode for the page.
+
+- Every USB write goes through one function that never blocks when nobody reads the port: it writes what fits,
+  waits at most 10 ms for room, and doesn't wait again until room has been seen.
+- **The owner** is saved in EEPROM 108-109 (below); `[kO n]` changes it. Without the block the main chip has it.
+- **Two RESET presses within 3 s** (slower than the bootloader's own double-tap) give the WiFi chip the connector
+  until the next reset, as `[kO 2]` does: a mark in the battery-backed registers (VBTBKR) survives a reset but not a
+  power-up. The mark is cleared 3 s after boot, and by `[kZR]` before it restarts the board.
+- `[rd!]` and the diagnostics frame's build flags: bit6 = the main chip has the connector now, bit7 = the saved
+  setting says so.
+- On the main chip's port there is no WiFi chip in the USB path, so `[kE1]` is refused there.
+
+On the WiFi chip's port (`[kO 0]`, or firmware 1.9.7 and 1.9.8), `[kE1]` restarts the WiFi chip: it sends `+RESET`
+over the module link, closes its side of the link and clears the WiFiS3 library's "begun" state; after 5 s it redoes
+the start-up handshake (`+SOFTRESETWIFI`, 1.5 s at most, every 2 s until the chip answers) and only then calls
+`WiFi.begin()`. When the request came over USB, WiFi waits up to 25 s so the cable link can come back first (page
+mode makes no WiFi calls). The diagnostics frame (version 6) reports how the last restart went.
+
 ### The USB bridge (page 2.8)
 
 The page usually runs somewhere else (a NAS), so a small bridge on the PC with the cable links the two. It opens the
@@ -127,6 +154,23 @@ ends the bridge with that reason. A bridge started by hand links at once; with `
 
 The Windows bridge is a PowerShell script the page serves at `/usb-bridge.ps1` with its own address filled in
 (`?dl=1` to download it); the page file itself is the bridge on any OS with `--usb-bridge PORT --page URL`.
+
+### The browser's own link (page 2.9)
+
+In browsers with Web Serial the page opens the port itself and pumps its bytes to the page server over a WebSocket,
+which takes it as a bridge:
+
+```
+GET /usb/browser?id=<random id>&port=<label>&computer=<name>&probe=ok 20 | bytes <n> | none
+Upgrade: websocket     Origin: <the page itself>
+```
+
+Binary frames carry the board's bytes both ways, unchanged; either side ends the link by closing, and the server's
+close reason says why. The same rules as for `POST /usb/link` decide whether it may link (`POST /usb/browser/check`
+asks first, with the same fields as JSON). The page's own requests also have `POST /usb/chip-restart` (the browser's
+probe got nothing back: the board restarts its WiFi chip, `[kE1]`, when it can), `POST /usb/owner {"mode": 0 | 1 | 2}`
+(`[kO n]`) and `POST /board/reboot` (`[kZR]`; refused while auto-tune, Seat setup or the full check runs, or SimHub
+drives). Browsers allow Web Serial only on a secure page (https or localhost).
 
 ## Telemetry (WiFi, TCP port 4210 - or USB in page mode, firmware 1.9.5)
 
@@ -205,7 +249,14 @@ Firmware 1.9.2 sends, after `[rdu]`, whenever the update's state changes and fou
   uint8 WiFi module firmware major, minor, patch (0.0.0 = unknown)
   uint8 WiFi flags: bit0 a WiFi name/password is remembered, bit1 joined with the remembered ones, bit2 this build has
         the placeholders   uint8 update state (as in "SM3U")   int16 update code
+  version 6 (1.9.8) continues:
+  uint8 WiFi chip restarts ([kE1]) since boot   uint16 seconds since the last one (65535 = never)
+  uint8 tenths of a second after it when the chip answered the handshake again (0 = not yet)
+  uint8 WiFi tries since it (low nibble) and the last result (high nibble: 0 none yet, 1 joined, 2 failed,
+        3 no module, 4 the chip doesn't answer)
 ```
+
+The payload is 255 bytes from version 6 on - the frame's limit.
 
 Why off: 4 = tilt limit (1.8), 5 = switched off for a firmware update (1.9.2).
 
@@ -239,6 +290,15 @@ Written by `[kSV]` and `[sav]`. Without the block, the tilt limits come from 1.8
 | 106-107 | int16 soft-start speed in counts/s, big-endian (0 = off) |
 
 Written as soon as `[k 82 '=']` changes it.
+
+### EEPROM 108-109 (firmware 2.0): the USB connector's owner
+
+| Address | Content |
+|---|---|
+| 108 | 0xC4 = valid (otherwise the main chip has the connector) |
+| 109 | 0 = the WiFi chip, 1 = the main chip |
+
+Written by `[kO 0]` and `[kO 1]`; `[kO 2]` and the double RESET don't change it.
 
 ### EEPROM 112-210 (firmware 1.9.2): WiFi memory
 

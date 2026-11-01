@@ -75,7 +75,15 @@ The USB port (page 2.8, firmware 1.9.5 USB page mode; the simulator says 1.9.6 u
                        SimHub; after [kU1] (every second, or it ends after 5 s) it streams telemetry there instead and
                        stops serving WiFi, as 1.9.5 does
   --fw194              firmware 1.9.4: no USB page mode ([kU] is ignored, USB only answers SMC3 commands)
-  --fw195              firmware 1.9.5 (the default is 1.9.6)
+  --fw195              firmware 1.9.5
+  --fw196              firmware 1.9.6
+  --fw197              firmware 1.9.7 (the default is 1.9.8)
+  --fw20               firmware 2.0: the USB connector is the main chip's (native port, no stall), [kZ R] restarts
+                       the board; --fw20-esp: 2.0 with the WiFi chip on the connector (the saved setting 0);
+                       --fw20b1: the test build 2.0b1 (no [kZ R])
+  (1.9.7 and 1.9.8 were test builds, never released; 2.0 has their chip-restart handling on the classic setting)
+  --usb-stall SEC      SEC s after page mode first starts, the board's USB output dies (nothing reaches the PC, the
+                       PC's commands still arrive) until the port re-enumerates: the UNO R4 WiFi's known stall (page 2.9)
   --usb-lose-ku        every [kU1] over USB arrives damaged (counted as thrown-away bytes), as 1.9.5 could lose
                        them: the board answers but never switches to the cable (page 2.8.3)
   --usb-reset SEC      opening the USB port resets the board (as some USB-serial boards do): it restarts when the
@@ -107,6 +115,19 @@ ap.add_argument("--imu-no-tx", action="store_true")
 ap.add_argument("--imu-lost-at", type=float, default=0)
 ap.add_argument("--flex", action="store_true")
 ap.add_argument("--slop", default="")
+ap.add_argument("--supply-sag", type=float, default=0.0,
+                help="test (page 2.9): a weak shared motor supply - when the motors together ask for more than 0.6 of "
+                     "full drive, every motor gets less, by 1/(1 + SAG x the excess)")
+ap.add_argument("--pot-crackle", default="",
+                help="test (page 2.9): M:N - motor M's pot crackles about N times a second: bursts of 50-300 ms of "
+                     "readings up to +-10 counts off - too small for the glitch filter, so the hold looks restless now "
+                     "and then whatever the Kp (a worn track / dirty wiper)")
+ap.add_argument("--stick", default="",
+                help="test (page 2.9): M:FACTOR - motor M needs FACTOR x its friction to break loose from standstill "
+                     "(stick-slip: held just short of the target it jerks now and then), e.g. 3:1.35")
+ap.add_argument("--fric", action="append", default=[],
+                help="test (page 2.9): M:PLUS:MINUS - motor M's friction (fraction of full drive) when driven towards "
+                     "higher / lower counts, e.g. 3:0.23:0.19 for a rear slide that is harder to push left")
 ap.add_argument("--heavy", type=int, default=0)
 ap.add_argument("--pot-noise", default="")
 ap.add_argument("--sag", type=int, default=0)
@@ -137,7 +158,19 @@ ap.add_argument("--no-potfilter", action="store_true", help="firmware 1.9.3: no 
 ap.add_argument("--tuned", action="store_true", help="start with sane settings (Kp 250, Ki 0, Kd 0, PWMmin 30, dead zone 2)")
 ap.add_argument("--usb", default="", help="the board's USB port as a pseudo-terminal, linked at this path (page 2.8)")
 ap.add_argument("--fw194", action="store_true", help="firmware 1.9.4: no USB page mode")
-ap.add_argument("--fw195", action="store_true", help="firmware 1.9.5 (the default is 1.9.6, page 2.8.3)")
+ap.add_argument("--fw195", action="store_true", help="firmware 1.9.5")
+ap.add_argument("--fw196", action="store_true", help="firmware 1.9.6")
+ap.add_argument("--fw197", action="store_true", help="firmware 1.9.7: the chip restart of 2.9/b2 (WiFi back 4 s later, no report)")
+ap.add_argument("--fw20", action="store_true", help="firmware 2.0: native USB port (the main chip has the connector), [kZ R] reboot")
+ap.add_argument("--fw20b1", action="store_true", help="the test build 2.0b1 (native USB, no [kZ R] reboot)")
+ap.add_argument("--fw20-esp", action="store_true", help="firmware 2.0 with the WiFi chip on the connector (saved setting 0)")
+ap.add_argument("--fw197-stuck", action="store_true",
+                help="test (page 2.9): firmware 1.9.7 as it really behaved after [kE1] - the board never rejoins WiFi and "
+                     "answers nothing on the cable either, until its reset button is pressed (never, here)")
+ap.add_argument("--usb-stall-now", action="store_true", help="test (page 2.9): the USB output is stalled from power-up, until the port re-enumerates")
+ap.add_argument("--usb-stall", type=float, default=0.0,
+                help="test (page 2.9): SEC s after page mode first starts, the board's USB output dies (the UNO R4 WiFi's known "
+                     "stall: input still works) until the port re-enumerates ([kE1], or --usb-unplug)")
 ap.add_argument("--usb-lose-ku", action="store_true",
                 help="test (page 2.8.3): every [kU1] over USB arrives damaged, as 1.9.5 could lose them")
 ap.add_argument("--usb-reset", type=float, default=0.0, help="opening the USB port restarts the board, silent SEC s")
@@ -169,6 +202,19 @@ for g_ in args.pot_glitches:
     m_, n_ = g_.split(":")
     POT_GLITCH[int(m_) - 1] = float(n_)
 GLITCH_BURST = [{"left": 0, "off": 0.0} for _ in range(3)]
+FRIC_M = {}                                   # --fric: motor index -> (towards higher counts, towards lower)
+for f_ in args.fric:
+    m_, a_, b_ = f_.split(":")
+    FRIC_M[int(m_) - 1] = (float(a_), float(b_))
+CRACKLE = {}                                  # --pot-crackle: motor index -> bursts per second
+CRACKLE_LEFT = {}
+if args.pot_crackle:
+    m_, n_ = args.pot_crackle.split(":")
+    CRACKLE[int(m_) - 1] = float(n_)
+STICK = {}                                    # --stick: motor index -> breakaway factor
+if args.stick:
+    m_, f_ = args.stick.split(":")
+    STICK[int(m_) - 1] = float(f_)
 if args.slop:
     m_, c_ = args.slop.split(":")
     SLOP[int(m_) - 1] = float(c_)
@@ -183,15 +229,31 @@ for st_ in args.start:
     m_, pot_ = st_.split(":")
     START[int(m_) - 1] = float(pot_)
 FW = {"ver": ("1.9" if args.old19 else ("1.9.1" if args.fw191 else ("1.9.3" if args.no_potfilter else
-       ("1.9.4" if args.fw194 else ("1.9.5" if args.fw195 else "1.9.6"))))) if args.fw >= 19
+       ("1.9.4" if args.fw194 else ("1.9.5" if args.fw195 else ("1.9.6" if args.fw196 else ("1.9.7" if (args.fw197 or args.fw197_stuck) else ("2.0b1" if args.fw20b1 else ("2.0" if (args.fw20 or args.fw20_esp) else "1.9.8"))))))))) if args.fw >= 19
       else f"{args.fw // 10}.{args.fw % 10}"}
 
 
 def _vt(v):
-    try:
-        return tuple(int(x) for x in v.split("."))
-    except ValueError:
-        return (0,)
+    m = re.match(r"(\d+(?:\.\d+)*)", str(v or ""))      # ("2.0b1" -> (2, 0): the beta mark is ignored here)
+    return tuple(int(x) for x in m.group(1).split(".")) if m else (0,)
+
+
+def fwnum():                                  # what [rd!] and [rdd] report: 19 for 1.9.x, 20 for 2.0
+    return 20 if _vt(FW["ver"]) >= (2, 0) else min(args.fw, 19)
+
+
+def native_fw():                              # firmware 2.0: the USB connector can be the main chip's
+    return args.fw >= 19 and _vt(FW["ver"]) >= (2, 0)
+
+
+def reboot_fw():                              # firmware 2.0 (2.0b2 on): [kZ 'R'] restarts the board
+    return native_fw() and FW["ver"] != "2.0b1"
+
+
+REBOOT = {"at": 0.0, "count": 0}
+
+
+USBO = {"native": bool(args.fw20), "saved": bool(args.fw20)}   # 2.0: who has the USB connector now / as saved
 
 
 def soft_fw():                                # firmware 1.9.1: soft start
@@ -209,7 +271,10 @@ def pot_filter():                             # firmware 1.9.4: pot glitch filte
 
 def build_flags():                            # what [rd!] and the diagnostics frame say about the build
     f = (2 | 4 | 8) if args.fw >= 18 else (2 | 8) if args.fw >= 17 else 0
-    return f | (32 if pot_filter() else 0)
+    f |= (32 if pot_filter() else 0)
+    if native_fw():
+        f |= (64 if USBO["native"] else 0) | (128 if USBO["saved"] else 0)
+    return f
 
 
 def ota_fw():                                 # firmware 1.9.2: updates from the page, WiFi memory
@@ -220,7 +285,8 @@ def usbpage_fw():                             # firmware 1.9.5: the page can use
     return args.fw >= 19 and _vt(FW["ver"]) >= (1, 9, 5)
 
 
-USBP = {"on": False, "ka": 0.0, "starts": 0, "fd": None, "extras": False}   # 1.9.5 USB page mode
+USBP = {"on": False, "ka": 0.0, "starts": 0, "fd": None, "extras": False,   # 1.9.5 USB page mode
+        "stalled": False, "replug": 0.0, "resets": 0}                          # 2.9: the stall, and [kE1] restarts
 
 
 WIFI_FW = tuple(int(x) for x in args.wifi_fw.split("."))
@@ -577,6 +643,12 @@ def chan_tick(c):
             if random.random() < 0.15:                               # contact bounce: a burst up to 25 ms
                 gb["left"], gb["off"] = random.randint(4, 100), off
             pos += off
+    if c.i in CRACKLE:                                               # --pot-crackle: a restless patch now and then
+        if CRACKLE_LEFT.get(c.i, 0) > 0:
+            CRACKLE_LEFT[c.i] -= 1
+            pos += random.uniform(-10.0, 10.0)
+        elif random.random() < CRACKLE[c.i] / PID_HZ:
+            CRACKLE_LEFT[c.i] = random.randint(int(0.05 * PID_HZ), int(0.3 * PID_HZ))
     TICKS[0] += 1
     if args.glitch == c.i + 1 and (TICKS[0] // 3) % 6000 < 4:     # wiper drops out for ~1 ms every 1.5 s
         pos = random.uniform(150, 300)
@@ -653,6 +725,10 @@ def phys_tick(p, d, brake):
             p.v += (deff * VMAX - p.v) * DT / tau
     else:
         fr = FRIC_UP if p.dl > 0 else FRIC_DN
+        if p.i in FRIC_M:                     # --fric: this motor's own friction each way
+            fr = FRIC_M[p.i][0] if p.dl > 0 else FRIC_M[p.i][1]
+        if p.i in STICK and abs(p.v) < 3.0:   # --stick: standing still, it takes more to break loose
+            fr *= STICK[p.i]
         if args.heavy == p.i + 1 and p.dl > 0:   # --heavy: lifting this corner needs a lot more, worse near the top
             fr = 0.22 + 0.30 * max(0.0, (p.x - 560) / 300.0)
         if kg:                                # --load: a worm gear lifting the rider / sliding the rider
@@ -707,6 +783,20 @@ def sim_loop():
     while True:
         nxt += 0.01
         with lock:
+            if REBOOT["at"] and time.time() >= REBOOT["at"]:     # 2.0: [kZ R] - as the RESET button
+                REBOOT["at"] = 0.0
+                REBOOT["count"] += 1
+                boot(cold=False)
+                reset_flags[:] = [0, 4, 1]                     # RSTSR1.SWRF: a software reset
+                samples.clear()
+                for c in list(clients):
+                    try: c.close()
+                    except OSError: pass
+                clients.clear()
+                OFFLINE_UNTIL[0] = time.time() + 3.0           # booting, rejoining WiFi
+                if args.usb:
+                    USBP["replug"] = time.time() + 0.05        # the main chip's USB port goes away and comes back
+                print("simboard restarted ([kZ R])", flush=True)
             if args.reboot_at and not rebooted and time.time() - started > args.reboot_at:
                 rebooted = True
                 boot(cold=True)
@@ -722,6 +812,11 @@ def sim_loop():
                     if c.soft and time.time() - c.soft_since > 40: c.soft = False
             for _ in range(SUB):
                 out = [chan_tick(c) for c in C]
+                if args.supply_sag:                   # --supply-sag: one supply for every motor
+                    tot = sum(abs(d) for d, br in out if not br)
+                    if tot > 0.6:
+                        k = 1.0 / (1.0 + args.supply_sag * (tot - 0.6))
+                        out = [(d * k, br) for d, br in out]
                 for i in range(3):
                     d, br = out[i]
                     phys_tick(P[drvmap[i]], d, br)
@@ -796,7 +891,7 @@ def diag_frame():
     since = lambda x: 65535 if not x else min(65535, int((now - x) * 1000))
     pl = struct.pack("<I3BB4I2HIbBB", ms, *reset_flags, 1, usb["ok"], usb["tgt"], usb["bad"], usb["tcp"],
                      since(usb["last"]), since(usb["last_tgt"]), random.randint(800, 4000), -58,
-                     build_flags(), min(args.fw, 19))
+                     build_flags(), fwnum())
     for c in C:
         pl += struct.pack("<BHhHHHH", c.reason, c.trips, c.trip_at, c.jumps, min(65535, c.jmax), c.fmin, c.fmax)
         c.jmax, c.fmin, c.fmax = 0, c.fb_q, c.fb_q
@@ -828,7 +923,15 @@ def diag_frame():
         return b"SM3D" + bytes([4, len(pl)]) + pl
     wf = 1 | (6 if OTA["placeholder"] else 0)     # remembered; joined with it + a build with the placeholders
     pl += struct.pack("<3BBBh", *WIFI_FW, wf, OTA["state"], OTA["code"])
-    return b"SM3D" + bytes([5, len(pl)]) + pl
+    if _vt(FW["ver"]) < (1, 9, 8):
+        return b"SM3D" + bytes([5, len(pl)]) + pl
+    age = 65535 if not MODR["at"] else min(65535, int(now - MODR["at"]))     # version 6 (1.9.8): the restart report
+    back = 0 if (not MODR["at"] or now < MODR["chip_back"]) else max(1, min(255, int((MODR["chip_back"] - MODR["at"]) * 10)))
+    if not MODR["at"]: tl = 0
+    elif now >= MODR["wifi_at"]: tl = 1 | (1 << 4)
+    else: tl = 0
+    pl += struct.pack("<BHBB", min(255, USBP["resets"]), age, back, tl)
+    return b"SM3D" + bytes([6, len(pl)]) + pl
 
 
 def ota_frame():
@@ -912,7 +1015,7 @@ def ota_run():
     time.sleep(0.45)
     if args.ota_fail == "flash" or time.time() - usb["last"] < 3:
         ota_fail(-104 if args.ota_fail == "flash" else -100); return
-    m = re.search(rb"SMC3_R4 v(\d+\.\d+(?:\.\d+)?)", binary)
+    m = re.search(rb"SMC3_R4 v(\d+\.\d+(?:\.\d+)?(?:b\d+)?)", binary)
     new = m.group(1).decode() if m else "?"
     print(f"simboard: programming firmware {new} ({len(binary)} bytes)", flush=True)
     OFFLINE_UNTIL[0] = time.time() + 4.0      # programming; the board restarts
@@ -963,6 +1066,24 @@ def handle_cmd(c, a, b, out, cl=None):
             board["last_pos"] = time.time()
         elif c == "w" and args.fw >= 19:
             VREG[0] = w - 65536 if w >= 32768 else w
+        elif c == "k" and a == ord("O") and native_fw() and cl is not None:   # 2.0: who gets the USB connector
+            n = b - ord("0") if ord("0") <= b <= ord("2") else b
+            if n in (0, 1, 2):
+                was_native = USBO["native"]
+                USBO["native"] = (n == 1)
+                if n < 2: USBO["saved"] = (n == 1)
+                print(f"simboard [kO {n}]: USB connector -> {'main chip' if n == 1 else 'WiFi chip'}" + (" until reset" if n == 2 else ""), flush=True)
+                USBP["on"] = False; USB_CL["extras"] = False   # (under handle_cmd's lock: not usb_page_end())
+                if was_native != USBO["native"] and args.usb:
+                    USBP["replug"] = time.time() + 0.3    # another port on the PC: the old one goes away, a new one appears
+        elif c == "k" and a == ord("Z") and reboot_fw() and cl is not None:   # 2.0: the page's reboot
+            simhub = usb["last_tgt"] and time.time() - usb["last_tgt"] < 10.0
+            if b == ord("R") and not simhub and not (1 <= OTA["state"] <= 5):
+                REBOOT["at"] = time.time() + 0.15
+                print("simboard [kZ R]: restarting", flush=True)
+        elif c == "k" and a == ord("E") and args.fw >= 19:
+            if _vt(FW["ver"]) >= (1, 9, 7) and b in (1, ord("1")) and (cl is not None) and not (native_fw() and USBO["native"]):   # 1.9.7: the page only; 2.0: not on the native port
+                module_restart(cl is USB_CL)
         elif c == "k" and args.fw >= 19:
             v = VREG[0]
             if b == ord("="):
@@ -1076,7 +1197,7 @@ def handle_cmd(c, a, b, out, cl=None):
             elif k == "~": out.append(reply2("~", 25, 25))
             elif k == "$": out.append(replyw("$", 70))
             elif k == "!" and args.fw >= 14:
-                out.append(reply2("!", build_flags(), args.fw))
+                out.append(reply2("!", build_flags(), fwnum()))
             elif k == "l" and args.fw >= 18: out.append(reply2("l", board["view"], board["lflags"]))
             elif k == "i" and args.fw >= 18: out.append(reply2("i", sensor_state(time.time()), tilt_deg()))
             elif k == "f" and args.fw >= 16: out.append(reply2("f", fshift, frate // 100))
@@ -1149,7 +1270,7 @@ USB_CL = {"extras": False, "peer": "", "usb": True}
 
 def usb_write(data):
     fd = USBP["fd"]
-    if fd is None or not data or args.usb_mute:
+    if fd is None or not data or args.usb_mute or USBP["stalled"]:
         return
     view = memoryview(data)
     end = time.time() + 0.5
@@ -1219,10 +1340,46 @@ def usb_cmd(c, a, b, out):
         usb["tcp"] -= 1                           # (handle_cmd counted it as the page's)
 
 
+MODR = {"at": 0.0, "usb": False, "chip_back": 0.0, "wifi_at": 0.0}   # 1.9.8: how the last chip restart goes
+
+
+def module_restart(via_usb):
+    """[kE1]: the USB/WiFi chip restarts - WiFi clients drop, the USB port goes away and comes back 2 s later (as after
+    a replug), which also clears a --usb-stall. At most once per 15 s.
+    1.9.7: nobody answers on WiFi for 4 s (--fw197-stuck: never again, and the cable stays silent too).
+    1.9.8: the chip answers the board again 5 s later; WiFi rejoins 2 s after that when the request came over WiFi,
+    and when it came over the cable only once the page has left the cable again (or 25 s later) - the board
+    reports all this in its [rdd] frame."""
+    if USBP["resets"] and time.time() - USBP.get("reset_at", 0) < 15:
+        return
+    USBP["resets"] += 1
+    USBP["reset_at"] = time.time()
+    now = time.time()
+    print("simboard [kE1]: USB/WiFi chip restarting" + (" (asked over USB)" if via_usb else ""), flush=True)
+    if args.fw197_stuck:
+        OFFLINE_UNTIL[0] = now + 1e9
+        USBP["stuck"] = True
+    elif _vt(FW["ver"]) >= (1, 9, 8):
+        MODR.update(at=now, usb=via_usb, chip_back=now + 5.0, wifi_at=(now + 27.0) if via_usb else (now + 7.0))
+        OFFLINE_UNTIL[0] = MODR["wifi_at"]
+    else:
+        OFFLINE_UNTIL[0] = now + 4.0
+    for cn in list(clients):
+        try: cn.close()
+        except OSError: pass
+    clients.clear()
+    USBP["replug"] = time.time() + 0.3            # the USB loop re-enumerates the port
+
+
 def usb_page_end():
     with lock:
+        was_on = USBP["on"]
         USBP["on"] = False
         USB_CL["extras"] = False
+        if was_on and MODR["at"] and MODR["usb"] and time.time() < MODR["wifi_at"]:   # 1.9.8: the page left the cable - rejoin now
+            MODR["wifi_at"] = max(time.time() + 2.5, MODR["chip_back"] + 2.0)
+            MODR["usb"] = False
+            OFFLINE_UNTIL[0] = MODR["wifi_at"]
 
 
 def usb_plug():
@@ -1247,6 +1404,7 @@ def usb_port():
     master, slave = usb_plug()
     unplug = [float(x) for x in args.usb_unplug.split(",")] if args.usb_unplug else None
     first_on = None
+    stall_from = 0                                # --usb-stall arms once page mode starts (again, after a restart)
     buf = b""
     last_send = time.time()
     booting_until = None
@@ -1267,6 +1425,35 @@ def usb_port():
             buf = b""
             master, slave = usb_plug()
             print("simboard USB cable back", flush=True)
+            continue
+        if args.usb_stall and USBP["starts"] > stall_from and first_on is None:
+            first_on = time.time()
+        if native_fw() and USBO["native"]:
+            USBP["stalled"] = False                 # 2.0: the main chip's own port doesn't stall
+        elif args.usb_stall_now and not USBP["stalled"] and not USBP.get("stalled_once"):
+            USBP["stalled"] = True; USBP["stalled_once"] = True   # --usb-stall-now: stalled from the start (once)
+            print("simboard USB output stalled (from the start)", flush=True)
+        if args.usb_stall and first_on is not None and not USBP["stalled"] and time.time() - first_on >= args.usb_stall and not (native_fw() and USBO["native"]):
+            USBP["stalled"] = True                # --usb-stall: from now on nothing the board sends reaches the PC
+            print("simboard USB output stalled", flush=True)
+        if USBP["replug"] and time.time() >= USBP["replug"]:
+            USBP["replug"] = 0.0                  # [kE1]: the port goes away for 2 s and comes back, stall cleared
+            USBP["fd"] = None
+            with lock:                            # (page mode ends with the restart - not "the page left the cable")
+                USBP["on"] = False
+                USB_CL["extras"] = False
+            for fd in (master, slave):
+                try: os.close(fd)
+                except OSError: pass
+            try: os.unlink(args.usb)
+            except OSError: pass
+            time.sleep(2.0)
+            buf = b""
+            USBP["stalled"] = bool(USBP.get("stuck"))   # (--fw197-stuck: the board stays silent on the cable too)
+            first_on = None
+            stall_from = USBP["starts"]           # (the next page mode gets its --usb-stall seconds again)
+            master, slave = usb_plug()
+            print("simboard USB port back after the chip restart (or on the other chip)", flush=True)
             continue
         r, _, _ = select.select([master], [], [], 0.01)
         if r:

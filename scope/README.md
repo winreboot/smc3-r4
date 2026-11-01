@@ -2,7 +2,7 @@
 
 `smc3_scope.py` is a single file that uses only the Python standard library (3.8 or newer). It connects to the
 board's telemetry port over WiFi, keeps the last two minutes of data, and serves the page. It also runs the test
-signals, auto-tune and Check, Seat setup, moving the motors from the page (2.4), the watcher and the diagnostics. SimHub keeps the USB port; the page never needs it.
+signals, auto-tune and Check, Seat setup, moving the motors from the page (2.4), the watcher and the diagnostics. SimHub keeps the USB port; the page needs it only for calibration over the cable with SimHub closed (2.8): the browser opens the port itself (Web Serial, 2.9) and sends its bytes here over a WebSocket (`/usb/browser`), or a bridge on the PC with the cable links in (`/usb/link`; the page file is the bridge too, `--usb-bridge PORT --page URL`). See [docs/PROTOCOL.md](../docs/PROTOCOL.md).
 
 The 3D view's engine, three.js r160 (MIT licence, served at `/vendor/three/LICENSE.txt`), is built into the file,
 so the page works on a network without internet access.
@@ -80,6 +80,8 @@ what the newest release has: `smc3_scope_v<version>.py` and `SMC3_R4_v<version>.
 - Restarting: `os.execv` on Linux, macOS and in Docker (same process - PID 1 stays PID 1). On Windows the file you
   started stays as a parent: it runs the page as a child and starts the right one again when the child exits with
   code 75 (`SMC3_RESTART_SPAWN=1` does the same on Linux, for testing).
+- Versions compare as numbers padded to four (2.0 = 2.0.0.0 < 2.0.1); a beta sorts before its release (2.9b1 < 2.9).
+  Releases carry only release versions.
 - **Go back to built-in** sets `off` and restarts. Firmware is only offered as a download link; the browser fetches
   it from GitHub.
 - The three `/update/` POSTs need the header `X-SMC3: 1`, which the page sends and another website open in the same
@@ -97,17 +99,21 @@ motors itself: 50 times a second it sends each motor's position, eased in and ou
 commands (`[kH 30]`: 3 s). So if this server stops, SimHub has the seat back within 3 s; Resume SimHub gives it back
 at once (`[kH 0]`). A dropped connection to the board, or anything else that moves the motors, ends it too.
 
-## The USB cable (2.8)
+## The USB cable (2.8, 2.9)
 
-With firmware 1.9.5 (1.9.6 recommended) the page can reach the board over its USB cable instead of WiFi, for calibration with SimHub
-closed. A bridge on the PC with the cable connects out to the page (`POST /usb/link` on the web port, then the board's
+With firmware 1.9.5 (2.0 recommended: the board's own USB port) the page can reach the board over its USB cable instead
+of WiFi, for calibration with SimHub closed. From 2.9 the browser opens the port itself (Web Serial) and pumps its bytes
+over a WebSocket (`GET /usb/browser`) - no bridge; the rest of this section is the bridge, for other browsers and
+other PCs. A bridge on the PC with the cable connects out to the page (`POST /usb/link` on the web port, then the board's
 bytes both ways), the page drops its WiFi connection and uses the cable until the bridge ends; it sends `[kU1]` every
 second so the board streams over USB and leaves WiFi alone. Windows: the page serves a PowerShell bridge at
 `/usb-bridge.ps1` with its own address in it (Settings, USB cable shows the line for Win+R). Anywhere else:
 `smc3_scope.py --usb-bridge PORT --page http://<page>:<port>` (pyserial if installed; Linux and macOS work without).
 From 2.8.1 the bridge keeps running when the page goes back to WiFi: it closes the port and asks the page every second
 (`POST /usb/standby`) until the header's WiFi / USB switch asks for the cable again (`--standby` starts it that way).
-Details in [docs/PROTOCOL.md](../docs/PROTOCOL.md#the-usb-bridge-page-28).
+Details in [docs/PROTOCOL.md](../docs/PROTOCOL.md#the-usb-bridge-page-28) and, for the browser's link and firmware
+2.0's own port, [the browser's own link](../docs/PROTOCOL.md#the-browsers-own-link-page-29) and
+[the board's own USB port](../docs/PROTOCOL.md#the-boards-own-usb-port-firmware-20).
 
 ## Security
 

@@ -17,8 +17,11 @@ The page lets you:
 - **move each motor by dragging its slider**, or send the whole seat back to center with one button;
 - find out why when something goes wrong, and where the rig struggles under load;
 - **update the firmware over WiFi**: pick the `.bin` from the Arduino IDE and press Install;
-- **calibrate over the USB cable** instead of WiFi, with SimHub closed: one line pasted into Win+R on the sim PC, then
-  a WiFi / USB switch at the top of the page, and the page talks to the board without WiFi's hiccups.
+- **calibrate over the USB cable** instead of WiFi, with SimHub closed: flip the WiFi / USB switch at the top of the
+  page (Chrome, Edge, Brave, Firefox 151+; or a bridge started with one line in Win+R), and the page talks to the
+  board without WiFi's hiccups;
+- **run test signals on several motors at once** (twist, heave, corner, wave) and test every motor moving together;
+- **restart the board** from the page - never while SimHub is driving.
 
 It knows two kinds of rig: **two front lifts plus a traction-loss motor** (motors 1 and 2 lift the front corners,
 motor 3 is mounted horizontally and swings the rear left and right about a pivot at the front - the default), and
@@ -26,7 +29,8 @@ motor 3 is mounted horizontally and swings the rear left and right about a pivot
 
 SimHub keeps driving the rig over USB exactly as before. The page talks to the board over WiFi, so both run at
 the same time. You can open it from any browser, including your phone. For calibration with SimHub closed, the page
-can use the USB cable instead (page 2.8, firmware 1.9.5; 1.9.6 recommended): see [USB cable for calibration](docs/INSTALL.md#usb-cable-for-calibration).
+can use the USB cable instead (page 2.8, firmware 1.9.5; 2.0 recommended - it gives the board its own USB port): see
+[USB cable for calibration](docs/INSTALL.md#usb-cable-for-calibration).
 
 ![Dashboard: three motors moving under SimHub, motor 2 selected](docs/img/dashboard.png)
 
@@ -36,11 +40,11 @@ can use the USB cable instead (page 2.8, firmware 1.9.5; 1.9.6 recommended): see
 
 | Folder | What it is |
 |---|---|
-| [`firmware/SMC3_R4`](firmware/SMC3_R4) | Firmware for the **Arduino UNO R4 WiFi**. It speaks the SMC3 v0.70 protocol, so SimHub, SimTools, FlyPT Mover and SMC3Utils work unchanged. It adds a 4 kHz control loop, 14-bit pot readings, quiet 25 kHz PWM, target smoothing, a fixed PID, WiFi telemetry at 100 samples a second, an LED matrix that shows live motor bars and problems in words, a level trim with travel limits and end stops for each motor, a soft start, firmware updates over WiFi from the page, and an optional WT901C motion sensor with tilt limits for each direction. |
+| [`firmware/SMC3_R4`](firmware/SMC3_R4) | Firmware for the **Arduino UNO R4 WiFi**. It speaks the SMC3 v0.70 protocol, so SimHub, SimTools, FlyPT Mover and SMC3Utils work unchanged. It adds a 4 kHz control loop, 14-bit pot readings, quiet 25 kHz PWM, target smoothing, a fixed PID, WiFi telemetry at 100 samples a second, an LED matrix that shows live motor bars and problems in words, a level trim with travel limits and end stops for each motor, a soft start, firmware updates over WiFi from the page, its own USB port (2.0: no WiFi chip in between), and an optional WT901C motion sensor with tilt limits for each direction. |
 | [`scope/`](scope) | `smc3_scope.py`: the page server. It's one file using only the Python standard library, with a Dockerfile and compose files for a NAS or any PC. A ready-made Docker image is on `ghcr.io/winreboot/smc3-scope`; step by step for Windows, Mac, Linux, Raspberry Pi, Docker and Synology: [docs/INSTALL.md](docs/INSTALL.md). |
 | [`tools/simboard.py`](tools/simboard.py) | A simulated rig. You can try everything without hardware, and inject faults (reversed motor, swapped wiring, glitchy pot and more). |
 | [`firmware/SMC3_smooth`](firmware/SMC3_smooth) | The original SMC3 for the **UNO R3**, with target smoothing and the PID fixes, for anyone staying on an R3. |
-| [`docs/`](docs) | [Install step by step](docs/INSTALL.md), screenshots, the [protocol](docs/PROTOCOL.md), the [diagnostics](docs/DIAGNOSTICS.md) file format and an [example diagnostics file](docs/examples/diagnostics-full-check.json). |
+| [`docs/`](docs) | [Install step by step](docs/INSTALL.md), screenshots, the [protocol](docs/PROTOCOL.md), the [diagnostics](docs/DIAGNOSTICS.md) file format, an [example diagnostics file](docs/examples/diagnostics-full-check.json) and the [lessons learned](docs/LESSONS-LEARNED.md) on the way. |
 
 > ⚠️ **A motion rig can hurt you.** It moves a person with motors strong enough to lift them. Test with the seat
 > empty, keep hands and feet clear, and keep a hand near the motor power switch whenever you test, tune or flash
@@ -163,6 +167,11 @@ cutoff ("Max limit") and Clip. You also get the loop divider, the PWM frequency,
 Drive one motor from the page with a sine, square, triangle or step, or hold it at a position. Use this to see
 overshoot and lag before you touch a game. Stop SimHub's motion output first.
 
+**Several motors at once** (page 2.9): the **Together** list and the Presets run one signal on several motors, each
+around its own centre - **Twist** moves the two front lifts opposite each other (one goes down while the other goes
+up: the most twist), **Heave** the lifts together, **Corner** the front lifts opposite each other with the rear slide,
+**Wave** every motor in turn, a third of a cycle apart.
+
 ![Square test on motor 1](docs/img/test-tools.png)
 
 ### Auto-tune
@@ -212,6 +221,13 @@ It measures the pot's noise first, and every limit that judges "it moved" or "it
 noisy pot doesn't look like a motor going the wrong way or ringing. A motor is only called wired backwards when it
 goes the wrong way **both** ways: a seat that sinks under its weight while the drive is still too weak goes the
 wrong way one way only. If it does stop for safety, that motor is switched off with its previous settings back.
+
+**Test together** (page 2.9) runs every motor in use with the values it has now: each alone, then all together,
+then twisted. It shows what moving together costs each one - more lag or running out of drive points to a shared
+supply that sags, more overshoot or ringing to a frame that flexes - and changes nothing.
+
+A crackling pot (bursts of readings a few counts off, whatever the Kp) doesn't end the Kp sweep early (page 2.9): the
+hold is judged over most of a second with a median spread, against what the pot does at the gentlest Kps.
 
 | Checklist first | Running | Result |
 |---|---|---|
@@ -302,6 +318,10 @@ says why. The first install of it (1.9.3 or later; 1.9.2 didn't compile) goes ov
 own firmware 0.4.0 or newer (Arduino IDE, Tools, Firmware Updater).
 
 ![Firmware update: SMC3_R4 1.9.3 installed over WiFi](docs/img/firmware-update.png)
+
+**Restart** (page 2.9, firmware 2.0): the button next to Settings restarts the board as its RESET button does - the
+motors switch off first, and the page reconnects by itself. It is refused while SimHub sends positions, and while
+auto-tune, Seat setup or the full check runs.
 
 **Updates** (page 2.7): the page asks GitHub twice a day what the newest release has. When there's a newer page or
 firmware, a balloon on the header's **Settings** button says **Update**; it leads straight here. The header shows the
@@ -478,6 +498,11 @@ Bourns 6639S-1-103, 10 kΩ) or a contactless Hall-effect sensor with a 0-5 V out
    [firmware/README.md](firmware/README.md).
 3. Upload. At power-up the board's IP address scrolls across the LED matrix. Reserve it in your router.
 
+Firmware 2.0 then takes the board's USB connector for the main chip: Windows plays its unplug and plug sounds and a
+new COM port appears - that is the one for SimHub. To upload again with the IDE, first press **WiFi
+chip until the next reset** in the page's Settings, USB cable (or press RESET twice, about a second apart); see
+[firmware/README.md](firmware/README.md#flashing).
+
 From firmware 1.9.2 on, later versions can be installed from the page instead (Settings, Firmware update).
 
 Your SMC3Utils settings stay in EEPROM in the same layout. If the board had none, the defaults are written.
@@ -504,7 +529,7 @@ board on network**).
 [latest release](https://github.com/winreboot/smc3-r4/releases/latest) and run
 
 ```sh
-python3 smc3_scope_v2.8.py --host 192.168.1.50 --bind 0.0.0.0 --web 8198
+python3 smc3_scope_v2.9.py --host 192.168.1.50 --bind 0.0.0.0 --web 8198
 ```
 
 (`py` instead of `python3` on Windows). `--bind 0.0.0.0` makes the page reachable from other devices; without it,
@@ -514,9 +539,10 @@ From then on the page updates itself: Settings, **Updates**, **Update page** (pa
 
 ### 3. SimHub
 
-In SimHub, set the motion output to an **SMC3** device on the board's COM port, exactly as with an UNO R3. Only
+In SimHub, set the motion output to an **SMC3** device on the board's COM port (with firmware 2.0 the new one
+that appeared after its first start), exactly as with an UNO R3. Only
 one program can use the COM port, so close SMC3Utils and the Arduino serial monitor. The page never needs the COM
-port. With a traction-loss rig, SimHub's traction-loss (yaw / slip) output goes to motor 3; if the rear swings the
+port while SimHub drives. With a traction-loss rig, SimHub's traction-loss (yaw / slip) output goes to motor 3; if the rear swings the
 wrong way in a slide (in a right-hand slide it should swing out to the left), tick Invert on that output.
 
 ### 4. Seat setup
@@ -528,8 +554,8 @@ traction loss, let each motor find its safe travel, and save. SimHub's centre is
 
 Run **auto-tune** on each motor: seat empty first, with your weight entered. Then either **Check** with you in the
 seat, or run auto-tune again with you in it. Try it in a game, and **Save to EEPROM**. Over WiFi a hiccup now and then
-makes auto-tune redo a test move; for a steadier link close SimHub and use the **USB cable** (Settings, USB cable -
-page 2.8, firmware 1.9.5).
+makes auto-tune redo a test move; for a steadier link close SimHub and use the **USB cable**: flip the switch at the
+top of the page to USB (page 2.9; firmware 2.0 recommended).
 
 **Soft start** (firmware 1.9.1): after the rig has been off the seat may have ridden down a little. At power-up, and
 when you press Enable Motors, each motor creeps back to its position instead of jumping there, then runs normally.
@@ -571,6 +597,11 @@ noise. To see what the diagnostics find, add a fault:
 | `--seat-tilt 1.6:-2.2` | the seat isn't level with every motor at 512 (for Seat setup) |
 | `--stops 3:180:860` | motor 3 hits a mechanical stop at pot 180 and 860 |
 | `--seat-setup` | start with a saved seat set-up (level trim, travel limits, end stops, tilt limits) |
+| `--usb PATH` | the board's USB port as a pseudo-terminal at PATH, for the bridge (`--usb-bridge PATH`) |
+| `--fw20` / `--fw20-esp` | firmware 2.0 with its own USB port / set to classic (the WiFi chip has the connector) |
+| `--usb-stall 30` | the WiFi chip's USB stall: 30 s after the cable link starts nothing comes back until the port re-enumerates |
+| `--pot-crackle 2:3` | motor 2's pot crackles about 3 times a second (bursts the glitch filter can't catch) |
+| `--supply-sag 2.5` | a weak shared motor supply: every motor gets less drive when they all pull at once |
 
 ## Compatibility
 
@@ -590,6 +621,8 @@ noise. To see what the diagnostics find, add a fault:
   - 1.9.4: a pot glitch filter - a reading too far from the last one to be the motor is held back for up to 10 ms;
   - 1.9.5: USB page mode - the page can use the USB cable instead of WiFi (calibration with SimHub closed);
   - 1.9.6: no more lost bytes on the USB port (the serial receive interrupts come before the PID interrupt).
+  - 2.0: its own USB port - the main chip has the USB connector, so the WiFi chip's USB stall and lost bytes are
+    gone; the page's Restart button; nothing restarts the board or its chips while SimHub sends positions.
 
   See the [CHANGELOG](CHANGELOG.md).
 - New commands are documented in [docs/PROTOCOL.md](docs/PROTOCOL.md). They go over WiFi; USB stays plain SMC3

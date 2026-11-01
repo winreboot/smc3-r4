@@ -80,6 +80,9 @@ cover:
 - old firmware;
 - the wrong bridge mode;
 - SimHub not sending, or garbage on the USB port;
+- the USB port (page 2.9): who has the board's USB connector (firmware 2.0: the main chip's own port), the board's
+  own report on its last WiFi/USB chip restart (when it came back, how WiFi rejoined), and a 1.9.7 board that should
+  update (its chip restart left the board off WiFi);
 - impossible settings: PWMmax 0, PWMmin at or above PWMmax, Kp 0, no cutoff, Clip outside the cutoff;
 - unsaved settings;
 - motors that are off;
@@ -117,7 +120,7 @@ The newest 20 are kept in `diagnostics/reports/` and can be downloaded from the 
 | `made`, `kind`, `problem` | When, quick or full, and what the owner typed |
 | `summary` | The findings as plain text |
 | `findings` | The findings, structured |
-| `board` | Connection, firmware, build options, uptime, last start cause, WiFi, USB counters, per-motor counters, motion sensor and LED matrix (1.8), seat set-up: level trim, travel limits, end stops, tilt limits (1.9), soft start (1.9.1), the WiFi module's firmware, WiFi memory and the last update (1.9.2) |
+| `board` | Connection, firmware, build options (2.0: who has the USB port), uptime, last start cause, WiFi, USB counters, per-motor counters, motion sensor and LED matrix (1.8), seat set-up: level trim, travel limits, end stops, tilt limits (1.9), soft start (1.9.1), the WiFi module's firmware, WiFi memory and the last update (1.9.2), the last WiFi/USB chip restart (`module_restart`, 1.9.8) |
 | `firmware_update` | The page's own record of the last firmware update: from and to which version, every step, the result |
 | `rig` | Motors in use, motor names, layout (front lifts + rear traction loss, or lifts), which motor is the rear slide and which way it goes for higher numbers |
 | `settings` | Running settings, saved settings (EEPROM), the differences, the last save made from the page |

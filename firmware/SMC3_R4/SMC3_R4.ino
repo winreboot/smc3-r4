@@ -41,9 +41,65 @@
 // Pots: wiper must stay within 0-5 V (the R4 is a 5 V board, so existing wiring is fine).
 //****************************************************************************************************************
 
-#define FW_VERSION     "1.9.6"         // shown in the USB boot banner; [ver] still answers 70 for SMC3Utils
-#define FW_VERSION_NUM 19              // reported by [rd!] so smc3_scope can check what it is talking to (1.9.x = 19)
-#define FW_CAPS        "SMC3CAPS:ota1,wifimem1,usbpage1"   // 1.9.2: what this build can do - smc3_scope looks for it in a .bin
+#define FW_VERSION     "2.0"           // shown in the USB boot banner; [ver] still answers 70 for SMC3Utils
+#define FW_VERSION_NUM 20              // reported by [rd!] so smc3_scope can check what it is talking to (1.9.x = 19, 2.0 = 20)
+#define FW_CAPS        "SMC3CAPS:ota1,wifimem1,usbpage1,modreset2,nativeusb1,reboot1"   // 1.9.2: what this build can do - smc3_scope looks for it in a .bin
+
+// v2.0 changes: the board's USB connector belongs to the main chip, and the page can restart the board.  Tested on
+//                a rig as 2.0b1 and 2.0b2; 2.0 also carries 1.9.7 and 1.9.8 (test builds, never released on their
+//                own): the USB/WiFi chip restart and its fixes, still used when the WiFi chip has the connector.
+//                The protocol for SimHub and SMC3Utils is unchanged, and every saved setting is kept (2.0 adds EEPROM
+//                108-109 for the connector's owner).
+
+// v2.0, part 2 (2.0b2): [kZ 'R'] (the page only) restarts the board, as its RESET button does: the motors are switched off
+//                (brakes on), the page's connection closed, then the main chip resets (NVIC_SystemReset). The WiFi
+//                chip keeps running (the main chip redoes the link handshake at boot, as after RESET); on the main
+//                chip's own USB port Windows sees an unplug and a plug.  Refused while SimHub is sending positions
+//                (the last one less than 10 s ago) and during a firmware update.  The double-RESET mark (part 1) is
+//                cleared first, so a restart soon after power-up doesn't hand the USB connector to the WiFi chip.
+//                FW_CAPS says "reboot1".
+
+// v2.0, part 1 (2.0b1): the USB connector is the main chip's.  On the UNO R4 WiFi the connector normally goes to the
+//                WiFi chip (ESP32-S3), which bridges it to the main chip's UART (SCI9) at the host's baud rate - and
+//                that bridge is where the USB stall (1.9.7/1.9.8 notes), the lost bytes (1.9.6) and the boot garbage
+//                came from.  The board has a USB switch the main chip controls (the Arduino core flips it for its
+//                HID libraries): with USB_OWNER 1 the sketch takes the connector itself at boot (__USBStart(), the
+//                core's TinyUSB CDC "SerialUSB"), so SimHub and the page talk to the main chip directly - full USB
+//                speed, no baud rate, nothing in between.  WiFi is unchanged (the WiFi chip stays on its own link).
+//                The port is a new COM port on the PC (product "UNO R4 WiFi", the same vendor id), once.
+//                What's where:  UsbPort points at SerialUSB or Serial; every USB write goes through UsbWrite(),
+//                which never blocks when nobody reads the port (the core's write() would spin for ever on a full
+//                buffer).  [kO n] (the page only): 0 = the WiFi chip owns the connector (saved), 1 = the main chip
+//                (saved), 2 = the WiFi chip until the next reset - for an Arduino IDE upload, which goes through
+//                the WiFi chip.  Two quick RESET presses (within 3 s, longer apart than the bootloader's own
+//                double-tap) do the same as [kO 2] without the page.  Saved in EEPROM 108-109 (0xC4 = valid).
+//                Build flags: bit 6 = the main chip has the connector now, bit 7 = that is the saved setting.
+//                The chip restart ([kE1]) is refused while SimHub is sending positions (never during a game) and is
+//                pointless on the native port (the WiFi chip isn't in the USB path): the page knows from bit 6.
+//                FW_CAPS says "nativeusb1".
+
+// v1.9.8 changes (test build, part of 2.0): the chip restart of 1.9.7 left the board off WiFi until its reset button was pressed.  After the
+//                chip's "+RESET" the main chip kept its side of the module link (SCI1, "Serial2") and the WiFiS3
+//                library's "already begun" state, so nothing re-opened the link or redid the start-up handshake
+//                ("+SOFTRESETWIFI") the chip expects after it boots; every WiFi.begin() then blocked for its 15 s
+//                timeout and failed, the loop crawled (the matrix scrolled at a tenth of its speed), the page's
+//                USB probes went unanswered.  Now RestartModule() closes the link (modem.end()) and clears the
+//                library's begun flag, and ServiceNetwork() after a restart: waits 5 s for the chip to boot, redoes
+//                the handshake first (1.5 s at most, every 2 s until it answers) and only then calls WiFi.begin();
+//                when the request came over the USB cable it leaves WiFi alone for 25 s so the page can link again
+//                over the cable without the board being busy (page mode makes no WiFi calls; WiFi rejoins within
+//                seconds of the page leaving the cable - UsbPageEnd() retries at once).  The [rdd] frame is version
+//                6: five bytes report how the last restart went (count, age, when the chip answered, WiFi tries and
+//                the last result), so the page can log it.  FW_CAPS says "modreset2".  Nothing else changed.
+
+// v1.9.7 changes (test build, part of 2.0): [kE1] (the page only - over WiFi, or over USB in page mode) restarts the board's USB/WiFi chip
+//                (the ESP32-S3: its "+RESET" command over the module link).  The UNO R4 WiFi's USB output dies now
+//                and then after minutes of streaming (a known board problem - the chip's USB stack; the PC's
+//                commands still arrive, nothing goes back, only a replug clears it): the page sends [kE1] when the
+//                cable goes quiet, the chip restarts, USB re-enumerates (as a replug) and WiFi rejoins a few seconds
+//                later (ServiceNetwork retries every 4 s for a minute after a restart).  Page mode and the WiFi client
+//                end at once; SimHub's USB port is gone for about two seconds.  At most once per 15 s.  FW_CAPS says
+//                "modreset1".  Nothing else changed.
 
 // v1.9.6 changes: no more lost bytes on the USB port.  On the RA4M1 the USB port (Serial, SCI9) and the motion
 //                sensor's port (Serial1, SCI2) have no receive FIFO: one byte waits in the receive register while
@@ -449,6 +505,36 @@ uint8_t      ReplyTarget = 0;                 // 0 = reply over USB, 1 = reply t
 bool         UsbPage = false;                 // 1.9.5: the page is on the USB cable ([kU1]): telemetry there, no WiFi
 unsigned long UsbPageMillis = 0;              // ... last [kU1]
 uint32_t     UsbPageStarts = 0;               // ... how often it was switched on (test / diagnostics)
+bool          ModuleRestartReq = false;        // 1.9.7: [kE1] asked for the USB/WiFi chip to restart (done in loop())
+unsigned long ModuleRestartAt = 0;             // when it last did (0 = never)
+uint16_t      ModuleRestarts = 0;
+bool          ModuleRestartUsb = false;        // 1.9.8: the request came over the USB cable (that link comes back first)
+uint8_t       ModemBackTenths = 0;             // 1.9.8: 0.1 s after the restart when the chip answered again (0 = not yet)
+uint8_t       ModuleWifiTries = 0;             // 1.9.8: WiFi.begin() calls since the restart (for the report)
+uint8_t       ModuleWifiLast = 0;              // 1.9.8: 0 none yet, 1 joined, 2 failed, 3 no module, 4 chip silent
+#define MODULE_BOOT_MS      5000               // 1.9.8: the chip is booting - nothing on the link before this
+#define MODULE_USB_FIRST_MS 25000              // 1.9.8: after a request over USB, WiFi waits this long for the cable
+
+//----------------------------------------------------------------------------------------------------------------
+//  2.0: who has the USB connector - the main chip (native CDC, "SerialUSB") or the WiFi chip (its bridge to SCI9)
+//----------------------------------------------------------------------------------------------------------------
+#ifndef USB_OWNER
+#define USB_OWNER 1                            // default for a board without the setting: 1 = the main chip
+#endif
+#define USB_EE          108                    // EEPROM 108 = 0xC4 "valid", 109 = owner (0 WiFi chip, 1 main chip)
+#define USB_DT_MS       3000                   // two resets this close together: the WiFi chip keeps the connector
+#define USB_DT_MAGIC1   0x5C
+#define USB_DT_MAGIC2   0xA3
+bool          RebootReq = false;               // 2.0: [kZ 'R'] - restart the board (done in loop())
+uint8_t       UsbOwner = USB_OWNER;            // the saved setting
+bool          UsbNative = false;               // the main chip has the connector right now
+bool          UsbTempEsp = false;              // the WiFi chip has it until the next reset ([kO 2] / double reset)
+bool          UsbNativeStarted = false;        // __USBStart() done (once per boot)
+bool          UsbHostSlow = false;             // the last write found the port full: don't wait for it again
+unsigned long UsbDoubleResetAt = 0;            // the double-reset mark is cleared USB_DT_MS after boot
+arduino::HardwareSerial *UsbPort = &Serial;    // where SimHub and the page are
+void __USBStart();                             // the core: start TinyUSB (and flip the switch to the main chip)
+void configure_usb_mux();                      // the variant: the switch alone
 #define USB_PAGE_TIMEOUT_MS 5000              // page mode ends this long after the last [kU1]
 
 //----------------------------------------------------------------------------------------------------------------
@@ -644,6 +730,8 @@ static inline int BuildFlags()
 #if POT_FILTER
     flags |= 32;                               // 1.9.4: pot glitch filter
 #endif
+    if (UsbNative) { flags |= 64; }           // 2.0: the main chip has the USB connector now
+    if (UsbOwner == 1) { flags |= 128; }       // 2.0: ...and that is the saved setting
     return flags;
 }
 
@@ -1393,6 +1481,131 @@ void SeatCommand(uint8_t f, uint8_t c)
 }
 
 //****************************************************************************************************************
+//    2.0: the USB connector - main chip (native) or WiFi chip (bridge)
+//****************************************************************************************************************
+
+void UsbPageEnd();
+
+void UsbDoubleResetMark(bool set)                // VBTBKR[2..3]: survives a reset, not a power-up (as the bootloader's double-tap)
+{
+#ifdef R_SYSTEM
+    R_SYSTEM->PRCR = (uint16_t) 0xA502U;         // PRC1: unlock the battery-backed registers
+    R_SYSTEM->VBTBKR[2] = set ? USB_DT_MAGIC1 : 0;
+    R_SYSTEM->VBTBKR[3] = set ? USB_DT_MAGIC2 : 0;
+    R_SYSTEM->PRCR = (uint16_t) 0xA500U;
+#else
+    (void)set;
+#endif
+}
+
+bool UsbDoubleResetSeen()
+{
+#ifdef R_SYSTEM
+    return R_SYSTEM->VBTBKR[2] == USB_DT_MAGIC1 && R_SYSTEM->VBTBKR[3] == USB_DT_MAGIC2;
+#else
+    return false;
+#endif
+}
+
+void ReadUsbOwner()
+{
+    if (EEPROM.read(USB_EE) == 0xC4) { UsbOwner = EEPROM.read(USB_EE + 1) ? 1 : 0; }
+}
+
+void WriteUsbOwner()
+{
+    EEPROM.update(USB_EE, 0xC4);
+    EEPROM.update(USB_EE + 1, UsbOwner);
+}
+
+void UsbGoNative()                               // the connector to the main chip: TinyUSB CDC on SerialUSB
+{
+    if (!UsbNativeStarted) { __USBStart(); UsbNativeStarted = true; }   // starts the stack and flips the switch
+    else { configure_usb_mux(); }                                       // the switch alone (the stack is up)
+    SerialUSB.begin(115200);                     // (the baud rate means nothing on a native port)
+    SerialUSB.dtr();                             // from now on the core ignores DTR: SimHub may not raise it
+    UsbPort = &SerialUSB;
+    UsbNative = true;
+    UsbHostSlow = false;
+    BufferEnd = -1;
+}
+
+void UsbGoEsp()                                  // the connector to the WiFi chip: its bridge to Serial (SCI9)
+{
+    if (UsbNativeStarted) { pinMode(21, OUTPUT); digitalWrite(21, LOW); }   // the switch back (left alone otherwise)
+    Serial.begin(500000);
+    RaiseSerialRxPriority();
+    UsbPort = &Serial;
+    UsbNative = false;
+    BufferEnd = -1;
+}
+
+void UsbStart()                                  // setup(): the saved setting, unless this is the second reset in 3 s
+{
+    ReadUsbOwner();
+    bool twice = UsbDoubleResetSeen();
+    UsbDoubleResetMark(true);
+    UsbDoubleResetAt = millis();
+    if (UsbDoubleResetAt == 0) { UsbDoubleResetAt = 1; }
+    if (twice) { UsbTempEsp = true; }
+    if (UsbOwner == 1 && !UsbTempEsp) { UsbGoNative(); } else { UsbGoEsp(); }
+}
+
+void UsbOwnerCommand(uint8_t n)                  // [kO n]: 0 WiFi chip (saved), 1 main chip (saved), 2 WiFi chip until reset
+{
+    if (n >= '0' && n <= '2') { n = (uint8_t)(n - '0'); }
+    if (n > 2) { return; }
+#if ENABLE_WIFI
+    if (UsbPage) { UsbPageEnd(); }               // whoever is on the cable loses it now
+#endif
+    if (n == 2) { UsbTempEsp = true; if (UsbNative) { UsbGoEsp(); } return; }
+    UsbOwner = n;
+    WriteUsbOwner();
+    UsbTempEsp = false;
+    if (n == 1 && !UsbNative) { UsbGoNative(); }
+    else if (n == 0 && UsbNative) { UsbGoEsp(); }
+}
+
+// Every byte to the USB port goes through here.  The core's SerialUSB.write() spins until its 256-byte buffer has
+// room - for ever when nobody reads the port (SimHub closed, a program holding the port without reading).  So:
+// write only what fits, wait at most 10 ms for room (the PC empties the buffer in well under 1 ms when it reads),
+// and once a wait has failed don't wait again until room was seen.  The WiFi chip's bridge (Serial) never blocks.
+size_t UsbWrite(const uint8_t *buf, size_t n)
+{
+    if (!UsbNative) { return Serial.write(buf, n); }
+    size_t done = 0;
+    unsigned long t0 = micros();
+    while (done < n)
+    {
+        int room = UsbPort->availableForWrite();
+        if (room <= 0)
+        {
+            if (UsbHostSlow || (micros() - t0) > 10000UL) { UsbHostSlow = true; return done; }
+            continue;
+        }
+        UsbHostSlow = false;
+        size_t k = (size_t)room < (n - done) ? (size_t)room : (n - done);
+        done += UsbPort->write(buf + done, k);
+    }
+    return done;
+}
+
+void UsbPrint(const char *s) { UsbWrite((const uint8_t *)s, strlen(s)); }
+
+void RebootBoard()                               // 2.0: [kZ 'R'] - as the RESET button
+{
+    RebootReq = false;
+    for (uint8_t m = 0; m < NUM_MOTORS; m++) { DisableMotor(m); DisableReason[m] = DIS_COMMAND; }
+#if ENABLE_WIFI
+    if (ClientUp) { TcpClient.stop(); ClientUp = false; }
+#endif
+    UsbPort->flush();
+    delay(100);                                  // brakes on, the last bytes out
+    UsbDoubleResetMark(false);                   // not "the second reset in 3 s"
+    NVIC_SystemReset();
+}
+
+//****************************************************************************************************************
 //    Serial replies (byte format unchanged)
 //****************************************************************************************************************
 
@@ -1405,7 +1618,7 @@ void ReplyWrite(const uint8_t *buf, size_t n)
         return;
     }
 #endif
-    Serial.write(buf, n);
+    UsbWrite(buf, n);
 }
 
 void SendTwoValues(int id, int v1, int v2)
@@ -1634,6 +1847,21 @@ void ParseCommand(const unsigned int *buf, uint8_t source)
         case 'w': ValueReg = (int16_t)(uint16_t)word; break;     // 1.9: value register for [k]
         case 'k':                                                // 1.9: seat set-up
             if (b1 == 'U') { if (source == 0) { UsbPageCommand((uint8_t)b2); } }   // 1.9.5: page on the USB cable
+            else if (b1 == 'E')                                  // 1.9.7: restart the USB/WiFi chip (the page only)
+            {
+                // 2.0: never while SimHub is sending positions (a game is on), and not on the native port
+                bool simhub = LastUsbTargetMillis && (millis() - LastUsbTargetMillis) < 10000;
+                if ((source == 1 || usbPage) && (b2 == 1 || b2 == '1') && !simhub && !UsbNative) { ModuleRestartReq = true; ModuleRestartUsb = usbPage; }
+            }
+            else if (b1 == 'O')                                  // 2.0: who owns the USB connector (the page only)
+            {
+                if (fromPage) { UsbOwnerCommand((uint8_t)b2); }
+            }
+            else if (b1 == 'Z')                                  // 2.0: restart the board (the page only)
+            {
+                bool simhub = LastUsbTargetMillis && (millis() - LastUsbTargetMillis) < 10000;
+                if (fromPage && b2 == 'R' && !simhub && !UpdateRunning()) { RebootReq = true; }
+            }
             else { SeatCommand((uint8_t)b1, (uint8_t)b2); }
             break;
 #if ENABLE_WIFI
@@ -1686,16 +1914,16 @@ void ParseCommand(const unsigned int *buf, uint8_t source)
 
 void CheckSerial()
 {
-    while (Serial.available())
+    while (UsbPort->available())
     {
         if (BufferEnd == -1)
         {
-            RxByte = Serial.read();
+            RxByte = UsbPort->read();
             if (RxByte != START_BYTE) { errorcount++; UsbBadBytes++; } else { BufferEnd = 0; }
         }
         else
         {
-            RxByte = Serial.read();
+            RxByte = UsbPort->read();
             RxBuffer[BufferEnd] = RxByte;
             BufferEnd++;
             if (BufferEnd > 3)
@@ -2112,7 +2340,7 @@ bool ReadIpText()
 // 1.9.5: to the page, wherever it is - the USB cable in page mode, else the WiFi client
 bool PageWrite(const uint8_t *buf, size_t n)
 {
-    if (UsbPage) { Serial.write(buf, n); return true; }
+    if (UsbPage) { UsbWrite(buf, n); return true; }
     if (!ClientUp) { return false; }
     if (TcpClient.write(buf, n) == 0) { ClientUp = false; return false; }
     return true;
@@ -2201,6 +2429,10 @@ void TelemetrySend()
 //   Version 4 (1.9.1) adds:  uint16 soft-start speed (counts/s, 0 = off) | uint8 motors still creeping (bit n =
 //   motor n+1).
 //   1.9.5: flags bit4 = USB page mode on.
+//   Version 6 (1.9.8) adds:  uint8 USB/WiFi chip restarts ([kE1]) since boot | uint16 seconds since the last one
+//   (65535 = never) | uint8 tenths of a second after it when the chip answered the handshake again (0 = not yet)
+//   | uint8 WiFi tries since it (low nibble) and the last result (high nibble: 0 none yet, 1 joined, 2 failed,
+//   3 no module, 4 the chip doesn't answer).  The payload is 255 bytes now - the frame's limit.
 // Only ever sent to the page (the WiFi client, or USB in page mode), so SimHub and SMC3Utils on USB never see it.
 uint8_t MatrixError();
 int8_t  LastRssi = -127;                         // 1.9.5: in USB page mode the last reading is sent (no WiFi calls)
@@ -2307,9 +2539,14 @@ void SendDiag()
     *p++ = wf;
     *p++ = OtaState;
     Put16(p, OtaCode); p += 2;
+    *p++ = (uint8_t)(ModuleRestarts > 255 ? 255 : ModuleRestarts);   // version 6 (1.9.8): the last chip restart
+    unsigned long ra = ModuleRestartAt ? (now - ModuleRestartAt) / 1000 : 65535UL;
+    Put16(p, (int)(ra > 65535UL ? 65535UL : ra)); p += 2;
+    *p++ = ModemBackTenths;
+    *p++ = (uint8_t)((ModuleWifiTries > 15 ? 15 : ModuleWifiTries) | (ModuleWifiLast << 4));
     size_t len = (size_t)(p - (buf + 6));
     buf[0] = 'S'; buf[1] = 'M'; buf[2] = '3'; buf[3] = 'D';
-    buf[4] = 5;
+    buf[4] = 6;
     buf[5] = (uint8_t)len;
     PageWrite(buf, 6 + len);
 }
@@ -2516,15 +2753,79 @@ void FeedTcpByte(unsigned int c)
     }
 }
 
+void UsbPageEnd();
+
+void RestartModule()                             // 1.9.7: [kE1] - see the v1.9.7 notes
+{
+    ModuleRestartReq = false;
+    if (ModuleRestartAt && (millis() - ModuleRestartAt) < 15000) { return; }
+    ModuleRestarts++;
+    bool viaUsb = ModuleRestartUsb;              // UsbPageEnd() may clear it
+    if (UsbPage) { UsbPageEnd(); }
+    ModuleRestartUsb = viaUsb;
+    if (ClientUp) { TcpClient.stop(); ClientUp = false; }
+    std::string res;
+    modem.timeout(300);                          // the chip restarts instead of answering
+    modem.write(std::string(PROMPT(_RESET)), res, "%s", CMD(_RESET));
+    modem.timeout(MODEM_TIMEOUT);
+    // 1.9.8: this side of the link starts over too - the next WiFi call re-opens the port and redoes the
+    // start-up handshake, which is what the reset button did when 1.9.7 left the board off WiFi
+    modem.end();
+    modem.beginned = false;
+    WifiUp = false;
+    strcpy(WifiText, "E9");
+    ModuleRestartAt = millis();
+    if (ModuleRestartAt == 0) { ModuleRestartAt = 1; }   // 0 means "never"
+    WifiLastAttempt = ModuleRestartAt;
+    ModemBackTenths = 0;
+    ModuleWifiTries = 0;
+    ModuleWifiLast = 0;
+}
+
+// 1.9.8: after a chip restart, before any WiFi.begin(): true once the chip answers the handshake again.
+// Blocks 1.5 s at most (three tries at 500 ms) and is asked every 2 s, so the loop keeps running.
+bool ModuleHandshake(unsigned long now)
+{
+    if (modem.beginned) { return true; }
+    if ((now - WifiLastAttempt) < 2000) { return false; }
+    WifiLastAttempt = now;
+    modem.begin();
+    if (!modem.beginned) { ModuleWifiLast = 4; return false; }
+    unsigned long t = (now - ModuleRestartAt) / 100;
+    ModemBackTenths = (uint8_t)(t < 1 ? 1 : (t > 255 ? 255 : t));
+    WifiLastAttempt = 0;                         // WiFi may follow at once
+    return true;
+}
+
 void ServiceNetwork(unsigned long now)
 {
     if (!WifiUp)
     {
         // Reconnect attempts block for up to WIFI_CONNECT_TIMEOUT_MS, so only try while SimHub is quiet.
+        // 1.9.7: every 4 s for a minute after the chip was restarted.  1.9.8: not before the chip has booted and
+        // answered the handshake; and when the page asked over the USB cable, that link comes back first - WiFi
+        // waits MODULE_USB_FIRST_MS unless the page has left the cable again (UsbPageEnd clears the wait).
         bool hostIdle = (now - LastPacketMillis) > 5000;
-        if (hostIdle && (now - WifiLastAttempt) > WIFI_RETRY_MS)
+        // (now is loop()'s clock from before RestartModule(), which itself takes 300 ms: never let that go negative)
+        unsigned long since = ((long)(now - ModuleRestartAt) < 0) ? 0 : now - ModuleRestartAt;
+        bool afterReset = ModuleRestartAt && since < 60000;
+        unsigned long retry = WIFI_RETRY_MS;
+        if (afterReset)
         {
-            if (ConnectWifi() && WifiText[0] != 'E') { PendingIpScroll = true; }   // back: show the address once
+            if (since < MODULE_BOOT_MS) { return; }
+            if (!ModuleHandshake(now)) { return; }
+            if (ModuleRestartUsb && since < MODULE_USB_FIRST_MS) { return; }
+            retry = 4000UL;
+        }
+        if (hostIdle && (now - WifiLastAttempt) > retry)
+        {
+            bool ok = ConnectWifi();
+            if (ModuleRestartAt)
+            {
+                if (ModuleWifiTries < 255) { ModuleWifiTries++; }
+                ModuleWifiLast = ok ? 1 : (WifiText[0] == 'E' && WifiText[1] == '0' ? 3 : 2);
+            }
+            if (ok && WifiText[0] != 'E') { PendingIpScroll = true; }   // back: show the address once
         }
         return;
     }
@@ -2603,6 +2904,13 @@ void UsbPageEnd()
     TelCount = 0;
     TelExtras = false;                           // the page asks for them again wherever it connects next
     NetLastSample = NetLastSend = NetLastPoll = NetLastCheck = NetLastAccept = millis();
+#if ENABLE_WIFI
+    if (!WifiUp)                                 // 1.9.8: the page left the cable while WiFi is down (chip restart):
+    {                                            // rejoin now rather than at the next 30 s / 25 s mark
+        ModuleRestartUsb = false;
+        WifiLastAttempt = 0;
+    }
+#endif
 }
 
 void UsbPageCommand(uint8_t n)
@@ -3019,7 +3327,7 @@ void setup()
     ResetCwsfOk = (R_SYSTEM->RSTSR2 & 1) ? 1 : 0;
 #endif
 
-    Serial.begin(500000);
+    UsbStart();                                  // 2.0: the connector to the main chip, or the WiFi chip's bridge
     RaiseSerialRxPriority();                     // 1.9.6: before the PID interrupt starts - see v1.9.6
 
 #ifdef DWT
@@ -3086,11 +3394,11 @@ void setup()
 #if ENABLE_WIFI
     ReadWifiMemory();                           // 1.9.2: the name and password it last joined with
     bool wifiOk = ConnectWifi();
-    if (Serial)                                 // a terminal has the USB port open: print one text line
+    if (*UsbPort)                               // a terminal has the USB port open: print one text line
     {
-        Serial.print(wifiOk ? "SMC3_R4 v" FW_VERSION " WiFi connected, IP " : "SMC3_R4 v" FW_VERSION " WiFi failed, code ");
-        Serial.print(WifiText);
-        Serial.print(" " FW_CAPS "\r\n");       // 1.9.2: the page finds this text in a .bin to see what it can do
+        UsbPrint(wifiOk ? "SMC3_R4 v" FW_VERSION " WiFi connected, IP " : "SMC3_R4 v" FW_VERSION " WiFi failed, code ");
+        UsbPrint(WifiText);
+        UsbPrint(" " FW_CAPS "\r\n");          // 1.9.2: the page finds this text in a .bin to see what it can do
     }
 #if LED_MATRIX
     if (wifiOk && WifiText[0] != 'E') { PendingIpScroll = true; }   // the address scrolls once the loop runs
@@ -3117,7 +3425,9 @@ void loop()
     unsigned long now = millis();
     uint32_t loopStartUs = micros();
 
+    if (UsbDoubleResetAt && (now - UsbDoubleResetAt) > USB_DT_MS) { UsbDoubleResetAt = 0; UsbDoubleResetMark(false); }
     CheckSerial();
+    if (RebootReq) { RebootBoard(); return; }   // 2.0
     now = millis();                             // 1.9.5: the commands just parsed stamped millis() - keep "now" at or after
                                                 // them, or "now - LastPacketMillis" wraps (a one-pass LOW POWER, and page
                                                 // mode ending at once)
@@ -3146,6 +3456,7 @@ void loop()
     }
 
 #if ENABLE_WIFI
+    if (ModuleRestartReq) { RestartModule(); }  // 1.9.7: [kE1] from the page
     if (UsbPage)                                // 1.9.5: the page is on the USB cable - no WiFi calls at all
     {
         ServiceUsbPage(now);

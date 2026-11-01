@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-smc3_scope v2.8.3 - live scope, tuner and auto-tuner for the SMC3_R4 motion controller (Arduino UNO R4 WiFi).
+smc3_scope v2.9 - live scope, tuner and auto-tuner for the SMC3_R4 motion controller (Arduino UNO R4 WiFi).
 
 Connects to the board's TCP telemetry port, keeps a rolling buffer of samples and serves a web page with live
 charts, a parameter editor (sends ordinary SMC3 commands back to the board), test signals and a per-motor
 auto-tune.  SimHub keeps the USB port; this runs alongside it.  For calibration with SimHub closed the page can use
-the USB cable instead (firmware 1.9.5): a bridge on the PC with the cable links it -
+the USB cable instead (firmware 1.9.5; 2.0 recommended): in Chrome, Edge, Brave or Firefox 151+ the page opens the
+port itself (Web Serial, page 2.9); otherwise a bridge on the PC with the cable links it -
 
     python3 smc3_scope.py --usb-bridge COM5 --page http://<page address>:<port>
 
@@ -17,6 +18,79 @@ Every option can also come from the environment (Docker): SMC3_HOST, SMC3_PORT, 
 SMC3_DATA_DIR.  Settings changed in the page (board address, theme, auto-find) are saved to
 <data dir>/config.json and survive restarts and upgrades.  Standard-library Python 3.8+ only.
 
+v2.9: the 2.9 betas below, tested on a rig, with firmware 2.0. Nothing restarts the board or its chips while SimHub
+        sends positions. In short: the page opens the USB port itself (Web Serial; the bridges stay). Firmware 2.0
+        gives the UNO R4 WiFi's USB connector to the main chip - no USB stall, no lost bytes, no chip restarts - and
+        Settings, USB cable moves it ([kO n], POST /usb/owner) for an Arduino IDE upload; on the classic setting the
+        page clears the WiFi chip's stall with [kE1] (fixed so the board comes back: 1.9.8). A Restart button
+        ([kZ R], POST /board/reboot). Test signals on several motors (Twist, Heave, Corner, Wave) and auto-tune's
+        Test together. Auto-tune on a crackling pot: the hold noise over 0.9 s as a median spread, the limits from
+        the first sweep steps, the buzz limit never raised. Versions: vkey() pads to four numbers before the
+        release mark, so 2.0 < 2.0.1 and 2.0b2 < 2.0.1 (the betas' vkey put 2.0 above 2.0.1), in the page's vk() too;
+        the 1.9.7 diagnostics finding compared against a tuple without the mark and never showed. The Python
+        bridge says the firmware it found (it always said 1.9.x). Texts recommend SMC3_R4_v2.0.ino.
+v2.9b7 (beta): three things asked for on the rig. A Restart button in the header (next to Settings): the board
+        switches its motors off and restarts as with its RESET button (POST /board/reboot -> [kZ 'R'], firmware
+        2.0b2; refused while SimHub sends positions, and while auto-tune, Seat setup or the full check runs). Test
+        signals on several motors at once (the Test Signal card's "Together" list, and Presets Twist, Heave, Corner,
+        Wave): the front lifts opposite each other (the most twist), the lifts together, the lifts opposite with the
+        rear slide, every motor a third of a cycle apart - each motor around its own centre. And "Test together" in
+        the Auto-Tune card: every motor in use with its current values - each alone, then all together, then
+        twisted - and what moving together costs each one (a sagging shared supply: more lag, running out of drive;
+        a flexing frame: overshoot, ringing). Changes nothing. Simulator: --fw20 is 2.0b2 ([kZ R]), --fw20b1,
+        --supply-sag F.
+v2.9b6 (beta): auto-tune's hold limits follow what the pot does at the gentlest Kps. On the rig the right motor's
+        sweep stopped at Kp 193 with clean moves (2-3% overshoot, no ringing) on a hold of 2.85 against a 2.58 limit,
+        while that pot held at 2.2-2.6 at every Kp, Kp 40 included: the limits came from one 3 s noise-at-rest reading
+        (1.3 on that run, 2.7 an hour before). Then the small-step check cut Kp 103 -> 82 -> 65 -> 52 for "too lively"
+        on hold noise alone, against a stricter 1.5 x limit, though the hold didn't calm down (2.22, 2.07, 2.41). Now:
+        the median hold noise of the first three sweep steps (Kp 40-68) raises the limits to 1.5 x (restless) / 1.3 x
+        (calm) of it when that is higher; no hold-noise stop before those three; the small-step check uses the sweep's
+        limit and says why it cuts ("ring" or "hold restlessly"), and when a cut doesn't make the hold at least 15%
+        calmer it goes back to the Kp before and stops; the Kd step's noise test uses the same limit. The buzz limit
+        (PID output noise 6) is never raised any more (2.9b5's re-test could raise it when the lower Kp happened to
+        buzz during a burst too).
+v2.9b5 (beta): auto-tune no longer stops its Kp sweep on a crackling pot. On the rig the traction motor's sweep
+        ended at Kp 68 as "too lively" with overshoot 1-2% and no ringing: only the hold noise was up (3.2 vs a
+        2.9 limit) - and the final check at Kp 44 showed the same 3.15. It was the pot: bursts of readings a few
+        counts off, too small for the firmware's glitch filter, that come and go whatever the Kp. The hold noise
+        was the spread over the last 0.3 s, which one burst fills. Now it is taken over the last 0.9 s with the
+        creep taken out, as a median spread, so a burst counts little and a motor that really hunts counts in full.
+        When a hold is still restless while the moves are clean, the last calm Kp is held again: if it is as
+        restless now, the hold limits go up for the rest of the run and the sweep goes on; if it holds calmly, the
+        sweep stops as before (now saying "holding gets restless", not "too lively"). Ki: when the first step (5)
+        already overshoots, Ki 2 is tried before giving up. Simulator: --fric M:PLUS:MINUS (friction each way),
+        --stick M:F (stick-slip), --pot-crackle M:N (bursts the glitch filter can't catch).
+v2.9b4 (beta): for firmware 2.0b1, which can give the board's USB connector to the main chip (the UNO R4 WiFi's
+        USB switch - the core flips it for its HID libraries): SimHub and the page then talk to the main chip over
+        its own USB port, and the WiFi chip's bridge - the stall, the lost bytes, the chip restarts that left the
+        board stuck twice more on the rig even with 1.9.8 - is out of the path. The page shows who has the
+        connector (build flags bits 6/7 from [rdd]/[rd!]) in Settings, USB cable, and moves it with [kO n] (POST
+        /usb/owner: 0 WiFi chip saved, 1 main chip saved, 2 WiFi chip until the next reset - for an Arduino IDE
+        upload). A USB link of the page's ends when the port moves (it is another COM port on the PC). On a native
+        port the page never sends [kE1] (and the firmware refuses it, as it does while SimHub is sending positions).
+        Diagnostics name the port's owner. Simulator: --fw20, --fw20-esp, [kO n].
+v2.9b3 (beta): for firmware 1.9.8. On the rig, 1.9.7's chip restart left the board off WiFi (and silent on the cable)
+        until its reset button was pressed: the board kept its old link to the restarted chip, every WiFi attempt
+        blocked for 15 s and failed, the loop crawled. 1.9.8 re-opens that link, redoes the handshake, and after a
+        request over the cable leaves WiFi alone for 25 s so the cable can come back first; its [rdd] frame (version
+        6) reports how the restart went. The page decodes that report and logs it ("the chip answered after 5.1 s;
+        WiFi joined after 1 try"), shows it in Diagnostics (and asks 1.9.7 boards to update), waits 3 s instead of 8
+        before linking again after a restart, gives the board 8 s to answer the browser's probe for a minute after
+        one (its handshake can take 1.5 s), and tells a 1.9.7 owner to press RESET when the board stays silent after
+        a restart. Simulator: 1.9.8 by default, --fw197, --fw197-stuck.
+v2.9b2 (beta): the board's USB stall is cleared also when it is already there before a link opens: nothing comes back
+        on a fresh link (the bridge's or the browser's probe says "none", or 45 s without an answer) and the board
+        runs 1.9.7 -> [kE1] over whatever link is up (POST /usb/chip-restart for the browser), the port comes back
+        and the link follows. The wrong "Windows hands the data to a polling program" text is gone.
+v2.9b1 (beta): the page itself can open the board's USB port - the Web Serial API in Chrome, Edge, Firefox 151+ and
+        Brave - so no PowerShell window is needed: flip the switch to USB, pick the Arduino once, done. The browser
+        sends the port's bytes to the page server over a WebSocket (GET /usb/browser, same gate as /usb/link; the
+        Board sees one end of a socketpair) and the page remembers the port (getPorts), reconnects by itself when
+        the cable comes back (the "connect" event), and after a silent drop closes and reopens the port. Browsers
+        offer Web Serial only on a secure page (https or localhost): opened over plain http from another machine,
+        the page shows the one-time step (the browser's "insecure origins treated as secure" flag with this page's
+        address, or a port proxy to localhost). The PowerShell / Python bridges stay as they were.
 v2.8.3: for firmware 1.9.6, which stops the board losing bytes on the USB port (its receive register holds one byte,
         and the PID interrupt kept the receive interrupt waiting at 500000 baud - the page's commands over the cable
         arrived damaged often enough that page mode dropped out). The page repeats [kU1] twice a second (was once)
@@ -186,7 +260,7 @@ v1.4: settings dialog (board address, port, find-board scan, auto-find), day/nig
       fixed a thread race that made the page flash "not reachable".
 """
 
-VERSION = "2.8.3"
+VERSION = "2.9"
 
 import argparse
 import base64
@@ -396,6 +470,9 @@ class Board:
         self.usb_want = False                # 2.8.1: the header's switch is on USB (a waiting bridge takes it up)
         self.usb_want_at = 0.0
         self.usb_want_grace = 6.0            # 2.8.2: 70 s after a link that went quiet (network down, no close)
+        self.module_reset_at = 0.0           # 2.9: when the page last told the board to restart its USB/WiFi chip
+        self.module_resets = 0
+        self._mr_key = None                  # 2.9: the last restart report logged (firmware 1.9.8's [rdd] bytes)
         self.standby = None                  # 2.8.1: a bridge waiting with the port closed: id, computer, port, msg, seen
 
     def start(self):
@@ -607,6 +684,166 @@ class Board:
         self._drop()
         return True
 
+    def reboot_ok(self):
+        """2.9 / firmware 2.0 (2.0b2 on): can the page restart this board ([kZ 'R'])?"""
+        k = self.fw_known or self.fw_version
+        return bool(k) and vkey(k) >= vkey("2.0b2")
+
+    def simhub_driving(self):
+        """SimHub sent a position command less than 10 s ago (from a fresh diagnostics frame), or None if unknown."""
+        d = self.read_diag(0.8) if self.connected else None
+        if not d:
+            return None
+        ms = d.get("ms_since_usb_target")
+        return ms is not None and ms < 10000
+
+    def reboot(self):
+        """[kZ 'R']: the board switches its motors off and restarts, as with its RESET button. The connection drops and
+        the page reconnects by itself (WiFi in a few seconds; on the cable the browser relinks when the port is back)."""
+        if not self.connected:
+            return False, "The page isn't connected to the board."
+        if not (self.fw_known or self.fw_version):
+            return False, "The board hasn't told the page its firmware version yet - try again in a few seconds."
+        if not self.reboot_ok():
+            return False, ("The board's firmware can't restart on request - that needs firmware 2.0. Press the board's "
+                           "RESET button instead.")
+        if self.simhub_driving():
+            return False, ("SimHub is sending positions to the board (a game is running) - stop SimHub's motion output "
+                           "first, then restart the board.")
+        self.send(b"[kZR]")                          # (over WiFi or the page's USB link, whichever is up)
+        log("board restart asked by the page ([kZ R])")
+        self._ev("link", "The page asked the board to restart (the motors switch off, the board comes back in a few "
+                 "seconds and soft-starts to its targets).", quiet=False)
+        return True, "restarting"
+
+    def usb_owner(self):
+        """2.9 / firmware 2.0: who has the board's USB connector. From the build flags ([rdd], or [rd!]): bit 6 = the
+        main chip has it now (native port), bit 7 = that is the saved setting. None when the board can't say."""
+        k = self.fw_known or self.fw_version
+        if not (k and vkey(k) >= (2, 0, 0)):
+            return None
+        fl = None
+        if self.connected and (not self.diag or time.time() - self.diag.get("rx", 0) > 3) and \
+                time.time() - getattr(self, "_owner_read_at", 0) > 3:
+            self._owner_read_at = time.time()           # a fresh frame: the owner can change at any moment ([kO])
+            self.read_diag(0.8)
+        if self.diag and isinstance(self.diag.get("build"), int):
+            fl = self.diag["build"]
+        elif self.fw_cache:
+            fl = self.fw_cache[0]
+        if fl is None:
+            return {"known": False}
+        return {"known": True, "native": bool(fl & 64), "saved_native": bool(fl & 128)}
+
+    def usb_native(self):
+        o = self.usb_owner()
+        return bool(o and o.get("native"))
+
+    def set_usb_owner(self, mode):
+        """[kO n]: 0 = the WiFi chip (saved), 1 = the main chip (saved), 2 = the WiFi chip until the next reset. The port
+        on the PC changes at once, so a USB link of ours ends here; the board stays on WiFi as it was."""
+        if self.usb_owner() is None:
+            return False, "The board's firmware can't move its USB port (that needs firmware 2.0)."
+        if not self.connected:
+            return False, "The page isn't connected to the board."
+        what = {0: "the WiFi chip (saved)", 1: "the main chip (saved)", 2: "the WiFi chip until the board's next reset"}[mode]
+        if self.link == "usb":
+            self.send(b"[kO" + bytes([mode]) + b"]")
+            time.sleep(0.05)
+            self.detach_usb(f"The board's USB port was handed to {what}: it comes back on the PC as another port (a new "
+                            "COM number); pick it in the browser once more, or point the bridge / SimHub at it.")
+        else:
+            self.send(b"[kO" + bytes([mode]) + b"]")
+        log(f"USB port owner -> {what} ([kO {mode}])")
+        self._ev("link", f"The board's USB port was handed to {what}. On the PC it is another COM port from now on "
+                 "(SimHub and the bridge need the new one; the browser asks which port once).", quiet=False)
+        return True, what
+
+    def module_reset_ok(self):
+        """2.9: can this board restart its USB/WiFi chip on request (firmware 1.9.7; done right from 1.9.8). Not on a
+        native USB port (firmware 2.0: the WiFi chip isn't in the USB path)."""
+        k = self.fw_known or self.fw_version
+        return bool(k) and vkey(k) >= (1, 9, 7) and not self.usb_native()
+
+    def module_reset_now(self):
+        """2.9: the board's USB output is stalled right now (nothing came back when a port was opened): ask it to restart
+        its USB chip over whatever link is up. False when it can't: firmware older than 1.9.7, not connected, or done
+        less than a minute ago."""
+        if not self.module_reset_ok() or not self.connected or time.time() - self.module_reset_at < 60:
+            return False
+        self.module_reset_at = time.time()
+        self.module_resets += 1
+        self.send(b"[kE\x01]")
+        log("USB stall (nothing comes back over the cable): asked the board to restart its USB/WiFi chip ([kE1])")
+        self._ev("link", "Nothing comes back from the board over the USB cable (the UNO R4 WiFi's USB output dies now and "
+                 "then). The page asked it to restart its USB/WiFi chip; " + self.module_after_text(), quiet=False)
+        return True
+
+    def module_resetting(self):
+        """True for a moment after the page asked the board to restart its USB chip: the port is about to go away
+        and come back, so a link now would only die again. (2.9: 3 s, was 8 - the port is back by then and the
+        board answers at once on firmware 1.9.8.)"""
+        return time.time() - self.module_reset_at < 3.0
+
+    def module_after_text(self):
+        """2.9: what follows the chip restart, for the firmware the board runs."""
+        k = self.fw_known or self.fw_version
+        if k and vkey(k) >= (1, 9, 8):
+            return ("the port comes back in a few seconds and the cable link follows by itself; the board rejoins WiFi "
+                    "once the page leaves the cable (or after 25 s).")
+        return ("the port comes back in a few seconds. On firmware 1.9.7 the board then gets stuck retrying WiFi (its "
+                "matrix crawls, nothing answers): press the board's RESET button. Firmware 2.0 fixes this.")
+
+    def _module_report(self, mr):
+        """2.9: firmware 1.9.8 reports how its last chip restart went in every [rdd] frame: log it once per restart,
+        and once more when the WiFi outcome changes (the first frame often comes over the cable, before WiFi)."""
+        if not mr.get("count") or mr.get("age_s") is None or mr["age_s"] > 600:
+            return
+        if not mr.get("chip_back_s") and mr["age_s"] < 15:     # too early to say anything (the chip boots for 5 s)
+            return
+        key = (mr["count"], bool(mr.get("chip_back_s")), mr.get("wifi_last_code"))
+        if key == self._mr_key:
+            return
+        self._mr_key = key
+        back = mr.get("chip_back_s")
+        txt = f"USB/WiFi chip restart #{mr['count']} ({mr['age_s']} s ago): "
+        txt += f"the chip answered again after {back} s" if back else "the chip hasn't answered the board yet"
+        txt += f"; WiFi {mr.get('wifi_last')}"
+        if mr.get("wifi_tries"):
+            txt += f" after {mr['wifi_tries']} tr{'y' if mr['wifi_tries'] == 1 else 'ies'}"
+        if self.link == "usb" and not mr.get("wifi_last_code"):
+            txt += " (the page is on the cable, so WiFi waits)"
+        txt += "."
+        log(txt)
+        self._ev("link", "The board says: " + txt, quiet=True)
+
+    def _module_reset(self, u):
+        """The board went quiet on the cable while the PC's commands still reach it: the UNO R4 WiFi's USB output has
+        died (a known board problem - only re-enumerating clears it). With firmware 1.9.7+ the page sends [kE1] down
+        the stalled link: the board restarts its USB/WiFi chip, the port comes back as after a replug and the browser
+        or bridge links again by itself. WiFi rejoins a few seconds later. At most once a minute."""
+        if not self.module_reset_ok():
+            if self.usb_native():
+                u["end"] += (" (This board's USB port is the main chip's own - firmware 2.0 - so this isn't the WiFi "
+                             "chip's known stall: check the cable, and that no other program has the port.)")
+            else:
+                u["end"] += (" The UNO R4 WiFi's USB output dies like this now and then; unplug the USB cable and plug it "
+                             "back in. Firmware 2.0 takes the WiFi chip out of the USB path, so this doesn't happen "
+                             "any more.")
+            return
+        if time.time() - self.module_reset_at < 60:
+            u["end"] += " (The board's USB chip was restarted less than a minute ago; not again yet.)"
+            return
+        self.module_reset_at = time.time()
+        self.module_resets += 1
+        self.send(b"[kE\x01]")
+        time.sleep(0.05)
+        u["end"] += (" The page asked the board to restart its USB chip, which clears this (a known UNO R4 WiFi "
+                     "problem): " + self.module_after_text())
+        log("USB stall: asked the board to restart its USB/WiFi chip ([kE1])")
+        self._ev("link", "The board went quiet on the USB cable (the UNO R4 WiFi's USB output dies now and then). The "
+                 "page asked it to restart its USB/WiFi chip; " + self.module_after_text(), quiet=False)
+
     def bridge_waiting(self):
         """2.8.1: the bridge that asked within the last 4 s whether the page wants the cable (port closed meanwhile)."""
         sb = self.standby
@@ -724,6 +961,16 @@ class Board:
                    "again.")
             self._ev("link", "USB cable: " + why, quiet=False)
             self.detach_usb(why, refuse=True)
+        elif age > 45 and not u.get("answer_at") and self.module_reset_ok() and time.time() - self.module_reset_at >= 60:
+            # 2.9: a board known to run 1.9.7 that sends nothing: its USB output has stalled - clear it
+            self.module_reset_at = time.time()
+            self.module_resets += 1
+            self.send(b"[kE\x01]")
+            why = ("Nothing came back from the board over the cable in 45 s: its USB output has stalled (a known UNO R4 "
+                   "WiFi problem). The page asked the board to restart its USB chip - " + self.module_after_text())
+            log("USB stall (no answer in 45 s): asked the board to restart its USB/WiFi chip ([kE1])")
+            self._ev("link", "USB cable: " + why, quiet=False)
+            self.detach_usb(why)
         elif age > 45 and not u.get("answer_at"):
             why = (f"The board didn't answer on {u.get('port') or 'that port'} in 45 s. Is it the Arduino's port? "
                    "(Run the bridge again: it lists the ports it can see when there are several.)")
@@ -814,6 +1061,7 @@ class Board:
                     if u and u["tel_at"] and quiet > 5:
                         u["end"] = "The board stopped sending over the cable for 5 s."
                         u["quiet_end"] = True            # (2.8.2: the bridge may be cut off - it gets a minute)
+                        self._module_reset(u)            # 2.9: the UNO R4 WiFi's USB stall - clear it (1.9.7)
                         self._drop()
                 elif quiet > 5:
                     log("board stopped sending - reconnecting")
@@ -923,6 +1171,8 @@ class Board:
                     self.diag = d
                     if "seat" in d:
                         self.seat = d["seat"]
+                    if "module_restart" in d:              # 2.9: firmware 1.9.8's restart report
+                        self._module_report(d["module_restart"])
                     self.diag_seq += 1
                 buf = buf[need:]
             elif buf[0:1] == b"[" and buf[4:5] == b"]":
@@ -1061,6 +1311,47 @@ class AutoFinder:
 # Test-signal generator (sends [Axx]/[Bxx]/[Cxx] at 50 Hz). Stop SimHub motion while using it.
 # --------------------------------------------------------------------------------------------------------------
 
+COMBOS = {                     # 2.9: test signals on several motors at once (the Test Signal card, Presets)
+    "twist": "the two front lifts opposite each other (one up while the other goes down) - the most twist",
+    "heave": "the lifts together, up and down",
+    "corner": "the front lifts opposite each other and the rear slide with them, as in a corner",
+    "wave": "every motor in turn, a third of a cycle apart",
+}
+
+
+def up_sign(cfg, m, fw_flags=0):
+    """+1 when a higher position command lifts lift m, -1 when it lowers it (as the tuner reads the rig: the full
+    check's answer, else away from where the corner sinks, else as SimHub expects; REVERSE_MOTOR1 mirrors motor 1)."""
+    rev = m == 0 and bool(fw_flags & 1)          # (lift_dir / lift_sink are in pot counts, as the tuner sees them)
+    seen = (cfg.get("lift_dir") or {}).get(str(m + 1))
+    sink = (cfg.get("lift_sink") or {}).get(str(m + 1))
+    if seen in (1, -1, "1", "-1"):
+        d = 1 if int(seen) > 0 else -1
+    elif sink in (1, -1, "1", "-1"):
+        d = -1 if int(sink) > 0 else 1
+    else:
+        d = -1 if rev else 1
+    return -d if rev else d                      # the generator sends position commands, mirrored for motor 1
+
+
+def combo_plan(cfg, combo, fw_flags=0):
+    """[(motor, sign, phase)] for a several-motor test signal, or None when this rig hasn't the motors for it."""
+    n = int(cfg.get("motors") or 3)
+    lifts, tl = lift_motors(cfg), tl_motor(cfg)
+    if combo == "twist" and len(lifts) >= 2:
+        a, b = lifts[0], lifts[1]
+        return [(a, up_sign(cfg, a, fw_flags), 0.0), (b, -up_sign(cfg, b, fw_flags), 0.0)]
+    if combo == "heave" and len(lifts) >= 2:
+        return [(m, up_sign(cfg, m, fw_flags), 0.0) for m in lifts]
+    if combo == "corner" and len(lifts) >= 2 and tl is not None:
+        a, b = lifts[0], lifts[1]
+        return [(a, up_sign(cfg, a, fw_flags), 0.0), (b, -up_sign(cfg, b, fw_flags), 0.0), (tl, 1, 0.0)]
+    if combo == "wave" and n >= 2:
+        ms = list(range(n))
+        return [(m, up_sign(cfg, m, fw_flags) if m in lifts else 1, i / len(ms)) for i, m in enumerate(ms)]
+    return None
+
+
 class Generator:
     def __init__(self, board):
         self.board = board
@@ -1070,12 +1361,24 @@ class Generator:
         self.period = 2.0
         self.value = 512
         self.centre = 512
+        self.combo = ""                # 2.9: "" = one motor, else a COMBOS key
+        self.plan = []                 # [(motor, sign, phase, centre)] for a combo
         threading.Thread(target=self._run, daemon=True).start()
 
     def set(self, **kw):
         for k, v in kw.items():
             if hasattr(self, k):
                 setattr(self, k, v)
+
+    def _wave(self, t, per):
+        if self.mode == "sine":
+            return math.sin(2 * math.pi * t / per)
+        if self.mode == "step":
+            return 1.0 if int(t / per) % 2 else -1.0
+        if self.mode == "triangle":
+            ph = (t / per) % 1.0
+            return 4 * ph - 1 if ph < 0.5 else 3 - 4 * ph
+        return 0.0
 
     def _run(self):
         t0 = time.time()
@@ -1085,15 +1388,13 @@ class Generator:
                 continue
             t = time.time() - t0
             per = max(0.05, self.period)
-            if self.mode == "sine":
-                v = self.centre + self.amp * math.sin(2 * math.pi * t / per)
-            elif self.mode == "step":
-                v = self.centre + (self.amp if int(t / per) % 2 else -self.amp)
-            elif self.mode == "triangle":
-                ph = (t / per) % 1.0
-                v = self.centre + self.amp * (4 * ph - 1 if ph < 0.5 else 3 - 4 * ph)
-            else:                                   # manual
-                v = self.value
+            plan = self.plan if self.combo else None
+            if plan:
+                for m, sign, phase, centre in plan:
+                    v = centre if self.mode == "manual" else centre + sign * self.amp * self._wave(t + phase * per, per)
+                    self.board.cmd_word("ABC"[m], int(max(0, min(1023, v))))
+                continue
+            v = self.value if self.mode == "manual" else self.centre + self.amp * self._wave(t, per)
             self.board.cmd_word("ABC"[self.motor], int(max(0, min(1023, v))))
 
 
@@ -1115,6 +1416,7 @@ PID_NOISE_MAX = 6.0          # PWM std of the PID output while holding - above t
 KP_START, KP_STEP, KP_MAX = 40, 1.3, 2000
 OS_STOP = 30.0
 KI_STEPS = [5, 10, 20, 40, 70]
+KI_SMALL = 2                 # 2.9: tried when the first step already overshoots
 KD_STEPS = [5, 10, 20, 40]
 SPEED_KP = (120, 200)        # Kp range for the one quick move each way that measures the top speed (page 2.5)
 RAMP_SHARE = 0.6             # test moves run at this share of the slower direction's top speed, so the motor can follow
@@ -1126,6 +1428,8 @@ RAMP_MIN_S = 0.3             # a test move takes at least this long, so a short 
 PHASES = [("countdown", "Get in"), ("prep", "Prepare"), ("noise", "Pot noise"), ("pwmmin", "Min drive"),
           ("speed", "Top speed"), ("kp", "Kp sweep"), ("small", "Small moves"), ("ki", "Ki"), ("kd", "Kd"),
           ("final", "Final check")]
+JOINT_PHASES = [("prep", "Prepare"), ("noise", "Pot noise"), ("solo", "Each alone"), ("together", "Together"),
+                ("opposite", "Twisted"), ("end", "Back")]
 CHECK_PHASES = [("countdown", "Get in"), ("prep", "Prepare"), ("noise", "Pot noise"), ("speed", "Top speed"),
                 ("big", "Test moves"), ("small", "Small moves")]
 
@@ -1144,6 +1448,22 @@ def _rstd(xs):
         return _std(xs)
     med = statistics.median(xs)
     return 1.4826 * statistics.median(abs(x - med) for x in xs)
+
+
+def _hold_spread(ts, xs):
+    """2.9: how restless a hold is - over its last 0.9 s (not just 0.3 s), with a slow creep taken out (the line
+    through the medians of the first and last thirds) and as a median spread (1.4826 x MAD). A motor hunting because
+    Kp is too high does it the whole time and counts in full; a crackling pot's burst (50-300 ms of readings a few
+    counts off, too small for the firmware's glitch filter) covers a third of the window at most and hardly counts.
+    On 0.3 s one burst filled the window: the sweep stopped on it and called the motor "too lively"."""
+    if len(xs) < 15:
+        return _rstd(xs)
+    k = len(xs) // 3
+    t1, t3 = _mean(ts[:k]), _mean(ts[-k:])
+    m1, m3 = statistics.median(xs[:k]), statistics.median(xs[-k:])
+    slope = (m3 - m1) / (t3 - t1) if t3 > t1 else 0.0
+    tm = _mean(ts)
+    return _rstd([x - slope * (t - tm) for x, t in zip(xs, ts)])
 
 
 def _med3(xs):
@@ -1243,8 +1563,11 @@ def _settle_metrics(ys, fs, post, f0, t_new, size, sgn, noise, m, t_from):
         if state and st != state:
             crossings += 1
         state = st
+    hold = [(t, s) for y, t, s in ys if t >= max(span - 900, 0.35 * span)]      # 2.9: see _hold_spread
+    hts = [t for t, s in hold]
     return {"os": os_pct, "settle": settle, "settled": settled, "sse": abs(sse), "osc": crossings,
-            "fb_std": _rstd(fb_tail), "pid_std": _rstd([s["m"][m]["p"] for s in tail])}
+            "fb_std": _hold_spread(hts, [s["m"][m]["f"] for t, s in hold]),
+            "pid_std": _hold_spread(hts, [s["m"][m]["p"] for t, s in hold])}
 
 
 def _wrong_start(early, m, f0, sgn, noise):
@@ -1511,7 +1834,8 @@ class Tuner:
                 "stage": self.stage, "progress": self.progress, "log": self.lines[-300:],
                 "result": self.result, "can_revert": bool(self.original) and not self.running(),
                 "revert_motor": None if self.orig_motor is None else self.orig_motor + 1,
-                "live": self.live, "countdown": self.countdown}
+                "live": self.live, "countdown": self.countdown,
+                "motors": [m + 1 for m in getattr(self, "jm", [])] if self.mode == "joint" else None}
 
     def start(self, motor, amp, style, do_friction, do_ki, do_kd, rider="empty", rider_kg=0.0, unit="lb",
               mode="tune"):
@@ -1523,7 +1847,13 @@ class Tuner:
             if self.board.pending_restore:
                 return False, ("The page is still putting back the settings from the last auto-tune (the link dropped "
                                "during it) - try again in a few seconds.")
-            self.motor, self.mode = motor, ("check" if mode == "check" else "tune")
+            self.motor, self.mode = motor, (mode if mode in ("check", "joint") else "tune")
+            if self.mode == "joint":                     # 2.9: every motor in use, together
+                self.jm = list(range(int(self.board.cfg.get("motors") or 3)))
+                if len(self.jm) < 2:
+                    self.state = "idle"
+                    return False, "The test together needs at least two motors in use (Settings, Rig layout)."
+                self.motor = self.jm[0]
             self.conn0 = self.board.conn_id              # 2.8: a new connection mid-run (the USB bridge closed, the
                                                          # board restarted) ends the run - the board may not be as it was
             self.state, self.stage, self.progress = "running", "Starting", 0
@@ -1668,12 +1998,18 @@ class Tuner:
             self.board.hold_page()                         # SimHub waits while auto-tune runs (firmware 1.9)
             self._check()
             if time.time() - self.last_cmd > 0.8:          # keep-alive: holds full power on firmware 1.4
-                self.set_target(self.cur)
+                if self.mode == "joint":
+                    for m in self.jm:
+                        self._jset(m, self.jcur[m])
+                else:
+                    self.set_target(self.cur)
             if time.time() >= end:
                 return
             time.sleep(0.05)
 
     def _check(self):
+        if self.mode == "joint":
+            return self._jcheck()
         m, n = self.motor, self.motor + 1
         if self.abort_flag:
             raise TuneAbort("Stopped by you.")
@@ -2115,6 +2451,8 @@ class Tuner:
             self.gen.set(mode="off")
             if self.mode == "check":
                 self._run_check(*a)
+            elif self.mode == "joint":
+                self._run_joint(*a)
             else:
                 self._run(*a)
             final = "done"
@@ -2122,7 +2460,10 @@ class Tuner:
             final = "aborted"
             self.say(("Cannot start: " if e.kind == "refuse" else "Stopped: ") + str(e))
             try:
-                if e.kind == "unsafe":
+                if self.mode == "joint":
+                    if e.kind != "refuse":
+                        self._jstop(e.kind == "unsafe")
+                elif e.kind == "unsafe":
                     self._safe_stop()
                 elif e.kind == "refuse":
                     pass                                 # nothing was moved or changed: leave it all alone
@@ -2139,7 +2480,9 @@ class Tuner:
         except Exception as e:                                  # a bug - leave the rig as it was
             self.say(f"Internal error: {e!r}")
             try:
-                if self.mode == "tune" and self.original:
+                if self.mode == "joint":
+                    self._jstop(False)
+                elif self.mode == "tune" and self.original:
                     self._restore_and_hold()
                 else:
                     self._hold_here()
@@ -2161,6 +2504,16 @@ class Tuner:
         if not self.events:
             return
         n = (self.motor or 0) + 1
+        if self.mode == "joint":
+            ms = "+".join(str(m + 1) for m in getattr(self, "jm", []))
+            if state == "done" and self.result:
+                self.events.add("tune", f"Test of motors {ms} together: " + (
+                    "fine." if self.result.get("ok") else "; ".join(self.result.get("issues") or [])))
+            else:
+                last = next((l[9:] for l in reversed(self.lines) if "Stopped" in l or "Cannot" in l or "error" in l),
+                            state)
+                self.events.add("tune", f"Test of motors {ms} together {state}: {last}")
+            return
         what = "Check of motor %d's values" % n if self.mode == "check" else f"Auto-tune of motor {n}"
         if state == "done" and self.result and self.mode == "tune":
             a, b = self.result["before"], self.result["after"]
@@ -2347,10 +2700,19 @@ class Tuner:
         self._ramp_to(c)
         self._settle(c, 3.0)
         calm2 = self._calm(2.0)
+        # 2.9: the hold limits - raised for the rest of the run when a restless hold turns out to be the pot's (or
+        # the slide's), not the Kp's: the Kp just below is re-tested, and if it is as restless now, it wasn't the Kp
+        lim = {"good": calm2, "stop": self._calm(2.5, 2.0), "pid": PID_NOISE_MAX, "raised": 0}
 
         def good(r):
-            return (r["reached"] and r["os"] <= os_t and r["osc"] <= 2 and r["fb_std"] <= calm2
-                    and r["pid_std"] <= PID_NOISE_MAX and not r.get("behind"))
+            return (r["reached"] and r["os"] <= os_t and r["osc"] <= 2 and r["fb_std"] <= lim["good"]
+                    and r["pid_std"] <= lim["pid"] and not r.get("behind"))
+
+        def restless(r):                   # the hold is restless (the pot's spread - the PID output's buzz has its
+            return r["fb_std"] > lim["stop"]   # own limit, which nothing raises: 2.9)
+
+        def moves_calm(r):                 # ...while the moves themselves show nothing of a too-high Kp
+            return (r["reached"] and not r.get("behind") and r["os"] <= max(os_t * 2, 10.0) and r["osc"] <= 2)
 
         def lag_ok(r):                     # both ways measured, and both within the target
             ls = [x.get("lag_ms") for x in (r.get("dp") or {}, r.get("dm") or {})]
@@ -2366,23 +2728,63 @@ class Tuner:
             self._settle(c, 1.0)
             r = self._test_set(c, A, p, hold=self._hold())
             if (not good(r) and results and good(results[-1][1]) and r["reached"] and not r.get("behind")
-                    and r["os"] <= OS_STOP and r["osc"] < 4 and r["pid_std"] <= PID_NOISE_MAX):
+                    and r["os"] <= OS_STOP and r["osc"] < 4 and (r["pid_std"] <= lim["pid"] or moves_calm(r))):
                 # one bad test right after a calm one: a glitchy pot can kick the motor (a burst of bad readings
                 # makes the PID push hard for a moment) - test this Kp once more before believing it (page 2.5)
                 self.say(f"Kp {p['kp']}: {fmt(r, self.dn)} - testing it once more, to be sure.")
                 self._settle(c, 1.0)
                 r = self._test_set(c, A, p, hold=self._hold())
+            ref = next((k for k, rr in reversed(results) if good(rr)), None)
+            if restless(r) and moves_calm(r) and r["pid_std"] <= lim["pid"] and ref is not None and lim["raised"] < 3:
+                # 2.9: still restless, but only while holding - no overshoot, no ringing. Before calling it the
+                # Kp's fault, hold at the last calm Kp again: if that is just as restless now, it is the pot (a
+                # crackling track, glitches the filter can't catch) or the slide (stick-slip), and the sweep goes on
+                # with the hold limits raised to what the board does anyway
+                kp_here = p["kp"]
+                self.say(f"Kp {kp_here}: {fmt(r, self.dn)} - restless only while holding (no overshoot, no ringing): "
+                         f"checking Kp {ref} again to see whether it's the Kp.")
+                p["kp"] = ref
+                self._apply(p)
+                self._settle(c, 1.0)
+                rr = self._test_set(c, A, p, hold=self._hold())
+                p["kp"] = kp_here
+                self._apply(p)
+                self._settle(c, 1.0)
+                if restless(rr):
+                    lim["raised"] += 1
+                    lim["stop"] = max(lim["stop"], 1.3 * rr["fb_std"], 1.15 * r["fb_std"])
+                    lim["good"] = max(lim["good"], 1.3 * rr["fb_std"], 1.15 * r["fb_std"])
+                    self.say(f"Kp {ref} is just as restless now (hold noise {rr['fb_std']:.2f}) - that's the pot or the "
+                             f"slide, not the Kp. Carrying on, allowing for it (hold noise up to {lim['stop']:.1f}).")
+                else:
+                    self.say(f"Kp {ref} holds calmly again ({rr['fb_std']:.2f}) - so it is Kp {kp_here} that makes it "
+                             f"restless.")
             results.append((p["kp"], r))
+            if len(results) == 3:
+                # 2.9: what this pot does while holding at the gentlest Kps (40-68), where the PID barely reacts -
+                # a hold that restless can't be the Kp's doing later either. The limits from the noise at rest (one
+                # 3 s reading, which came out 1.3 on one run and 2.7 on the next on the same rig) can be below it:
+                # then every Kp looked restless and the sweep stopped while the moves were clean
+                base = statistics.median(rr["fb_std"] for k, rr in results)
+                if 1.5 * base > lim["stop"]:
+                    lim["stop"] = max(lim["stop"], 1.5 * base)
+                    lim["good"] = max(lim["good"], 1.3 * base)
+                    self.say(f"This pot holds at ±{base:.1f} counts even at the gentlest Kps - the hold limits allow for "
+                             f"that (restless above {lim['stop']:.1f}).")
             sweep = sweep + [{"kp": p["kp"], "p": _slim(r["dp"]), "m": _slim(r["dm"]), "good": good(r)}]
             self._lv(sweep=sweep)
             self._show(f"Kp {p['kp']}", r)
             self.say(f"Kp {p['kp']}: {fmt(r, self.dn)}")
             # (a restless hold counts only once the motor got there: a slow motor still creeping in isn't lively)
-            if r["os"] > OS_STOP or r["osc"] >= 4 or (r["reached"] and r["fb_std"] > self._calm(2.5, 2.0)):
+            if r["os"] > OS_STOP or r["osc"] >= 4:
                 self.say("Too lively - stopping the sweep here.")
                 why = "edge"
                 break
-            if r["pid_std"] > PID_NOISE_MAX:
+            if r["reached"] and r["fb_std"] > lim["stop"] and len(results) >= 3:
+                self.say("Holding gets restless at this Kp - stopping the sweep here.")
+                why = "edge"
+                break
+            if r["pid_std"] > lim["pid"]:
                 self.say("Holding gets twitchy (the pot noise is being amplified) - stopping the sweep here.")
                 why = "edge"
                 break
@@ -2460,15 +2862,15 @@ class Tuner:
                 why_not.append(f"swings {r_best['osc']}x before it settles")
             if r_best.get("behind"):
                 why_not.append("can't keep up with the test moves (PWMmax too low for the load?)")
-            if r_best["fb_std"] > calm2:
+            if r_best["fb_std"] > lim["good"]:
                 why_not.append(f"doesn't hold still (±{r_best['fb_std']:.1f} counts - a noisy or glitchy pot?)")
-            if r_best["pid_std"] > PID_NOISE_MAX:
+            if r_best["pid_std"] > lim["pid"]:
                 why_not.append("buzzes while holding (pot noise amplified)")
             notes.append(f"No Kp was calm: even the gentlest one that gets there (Kp {kp_best}) "
                          + ("; ".join(why_not) or "falls outside the limits") + ". It is used as it is.")
         # floor: whatever the style, don't settle on a Kp that leaves the seat far from where it is sent
         calm_enough = [(k, r) for k, r in results if r["reached"] and r["os"] <= max(os_t, 15.0) and r["osc"] <= 2
-                       and r["pid_std"] <= PID_NOISE_MAX and r["fb_std"] <= calm2 and not r.get("behind")]
+                       and r["pid_std"] <= lim["pid"] and r["fb_std"] <= lim["good"] and not r.get("behind")]
         limit = (goods[-1][0] * margin) if (goods and why == "edge") else float("inf")
         floor = next((k for k, r in calm_enough if r["sse"] <= SSE_FLOOR and k <= limit), None)
         if floor is not None and kp_best < floor:
@@ -2481,17 +2883,31 @@ class Tuner:
         # 5. small movements (road-texture sized, sharp like a kerb) must not ring
         self._phase("small", "Checking small movements", 72)
         self._apply(p)
+        prev = None                        # (Kp, why, hold noise) before the last cut
         for _ in range(3):
             self._ramp_to(c)
             self._settle(c, 2.0)
             rs = self._test_set(c, SMALL_STEP, p, hold=1.3, ramp=False)
             self._show(f"Small ±{SMALL_STEP} steps, Kp {p['kp']}", rs, "small")
             self.say(f"Small ±{SMALL_STEP} steps at Kp {p['kp']}: {fmt(rs, self.dn)}")
-            if (rs["osc"] >= 2 or rs["os"] > 35 or rs["fb_std"] > self._calm(1.5)) and p["kp"] > KP_START:
+            ringing = rs["osc"] >= 2 or rs["os"] > 35
+            # 2.9: the sweep's hold limit (it was a stricter 1.5 x the noise at rest, which cut a clean Kp 103 to 52
+            # on a real rig, 20% at a time, while the hold stayed as it was: 2.22, 2.07, 2.41)
+            restless = rs["fb_std"] > lim["stop"]
+            if prev and prev[1] == "hold" and not ringing and rs["fb_std"] > 0.85 * prev[2]:
+                p["kp"] = prev[0]
+                self._apply(p)
+                self._lv(chosen=p["kp"])
+                self.say(f"Lowering Kp didn't make the hold calmer ({prev[2]:.2f} -> {rs['fb_std']:.2f}) - that's the "
+                         f"pot, not the Kp: back to Kp {p['kp']}.")
+                break
+            if (ringing or restless) and p["kp"] > KP_START:
+                prev = (p["kp"], "ring" if ringing else "hold", rs["fb_std"])
                 p["kp"] = max(KP_START, int(p["kp"] * 0.8))
                 self._apply(p)
                 self._lv(chosen=p["kp"])
-                self.say(f"Small moves are too lively - Kp reduced to {p['kp']}.")
+                self.say(("Small moves ring" if ringing else "Small moves hold restlessly") +
+                         f" - Kp reduced to {p['kp']}.")
             else:
                 break
 
@@ -2530,8 +2946,22 @@ class Tuner:
                 # judged against what was already there, so a springy linkage's normal ringing doesn't veto it;
                 # ringing on the motor only - holding position (Ki) isn't what makes a flexing frame ring
                 mo = lambda r: r.get("motor_osc", r["osc"])
-                if (big["os"] > r_base["os"] + 8 or mo(big) > max(2, mo(r_base) + 1)
-                        or mo(small) > max(2, mo(r_small) + 1) or small["os"] > max(35.0, r_small["os"] + 15)):
+                too_much = lambda bg, sm: (bg["os"] > r_base["os"] + 8 or mo(bg) > max(2, mo(r_base) + 1)
+                                           or mo(sm) > max(2, mo(r_small) + 1) or sm["os"] > max(35.0, r_small["os"] + 15))
+                if too_much(big, small):
+                    if i == 0 and ki > KI_SMALL and need:
+                        # 2.9: the first step is already too much - a smaller one may still take the error down
+                        # (a rear slide that stops short one way: Ki 5 halved it on a real rig, at 9% overshoot)
+                        self.say(f"Ki {ki} overshoots ({big['os']:.0f}%) - trying Ki {KI_SMALL}.")
+                        p["ki"] = KI_SMALL
+                        self._apply(p)
+                        big2, small2 = measure(f"Ki {KI_SMALL}")
+                        self.say(f"Ki {KI_SMALL}: test moves {big2['os']:.0f}% over / off by {big2['sse']:.1f}, "
+                                 f"small {small2['os']:.0f}% over / off by {small2['sse']:.1f}")
+                        if not too_much(big2, small2):
+                            best = (KI_SMALL, big2, small2)
+                            tried.append(best)
+                            break
                     self.say("Ki starts causing overshoot - stopping.")
                     break
                 best = (ki, big, small)
@@ -2580,7 +3010,7 @@ class Tuner:
                 r = self._test_set(c, A, p, hold=self._hold())
                 self._show(f"Kd {kd}", r)
                 self.say(f"Kd {kd} (Ks 4): {fmt(r, self.dn)}")
-                if r["pid_std"] > r_base["pid_std"] * 1.5 + 3 or r["fb_std"] > self._calm(2.0) or r["osc"] >= 2:
+                if r["pid_std"] > r_base["pid_std"] * 1.5 + 3 or r["fb_std"] > lim["good"] or r["osc"] >= 2:
                     self.say("Kd starts adding noise - stopping.")
                     break
                 if best is None or score(r) < score(best[1]):
@@ -2638,6 +3068,351 @@ class Tuner:
             self.say("Note: " + note)
         self.say("Done. The new values are running now but NOT saved - try them in a game, then press "
                  "'Save to EEPROM' to keep them or 'Revert' to go back.")
+        self.progress = 100
+
+    # ---- 2.9: every motor together ----
+    def _jset(self, m, v):
+        v = int(max(self.jwin[m][0], min(self.jwin[m][1], round(v))))
+        self.board.cmd_word("ABC"[m], 1023 - v if (m == 0 and self.jrev) else v)
+        if v != self.jstart.get(m, v):
+            self.moved = True
+        self.jcur[m] = v
+        self.last_cmd = time.time()
+        self.jrecent[m].append((self.last_cmd, v))
+
+    def _jramp(self, xs, v):
+        """Every motor in xs from where it is to its target at once, on the same eased profile (the longest move at
+        v counts/s, the others in step with it), 50 updates a second."""
+        x0 = {m: float(self.jcur[m]) for m in xs}
+        far = max(abs(xs[m] - x0[m]) for m in xs)
+        if far < 1.0 or v <= 0:
+            for m in xs:
+                self._jset(m, xs[m])
+            return
+        a = v / 0.12
+        ta = v / a
+        if a * ta * ta >= far:
+            ta, tc, vp = math.sqrt(far / a), 0.0, None
+            vp = a * ta
+        else:
+            tc, vp = (far - a * ta * ta) / v, v
+        total = 2 * ta + tc
+        t_start = time.time()
+        while True:
+            t = time.time() - t_start
+            if t >= total:
+                break
+            if t < ta:
+                sd = 0.5 * a * t * t
+            elif t < ta + tc:
+                sd = 0.5 * a * ta * ta + vp * (t - ta)
+            else:
+                td = total - t
+                sd = far - 0.5 * a * td * td
+            f = sd / far
+            for m in xs:
+                self._jset(m, x0[m] + (xs[m] - x0[m]) * f)
+            self._check()
+            time.sleep(0.02)
+        for m in xs:
+            self._jset(m, xs[m])
+
+    def _jfb(self, m, n=9):
+        with self.board.slock:
+            snap = list(self.board.samples)[-n:]
+        fs = [x["m"][m]["f"] for x in snap]
+        return statistics.median(fs) if fs else 512.0
+
+    def _jsettle(self, xs, timeout):
+        end = time.time() + timeout
+        while time.time() < end:
+            self.wait(0.1)
+            if all(abs(self._jfb(m, 5) - xs[m]) <= max(4.0, 1.5 * self.jnoise.get(m, 0.5)) for m in xs):
+                self.wait(0.2)
+                return True
+        return False
+
+    def _jcheck(self):
+        if self.abort_flag:
+            raise TuneAbort("Stopped by you.")
+        if not self.board.connected:
+            raise TuneAbort("Lost the connection to the board.")
+        if self.board.conn_id != getattr(self, "conn0", self.board.conn_id):
+            raise TuneAbort("The connection to the board changed during the run (the USB bridge closed, or the "
+                            "board restarted).")
+        new = self.board.since(self.chk_seq)
+        if not new:
+            return
+        self.chk_seq = new[-1]["seq"]
+        now = time.time()
+        for m in self.jm:
+            n = m + 1
+            allowed = {v for t, v in self.jrecent[m] if now - t < 15.0} | {self.jcur[m]}
+            lo_ok, hi_ok = self.jwin[m][0] - 25, self.jwin[m][1] + 25
+            for smp in new:
+                mm = smp["m"][m]
+                self.jfwin[m].append(mm["f"])
+                fmed = statistics.median(self.jfwin[m])
+                if smp["dis"][m]:
+                    raise TuneAbort(f"Motor {n} was shut off by its safety cutoff (feedback went past Max limit).",
+                                    "unsafe")
+                if mm["t"] in allowed:
+                    self.jinterf[m] = 0
+                else:
+                    self.jinterf[m] += 1
+                    if self.jinterf[m] >= 6:
+                        raise TuneAbort(f"Something else is moving motor {n} (SimHub?). Stop SimHub's motion output "
+                                        f"and start again.")
+                if abs(mm["t"] - fmed) > self.runaway_limit:
+                    raise TuneAbort(f"Motor {n} ran away from its target - most likely the motor or the pot is wired "
+                                    f"backwards (or the pot slipped on its shaft).", "unsafe")
+                if fmed < lo_ok or fmed > hi_ok:
+                    raise TuneAbort(f"Motor {n} went outside its allowed travel ({fmed:.0f}).")
+
+    def _jstop(self, unsafe):
+        """End of a joint run that didn't finish: every motor holds where it is - switched off first if unsafe."""
+        if unsafe and self.board.fwnum() >= 15:
+            for m in self.jm:
+                self.board.cmd_text(f"di{m + 1}")
+                time.sleep(0.05)
+            self.say("SAFETY: the motors are switched off; their values are unchanged. Fix the cause first, then "
+                     "press Enable Motors.")
+        if self.moved:
+            for m in self.jm:
+                try:
+                    self._jset(m, self._jfb(m))
+                except Exception:
+                    pass
+
+    def _jmove_once(self, xs, hold, ps, t_old):
+        seq0 = self.board.seq
+        t_begin = time.time()
+        t0 = time.time()
+        self._jramp(xs, self.ramp_v)
+        page_ms = (time.time() - t0) * 1000.0
+        self.wait(hold)
+        self.wait(0.15)
+        out = {}
+        keep = self.motor
+        try:
+            for m in xs:
+                got = despike(self.board.since(seq0 - 30), m)
+                self.motor = m                                   # (_link_trouble reads this motor's figures)
+                why = self._link_trouble(got, seq0, t_old[m], xs[m], page_ms if page_ms > 150 else None,
+                                         (time.time() - t_begin) * 1000.0)
+                if why:
+                    return None, f"motor {m + 1}: {why}"
+                r = analyze_move(got, m, t_old[m], ps[m]["pwmmin"], ps[m]["pwmmax"], hold * 1000 - 100,
+                                 self.jnoise[m], seq0)
+                if r is None:
+                    return None, f"motor {m + 1}'s move didn't show up in the telemetry"
+                if r["wrong"]:
+                    raise TuneAbort(f"Motor {m + 1} moved the wrong way. The motor or the pot is wired backwards.",
+                                    "unsafe")
+                out[m] = r
+        finally:
+            self.motor = keep
+        return out, None
+
+    def _jmove(self, xs, hold, ps):
+        """One move of several motors at once; a move the link spoiled goes back and is done again (as _move)."""
+        t_old = {m: self.jcur[m] for m in xs}
+        for attempt in range(4):
+            r, why = self._jmove_once(xs, hold, ps, t_old)
+            if not why:
+                return r
+            if attempt == 3:
+                raise TuneAbort(f"The link to the board kept stalling during the test moves ({why}).")
+            self.link_trouble_at = time.time()
+            self.say(f"Link hiccup during that move ({why}) - doing it again.")
+            self._jramp(t_old, self.ramp_v)
+            self.wait(1.0)
+            self._jsettle(t_old, 3.0)
+
+    def _jset_test(self, signs, c, A, ps, hold=1.6):
+        """Out and back each way, as _test_set, for every motor in signs at once: sign +1 sets off towards higher
+        counts. Returns {motor: result with 'dp' / 'dm'}."""
+        moves = []
+        for f in (1, 0, -1, 0):
+            moves.append(self._jmove({m: c[m] + signs[m] * f * A for m in signs}, hold, ps))
+        res = {}
+        for m, sg in signs.items():
+            up = (moves[0][m], moves[3][m]) if sg > 0 else (moves[1][m], moves[2][m])
+            dn = (moves[1][m], moves[2][m]) if sg > 0 else (moves[0][m], moves[3][m])
+            dp, dm = worst(*up), worst(*dn)
+            r = worst(dp, dm)
+            r["dp"], r["dm"] = dp, dm
+            res[m] = r
+        return res
+
+    def _run_joint(self, motor, amp, style, do_friction, do_ki, do_kd, rider="empty", rider_kg=0.0, unit="lb"):
+        """Every motor in use with its CURRENT values (page 2.9): each one alone, then all together (the lifts up
+        and down at once), then twisted (the front lifts opposite each other). Changes nothing; says where moving
+        together costs a motor something - the motors share one power supply and one frame."""
+        b = self.board
+        cfg = b.cfg
+        jm = self.jm
+        names_all = {}
+        self._lv(phases=[[k, l] for k, l in JOINT_PHASES], joint=True, jm=[m + 1 for m in jm], style=style)
+        self._phase("prep", "Reading settings", 2)
+        self.say(f"Test of motors {', '.join(str(m + 1) for m in jm)} together, with their current values, travel "
+                 f"±{amp} counts. Nothing is changed.")
+        pr = b.read_params()
+        fw = pr.get("FW")
+        if not fw or fw[1] < 14:
+            raise TuneAbort("the test needs firmware 1.4 or newer on the board.", "refuse")
+        self.jrev = bool(fw[0] & 1)
+        s0 = b.latest()
+        if not s0:
+            raise TuneAbort("No telemetry from the board yet.", "refuse")
+        ps, c = {}, {}
+        self.jwin, self.jcur, self.jstart, self.jrecent = {}, {}, {}, {}
+        self.jfwin, self.jinterf, self.jnoise = {}, {}, {}
+        room = []
+        for m in jm:
+            n = m + 1
+            need = [f"Kp{n}", f"Ki{n}", f"Kd{n}", f"Ks{n}", f"PWM{n}", f"DZ{n}"]
+            if any(k not in pr for k in need):
+                raise TuneAbort(f"Couldn't read motor {n}'s settings from the board. Try again.", "refuse")
+            if s0["dis"][m]:
+                raise TuneAbort(f"motor {n} is shut off - press 'Enable motors' first.", "refuse")
+            ps[m] = {"kp": pr[f"Kp{n}"], "ki": pr[f"Ki{n}"], "kd": pr[f"Kd{n}"], "ks": pr[f"Ks{n}"],
+                     "pwmmin": pr[f"PWM{n}"][0], "pwmmax": pr[f"PWM{n}"][1], "dz": pr[f"DZ{n}"][0]}
+            self.jwin[m] = b.window(m)
+            c[m] = b.centre(m)
+            room.append(min(c[m] - self.jwin[m][0], self.jwin[m][1] - c[m]) - 60)
+            self.jcur[m] = s0["m"][m]["t"]
+            self.jstart[m] = self.jcur[m]
+            self.jrecent[m] = collections.deque(maxlen=1500)
+            self.jrecent[m].append((time.time(), self.jcur[m]))
+            self.jfwin[m] = collections.deque(maxlen=5)
+            self.jinterf[m] = 0
+            names_all[m] = dict(self._directions(m))
+            self.say(f"Motor {n}: Kp {ps[m]['kp']}, Ki {ps[m]['ki']}, Kd {ps[m]['kd']}, PWMmin {ps[m]['pwmmin']}, "
+                     f"PWMmax {ps[m]['pwmmax']}, dead zone {ps[m]['dz']}.")
+        if min(room) < 40:
+            raise TuneAbort("the allowed travel of one of the motors is too narrow to test in.", "refuse")
+        A = int(max(40, min(amp, min(room))))
+        if A < amp:
+            self.say(f"Travel limited to ±{A} by the allowed travel.")
+        self.runaway_limit = 2 * A + 80
+        self.moved, self.chk_seq, self.t_start = False, b.seq, time.time()
+        self._lv(travel=A)
+        # test speed: the slowest motor's, from its last auto-tune (so every motor can follow)
+        vs = []
+        for m in jm:
+            ts = (cfg.get("tune_speed") or {}).get(str(m + 1)) or {}
+            if ts.get("ramp") and ts.get("pwmmax") == ps[m]["pwmmax"]:
+                vs.append(int(ts["ramp"]))
+        self.ramp_v = min(vs) if vs else 200
+        self.say(f"Test moves at {self.ramp_v} counts/s" + (" - the slowest motor's speed from its last auto-tune."
+                 if vs else " (no auto-tune speed known yet)."))
+        self._lv(speed={"ramp": self.ramp_v})
+        self._phase("prep", "Moving to centre", 5)
+        self._jramp(c, 160.0)
+        self._jsettle(c, 5.0)
+        for m in jm:
+            if abs(self._jfb(m) - c[m]) > 40:
+                raise TuneAbort(f"motor {m + 1} didn't follow the target (feedback {self._jfb(m):.0f}, wanted "
+                                f"{c[m]}). Is motor power on?")
+        # pot noise of each, at rest
+        self._phase("noise", "Measuring pot noise", 10)
+        self.wait(1.0)
+        seq = b.seq
+        self.wait(1.5)
+        got = b.since(seq)
+        for m in jm:
+            fs = [x["m"][m]["f"] for x in got]
+            resid = [fs[i] - _mean(fs[i - 2:i + 3]) for i in range(2, len(fs) - 2)]
+            self.jnoise[m] = max(0.3, _rstd(resid) * 1.12) if resid else 0.5
+        self.say("Pot noise at rest: " + ", ".join(f"motor {m + 1} ±{self.jnoise[m]:.2f}" for m in jm) + ".")
+        self._lv(jnames={str(m + 1): {"p": names_all[m][1], "m": names_all[m][-1]} for m in jm})
+        lifts, tl = [m for m in lift_motors(cfg) if m in jm], tl_motor(cfg)
+        fw_ = lambda m: -1 if names_all[m].get(-1) in ("up", "right") else 1      # up first, right first
+        rows = {m: {} for m in jm}
+
+        def show(key, res):
+            for m, r in res.items():
+                rows[m][key] = {"p": _slim(r["dp"]), "m": _slim(r["dm"]), "fb_std": round(r["fb_std"], 2),
+                                "pid_std": round(r["pid_std"], 2)}
+            self._lv(jrows={str(m + 1): dict(rows[m]) for m in jm}, n=self.live.get("n", 0) + 1)
+
+        # 1. each alone - its own figures to compare with
+        self._phase("solo", "Each motor alone", 15)
+        for i, m in enumerate(jm):
+            self.progress = 15 + int(35 * i / len(jm))
+            self._jsettle(c, 2.0)
+            r = self._jset_test({m: fw_(m)}, c, A, ps)
+            show("solo", r)
+            self.say(f"Motor {m + 1} alone: {fmt(r[m], names_all[m])}")
+        # 2. together: the lifts up at once (and the rear slide with them)
+        self._phase("together", "All together", 55)
+        self._jsettle(c, 2.0)
+        sg = {m: fw_(m) for m in jm}
+        rt = self._jset_test(sg, c, A, ps)
+        show("together", rt)
+        for m in jm:
+            self.say(f"Motor {m + 1}, all together: {fmt(rt[m], names_all[m])}")
+        # 3. twisted: the first two lifts opposite each other
+        ro = None
+        if len(lifts) >= 2:
+            self._phase("opposite", "Twisted", 75)
+            self._jsettle(c, 2.0)
+            so = dict(sg)
+            so[lifts[1]] = -so[lifts[1]]
+            ro = self._jset_test(so, c, A, ps)
+            show("opposite", ro)
+            for m in jm:
+                self.say(f"Motor {m + 1}, twisted: {fmt(ro[m], names_all[m])}")
+        self._phase("end", "Back to where they were", 95)
+        self._jramp(self.jstart, 160.0)
+        self._jsettle(self.jstart, 3.0)
+        # verdict: what moving together costs each motor, each way - one line per motor
+        issues, suggest, power, frame = [], [], False, False
+        for m in jm:
+            nm, found = names_all[m], []
+            for key, label in (("together", "together"), ("opposite", "twisted")):
+                if key not in rows[m]:
+                    continue
+                res = rt if key == "together" else ro
+                for d, k, rk in ((1, "dp", "p"), (-1, "dm", "m")):
+                    a, z = rows[m]["solo"][rk], res[m][k]
+                    w = f"{nm[d]} {label}"
+                    if a.get("lag_ms") is not None and z.get("lag_ms") is not None and \
+                            z["lag_ms"] > 1.25 * a["lag_ms"] and z["lag_ms"] - a["lag_ms"] > 25:
+                        out = (z.get("behind") or (z.get("sat") or 0) > 0.3) and not (a.get("behind") or
+                                                                                      (a.get("sat") or 0) > 0.3)
+                        found.append(f"lags {z['lag_ms']:.0f} ms going {w} (alone {a['lag_ms']:.0f})" +
+                                     (", out of drive" if out else ""))
+                        power = True
+                    elif (z.get("behind") or (z.get("sat") or 0) > 0.3) and not (a.get("behind") or
+                                                                                 (a.get("sat") or 0) > 0.3):
+                        found.append(f"runs out of drive going {w}")
+                        power = True
+                    if z["os"] > a["os"] + 8 and z["os"] > 10:
+                        found.append(f"overshoots {z['os']:.0f}% going {w} (alone {a['os']:.0f}%)")
+                        frame = True
+                    if z["osc"] > max(2, a["osc"] + 1):
+                        found.append(f"rings going {w}")
+                        frame = True
+                    if z["sse"] > a["sse"] + 3 and z["sse"] > ps[m]["dz"] + 3:
+                        found.append(f"stops {z['sse']:.1f} counts short going {w} (alone {a['sse']:.1f})")
+            if found:
+                issues.append(f"motor {m + 1} " + ", ".join(found))
+        if power:
+            suggest.append("The motors share the power supply: when they all pull at once it may sag. Check its "
+                           "current rating against the motors' stall current, the voltage at the motor drivers while "
+                           "they all move, and the wire gauge - or lower PWMmax a little on every motor.")
+        if frame:
+            suggest.append("Overshoot or ringing that shows only together comes from the frame or the seat flexing "
+                           "when the motors work against each other: stiffen the mounts, or let auto-tune try Kd.")
+        ok = not issues
+        self.say("Together: " + ("every motor does as well as alone." if ok else "; ".join(issues) + "."))
+        self.result = {"joint": True, "ok": ok, "issues": issues, "suggest": suggest, "amp": A,
+                       "ramp_v": self.ramp_v, "motors": [m + 1 for m in jm],
+                       "names": {str(m + 1): {"p": names_all[m][1], "m": names_all[m][-1]} for m in jm},
+                       "rows": {str(m + 1): rows[m] for m in jm},
+                       "values": {str(m + 1): ps[m] for m in jm}}
         self.progress = 100
 
     def _run_check(self, m, amp, style, do_friction, do_ki, do_kd, rider="empty", rider_kg=0.0, unit="lb"):
@@ -3036,6 +3811,8 @@ DIAG_SENSOR = struct.Struct("<BBBIHIHHhhhhhHBBB")  # firmware 1.8 (frame version
 DIAG_SEAT = struct.Struct("<15h4hBIHH3h3hh")      # firmware 1.9 (frame version 3): seat set-up, acceleration, gyro
 DIAG_SOFT = struct.Struct("<HB")                    # firmware 1.9.1 (frame version 4): soft-start speed, motors creeping
 DIAG_WIFI = struct.Struct("<3BBBh")                 # firmware 1.9.2 (frame version 5): WiFi module, WiFi memory, update
+DIAG_MODULE = struct.Struct("<BHBB")                # firmware 1.9.8 (frame version 6): the last USB/WiFi chip restart
+MODULE_WIFI_LAST = {0: "not tried yet", 1: "joined", 2: "failed", 3: "no module", 4: "the chip doesn't answer"}
 TILT_DIRS = ("roll_right", "roll_left", "front_up", "front_down")   # roll +, roll -, pitch +, pitch - (firmware order)
 ACC_G = 32768.0 / 16.0                            # WitMotion raw -> g
 GYRO_DPS = 32768.0 / 2000.0                       # WitMotion raw -> degrees per second
@@ -3150,6 +3927,13 @@ def decode_diag(pl, ver=1):
                      "remembered": bool(wf & 1), "joined_with_remembered": bool(wf & 2),
                      "sketch_has_wifi": not (wf & 4)}
         d["update"] = {"state": OTA_STATES.get(ust, str(ust)), "code": ucode}
+        off += DIAG_WIFI.size
+    if ver >= 6 and len(pl) >= off + DIAG_MODULE.size:
+        cnt, age, back, tl = DIAG_MODULE.unpack_from(pl, off)
+        d["module_restart"] = {"count": cnt, "age_s": None if age == 65535 else age,
+                               "chip_back_s": None if back == 0 else round(back / 10.0, 1),
+                               "wifi_tries": tl & 15, "wifi_last": MODULE_WIFI_LAST.get(tl >> 4, str(tl >> 4)),
+                               "wifi_last_code": tl >> 4}
     return d
 
 
@@ -3169,7 +3953,8 @@ def reset_cause(d):
     if r1 & 0x03:
         parts.append("watchdog")
     if r1 & 0x04:
-        parts.append("software reset (a new sketch was uploaded, or the WiFi/USB chip restarted the board)")
+        parts.append("software reset (a new sketch was uploaded, the page's Restart button, or the WiFi/USB chip "
+                     "restarted the board)")
     cold = d["cwsf_ok"] and not (r2 & 1)
     if cold or (r0 & 1):
         head = "power-on (the supply was off or dipped low enough to restart it)"
@@ -4923,7 +5708,9 @@ class Diagnostics:
                           "build": {"bridge": "IBT-2 / BTS7960 (MODE2)" if dg["build"] & 2 else
                                     "PWM + direction pins (MODE1)", "reverse_motor1": bool(dg["build"] & 1),
                                     "imu": bool(dg["build"] & 4), "led_matrix": bool(dg["build"] & 8),
-                                    "static_ip": bool(dg["build"] & 16), "pot_filter": bool(dg["build"] & 32)},
+                                    "static_ip": bool(dg["build"] & 16), "pot_filter": bool(dg["build"] & 32),
+                                    "usb_port": ("main chip (native)" if dg["build"] & 64 else "WiFi chip (bridge)")
+                                    if vkey(board.get("firmware")) >= (2, 0, 0) else None},
                           "usb": {"commands_ok": dg["usb_ok"], "position_commands": dg["usb_targets"],
                                   "bytes_thrown_away": dg["usb_bad_bytes"],
                                   "ms_since_last_command": dg["ms_since_usb"],
@@ -4944,6 +5731,8 @@ class Diagnostics:
                 board["firmware_update"] = dict(dg["update"])
                 if dg["update"]["code"]:
                     board["firmware_update"]["meaning"] = ota_error_text(dg["update"]["code"])
+            if "module_restart" in dg:               # firmware 1.9.8: how the last USB/WiFi chip restart went
+                board["module_restart"] = {k: v for k, v in dg["module_restart"].items() if k != "wifi_last_code"}
         rep["board"] = board
         fwup = getattr(self, "fwup", None)              # page 2.3: the page's own record of the last firmware update
         if fwup is not None and fwup.state != "idle":
@@ -5351,7 +6140,7 @@ def analyze(rep):
                 why = (" This is the classic cause of sudden violent jerks: for a moment the controller thinks the motor "
                        "is somewhere else and drives hard.")
             fwfix = ("" if pot_filter_fw else " Firmware 1.9.4 also holds short glitches back from the motors (flash "
-                     "SMC3_R4_v1.9.6.ino" + (", or Settings, Firmware update" if upd_ok else " over USB")
+                     "SMC3_R4_v2.0.ino" + (", or Settings, Firmware update" if upd_ok else " over USB")
                      + ").")
             add(lvl, f"Motor {n}'s pot reading jumps (glitches)",
                 f"Readings that change faster than any motor can move: {gl_fw} counted by the board"
@@ -5531,11 +6320,12 @@ def analyze(rep):
                 "(soft start)", f"At {sst['rate']} counts/s after power-up or Enable Motors; normal once it has caught "
                 "up.", code="soft_creeping")
     elif board.get("seat_setup") is not None and board.get("wifi") is None:
-        add("info", "Firmware 1.9.6 adds a soft start, updates from this page, a pot glitch filter and the USB cable link",
+        add("info", "Firmware 1.9.6 and later add a soft start, updates from this page, a pot glitch filter and the USB cable link",
             "With 1.9 the motors go straight to their positions at power-up - a seat that rode down while the rig "
-            "was off jumps back. 1.9.6 also lets you install later firmware from Settings, Firmware update, keeps "
-            "pot glitches away from the motors and no longer loses bytes on the USB port.",
-            "Flash SMC3_R4_v1.9.6.ino over USB with the Arduino IDE.", code="soft_fw")
+            "was off jumps back. Later firmware also lets you install updates from Settings, Firmware update, keeps "
+            "pot glitches away from the motors and no longer loses bytes on the USB port (2.0: the board's own USB "
+            "port, no stall).",
+            "Flash SMC3_R4_v2.0.ino over USB with the Arduino IDE.", code="soft_fw")
     # ---- firmware update over WiFi (firmware 1.9.2) ----
     wfi = board.get("wifi")
     fup = board.get("firmware_update") or {}
@@ -5565,9 +6355,9 @@ def analyze(rep):
                 "This build has no WiFi details of its own (or they didn't work), so it used the ones it last joined "
                 "with.", code="wifi_remembered")
     elif sst is not None:
-        add("info", "Firmware 1.9.6 can be updated from this page",
+        add("info", "Firmware 1.9.2 and later can be updated from this page",
             "Settings, Firmware update installs later firmware over WiFi - no USB cable, SimHub can stay open.",
-            "Flash SMC3_R4_v1.9.6.ino over USB once with the Arduino IDE.", code="update_fw")
+            "Flash SMC3_R4_v2.0.ino over USB once with the Arduino IDE.", code="update_fw")
     # ---- page 2.8.3: firmware 1.9.6 stops bytes getting lost on the USB port ----
     fwk = vkey(board.get("firmware"))
     if (1, 9, 2) <= fwk < (1, 9, 6):
@@ -5577,10 +6367,34 @@ def analyze(rep):
             "(the board's USB port holds one byte, and the motor loop kept it waiting at 500000 baud): now and then "
             "one of SimHub's position commands, and often enough the page's commands over the USB cable that the "
             "cable link drops out." + (f" The board has thrown away {lost} bytes since it started." if lost else ""),
-            "Upload SMC3_R4_v1.9.6.ino with the Arduino IDE" + (", or export its .bin (Sketch, Export Compiled Binary) "
+            "Upload SMC3_R4_v2.0.ino with the Arduino IDE" + (", or export its .bin (Sketch, Export Compiled Binary) "
                                                                  "and install it in Settings, Firmware update."
                                                                  if wfi is not None else "."),
             code="usb_rx_fw")
+    # ---- page 2.9: firmware 1.9.7's chip restart left the board off WiFi until its reset button was pressed ----
+    if fwk == vkey("1.9.7"):
+        add("warn", "Firmware 2.0: the USB chip restart no longer leaves the board off WiFi",
+            "On 1.9.7, after the page has the board restart its USB/WiFi chip (the cable stall), the board kept its "
+            "old link to that chip, every WiFi attempt then blocked and failed, and only the reset button brought it "
+            "back. 2.0 re-opens the link and lets the cable come back first - and gives the USB connector to the main "
+            "chip, so the chip needn't restart at all.",
+            "Upload SMC3_R4_v2.0.ino with the Arduino IDE" + (", or export its .bin (Sketch, Export Compiled Binary) "
+                                                                 "and install it in Settings, Firmware update."
+                                                                 if wfi is not None else "."),
+            code="modreset_fw")
+    if (board.get("build") or {}).get("usb_port") == "main chip (native)":
+        add("ok", "USB port: the main chip's own (firmware 2.0)",
+            "SimHub and the page talk to the main chip directly over USB; the WiFi chip's bridge - its stall, its lost "
+            "bytes - is out of the path. An Arduino IDE upload needs the WiFi chip on the port: Settings, USB cable, "
+            "\"WiFi chip until the next reset\", or two quick RESET presses.", code="usb_native")
+    mr = board.get("module_restart")
+    if mr and mr.get("count"):
+        back = mr.get("chip_back_s")
+        add("info", f"The board restarted its USB/WiFi chip {mr['count']} time{'s' if mr['count'] != 1 else ''} since it started",
+            f"The last one {mr['age_s']} s ago: the chip answered again after {back} s; WiFi {mr['wifi_last']}"
+            + (f" after {mr['wifi_tries']} tr{'y' if mr['wifi_tries'] == 1 else 'ies'}" if mr['wifi_tries'] else "") + "."
+            if back else f"The last one {mr['age_s']} s ago: the chip hasn't answered since ({mr['wifi_last']}).",
+            code="modreset_report")
     # ---- seat set-up (firmware 1.9) ----
     ss = board.get("seat_setup")
     if ss:
@@ -7086,7 +7900,7 @@ def ota_unwrap(ota):
     return bytes(d.out), None
 
 
-FW_ID_RE = re.compile(rb"SMC3_R4 v(\d+\.\d+(?:\.\d+)?)")
+FW_ID_RE = re.compile(rb"SMC3_R4 v(\d+\.\d+(?:\.\d+)?(?:b\d+)?)")   # 2.9: with a beta mark (2.0b2)
 FW_CAPS_RE = re.compile(rb"SMC3CAPS:([a-z0-9,]+)")
 FW_WIFI_PLACEHOLDER = b"YourNetworkName"
 
@@ -7245,7 +8059,7 @@ class FirmwareUpdate:
                                 "0.4.0 or newer. Update it once over USB: " + WIFI_MODULE_STEPS)
         else:
             v["problem"] = ("The board runs firmware " + (v["fw"] or "older than 1.7") + ", which can't be updated from "
-                            "the page. Flash SMC3_R4_v1.9.6.ino over USB with the Arduino IDE once - from then on "
+                            "the page. Flash SMC3_R4_v2.0.ino over USB with the Arduino IDE once - from then on "
                             "updates can come from here.")
         if self.bind in ("127.0.0.1", "localhost", "::1"):
             v["capable"] = False
@@ -7749,16 +8563,21 @@ PAGE_ASSET = re.compile(r"^smc3_scope_v(\d+(?:\.\d+){1,3})\.py$")
 FW_ASSET = re.compile(r"^SMC3_R4_v(\d+(?:\.\d+){1,3})\.ino$")
 
 
+VKEY_PARTS = 4                                       # numbers a version is padded to (2.0 -> 2.0.0.0)
+
+
 def vkey(v):
-    """'2.6.10' -> (2, 6, 10), so versions compare as numbers. Trailing zeros don't count (2.7 == 2.7.0), and
-    anything after the numbers is ignored (1.9.4-mine -> (1, 9, 4)); no number at all sorts lowest."""
-    m = re.match(r"\s*[vV]?(\d+(?:\.\d+)*)", str(v or ""))
+    """'2.6.10' -> (2, 6, 10, 0, 1), so versions compare as numbers. The numbers are padded to four, so trailing
+    zeros don't count (2.7 == 2.7.0) and 2.0 < 2.0.1; anything after the numbers is ignored (1.9.4-mine == 1.9.4);
+    no number at all sorts lowest. A beta ("2.9") sorts before its release ("2.9") and after the release before
+    it: the numbers, then (0, n) for a beta and (1,) for a release. A tuple with fewer parts compares as a prefix:
+    vkey(x) >= (2, 0, 0) for 2.0, 2.0.1 and the 2.0 betas."""
+    m = re.match(r"\s*[vV]?(\d+(?:\.\d+)*)(b(\d*))?", str(v or ""))
     if not m:
         return (0,)
     k = [int(x) for x in m.group(1).split(".")]
-    while len(k) > 1 and k[-1] == 0:
-        k.pop()
-    return tuple(k)
+    k += [0] * (VKEY_PARTS - len(k))
+    return tuple(k) + ((0, int(m.group(3) or 0)) if m.group(2) else (1,))
 
 
 def _ustate_path(data_dir):
@@ -8199,7 +9018,7 @@ def usb_bridge_ps1(page_url):
 
 USB_BRIDGE_PS1 = r"""# SMC3 R4 USB bridge (smc3_scope __VERSION__): lets the smc3_scope page talk to the board over the USB cable instead
 # of WiFi - for calibration (auto-tune, the full check, Seat setup) with SimHub closed. Windows PowerShell 5.1 or
-# PowerShell 7, nothing to install. Needs firmware 1.9.5 or newer on the board (1.9.6 recommended).
+# PowerShell 7, nothing to install. Needs firmware 1.9.5 or newer on the board (2.0 recommended).
 #   From the page: Settings, USB cable - press Win+R and paste the line shown there.
 #   As a file:     powershell -NoProfile -ExecutionPolicy Bypass -File smc3-usb-bridge.ps1 [http://<page>:<port>] [COMx] [standby]
 # It links at once. When the page's switch goes back to WiFi it lets go of the port (SimHub can have it) and waits:
@@ -8689,7 +9508,44 @@ def _page_addr(page):
     return u.hostname, u.port or 80, u.netloc
 
 
-def _bridge_link(ser, page, port_name, bid, say):
+def _bridge_probe(ser):
+    """2.9: as the PowerShell bridge does - ask the board for its firmware number ([rd!]) a few times right after the
+    port opens: "ok 19", "bytes N" or "none" (nothing at all came back: the board's USB output has stalled)."""
+    got = b""
+    end = time.time() + 2.5
+    asked, ask_at = 0, 0.0
+    while time.time() < end:
+        if asked < 6 and time.time() - ask_at >= 0.35:
+            try:
+                ser.write(b"[rd!]")
+            except OSError:
+                return "none"
+            asked += 1
+            ask_at = time.time()
+        try:
+            d = ser.read()
+        except OSError:
+            return "none"
+        if d:
+            got += d
+            for j in range(len(got) - 4):
+                if got[j] == 0x5B and got[j + 1] == 0x21 and got[j + 4] == 0x5D:
+                    return f"ok {got[j + 3]}"
+        else:
+            time.sleep(0.02)
+    return f"bytes {len(got)}" if got else "none"
+
+
+def _probe_fw(probe):
+    """'ok 20' -> '2.0.x' (the firmware number [rd!] answers: 19 for 1.9.x, 20 for 2.0)."""
+    try:
+        n = int(probe.split()[1])
+    except (IndexError, ValueError):
+        return "?"
+    return f"{n // 10}.{n % 10}.x"
+
+
+def _bridge_link(ser, page, port_name, bid, say, probe=""):
     """One link to the page. Returns ("again", why) when the page or the network ended it, ("wait", why) when the
     page is busy, or raises SystemExit with the page's reason when it won't take this bridge."""
     host, port, netloc = _page_addr(page)
@@ -8700,7 +9556,7 @@ def _bridge_link(ser, page, port_name, bid, say):
     s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     req = (f"POST /usb/link HTTP/1.1\r\nHost: {netloc}\r\nX-SMC3: 1\r\nX-SMC3-Bridge: {bid}\r\n"
            f"X-SMC3-Computer: {_clean_hdr(socket.gethostname())}\r\nX-SMC3-Port: {_clean_hdr(port_name)}\r\n"
-           f"X-SMC3-Bridge-Version: {BRIDGE_VERSION}\r\nContent-Length: 0\r\n\r\n")
+           f"X-SMC3-Bridge-Version: {BRIDGE_VERSION}\r\nX-SMC3-Probe: {probe}\r\nContent-Length: 0\r\n\r\n")
     head = b""
     try:
         s.sendall(req.encode())
@@ -8845,6 +9701,7 @@ def usb_bridge_main(port_name, page, quiet=False, standby=False):
     except (ValueError, OSError, AttributeError):
         pass
     ser = None
+    probe = None
     want, via_page, busy, said, away = not standby, False, "", "", 0.0
 
     def once(key, msg):
@@ -8854,10 +9711,10 @@ def usb_bridge_main(port_name, page, quiet=False, standby=False):
             said = key
 
     def let_go():
-        nonlocal ser, want, via_page, said, away
+        nonlocal ser, want, via_page, said, away, probe
         if ser is not None:
             ser.close()
-        ser, want, via_page, said, away = None, False, False, "", 0.0
+        ser, probe, want, via_page, said, away = None, None, False, False, "", 0.0
     try:
         while True:
             if not want:                             # waiting, port closed, until the page's switch asks for it
@@ -8880,6 +9737,7 @@ def usb_bridge_main(port_name, page, quiet=False, standby=False):
                 try:
                     ser = _SerialPort(port_name)
                     busy = ""
+                    probe = None
                 except OSError as e:
                     in_use = "busy" in str(e).lower() or "denied" in str(e).lower() or "in use" in str(e).lower()
                     busy = (f"{port_name} is in use - close SimHub (or SMC3Utils, the Arduino IDE's Serial Monitor)."
@@ -8898,7 +9756,12 @@ def usb_bridge_main(port_name, page, quiet=False, standby=False):
                 say(f"No word from the page for a minute - letting go of {port_name}.")    # port: SimHub can have it
                 let_go()
                 continue
-            kind, why = _bridge_link(ser, page, port_name, bid, say)
+            if probe is None:                        # (once per opening of the port)
+                probe = _bridge_probe(ser)
+                say(f"The board answers on the port (firmware {_probe_fw(probe)})." if probe.startswith("ok") else
+                    f"No answer from the board on {port_name}: nothing comes back over USB yet." if probe == "none" else
+                    f"Something answers on {port_name}, but not like the board.")
+            kind, why = _bridge_link(ser, page, port_name, bid, say, probe)
             if kind == "wait":
                 say(f"Waiting: {why} (trying again in 5 s)")
                 r = _ask_page(page, bid, port_name)  # 2.8.2: let go if the switch went back to WiFi meanwhile
@@ -8918,7 +9781,7 @@ def usb_bridge_main(port_name, page, quiet=False, standby=False):
             if kind == "usb":                        # 2.8.2: the cable came out - open the port again when it's back
                 say(why)
                 ser.close()
-                ser, said = None, ""
+                ser, probe, said = None, None, ""
                 time.sleep(2)
                 continue
             try:
@@ -8963,6 +9826,214 @@ def usb_bridge_main(port_name, page, quiet=False, standby=False):
                 pass
             ser.close()
     return 0
+
+
+# ---- 2.9: the browser as the bridge (Web Serial) --------------------------------------------------------------------
+# In Chrome, Edge, Firefox 151+ or Brave the page itself can open the board's USB port (the Web Serial API) - no
+# PowerShell window. The page sends the port's bytes to the page server over a WebSocket (/usb/browser) and the server
+# feeds them to the Board exactly as a bridge's connection: one end of a socketpair is the Board's "socket", the other
+# end is pumped to and from the WebSocket by the request's thread. Browsers only offer Web Serial on a secure page
+# (https, or localhost), so the page explains the one-time step when it is opened over plain http from another machine.
+
+WS_MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+
+def ws_accept(key):
+    return base64.b64encode(hashlib.sha1((key + WS_MAGIC).encode("ascii")).digest()).decode("ascii")
+
+
+def ws_frame(opcode, payload=b""):
+    """One unmasked server frame."""
+    n = len(payload)
+    if n < 126:
+        head = bytes([0x80 | opcode, n])
+    elif n < 65536:
+        head = bytes([0x80 | opcode, 126]) + struct.pack("!H", n)
+    else:
+        head = bytes([0x80 | opcode, 127]) + struct.pack("!Q", n)
+    return head + payload
+
+
+def ws_close_frame(code=1000, reason=""):
+    r = reason.encode("utf-8")[:120]
+    return ws_frame(8, struct.pack("!H", code) + r)
+
+
+class _WsReader:
+    """Collects a browser's (masked) frames from the bytes as they arrive; frames() yields (opcode, payload)."""
+
+    def __init__(self):
+        self.buf = b""
+
+    def feed(self, data):
+        self.buf += data
+
+    def frames(self):
+        while True:
+            b = self.buf
+            if len(b) < 2:
+                return
+            fin, op, masked, n = b[0] & 0x80, b[0] & 0x0F, b[1] & 0x80, b[1] & 0x7F
+            i = 2
+            if n == 126:
+                if len(b) < 4:
+                    return
+                n, i = struct.unpack_from("!H", b, 2)[0], 4
+            elif n == 127:
+                if len(b) < 10:
+                    return
+                n, i = struct.unpack_from("!Q", b, 2)[0], 10
+            if not fin or not masked or n > 1 << 20:
+                raise ValueError("bad WebSocket frame")
+            if len(b) < i + 4 + n:
+                return
+            mask = b[i:i + 4]
+            data = bytes(c ^ mask[k & 3] for k, c in enumerate(b[i + 4:i + 4 + n]))
+            self.buf = b[i + 4 + n:]
+            yield op, data
+
+
+def usb_browser_check(handler, info):
+    """The same gate as /usb/link: None when a browser link may start, else (why, http code)."""
+    b = handler.board
+    u = b.usb
+    if not handler.cfg.get("usb_link"):
+        return ("This page is set to WiFi only: in Settings, USB cable, tick \"Let a USB bridge take over\" first.", 403)
+    if info["id"] and info["id"] in b.usb_refused:
+        return (b.usb_refused[info["id"]], 410)
+    if b.link == "usb" and u and u.get("id") != info["id"]:
+        return (f"Another USB bridge is linked already ({u.get('computer') or '?'}, {u.get('port') or '?'}).", 409)
+    if b.usb_pending:
+        return ("Another USB bridge is linking right now.", 409)
+    if b.module_resetting():                             # 2.9: the port is about to go away and come back
+        return ("The board is restarting its USB chip to clear a USB stall - the port comes back in a few seconds.", 409)
+    if info.get("probe") == "none" and b.link != "usb" and b.module_reset_now():   # 2.9: stalled before the link
+        return ("Nothing comes back from the board over USB: its USB output has stalled (a known UNO R4 WiFi problem). "
+                "The page asked the board to restart its USB chip - " + b.module_after_text(), 409)
+    why = Handler.usb_busy() if Handler.usb_busy else None    # (a plain function kept on the class)
+    return (why, 409) if why else None
+
+
+def usb_browser_info(handler, q):
+    def one(k, n=40):
+        return _clean_hdr((q.get(k) or [""])[0], n)
+    return {"id": one("id"), "computer": one("computer", 40) or "the browser", "port": one("port", 40) or "Web Serial",
+            "version": "web-" + VERSION, "probe": one("probe", 20), "from": handler.client_address[0]}
+
+
+def usb_browser_link(handler):
+    """GET /usb/browser (a WebSocket): the page's own USB link. Binary frames carry the board's bytes both ways; the
+    link ends when either side closes. The close frame's reason tells the page why the server ended it."""
+    h = handler.headers
+    origin, host = h.get("Origin", ""), h.get("Host", "")
+    if not origin or urlparse(origin).netloc.lower() != host.lower():
+        handler._text("The USB link is for this page only.", 403)
+        return
+    key = h.get("Sec-WebSocket-Key", "")
+    try:
+        key_ok = len(base64.b64decode(key, validate=True)) == 16
+    except Exception:
+        key_ok = False
+    if not (key_ok and h.get("Upgrade", "").lower() == "websocket" and "upgrade" in h.get("Connection", "").lower()):
+        handler._text("That needs a WebSocket.", 400)
+        return
+    info = usb_browser_info(handler, parse_qs(urlparse(handler.path).query))
+    bad = usb_browser_check(handler, info)
+    if bad:
+        handler._text(bad[0], bad[1])
+        return
+    b = handler.board
+    u = b.usb
+    if b.link == "usb" and u:                            # the same browser again: its old link is gone
+        u["end"] = "The browser linked again."
+    handler.protocol_version = "HTTP/1.1"
+    handler.send_response(101, "Switching Protocols")
+    handler.send_header("Upgrade", "websocket")
+    handler.send_header("Connection", "Upgrade")
+    handler.send_header("Sec-WebSocket-Accept", ws_accept(key))
+    handler.end_headers()
+    handler.wfile.flush()
+    handler.close_connection = True
+    conn = handler.connection
+    try:
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except OSError:
+        pass
+    conn.settimeout(2.0)                                 # (sendall may wait a little; recv only after select)
+    board_end, pump_end = socket.socketpair()
+    board_end.settimeout(1.0)
+    pump_end.settimeout(2.0)
+    handler.events.add("link", f"The page linked the USB cable itself: {info['computer']} ({info['from']}), "
+                        f"{info['port']}" + (f", board check: {info['probe']}" if info["probe"] else "") + ".", quiet=True)
+    b.usb_want, b.usb_want_at, b.usb_want_grace = True, time.time(), 6.0
+    done = b.attach_usb(board_end, info)
+    rd = _WsReader()
+    reason = None
+    try:
+        while not done.is_set():
+            r, _, _ = select.select([conn, pump_end], [], [], 0.25)
+            if pump_end in r:
+                try:
+                    data = pump_end.recv(16384)
+                except (socket.timeout, BlockingIOError, InterruptedError):
+                    data = None
+                if data == b"":
+                    break
+                if data:
+                    conn.sendall(ws_frame(2, data))
+            if conn in r:
+                try:
+                    data = conn.recv(65536)
+                except (socket.timeout, BlockingIOError, InterruptedError):
+                    data = None
+                if data == b"":
+                    reason = "closed"
+                    break
+                if data:
+                    rd.feed(data)
+                    for op, payload in rd.frames():
+                        if op == 8:
+                            reason = "closed"
+                            break
+                        if op == 9:
+                            conn.sendall(ws_frame(10, payload))
+                        elif op == 2 and payload:
+                            pump_end.sendall(payload)
+                    if reason:
+                        break
+    except (OSError, ValueError) as e:
+        reason = f"error: {e}"
+    finally:
+        if reason is None:                               # the server ended it: tell the page why
+            done.wait(1.5)                               # (the Board closes the socket first, then records why)
+            why = ((b.usb_last or {}).get("why") if b.usb_last else None) or "The link ended."
+            # the close frame's reason is short (123 bytes), so a tag goes first: the page's JS reads the tag and
+            # fetches the whole text from /usb/status
+            if "restart its USB chip" in why and "not again yet" not in why and "unplug the USB cable" not in why:
+                tag = "stall-reset"
+            elif "unplug the USB cable" in why:
+                tag = "stall-replug"
+            elif "stopped sending" in why or "didn't answer" in why:
+                tag = "quiet"
+            elif "switched to WiFi" in why or "WiFi only" in why or "closed its USB link" in why:
+                tag = "wifi"
+            else:
+                tag = "ended"
+            try:
+                conn.settimeout(1.0)
+                conn.sendall(ws_close_frame(1000, tag + " " + why))
+            except OSError:
+                pass
+        else:
+            mine = (b.usb and b.usb.get("id") == info["id"]) or (b.usb_pending and b.usb_pending[1].get("id") == info["id"])
+            if mine:
+                b.detach_usb("The page closed its USB link (the tab was closed, or the cable came out).")
+            done.wait(1.0)
+        for s in (pump_end, board_end):
+            try:
+                s.close()
+            except OSError:
+                pass
 
 
 # --------------------------------------------------------------------------------------------------------------
@@ -11071,7 +12142,11 @@ svg.i{width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:1.8;stro
 .seg button.on{background:linear-gradient(#1559cc,#0b45a8);color:#fff;box-shadow:inset 0 0 0 1px #3b82f6}
 .hbtn{display:flex;align-items:center;gap:9px;height:46px;text-decoration:none;padding:0 18px;border:1px solid var(--chrome-line);border-radius:10px;background:#0c141d;color:var(--chrome-text);cursor:pointer}
 .hbtn:hover,.seg button:hover:not(.on){background:#121d29;color:#fff}
-.hbtn{position:relative}
+.hbtn{position:relative;font:inherit}
+.hbtn:disabled{opacity:.45;cursor:default}
+.hbtn.old{opacity:.7}
+#combo_presets{margin-top:8px}
+@media (max-width:1880px){#rebootBtn{padding:0 13px}#rebootBtn .rbl{display:none}}   /* the status pill needs the room */
 .updballoon{position:absolute;top:-11px;right:-8px;display:flex;align-items:center;gap:4px;height:22px;padding:0 9px;border-radius:11px;background:var(--amber);color:#1b1300;font-size:12px;font-weight:700;white-space:nowrap;box-shadow:0 2px 8px rgba(0,0,0,.45);animation:updpulse 2s ease-out infinite;z-index:3}
 .updballoon::after{content:"";position:absolute;left:50%;bottom:-5px;margin-left:-5px;border:5px solid transparent;border-top-color:var(--amber);border-bottom:0}
 .updballoon[hidden]{display:none}
@@ -11248,9 +12323,11 @@ html[data-theme=light] .pid th.h0{color:#0b5fd6}html[data-theme=light] .pid th.h
 .tune .chks label{margin-right:9px;font-size:12px;gap:5px}
 .tune .chks label:last-child{margin-right:0}
 .tune .chks input{width:15px;height:15px}
-.tune .acts{display:flex;gap:10px;align-items:center}
+.tune .acts{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
 .tune .acts .b-green{flex:1;height:37px}
 .tune .acts .btn{height:37px}
+.tjoint td:nth-child(2){white-space:nowrap}.tjoint tr.jfirst td{border-top:1px solid var(--line)}
+.tjoint tr.jworse td{background:color-mix(in srgb,var(--st-warn) 14%,transparent)}
 .bar{height:7px;background:var(--input);border:1px solid var(--input-line);border-radius:5px;overflow:hidden;margin:10px 0 6px}
 .bar div{height:100%;width:0;background:linear-gradient(90deg,#0b55d6,#1f8fff);transition:width .4s}
 @media (prefers-reduced-motion:reduce){.bar div{transition:none}}
@@ -11360,6 +12437,9 @@ ul.tips{margin:6px 0 10px;padding-left:18px}ul.tips li{color:var(--dim);margin:4
 .fwinfo{font-size:14px;margin:6px 0 2px;line-height:1.5}.fwinfo b{font-family:var(--mono)}
 .fwhow ol{margin:4px 0 8px;padding-left:20px;font-size:14px;line-height:1.5}.fwhow li{margin:4px 0}
 .usbsteps{margin:8px 0 10px;padding-left:20px;font-size:14px;line-height:1.5}.usbsteps li{margin:6px 0}
+.wsbox{border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin:10px 0}.wshead{margin-bottom:6px}
+.wsalt{margin:8px 0}.wsalt summary{cursor:pointer;color:var(--dim);font-size:14px}.wsalt[open] summary{margin-bottom:6px}
+.wsol{margin:6px 0 4px;padding-left:20px;font-size:14px;line-height:1.5}.wsol li{margin:6px 0}
 .cmdbox{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:center;margin:6px 0;max-width:100%}
 .cmdbox code{min-width:0;font-family:var(--mono);font-size:12.5px;padding:7px 9px;border-radius:8px;background:var(--bg);border:1px solid var(--line);overflow-x:auto;white-space:nowrap;user-select:all}
 .cmdbox .btn{height:auto;min-height:34px;padding:4px 12px}
@@ -11572,6 +12652,7 @@ details.oks .flist{margin-top:6px}
   <button data-theme-set="dark" data-k="th_dark"><svg class="i" viewBox="0 0 24 24"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>Dark</button>
   <button data-theme-set="auto" data-k="th_auto"><svg class="i" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>Auto</button>
  </div>
+ <button class="hbtn" id="rebootBtn" data-k="rebootBtn" onclick="rebootAsk()"><svg class="i" viewBox="0 0 24 24"><path d="M12 3v8"/><path d="M6.3 7.3a8 8 0 1 0 11.4 0"/></svg><span class="rbl">Restart</span></button>
  <a class="hbtn" href="#settings" data-k="settingsBtn" onclick="if(!$('updBalloon').hidden)updGo()"><svg class="i" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>Settings<span class="updballoon" id="updBalloon" data-k="updballoon" hidden><svg class="i" viewBox="0 0 24 24" style="width:13px;height:13px"><path d="M12 19V5M5 12l7-7 7 7"/></svg>Update</span></a>
 </header>
 
@@ -11679,6 +12760,7 @@ details.oks .flist{margin-top:6px}
   <div class="ct"><svg class="i" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M6 14l3-4 3 3 3-5 3 4"/></svg>Test Signal <small>(stop SimHub motion first)</small></div>
   <div class="frow">
    <div><span class="lbl" data-k="gmotor">Motor</span><select id="gm" class="msel" onchange="setSel(+this.value)"></select></div>
+   <div><span class="lbl" data-k="g_combo">Together</span><select id="gcombo"><option value="">Just this motor</option><option value="twist">Twist (1 vs 2)</option><option value="heave">Heave (lifts)</option><option value="corner">Corner (all 3)</option><option value="wave">Wave (all)</option></select></div>
    <div><span class="lbl" data-k="gmode">Mode</span><select id="gmode"><option value="sine">Sine</option><option value="step">Square</option><option value="triangle">Triangle</option><option value="manual">Hold</option></select></div>
    <div><span class="lbl" data-k="gamp">Amplitude</span><input type="number" id="gamp" value="150"></div>
    <div><span class="lbl" data-k="gper">Period (s)</span><input type="number" id="gper" value="2" step="0.1"></div>
@@ -11698,6 +12780,12 @@ details.oks .flist{margin-top:6px}
    <button class="preset ap" data-k="p_tri" onclick="preset('triangle')"><svg class="i" viewBox="0 0 24 24"><path d="M2 16l5-8 5 8 5-8 5 8"/></svg>Triangle</button>
    <button class="preset ap" data-k="p_step" onclick="preset('step')"><svg class="i" viewBox="0 0 24 24"><path d="M2 17h8V7h12"/></svg>Step</button>
    <button class="preset ap" data-k="p_manual" onclick="preset('manual')"><svg class="i" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>Manual</button>
+  </div>
+  <div class="presets" id="combo_presets">
+   <button class="preset ap" data-k="p_twist" onclick="preset('twist')"><svg class="i" viewBox="0 0 24 24"><path d="M2 12c2.5-7 5.5-7 8 0s5.5 7 8 0"/><path d="M2 12c2.5 7 5.5 7 8 0s5.5-7 8 0" opacity=".55"/></svg>Twist</button>
+   <button class="preset ap" data-k="p_heave" onclick="preset('heave')"><svg class="i" viewBox="0 0 24 24"><path d="M2 10c2.5-6 5.5-6 8 0s5.5 6 8 0"/><path d="M2 15c2.5-6 5.5-6 8 0s5.5 6 8 0" opacity=".55"/></svg>Heave</button>
+   <button class="preset ap" data-k="p_corner" id="pc_corner" onclick="preset('corner')"><svg class="i" viewBox="0 0 24 24"><path d="M4 18c0-8 6-14 16-14"/><path d="M15 2l5 2-2 5"/></svg>Corner</button>
+   <button class="preset ap" data-k="p_wave" onclick="preset('wave')"><svg class="i" viewBox="0 0 24 24"><path d="M2 12c2-6 4-6 6 0s4 6 6 0 4-6 6 0"/></svg>Wave</button>
   </div>
  </section>
 
@@ -11721,6 +12809,7 @@ details.oks .flist{margin-top:6px}
   <div class="acts">
    <button class="btn b-green" id="tstart" data-k="tstart" onclick="tuneConfirm()">Start Auto-Tune</button>
    <button class="btn b-blue" id="tcheck" data-k="tcheck" onclick="tuneConfirm('check')">Check</button>
+   <button class="btn b-blue" id="tjoint" data-k="tjoint" onclick="tuneConfirm('joint')">Test together</button>
    <button class="btn b-grey" id="tstop" data-k="tstop" onclick="post('/tune/abort')" disabled>Stop</button>
    <a class="btn b-grey ibtn" href="#autotune" data-k="tgear"><svg class="i" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M4.9 19.1L7 17M17 7l2.1-2.1"/></svg></a>
   </div>
@@ -11939,24 +13028,47 @@ details.oks .flist{margin-top:6px}
    <div>
     <div class="sstat" id="usb_stat"><i class="dot"></i><span>Not read yet</span></div>
     <label class="chk" data-k="usb_allow"><input type="checkbox" id="usb_allow" onchange="usbAllow()"><span>Let a USB bridge take over from WiFi</span></label>
-    <ol class="usbsteps">
-     <li><b>Close SimHub</b> - it holds the board's USB port while it runs.</li>
-     <li>On the PC the board is plugged into, press <b>Win+R</b>, paste this line and press Enter:
-      <div class="cmdbox"><code id="usb_cmd"></code><button class="btn b-grey" id="usb_copy" data-k="usb_copy" onclick="usbCopy()">Copy</button></div>
-      A window opens, finds the board's COM port and links it to this page.</li>
-     <li>The page switches to the cable by itself - the switch at the top of the page moves to <b class="usbb">USB</b>. Run auto-tune, the full check or Seat setup as usual.</li>
-     <li>When you're done, flip that switch to <b>WiFi</b> (or press <b>Back to WiFi</b>) and start SimHub again. The bridge lets go of the port and waits in its window, so next time just close SimHub and flip the switch to USB. Closing the bridge window ends it.</li>
-    </ol>
+    <div class="wsbox" id="ws_box">
+     <div class="wshead"><b>From this browser</b> <span class="muted">- Chrome, Edge, Firefox 151+, Brave</span></div>
+     <div class="sbtns">
+      <button class="btn b-blue" id="ws_go" data-k="ws_go" onclick="wsConnect(true)">Connect the Arduino</button>
+      <button class="btn b-grey" id="ws_any" data-k="ws_any" onclick="wsConnect(true,true)" hidden>Any serial port…</button>
+      <button class="btn b-grey" id="ws_forget" data-k="ws_forget" onclick="wsForget()" hidden>Forget the port</button>
+     </div>
+     <div class="msg" id="ws_msg"></div>
+    </div>
+    <details class="wsalt" id="ws_alt" ontoggle="this.dataset.touched=1">
+     <summary>Or: the bridge - a small PowerShell window on the PC with the cable</summary>
+     <ol class="usbsteps">
+      <li><b>Close SimHub</b> - it holds the board's USB port while it runs.</li>
+      <li>On the PC the board is plugged into, press <b>Win+R</b>, paste this line and press Enter:
+       <div class="cmdbox"><code id="usb_cmd"></code><button class="btn b-grey" id="usb_copy" data-k="usb_copy" onclick="usbCopy()">Copy</button></div>
+       A window opens, finds the board's COM port and links it to this page.</li>
+      <li>The page switches to the cable by itself - the switch at the top of the page moves to <b class="usbb">USB</b>.</li>
+      <li>When you're done, flip that switch to <b>WiFi</b> and start SimHub again. The bridge lets go of the port and waits in its window; next time just close SimHub and flip the switch to USB.</li>
+     </ol>
+     <div class="sbtns"><a class="btn b-grey" id="usb_dl" data-k="usb_dl" href="/usb-bridge.ps1?dl=1">Download the bridge (.ps1)</a></div>
+     <p class="note">Mac or Linux (or Windows with Python and pyserial): <code id="usb_py"></code></p>
+    </details>
     <div class="sbtns">
      <button class="btn b-blue" id="usb_drop" data-k="usb_drop" onclick="usbDrop()" hidden>Back to WiFi</button>
-     <a class="btn b-grey" id="usb_dl" data-k="usb_dl" href="/usb-bridge.ps1?dl=1">Download the bridge (.ps1)</a>
     </div>
     <div class="msg" id="usb_msg"></div>
+    <div class="wsbox" id="own_box" hidden>
+     <div class="wshead"><b>Who has the board's USB connector</b> <span class="muted">- firmware 2.0</span></div>
+     <div class="msg" id="own_stat"></div>
+     <div class="sbtns">
+      <button class="btn b-blue" id="own_native" data-k="own_native" onclick="usbOwner(1)">Main chip (direct)</button>
+      <button class="btn b-grey" id="own_esp" data-k="own_esp" onclick="usbOwner(0)">WiFi chip (classic)</button>
+      <button class="btn b-grey" id="own_temp" data-k="own_temp" onclick="usbOwner(2)">WiFi chip until the next reset</button>
+     </div>
+     <p class="note">On the UNO R4 WiFi the USB connector normally goes to the WiFi chip, which relays it to the main chip over a slow link - the source of the USB stall and the lost bytes. Firmware 2.0 can give the connector to the <b>main chip</b> itself: SimHub and this page then talk to it directly. Each side is a <b>different COM port</b> on the PC: after a change, point SimHub at the new one (the browser asks which port once). An <b>Arduino IDE upload</b> goes through the WiFi chip: press "WiFi chip until the next reset" first (or press the board's RESET twice, about a second apart), upload, and the board comes back on the main chip's port by itself. Updates from this page over WiFi need nothing.</p>
+    </div>
    </div>
    <div class="fwhow">
     <p class="note"><b>Why:</b> the board's WiFi module now and then holds the board up for a second or more. Then the page's moves lag, and auto-tune has to do a test move again. On the cable the board sends its live data over USB and makes no WiFi calls at all, so nothing waits.</p>
-    <p class="note">Needs firmware <b>1.9.5</b> or newer on the board (<b>1.9.6</b> recommended: 1.9.5 loses bytes on the USB port now and then, often enough that the link can drop out), and works with SimHub closed only - one program at a time can have the USB port. The bridge connects out to this page (nothing listens on the PC, so its firewall doesn't ask) and needs nothing installed (Windows PowerShell). Firmware updates from the page still go over WiFi. If the bridge gets no answer at all from the board, update the board's USB chip to 0.6.0 or newer with Arduino's standalone updater (the install guide has the steps).</p>
-    <p class="note">Mac or Linux (or Windows with Python and pyserial): <code id="usb_py"></code></p>
+    <p class="note">Needs firmware <b>1.9.5</b> or newer on the board (<b>2.0</b> recommended: the board's USB port is then the main chip's own - no stall, no lost bytes), and works with SimHub closed only - one program at a time can have the USB port. Firmware updates from the page still go over WiFi. While the WiFi chip has the connector (older firmware, or 2.0 set to classic): if nothing ever comes back from the board, even right after a replug, update the board's USB chip to 0.6.0 or newer with Arduino's standalone updater (the install guide has the steps).</p>
+    <p class="note"><b>From the browser:</b> flip the switch at the top of the page to USB (or press Connect the Arduino), pick the Arduino in the browser's list once - from then on the page links it without asking and reconnects by itself when the cable comes back. <b>The board's USB stall:</b> while the WiFi chip has the connector, the UNO R4 WiFi's USB output dies now and then (a known problem of that chip; the PC's commands still arrive). Firmware <b>2.0</b> gives the connector to the main chip, so there is no stall at all. Set to classic, 2.0 has the page clear it by itself - the board restarts that chip (never while SimHub sends positions), the port comes back as after a replug and the link follows in about 10 s; WiFi rejoins once the page leaves the cable. On firmware older than 2.0, unplug and replug the cable. Browsers only do this from a <b>secure</b> page: https, or <b>localhost</b> - the card says what to do when this page isn't one.</p>
    </div>
   </div>
  </section>
@@ -12072,15 +13184,18 @@ details.oks .flist{margin-top:6px}
    <div><h3>Every control explains itself</h3><p>Hold the mouse over any setting, button, legend entry or status item for a short note on what it does on the rig, what too low and too high feel like, and where to start.</p>
     <h3>Tuning by hand</h3><ol><li>Stop SimHub's motion output.</li><li>Set Ki 0, Kd 0, PWMmin 10-15, dead zone 2-4 and press Apply.</li><li>Run a Square test on one motor and raise Kp until the green line just stops overshooting the blue one.</li><li>Add a little Ki (5-20) only if the seat settles short of the target.</li><li>Save to EEPROM.</li></ol></div>
    <div><h3>Auto-tune</h3><p>Measures pot noise (dead zone) and friction (PWMmin), then the motor's top speed each way with one quick move. Every test after that is a <b>gradual move</b> at 60% of the slower way's top speed - a move the motor can follow, like a game's - in <b>both directions</b>, out and back from where the seat starts the way you'd move a knob on the dashboard (up, back, down, back for a lift; right, back, left, back for the rear slide), and each direction is judged on its own: how far the motor trails the move (lag), overshoot, settling, how far short it stops, ringing and how much of PWMmax it takes. Kp rises until the motor follows within the style's lag target both ways, or until it starts to overshoot; small sharp steps (kerb-sized) check it stays calm; Ki and Kd are added only if they help. The board has one set of values per motor, so the worse direction decides. The <b>Auto-tune live</b> gauges show each test: the needles are the two directions, the coloured band says what's good. The sweep charts scale to the results; the tabs switch the second chart between overshoot, off by and settle time. With the seat empty and your weight entered, it allows for you (stricter overshoot, stiffer, a little Ki); <b>Check</b> with you in the seat then tests the values with your weight. With the motion sensor it also watches the seat. It stops by itself and restores the previous settings if SimHub moves the rig or anything looks wrong; Stop, Space or Esc stops it at once. Nothing is saved until you press Save to EEPROM. Every limit allows for the pot's noise, and a motor is only called wired backwards when it goes the wrong way <b>both</b> ways. If it does stop for safety, that motor is switched off with its previous settings back: fix the cause, then Enable Motors.</p>
+    <p>A pot that crackles (bursts of readings a few counts off, which come and go whatever the Kp) doesn't end the Kp sweep (page 2.9): the hold noise is measured over most of a second as a median spread, and the limits follow what the pot does at the gentlest Kps. <b>Test together</b> runs every motor in use with the values it has now - each alone, then all together, then twisted (the front lifts opposite each other) - and shows what moving together costs each one: more lag or running out of drive points to a shared supply that sags, more overshoot or ringing to a frame that flexes. It changes nothing.</p>
     <h3>Profiles and recommendations</h3><p>Save the settings that suit a car or game under a name and load them later. The recommendations (circuit, rally, flight, space, trucks) adjust your own tuned settings for that kind of sim and list the SimHub settings that matter most for it. Loading applies live; save to EEPROM to make it the power-on default.</p>
     <h3>Backups</h3><p>Every Save to EEPROM, and every bigger change, keeps a copy on the NAS (EEPROM section). Switch back to any of them live, or switch and save in one go.</p></div>
    <div><h3>Motor names and the rig</h3><p>Settings, Motor names: call the motors Front left, Front right, Traction loss (or anything you like). The names appear everywhere in the page and in diagnostics files; the number stays alongside because the wiring, SimHub and the LED matrix use numbers. The same card says what <b>motor 3</b> does: on a <b>traction-loss</b> rig motors 1 and 2 lift the front corners and motor 3, mounted horizontally, swings the rear left and right about a pivot at the front; on a <b>three-lift</b> rig it lifts the rear. Seat setup, the full check, auto-tune and the 3D view follow that.</p>
     <h3>Moving the motors from the page (firmware 1.9)</h3><p><b>Drag a motor card's knob</b> and that motor follows - up to 200 counts/s, easing in and out, never past its Clip window or travel limits (hatched on the track; a thin line marks where it is going). Arrow keys on a selected knob move it 5 counts, with Shift 25. <b>Quick Controls, Return to center</b> brings every motor back to its neutral position - SimHub's 0: the level seat with the rear centred, your Seat setup's level if you made one - gently. Either way the page takes the seat: the board ignores SimHub's position commands (SimHub keeps sending), and every motor runs at full power. <b>Resume SimHub</b> gives the seat back - it then goes straight to wherever the game puts it, so pause the game first if you sit in it. The page also lets go by itself when the board restarts, the page server stops (SimHub has the seat back within 3 s), or something else moves the motors. A motor that runs away from where it is sent (wired backwards) is switched off within a tenth of a second; one that sinks, is stuck or falls far behind (too weak, blocked, no motor power) is held where it is. Either way the page keeps the seat.</p>
     <h3>Selected motor</h3><p>Click a motor card or chart, or choose a motor in Test Signal or Auto-Tune: the same motor is highlighted everywhere. While a test signal or auto-tune runs, its chart is marked and the others fade.</p>
     <h3>Diagnostics</h3><p>Settings section. <b>Quick check</b> reads the board and listens for a few seconds; <b>Full check</b> also moves each motor a little to see which way it goes, how much drive it needs, whether the wiring is swapped and how it answers a small step - and can ask you what you saw. Both make one file (saved on the NAS too) to download and give to whoever helps you. The page also watches while you drive and notes pot glitches, a motor moving the wrong way or stalling, hunting, cutoffs, the tilt limit and board restarts. It also keeps a <b>load map</b>: where each motor falls behind or runs at full power, each way across its travel - a quick check after a session names where the rig struggles (lifting a heavy driver, say). With the motion sensor, the full check also measures the seat itself: degrees per count, bounce and play in the linkage - for the traction-loss motor, how far the seat turns. For the rear slide it asks whether the rear went left or right.</p>
+    <h3>Test signals on several motors (page 2.9)</h3><p>The Test Signal card's <b>Together</b> list, and Presets <b>Twist</b>, <b>Heave</b>, <b>Corner</b> and <b>Wave</b>, run one signal on several motors at once, each around its own centre (the level seat): Twist moves the two front lifts opposite each other - one goes down while the other goes up, the most twist the rig can do; Heave moves the lifts together; Corner the front lifts opposite each other with the rear slide; Wave every motor in turn, a third of a cycle apart. Only what the rig has the motors for is offered.</p>
+    <h3>Restart the board (page 2.9, firmware 2.0)</h3><p>The <b>Restart</b> button next to Settings restarts the board as its RESET button does: the motors switch off first, the board is back in a few seconds and the page reconnects by itself (over the cable, once the port is back). It is refused while SimHub sends positions - a game is running - and while auto-tune, Seat setup or the full check runs. Nothing in the firmware restarts the board by itself; only this button, a firmware update you start, the RESET button or a power cut do.</p>
     <h3>Status bar</h3><p>LOW POWER means no position commands for 15 s, so the board runs at quarter drive until SimHub or this page sends targets again.</p>
     <h3>Firmware update (firmware 1.9.2)</h3><p>Settings, Firmware update installs new firmware over WiFi - no USB cable, and SimHub can stay open (with its motion output paused). In the Arduino IDE open the new .ino and use <b>Sketch, Export Compiled Binary</b>; choose that .bin on the page and press Install. The page checks the file (an SMC3_R4 build for the UNO R4 WiFi, and which version), the board switches the motors off, its WiFi module downloads and checks the file and installs it, and the page confirms the new version once the board is back. The board remembers the WiFi name and password it last joined with, so a build with the placeholders still connects. Needs the WiFi module's own firmware 0.4.0 or newer (0.5.0+ shows progress): Arduino IDE, Tools, Firmware Updater, with SimHub closed (it keeps the USB port busy) - and since that erases the sketch on the board, upload SMC3_R4 again over USB afterwards. The first install of it (SMC3_R4_v1.9.3.ino - 1.9.2 didn't compile in the Arduino IDE) goes over USB.</p>
-    <h3>USB cable for calibration (page 2.8, firmware 1.9.5; 1.9.6 recommended)</h3><p>The board's WiFi module now and then holds the board up for a second or more, so the page's moves can lag and auto-tune redoes a test move. For calibration, link the page to the board over its USB cable instead: close SimHub, then on the PC with the cable press <b>Win+R</b> and paste the line from <b>Settings, USB cable</b>. That starts a small bridge (Windows PowerShell, nothing to install) which finds the board's COM port and links it to the page; the switch at the top of the page then shows <b>USB</b> and the board makes no WiFi calls at all. When you're done flip the switch to <b>WiFi</b> and start SimHub again: the bridge lets go of the port and waits, so from then on the switch moves between WiFi and the cable (close SimHub before flipping to USB). Closing the bridge window ends it. Settings, USB cable can also turn bridges away (WiFi only). Firmware updates from the page still go over WiFi.</p>
+    <h3>USB cable for calibration (page 2.8, firmware 1.9.5; 2.0 recommended)</h3><p>The board's WiFi module now and then holds the board up for a second or more, so the page's moves can lag and auto-tune redoes a test move. For calibration, link the page to the board over its USB cable instead: close SimHub, then flip the switch at the top of the page to <b>USB</b>. In Chrome, Edge, Brave or Firefox 151+ on the PC with the cable (page 2.9) the page opens the port itself - pick the Arduino in the browser's list once; the page must be a secure one (https, or localhost), and Settings, USB cable says how when it isn't. With firmware 2.0 the port is the main chip's own (a COM port of its own): no USB stall, no lost bytes; an Arduino IDE upload goes through the WiFi chip, so press <b>WiFi chip until the next reset</b> in Settings, USB cable first (or press the board's RESET twice, about a second apart). Other browsers, or another PC: press <b>Win+R</b> on the PC with the cable and paste the line from <b>Settings, USB cable</b>. That starts a small bridge (Windows PowerShell, nothing to install) which finds the board's COM port and links it to the page; the switch at the top of the page then shows <b>USB</b> and the board makes no WiFi calls at all. When you're done flip the switch to <b>WiFi</b> and start SimHub again: the bridge lets go of the port and waits, so from then on the switch moves between WiFi and the cable (close SimHub before flipping to USB). Closing the bridge window ends it. Settings, USB cable can also turn bridges away (WiFi only). Firmware updates from the page still go over WiFi.</p>
     <h3>Updates (page 2.7)</h3><p>Settings, Updates: the page asks GitHub twice a day (or when you press <b>Check now</b>) whether the newest release has a newer page or firmware, and says so in the header. <b>Update page</b> downloads the new page, checks it and restarts into it - the board isn't touched, and settings stay. The downloaded page is kept in the data folder (<code>updates</code>), so it is used again after a restart or a re-created Docker container, until a newer one comes, or a newer image or file is started. <b>Go back to built-in</b> undoes it. Firmware is only downloaded: flash the .ino with the Arduino IDE, or export the .bin and install it in Firmware update.</p>
     <h3>Soft start (firmware 1.9.1)</h3><p>After the rig has been off the seat may have ridden down a little. At power-up, and when you press Enable Motors, each motor creeps from wherever it is to its position (SimHub's centre at power-up) instead of jumping there - 60 counts/s by default, easing in and out. Once it has caught up everything runs normally. A seat that rode down past an end stop is allowed to come back (only going further out switches the motor off), the tilt limit waits, and the board keeps full power meanwhile. Settings, Loop, PWM &amp; smoothing: Soft start.</p></div>
    <div><h3>Seat setup (firmware 1.9)</h3><p>Levels the platform first and makes that SimHub's centre: the board adds a <b>level trim</b> to every position SimHub sends, so SimHub's middle (512) is the level seat - and the seat goes level at power-up. With the motion sensor it levels itself (each motor moves a little to learn how it tilts the seat, then the page moves them until the sensor reads level, choosing the level position nearest the middle of every motor); without it you nudge the motors with a spirit level on the seat. On a traction-loss rig only motors 1 and 2 level the seat; you <b>centre</b> motor 3, the rear slide, so the seat points straight ahead, and tell the page which way the rear went for +10.</p>
@@ -12120,6 +13235,17 @@ details.oks .flist{margin-top:6px}
  <div style="display:flex;gap:10px;margin-top:12px"><button class="btn b-green" id="mt_go" onclick="tuneStart()">Start auto-tune</button><button class="btn b-grey" onclick="closeModal('mTune')">Cancel</button></div>
 </div></div>
 
+<div class="modal" id="mReboot"><div class="box">
+ <h2>Restart the board?</h2>
+ <ul>
+  <li>The motors <b>switch off</b> at once (brakes on) and the board restarts, as with its <b>RESET</b> button. In a few seconds it is back and the motors creep to their positions (soft start).</li>
+  <li>The page reconnects by itself - over WiFi, or on the USB cable when this browser holds the port (Windows plays its unplug and plug sounds).</li>
+  <li>SimHub must not be driving the rig: the board refuses while a game sends positions.</li>
+  <li id="rb_note" class="muted"></li>
+ </ul>
+ <div style="display:flex;gap:10px;margin-top:12px"><button class="btn b-red" id="rb_go" onclick="rebootGo()">Restart the board</button><button class="btn b-grey" onclick="closeModal('mReboot')">Cancel</button></div>
+</div></div>
+
 <div class="modal" id="mFw"><div class="box">
  <h2>Install firmware <span id="mf_v"></span></h2>
  <ul>
@@ -12144,14 +13270,15 @@ details.oks .flist{margin-top:6px}
 
 <div class="modal" id="mUsb"><div class="box">
  <h2>Switch to the USB cable</h2>
- <p>The switch needs the small bridge running on the PC the board is plugged into. Start it once:</p>
+ <div id="mu_ws"></div>
+ <details class="wsalt"><summary>Or start the bridge on the PC with the cable (a small PowerShell window)</summary>
  <ol class="usbsteps">
   <li><b>Close SimHub</b> - it holds the board's USB port while it runs.</li>
   <li>On that PC press <b>Win+R</b>, paste this line and press Enter:
    <div class="cmdbox"><code id="mu_cmd"></code><button class="btn b-grey" id="mu_copy" onclick="usbCopy('mu_cmd','mu_copy')">Copy</button></div></li>
-  <li>The page switches to the cable by itself.</li>
+  <li>The page switches to the cable by itself. Leave the window open (minimised is fine): from then on this switch moves between WiFi and the cable.</li>
  </ol>
- <p class="note">Leave the bridge window open (minimised is fine). Flipping the switch back to WiFi lets go of the port, so SimHub can have it, and the bridge waits - from then on this switch moves between WiFi and the cable without going to the PC.</p>
+ </details>
  <div style="display:flex;gap:10px;margin-top:12px"><button class="btn b-grey" onclick="closeModal('mUsb')">Close</button><a class="btn b-grey" href="#settings" onclick="closeModal('mUsb');setTimeout(()=>$('usbcard').scrollIntoView({block:'start'}),300)">Settings, USB cable</a></div>
 </div></div>
 
@@ -12277,6 +13404,13 @@ const TIPS={
  th_day:"Light work area for daytime.",th_dark:"Dark look for a dim room.",th_auto:"Follows your computer's light/dark setting.",
  theme:"Day, Dark, or follow your computer's setting. Saved on the NAS, so every browser gets the same.",
  settingsBtn:"Board address, port, auto-find and theme.",
+ rebootBtn:"Restart the board, as with its RESET button: the motors switch off, it is back in a few seconds and the page reconnects. Needs firmware 2.0.",
+ g_combo:"Several motors at once: <b>Twist</b> - the front lifts opposite each other (the most roll); <b>Heave</b> - the lifts together; <b>Corner</b> - twist with the rear slide; <b>Wave</b> - every motor in turn. Each motor moves around its own centre (the level seat), shifted by the Offset's distance from 512.",
+ p_twist:"Twist: sine on the two front lifts, opposite each other - one goes up while the other goes down. ±100, 3 s cycle.",
+ p_heave:"Heave: sine on the lifts together - the seat rises and falls. ±100, 3 s cycle.",
+ p_corner:"Corner: the front lifts opposite each other and the rear slide with them - roll and traction loss together. ±100, 3 s cycle.",
+ p_wave:"Wave: every motor in turn, a third of a cycle apart - all three working at once. ±100, 3 s cycle.",
+ tjoint:"Test every motor in use together with the values they have now: each alone, then all together (the lifts up and down at once), then twisted (the front lifts opposite each other). Changes nothing; shows where moving together costs a motor something - a sagging power supply, or a flexing frame.",
  s_host:"IP address (or name) of the UNO R4. It scrolls across the LED matrix at boot.",
  s_port:"TCP port the board listens on - TELEMETRY_PORT in the firmware (4210).",
  s_auto:"If the board can't be reached for a minute, search the network for it (then every 10 minutes) and switch to the new address automatically.",
@@ -12401,6 +13535,11 @@ function updateSelUI(){const busy=genMotor!=null||tuneMotor!=null||diagMotor!=nu
  document.querySelectorAll('#pidtable th[class*=c],#pidtable td[class*=c]').forEach(c=>c.classList.toggle('sel',c.classList.contains('c'+sel)));}
 function applyMotorCount(){NM=Math.max(1,Math.min(3,+cfg.motors||3));
  $('mrow').style.setProperty('--n',NM);
+ {const tl=cfg.layout==='tl'&&NM>=3,lifts=tl?NM-1:NM;            // 2.9: which several-motor tests this rig can do
+  const ok={twist:lifts>=2,heave:lifts>=2,corner:tl&&lifts>=2,wave:NM>=2};
+  [...$('gcombo').options].forEach(o=>{if(o.value)o.hidden=!ok[o.value];});
+  ['twist','heave','corner','wave'].forEach(k=>{const b=document.querySelector(`[data-k=p_${k}]`);if(b)b.hidden=!ok[k];});
+  $('combo_presets').hidden=!Object.values(ok).some(x=>x);$('tjoint').hidden=NM<2;}
  document.querySelectorAll('.motor').forEach(c=>c.hidden=+c.dataset.m>=NM);
  document.querySelectorAll('.chart[data-m]').forEach(c=>c.hidden=+c.dataset.m>=NM);
  const opts=[0,1,2].slice(0,NM).map(m=>`<option value="${m}">${esc(mname(m)?(m+1)+' '+mname(m):String(m+1))}</option>`).join('');
@@ -12441,7 +13580,7 @@ const TLM=()=>(cfg&&cfg.layout!=='lifts'&&NM>=3)?2:null;
 function fillLayout(){const tl=cfg.layout!=='lifts';$('s_layout').value=tl?'tl':'lifts';$('s_tldir').value=String(+cfg.tl_dir<0?-1:1);
  $('s_layoutf').hidden=NM<3;$('s_tldirf').hidden=!tl||NM<3;
  $('s_layoutnote').innerHTML=NM<3?'':tl?'Motors 1 and 2 lift the front corners and level the seat; motor 3 swings the rear left and right about a pivot at the front - SimHub\'s traction loss. Seat setup and the full check ask which way it goes.':'Every motor lifts the seat (motors 1 and 2 at the front, motor 3 at the rear).';}
-async function saveLayout(){cfg=await post('/config',{layout:$('s_layout').value,tl_dir:+$('s_tldir').value});fillLayout();if(typeof v3LoadGeom==='function')v3LoadGeom();
+async function saveLayout(){cfg=await post('/config',{layout:$('s_layout').value,tl_dir:+$('s_tldir').value});fillLayout();applyMotorCount();if(typeof v3LoadGeom==='function')v3LoadGeom();
  toast(cfg.layout==='lifts'?'Motor 3 is a lift, like motors 1 and 2.':'Motor 3 slides the rear (traction loss); higher numbers move it to the '+(+cfg.tl_dir<0?'left':'right')+'.');}
 function fillSettings(){$('s_host').value=cfg.host||'';$('s_port').value=cfg.port||4210;$('s_auto').checked=!!cfg.auto_find;$('s_subnet').value=cfg.scan_subnet||'';$('s_theme').value=cfg.theme||'dark';
  $('s_motors').value=cfg.motors||3;$('s_unused').checked=cfg.disable_unused!==false;fillNames();fillLayout();
@@ -12462,7 +13601,7 @@ let fwSt=null,fwTimer=null;
 const kB=n=>Math.round((n||0)/1024)+' kB';
 // ---------- updates from GitHub (page 2.7) ----------
 let upSt=null,upWait=null;
-const vk=v=>String(v||'').split('.').map(x=>+x||0);
+const vk=v=>{const m=/^\s*v?(\d+(?:\.\d+)*)(b(\d*))?/.exec(String(v||''));if(!m)return [0];const k=m[1].split('.').map(x=>+x||0);while(k.length<4)k.push(0);return m[2]?k.concat([0,+m[3]||0]):k.concat([1]);};   // 2.9: padded to four numbers (2.0 < 2.0.1), '2.9' < '2.9'
 const vgt=(a,b)=>{const x=vk(a),y=vk(b);for(let i=0;i<Math.max(x.length,y.length);i++){const d=(x[i]||0)-(y[i]||0);if(d)return d>0;}return false;};
 function agoText(s){if(s==null)return'';if(s<90)return'just now';if(s<5400)return Math.round(s/60)+' min ago';if(s<129600)return Math.round(s/3600)+' h ago';return Math.round(s/86400)+' days ago';}
 async function updLoad(){try{updShow(await (await fetch('/update/status')).json());}catch(e){}}
@@ -12473,28 +13612,188 @@ function usbShow(r){usbSt=r;const l=r.link||{},u=l.kind==='usb';
  $('usb_allow').checked=!!r.allowed;$('usb_drop').hidden=!u;$('usb_drop').disabled=false;
  let cls,h;
  if(u){cls=l.streaming?'on':'warn';h=`On the <b>USB cable</b> - ${esc(l.computer||'the PC')}, ${esc(l.port||'?')}, for ${esc(durText(l.age))}`+(l.streaming?'':' <span class="muted">- waiting for the board\'s data…</span>');}
- else if(connected){cls='';h=`On <b>WiFi</b>`+(l.host?` (${esc(l.host)})`:'')+(r.allowed?'. Start the bridge to switch to the cable.':'. <span class="muted">WiFi only: a bridge is turned away.</span>');}
+ else if(connected){cls='';h=`On <b>WiFi</b>`+(l.host?` (${esc(l.host)})`:'')+(r.allowed?(wsSupport()===''?'. Flip the switch at the top (or Connect) for the cable.':'. Start the bridge to switch to the cable.'):'. <span class="muted">WiFi only: a bridge is turned away.</span>');}
  else{cls='off';h='Not connected to the board.'+(r.allowed?' A bridge can link it over the cable.':'');}
  $('usb_stat').innerHTML=`<i class="dot ${cls}"></i><span>${h}</span>`;
  let m='';
  if(!u&&r.busy&&r.allowed)m+=`<div class="warnc">A bridge would wait now: ${esc(r.busy)}</div>`;
  if(location.protocol==='https:')m+='<div class="warnc">This page is open over https (a reverse proxy?): the bridge needs its plain http:// address - open the page that way to get the right line.</div>';
  if(r.last)m+=`<span class="muted">Last USB link: ${esc(r.last.computer||'?')}, ${esc(r.last.port||'?')}, ended ${esc(agoText(r.last.ago))} - ${esc(r.last.why||'')}</span>`;
- $('usb_msg').innerHTML=m;tipAttach($('usbcard'));}
+ $('usb_msg').innerHTML=m;
+ const o=r.owner;$('own_box').hidden=!o;                       // 2.9 / firmware 2.0: who has the USB connector
+ if(o){let t;if(!o.known)t='<span class="muted">Not read yet - the board says so in its next diagnostics frame.</span>';
+  else t=(o.native?'<b>The main chip</b> has the connector now (direct USB - no stall, no bridge)':'<b>The WiFi chip</b> has the connector now (classic: its bridge to the main chip)')
+   +(o.native!==o.saved_native?` - until the next reset; the saved setting is <b>${o.saved_native?'main chip':'WiFi chip'}</b>.`:' - and that is the saved setting.');
+  $('own_stat').innerHTML=t;$('own_native').disabled=!!(o.known&&o.native&&o.saved_native);$('own_esp').disabled=!!(o.known&&!o.native&&!o.saved_native);$('own_temp').disabled=!!(o.known&&!o.native);}
+ wsUi();tipAttach($('usbcard'));}
+async function usbOwner(mode){
+ const what={0:'the WiFi chip (saved)',1:'the main chip (saved)',2:'the WiFi chip until the next reset'}[mode];
+ if(!confirm(`Hand the board's USB connector to ${what}?\n\nOn the PC it becomes another COM port: SimHub (and the bridge) must be pointed at the new one; this browser asks which port once. If the page is on the cable now, the link ends here and you reconnect on the new port.`))return;
+ for(const id of ['own_native','own_esp','own_temp'])$(id).disabled=true;
+ try{const r=await post('/usb/owner',{mode});if(r.ok===false){toast(esc(r.error||'The board refused.'),true);}
+  else{toast('Done: the USB connector goes to '+esc(what)+'. Pick the new port when you connect next.');if(wsPort)await wsTeardown(false);wsWant=false;}
+ }catch(e){toast('The page didn\'t answer.',true);}
+ setTimeout(usbLoad,1500);}
+// ---------- the browser as the bridge (2.9, Web Serial) ----------
+// Chrome, Edge, Firefox 151+ and Brave let a secure page (https, or localhost) open a serial port itself. The page then
+// pumps the port's bytes to the page server over a WebSocket (/usb/browser), which treats it as a bridge. The port is
+// remembered: after the first pick the switch links without asking, the cable coming back relinks by itself (the
+// 'connect' event), and a board that goes quiet gets its port closed and opened afresh.
+let wsPort=null,wsSock=null,wsWriter=null,wsReader=null,wsBusy=false,wsWant=false,wsRetry=0,wsWrites=Promise.resolve(),wsLastWhy='',wsKnown=[];
+const wsId='web-'+Math.random().toString(16).slice(2,10),WS_ARDUINO=0x2341;
+function wsSupport(){if(navigator.serial)return '';return window.isSecureContext?'none':'insecure';}
+function wsMobile(){return /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);}
+function wsComputer(){const ua=navigator.userAgent;let b='the browser';
+ if(navigator.brave)b='Brave';else if(/Edg\//.test(ua))b='Edge';else if(/OPR\//.test(ua))b='Opera';else if(/Firefox\//.test(ua))b='Firefox';else if(/Chrome\//.test(ua))b='Chrome';else if(/Safari\//.test(ua))b='Safari';
+ const os=/Windows/.test(ua)?'Windows':/Mac OS/.test(ua)?'Mac':/CrOS/.test(ua)?'ChromeOS':/Linux/.test(ua)?'Linux':'';return os?b+' on '+os:b;}
+function wsLabel(p){try{const i=p.getInfo()||{},v=i.usbVendorId,d=i.usbProductId;
+ if(v===WS_ARDUINO)return d===0x1002?'Arduino UNO R4 WiFi':d===0x0069?'Arduino UNO R4 Minima':'Arduino '+(d||0).toString(16).padStart(4,'0');
+ if(v)return 'USB serial '+v.toString(16).padStart(4,'0')+':'+(d||0).toString(16).padStart(4,'0');}catch(e){}return 'serial port';}
+function wsHowTo(){const o=location.origin,host=location.hostname,port=location.port||'80',ua=navigator.userAgent;
+ if(wsMobile())return '<p>Phones and tablets can\'t open USB ports. Use Chrome, Edge or Firefox on the PC the board is plugged into - or the bridge below.</p>';
+ if(window.isSecureContext)return '<p>This browser has no Web Serial (Safari, or an old version). On the PC the board is plugged into, open this page in Chrome, Edge, Firefox 151+ or Brave - or use the bridge below.</p>';
+ const ff=/Firefox\//.test(ua),flags=navigator.brave?'brave':/Edg\//.test(ua)?'edge':'chrome',netsh=`netsh interface portproxy add v4tov4 listenaddress=127.0.0.1 listenport=${port} connectaddress=${host} connectport=${port}`;
+ let s=`<p>This browser can open USB ports itself, but only from a <b>secure</b> page - https, or localhost - and <code>${esc(o)}</code> is plain http from another machine. One-time step, on the PC with the cable:</p><ol class="wsol">`;
+ if(!ff)s+=`<li><b>Allow this address</b> in the browser: open <code>${flags}://flags/#unsafely-treat-insecure-origin-as-secure</code>, type <code>${esc(o)}</code> into its box, set it to <b>Enabled</b> and press <b>Relaunch</b>. <button class="btn b-grey" onclick="copyText('${esc(o)}').then(k=>toast(k?'Address copied.':'Copy failed.',!k))">Copy the address</button></li>`;
+ s+=`<li>${ff?'':'<b>Or</b> r'}${ff?'<b>R':''}each this page as <b>localhost</b>: in PowerShell <b>run as administrator</b>, once: <div class="cmdbox"><code>${esc(netsh)}</code><button class="btn b-grey" onclick="copyText('${esc(netsh)}').then(k=>toast(k?'Copied.':'Copy failed.',!k))">Copy</button></div> then open <a href="http://localhost:${port}/">http://localhost:${port}</a> here.</li></ol>`;
+ if(ff)s+='<p class="note">Firefox has no "treat as secure" flag, so localhost is the way.</p>';
+ return s;}
+function wsUi(){const box=$('ws_box');if(!box)return;const sup=wsSupport(),go=$('ws_go'),any=$('ws_any'),fg=$('ws_forget'),m=$('ws_msg');
+ const linked=!!wsPort,known=wsKnown.length>0;
+ go.hidden=!!sup;go.disabled=wsBusy||linked;const alt=$('ws_alt');if(alt&&sup&&!alt.dataset.touched)alt.open=true;   // no Web Serial here: the bridge is the way
+go.textContent=wsBusy?'Connecting…':linked?'On the USB cable':known?'Connect the Arduino':'Connect the Arduino…';
+ any.hidden=!!sup||linked||wsBusy;fg.hidden=!!sup||!known||linked;
+ let h='';
+ if(sup)h=wsHowTo();
+ else if(linked)h=`<span class="okc">This browser holds the ${esc(wsLabel(wsPort))} and feeds the page. Flip the switch at the top to WiFi (or Back to WiFi) to let go of it for SimHub.</span>`;
+ else if(known)h=`<span class="muted">${esc(wsLabel(wsKnown[0]))} is remembered: with SimHub closed, flip the switch at the top to USB (or press Connect) - no question asked.</span>`;
+ else h='<span class="muted">Close SimHub, press Connect and pick the Arduino in the browser\'s list - once. The list only shows Arduinos; "Any serial port" shows the rest.</span>';
+ if(wsLastWhy&&!linked)h+=`<div class="warnc">${esc(wsLastWhy)}</div>`;
+ m.innerHTML=h;}
+async function wsRefresh(){try{if(navigator.serial)wsKnown=await navigator.serial.getPorts();}catch(e){wsKnown=[];}wsUi();}
+let wsResetAt=0;   // 2.9: when the board was last asked to restart its USB chip (the probe is patient for a while after)
+function wsProbe(port,ms){
+ // ask the board for its firmware number ([rd!]) a few times - "ok 19", "bytes N" or "none" (as the bridges do).
+ // 2.9: for up to ms (2.2 s; 8 s right after the chip restart, when the board may be in its 1.5 s handshake)
+ return new Promise(async res=>{let got=[],out='none',reader=null;const t0=Date.now();
+  try{const w=port.writable.getWriter();reader=port.readable.getReader();
+   const ask=async()=>{try{await w.write(new Uint8Array([0x5b,0x72,0x64,0x21,0x5d]));}catch(e){}};
+   const timer=setInterval(ask,350);await ask();
+   const stop=setTimeout(()=>{try{reader.cancel();}catch(e){}},ms||2200);
+   while(true){const {value,done}=await reader.read();if(done)break;for(const x of value)got.push(x);
+    for(let j=0;j+4<got.length;j++)if(got[j]===0x5b&&got[j+1]===0x21&&got[j+4]===0x5d){out='ok '+got[j+3];break;}
+    if(out!=='none'){try{reader.cancel();}catch(e){}break;}}
+   clearInterval(timer);clearTimeout(stop);try{reader.releaseLock();}catch(e){}try{w.releaseLock();}catch(e){}
+  }catch(e){try{if(reader)reader.releaseLock();}catch(_){}}
+  if(out==='none'&&got.length)out='bytes '+got.length;res(out);});}
+async function wsConnect(fromClick,anyPort){
+ if(wsBusy||wsPort)return;const sup=wsSupport();
+ if(sup){if(fromClick){$('mu_ws').innerHTML=wsHowTo();$('mu_cmd').textContent=usbLine();openModal('mUsb');}return;}
+ wsBusy=true;wsWant=true;wsLastWhy='';wsUi();let port=null,sock=null,opened=false;
+ try{
+  const known=await navigator.serial.getPorts();wsKnown=known;
+  port=known.find(p=>(p.getInfo()||{}).usbVendorId===WS_ARDUINO)||known[0]||null;
+  if(!port||anyPort){if(!fromClick)throw Object.assign(Error('no remembered port'),{name:'NoPort'});
+   port=await navigator.serial.requestPort(anyPort?{}:{filters:[{usbVendorId:WS_ARDUINO}]});wsKnown=await navigator.serial.getPorts();}
+  const label=wsLabel(port),who=wsComputer();
+  const chk=await post('/usb/browser/check',{id:wsId,port:label,computer:who});
+  if(chk.ok===false)throw Object.assign(Error(chk.error||'The page can\'t take the cable now.'),{name:'PageNo'});
+  await port.open({baudRate:500000,bufferSize:65536});opened=true;
+  try{await port.setSignals({dataTerminalReady:true,requestToSend:true});}catch(e){}
+  const probe=await wsProbe(port,(Date.now()-wsResetAt)<60000?8000:2200);
+  if(probe==='none'&&wsRetry>0){
+   // opened afresh after the board went quiet, and still nothing: leave the port alone and wait for the cable to be
+   // plugged in again (the 'connect' event links it) rather than blame the driver
+   try{await port.close();}catch(_){}opened=false;
+   let r2=null;try{r2=await post('/usb/chip-restart',{});}catch(_){}
+   if(r2&&r2.ok)wsResetAt=Date.now();
+   if(r2&&r2.ok)throw Object.assign(Error('The board still sends nothing: the page asked it to restart its USB chip - the link comes back by itself in a few seconds.'),{name:'Stalled'});
+   throw Object.assign(Error('The board still sends nothing after the port was opened afresh. Unplug the USB cable and plug it back in - the page links it again by itself.'),{name:'StillQuiet'});}
+  if(probe==='none'){
+   // nothing came back although the port opened: the board's USB output has stalled (the UNO R4 WiFi's known problem -
+   // the PC's commands still arrive). With firmware 1.9.8+ (2.0: on the classic setting) the page server can ask the board to restart its USB chip
+   // over WiFi; the port then goes away and comes back, and the 'connect' event links it
+   try{await port.close();}catch(_){}opened=false;
+   let r=null;try{r=await post('/usb/chip-restart',{});}catch(_){}
+   if(r&&r.ok)wsResetAt=Date.now();
+   if(r&&r.ok)throw Object.assign(Error('Nothing came back from the board: its USB output has stalled (a known UNO R4 WiFi problem). The page asked the board to restart its USB chip - the port comes back in a few seconds and the link follows by itself.'),{name:'Stalled'});
+   if(r&&r.owner&&r.owner.native)throw Object.assign(Error('Nothing comes back from the board over USB. Unplug the USB cable and plug it back in, or press the board\'s RESET button; the page links it again by itself.'),{name:'NoData'});   // firmware 2.0's own port: no USB chip in the way
+   throw Object.assign(Error('Nothing comes back from the board over USB: its USB output has stalled (a known UNO R4 WiFi problem - the PC\'s commands still arrive). Unplug the USB cable and plug it back in; the page links it again by itself.'+(r&&r.error?' ('+r.error+')':'')),{name:'NoData'});}
+  const q=new URLSearchParams({id:wsId,port:label,computer:who,probe}).toString();
+  sock=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/usb/browser?'+q);sock.binaryType='arraybuffer';
+  await new Promise((ok,no)=>{const t=setTimeout(()=>no(Error('The page didn\'t answer the USB link.')),8000);
+   sock.onopen=()=>{clearTimeout(t);ok();};sock.onerror=()=>{clearTimeout(t);no(Object.assign(Error('The page refused the USB link'+(usbSt&&usbSt.busy?': '+usbSt.busy:'.')),{name:'PageNo'}));};});
+  wsPort=port;wsSock=sock;wsWriter=port.writable.getWriter();wsWrites=Promise.resolve();
+  sock.onmessage=e=>{const b=new Uint8Array(e.data);wsWrites=wsWrites.then(()=>wsWriter.write(b)).catch(err=>wsPortLost('The USB port stopped taking data ('+err.message+').'));};
+  sock.onclose=e=>wsEnded(e.reason||'');sock.onerror=null;
+  wsRead(port,sock);wsRetry=0;
+  toast('On the USB cable: '+esc(label)+(probe.startsWith('ok')?' (firmware 1.9.x answers).':'.'));
+ }catch(e){
+  try{if(sock)sock.close();}catch(_){}try{if(opened)await port.close();}catch(_){}
+  if(e.name==='NotFoundError')wsLastWhy='No port picked. If your board isn\'t an Arduino-branded one, use "Any serial port".';
+  else if(e.name==='NoPort'){wsLastWhy='The browser no longer lists the port - press Connect the Arduino and pick it again.';toast(wsLastWhy,true);}
+  else if(e.name==='NoData'||e.name==='StillQuiet'||e.name==='Stalled')wsLastWhy=e.message;
+  else if(e.name==='InvalidStateError')wsLastWhy='That port is open in another tab of this browser.';
+  else if(e.name==='NetworkError'&&!opened)wsLastWhy='The port can\'t be opened: close SimHub (or SMC3Utils, the Arduino IDE\'s Serial Monitor) - one program at a time can have it.';
+  else if(e.name==='SecurityError')wsLastWhy='The browser didn\'t allow it: click Connect again (the pick must follow a click).';
+  else wsLastWhy=e.message||String(e);
+  const soon=(e.name==='PageNo'&&/restart.* its USB chip/i.test(e.message))||e.name==='Stalled';
+  if(soon){if(e.name==='Stalled')toast(esc(e.message),true);else wsLastWhy='';setTimeout(()=>{if(wsWant&&!wsPort&&!wsBusy)wsConnect(false);},e.name==='Stalled'?8000:4000);}
+  else if(wsLastWhy&&(fromClick||e.name==='StillQuiet'))toast(esc(wsLastWhy),true);
+  wsWant=e.name==='StillQuiet'||e.name==='NoData'||soon;   // (still wanted: a replug, or the chip's restart, relinks)
+ }finally{wsBusy=false;wsUi();usbLoad();}}
+async function wsRead(port,sock){let empty=0;
+ while(wsPort===port&&port.readable){const r=port.readable.getReader();wsReader=r;let got=false;
+  try{while(true){const {value,done}=await r.read();if(done)break;if(value&&value.byteLength){got=true;if(sock.readyState===1)sock.send(value);}}}
+  catch(e){if(wsPort!==port)return;if(e.name==='NetworkError'||!port.readable){wsPortLost('The USB cable came out (or the port was lost).');return;}}
+  finally{try{r.releaseLock();}catch(_){}if(wsReader===r)wsReader=null;}
+  // a stream that ends at once, again and again, must not spin the tab (a non-fatal error gives a new stream)
+  empty=got?0:empty+1;if(empty>5){wsPortLost('The USB port stopped delivering data.');return;}if(empty)await new Promise(ok=>setTimeout(ok,100));}}
+async function wsTeardown(sayBye){
+ const port=wsPort,sock=wsSock,writer=wsWriter,reader=wsReader;wsPort=null;wsSock=null;wsWriter=null;wsReader=null;
+ if(sock){sock.onclose=null;try{if(sock.readyState<2)sock.close(1000,'bye');}catch(_){}}
+ try{await Promise.race([wsWrites,new Promise(r=>setTimeout(r,500))]);}catch(_){}
+ if(writer&&sayBye){try{await writer.write(new Uint8Array([0x5b,0x6b,0x55,0x00,0x5d]));}catch(_){}}   // [kU0]: back to WiFi at once
+ try{if(writer)writer.releaseLock();}catch(_){}try{if(reader)await reader.cancel();}catch(_){}
+ try{if(port)await port.close();}catch(_){}wsUi();}
+async function wsRelease(){wsWant=false;wsRetry=0;if(!wsPort)return;await wsTeardown(true);try{await post('/usb/drop');}catch(e){}usbLoad();}   // (/usb/drop: the switch is off at once, not after the 6 s grace)
+async function wsPortLost(why){if(!wsPort)return;wsLastWhy=why;toast(esc(why),true);await wsTeardown(false);usbLoad();}
+async function wsEnded(reason){
+ // the page server closed the link: it says why (the switch, a refusal, the board went quiet - and whether it asked the
+ // board to restart its USB chip, in which case the port goes away and comes back: the 'connect' event relinks it)
+ if(!wsPort)return;const tag=(reason||'').split(' ')[0],silent=tag==='quiet'||tag==='stall-reset'||tag==='stall-replug',byChoice=tag==='wifi',resetting=tag==='stall-reset';
+ await wsTeardown(!silent);
+ if(reason&&!byChoice){wsLastWhy=reason.slice(tag.length+1);try{const st=await (await fetch('/usb/status',{cache:'no-store'})).json();if(st.last&&st.last.why)wsLastWhy=st.last.why;}catch(e){}}
+ if(resetting&&wsWant){wsRetry=0;wsResetAt=Date.now();toast('The board went quiet on the cable: it is restarting its USB chip - the link comes back by itself in a few seconds.',true);
+  setTimeout(()=>{if(wsWant&&!wsPort&&!wsBusy)wsConnect(false);},8000);wsUi();usbLoad();return;}   // (the 'connect' event is usually first)
+ if(silent&&wsWant&&wsRetry<3){wsRetry++;toast('The board went quiet on the cable - opening the port afresh ('+wsRetry+'/3)…',true);
+  setTimeout(()=>{if(wsWant&&!wsPort)wsConnect(false);},2500);return;}
+ if(byChoice)wsWant=false;else if(wsLastWhy)toast(esc(wsLastWhy),true);
+ wsUi();usbLoad();}
+async function wsForget(){try{for(const p of wsKnown){if(p.forget)await p.forget();}}catch(e){}wsWant=false;await wsRefresh();toast('Forgotten: the next Connect asks which port.');}
+if(navigator.serial){
+ navigator.serial.addEventListener('connect',()=>{wsRefresh();if(wsWant&&!wsPort&&!wsBusy){toast('The Arduino is back - linking the cable again.');setTimeout(()=>wsConnect(false),800);}});
+ navigator.serial.addEventListener('disconnect',e=>{if(wsPort&&e.target===wsPort)wsPortLost('The USB cable came out.');else wsRefresh();});
+ wsRefresh();}
+window.addEventListener('pagehide',()=>{try{if(wsWriter)wsWriter.write(new Uint8Array([0x5b,0x6b,0x55,0x00,0x5d]));}catch(e){}try{if(wsSock)wsSock.close();}catch(e){}});
 function usbLine(){return `powershell -NoProfile -ExecutionPolicy Bypass -Command "irm ${location.origin}/usb-bridge.ps1 | iex"`;}
 let lnkSt={},lnkBusy=false;
 function lnkShow(l){lnkSt=l;const el=$('lnk');if(!el)return;
  const on=l.kind==='usb',pend=!on&&!!l.want,w=l.waiting;
  el.classList.toggle('on',on);el.classList.toggle('pend',pend);el.classList.toggle('dis',lnkBusy);el.setAttribute('aria-checked',on?'true':'false');
  let t;
- if(on)t=`<b>On the USB cable</b> - ${esc(l.computer||'the PC')}, ${esc(l.port||'?')}`+(l.streaming?'':' (waiting for the board\'s data)')+'.<br>Click for WiFi: the bridge lets go of the port, so SimHub can have it, and waits.';
+ if(on)t=`<b>On the USB cable</b> - ${esc(l.computer||'the PC')}, ${esc(l.port||'?')}`+(l.streaming?'':' (waiting for the board\'s data)')+'.<br>Click for WiFi: '+(wsPort?'this browser lets go of the port, so SimHub can have it.':'the bridge lets go of the port, so SimHub can have it, and waits.');
  else if(pend)t='<b>Switching to the USB cable</b>…'+(w&&w.msg?'<br>'+esc(w.msg):'');
  else if(w)t=`<b>On WiFi.</b> The bridge is waiting on ${esc(w.computer||'the PC')} (${esc(w.port||'?')}).<br>Click for the USB cable - close SimHub first.`+(w.msg?'<br>'+esc(w.msg):'');
- else t='<b>On WiFi.</b> Click for the USB cable (for calibration, SimHub closed): it shows how to start the bridge on the PC with the cable.';
+ else if(wsSupport()==='')t='<b>On WiFi.</b> Click for the USB cable (for calibration, SimHub closed): this browser opens the Arduino\'s port itself'+(wsKnown.length?'.':' - it asks which port, once.');
+ else t='<b>On WiFi.</b> Click for the USB cable (for calibration, SimHub closed): it shows how to let this browser open the port, or how to start the bridge.';
  if(el.dataset.tip!==t){el.dataset.tip=t;if(el.matches(':hover')&&tipEl.style.display==='block')tipEl.innerHTML=t;}}
-async function lnkFlip(){if(lnkBusy)return;const on=lnkSt.kind==='usb'||!!lnkSt.want;lnkBusy=true;$('lnk').classList.add('dis');
+async function lnkFlip(){if(lnkBusy)return;const on=lnkSt.kind==='usb'||!!lnkSt.want;
+ if(on&&wsPort){wsRelease();toast('Back to WiFi: the port is free for SimHub.');return;}          // 2.9: this browser holds the cable
+ if(!on&&!lnkSt.waiting&&wsSupport()===''){wsConnect(true);return;}                                  // 2.9: the browser can link it itself
+ lnkBusy=true;$('lnk').classList.add('dis');
  try{const r=await post('/usb/want',{on:!on});
-  if(r.need_bridge){$('mu_cmd').textContent=usbLine();openModal('mUsb');}
+  if(r.need_bridge){$('mu_ws').innerHTML=wsHowTo();$('mu_cmd').textContent=usbLine();openModal('mUsb');}
   else if(r.ok===false&&r.error)toast(esc(r.error),true);
   else{toast(on?'Back to WiFi: the bridge lets go of the port.':'Switching to the USB cable…');if(r.link)lnkShow({...r.link,want:r.want});}
  }catch(e){toast('No answer from the page.',true);}
@@ -12502,7 +13801,8 @@ async function lnkFlip(){if(lnkBusy)return;const on=lnkSt.kind==='usb'||!!lnkSt.
 function durText(s){s=Math.max(0,Math.round(s||0));return s<60?s+' s':s<3600?Math.floor(s/60)+' min':Math.floor(s/3600)+' h '+Math.floor(s%3600/60)+' min';}
 async function usbLoad(){try{usbShow(await (await fetch('/usb/status',{cache:'no-store'})).json());}catch(e){}}
 async function usbAllow(){const r=await post('/config',{usb_link:$('usb_allow').checked});if(r.error)toast(esc(r.error)+' The cable stays until then.',true);else cfg=r;usbLoad();}
-async function usbDrop(){$('usb_drop').disabled=true;try{const r=await post('/usb/drop');usbShow(r);
+async function usbDrop(){if(wsPort){await wsRelease();toast('Back to WiFi: the port is free for SimHub.');return;}
+ $('usb_drop').disabled=true;try{const r=await post('/usb/drop');usbShow(r);
  if(r.ok===false&&r.error){toast(esc(r.error)+' Back to WiFi after that.',true);$('usb_drop').disabled=false;}else toast('Back to WiFi: the bridge window says so too.');}catch(e){$('usb_drop').disabled=false;}}
 async function usbCopy(src,btn){const b=$(btn||'usb_copy'),ok=await copyText($(src||'usb_cmd').textContent);
  b.textContent=ok?'Copied':'Copy failed';clearTimeout(usbCopy.h);usbCopy.h=setTimeout(()=>b.textContent='Copy',1800);if(!ok)toast('The browser didn\'t allow copying - select the line and copy it by hand.',true);}
@@ -12672,6 +13972,7 @@ function updateStatus(j){const s=data[data.length-1];const fresh_inc=watch.newes
  let h=connected?'<span data-k="st_conn"><i class="dot on"></i>Board Connected</span>'+(man.active?'<span class="mheld" data-k="st_held">Page has the seat</span>':''):`<span data-k="st_conn"><i class="dot off"></i>Not connected <span class="muted" style="font-weight:400">(${esc(j.host||'no address set')})</span></span>`;
  linkK=(j.link||{}).kind||'wifi';lnkShow(j.link||{});
  if(j.fw)h+=`<span data-k="st_fw">fw v${esc(j.fw)}</span>`;
+ rebootFw=j.fw||'';const rb=$('rebootBtn');if(rb){const can=connected&&!vgt('2.0b2',rebootFw);rb.disabled=!connected||tuneRunning;rb.classList.toggle('old',connected&&!can);}
  h+='<span data-k="st_page">page v__VERSION__</span>';
  if(s&&connected){h+=`<span data-k="st_isr">ISR max ${s.isr} µs</span><span data-k="st_div">Fpid/${s.div}</span>`+(s.low?'<span class="bad" data-k="st_low">LOW POWER</span>':'<span class="ok" data-k="st_full">Full power</span>');
   if(s.roll!=null)h+=`<span data-k="seatchart">Seat ${s.roll.toFixed(1)}° / ${s.pitch.toFixed(1)}°</span>`;}
@@ -12825,10 +14126,23 @@ function manUI(){const held=man.active,why=manBlock(null);
  if(man.msg_id!=null)manMsgSeen=man.msg_id;}
 
 // ---------- test signal ----------
-async function gen(mode){const body={motor:+$('gm').value,mode:mode||$('gmode').value,amp:+$('gamp').value,period:+$('gper').value,centre:+$('goff').value,value:+$('goff').value};
- const r=await post('/gen',body);$('gmsg').innerHTML=r.ok?(body.mode==='off'?'Stopped.':'Running on '+esc(mfull(body.motor))+'.'):'<span class="badc">'+esc(r.error)+'</span>';}
+async function gen(mode){const combo=$('gcombo').value,body={motor:+$('gm').value,mode:mode||$('gmode').value,amp:+$('gamp').value,period:+$('gper').value,centre:+$('goff').value,value:+$('goff').value,combo};
+ const r=await post('/gen',body);
+ const who=r.motors&&r.motors.length>1?'motors '+r.motors.map(n=>esc(mshort(n-1))).join(' + ')+' ('+esc($('gcombo').selectedOptions[0].textContent)+')':esc(mfull(body.motor));
+ $('gmsg').innerHTML=r.ok?(body.mode==='off'?'Stopped.':'Running on '+who+'.'):'<span class="badc">'+esc(r.error)+'</span>';}
 function genStop(){gen('off');}
+// ---------- restart the board (2.9, firmware 2.0 - 2.0b2 on) ----------
+let rebootFw='';
+function rebootAsk(){const can=!vgt('2.0b2',rebootFw);
+ $('rb_note').innerHTML=can?'':`The board runs firmware ${esc(rebootFw||'?')}: restarting on request needs <b>2.0</b> (SMC3_R4_v2.0.ino). Until then press the board's RESET button.`;
+ $('rb_go').disabled=!can;openModal('mReboot');}
+async function rebootGo(){closeModal('mReboot');let r=null;try{r=await post('/board/reboot',{});}catch(e){}
+ if(r&&r.ok)toast('Restarting the board - the motors are off; it is back in a few seconds and the page reconnects by itself.');
+ else toast(esc((r&&r.error)||'The page didn\'t answer.'),true);}
 function preset(k){const P={sine:['sine',150,2],square:['step',100,2],triangle:['triangle',150,3]};
+ const C={twist:['sine',100,3],heave:['sine',100,3],corner:['sine',100,3],wave:['sine',100,3]};   // 2.9: several motors at once
+ if(C[k]){$('gcombo').value=k;$('gmode').value=C[k][0];$('gamp').value=C[k][1];$('gper').value=C[k][2];$('goff').value=512;gen();return;}
+ if(P[k]||k==='step'||k==='manual')$('gcombo').value='';
  if(P[k]){$('gmode').value=P[k][0];$('gamp').value=P[k][1];$('gper').value=P[k][2];gen();}
  else if(k==='step'){post('/gen',{motor:+$('gm').value,mode:'manual',value:+$('goff').value+ +$('gamp').value,centre:+$('goff').value}).then(r=>$('gmsg').innerHTML=r.ok?'Stepped to '+(+$('goff').value+ +$('gamp').value)+' and holding.':'<span class="badc">'+esc(r.error)+'</span>');}
  else if(k==='manual'){$('gmode').value='manual';gen();}}
@@ -12904,7 +14218,12 @@ function riderUnit(){const u=$('tunit').value,prev=$('tunit').dataset.u||'lb',v=
  if(prev!==u&&v)$('tkg').value=Math.round(u==='kg'?v*KG_LB:v/KG_LB);$('tunit').dataset.u=u;riderUI();}
 function riderUI(){const seated=$('trider').value==='seated';$('tkg').disabled=seated;$('tunit').disabled=seated;}
 function riderKg(){const v=Math.max(0,+$('tkg').value||0);return $('tunit').value==='lb'?v*KG_LB:v;}
-function tuneConfirm(mode){const chk=mode==='check';tuneConfirm.mode=chk?'check':'tune';const seated=$('trider').value==='seated',v=+$('tkg').value||0,u=$('tunit').value;
+function tuneConfirm(mode){if(mode==='joint'){tuneConfirm.mode='joint';const n=(cfg&&+cfg.motors)||3;
+  $('mt_what').textContent='Before testing';$('mt_n').textContent=(n>=3?'all three motors':'both motors')+' together';$('mt_a').textContent=$('tamp').value;
+  $('mt_seat').innerHTML='Your hand is near the <b>motor power switch</b>. The seat <b>rises, falls and twists</b>: the front lifts move together and then opposite each other.';
+  $('mt_rider').innerHTML='Each motor is tested alone first, then all together, then twisted - with the values they have now. It changes nothing and shows what moving together costs each motor (a sagging power supply, a flexing frame). Run it after tuning every motor.';
+  $('mt_time').innerHTML='Takes about a minute. Nothing is changed.';$('mt_go').textContent='Start the test';openModal('mTune');return;}
+ const chk=mode==='check';tuneConfirm.mode=chk?'check':'tune';const seated=$('trider').value==='seated',v=+$('tkg').value||0,u=$('tunit').value;
  $('mt_what').textContent=chk?'Before checking':'Before auto-tune on';$('mt_n').textContent=mfull(+$('tm').value)+(chk?"'s values":'');$('mt_a').textContent=$('tamp').value;
  $('mt_seat').innerHTML=seated?'<b>You will be in the seat.</b> After Start you have <b>15 s</b> to get in - sit as you do when you drive, feet and hands clear of moving parts. <b>Stop</b>, <b>Space</b> or <b>Esc</b> on this page ends it at once; keep the motor power switch in reach too.':'Your hand is near the <b>motor power switch</b>.';
  $('mt_rider').innerHTML=chk?(seated?'It tests the values the motor has now <b>with you in the seat</b> and says what to change.':'It tests the values the motor has now, with the seat as it is. After tuning with the seat empty, choose <b>Me</b> so it tests with your weight.'):
@@ -12921,11 +14240,12 @@ const NAMES={kp:'Kp',ki:'Ki',kd:'Kd',ks:'Ks',pwmmin:'PWMmin',dz:'Dead zone'};
 let tuneLast=null;
 async function tunePoll(){
  try{const s=await (await fetch('/tune/status')).json();tuneRunning=s.state==='running';tuneLast=s;const chk=s.mode==='check';
-  const tm2=tuneRunning?s.motor-1:null;if(tm2!==tuneMotor){tuneMotor=tm2;if(tm2!=null)setSel(tm2);else updateSelUI();}
-  lockAp();$('tstart').disabled=$('tcheck').disabled=tuneRunning||diagBusy;$('tstop').disabled=!tuneRunning;
+  const tm2=tuneRunning&&s.mode!=='joint'?s.motor-1:null;if(tm2!==tuneMotor){tuneMotor=tm2;if(tm2!=null)setSel(tm2);else updateSelUI();}
+  lockAp();$('tstart').disabled=$('tcheck').disabled=$('tjoint').disabled=tuneRunning||diagBusy;$('tstop').disabled=!tuneRunning;
   document.querySelectorAll('.tbar').forEach(b=>b.style.width=(s.progress||0)+'%');
-  const what=chk?'Check of '+mfull(s.motor-1)+"'s values":mfull(s.motor-1);
-  const label={idle:'Idle - choose a motor and press Start Auto-Tune.',running:what+': '+s.stage,done:'Finished '+(chk?'the check of '+mfull(s.motor-1)+"'s values":mfull(s.motor-1))+'.',aborted:'Stopped.',error:'Error - see the log.'}[s.state]||s.state;
+  const jt=s.mode==='joint',jw='the test of motors '+(s.motors||[]).join(', ')+' together';
+  const what=jt?'Test together':chk?'Check of '+mfull(s.motor-1)+"'s values":mfull(s.motor-1);
+  const label={idle:'Idle - choose a motor and press Start Auto-Tune.',running:what+': '+s.stage,done:'Finished '+(jt?jw:chk?'the check of '+mfull(s.motor-1)+"'s values":mfull(s.motor-1))+'.',aborted:'Stopped.',error:'Error - see the log.'}[s.state]||s.state;
   document.querySelectorAll('.tstage').forEach(e=>e.textContent=label);$('tmini').hidden=s.state==='idle';
   const cd=s.countdown;document.querySelectorAll('.tcd').forEach(e=>{e.hidden=!cd;const h=cd?`<div class="ccount" role="status"><b>${cd}</b><span><b>Get in the seat.</b> The test starts in ${cd} s - Stop, Space or Esc ends it.</span></div>`:'';if(e.dataset.h!==h){e.innerHTML=h;e.dataset.h=h;}});
   const lg=$('tlog'),atEnd=lg.scrollTop+lg.clientHeight>=lg.scrollHeight-5,t=nameify(s.log.join('\n'));if(lg.textContent!==t){lg.textContent=t;if(atEnd)lg.scrollTop=lg.scrollHeight;}
@@ -12944,7 +14264,19 @@ function dirRows(D,dirs,small,pm){const f=(v,d,u)=>v==null?'-':(+v).toFixed(d)+u
  return h+'</table>';}
 function resDirs(r){const n=r.names||{p:'higher',m:'lower'},sy={up:'▲',down:'▼',left:'◀',right:'▶',higher:'▲',lower:'▼'};
  const ord=(n.m==='up'||n.m==='left')?['m','p']:['p','m'];return ord.map((k,i)=>({k,name:n[k],sym:sy[n[k]]||'',cls:i?'db':'da'}));}
+function jointTable(rows,names,vals){const f=(v,d,u)=>v==null?'-':(+v).toFixed(d)+u,sy={up:'▲',down:'▼',left:'◀',right:'▶',higher:'▲',lower:'▼'};
+ const PH=[['solo','alone'],['together','together'],['opposite','twisted']];let h='<table class="tdirs tjoint"><tr><th></th><th></th><th>lag</th><th>overshoot</th><th>settle</th><th>off by</th><th>drive</th></tr>';
+ for(const n of Object.keys(rows||{})){const R=rows[n],N=(names||{})[n]||{p:'higher',m:'lower'},pm=((vals||{})[n]||{}).pwmmax;
+  const ord=(N.m==='up'||N.m==='left')?['m','p']:['p','m'];let first=true;
+  for(const [ph,pl] of PH){const X=R[ph];if(!X)continue;
+   for(const k of ord){const r=X[k]||{},a=(R.solo||{})[k]||{},worse=ph!=='solo'&&((r.lag_ms!=null&&a.lag_ms!=null&&r.lag_ms>1.25*a.lag_ms&&r.lag_ms-a.lag_ms>25)||(r.os>a.os+8&&r.os>10)||(r.sse>a.sse+3));
+    h+=`<tr class="${worse?'jworse':''}${first?' jfirst':''}"><td>${first?'<b>'+esc(mshort(+n-1))+'</b>':''}</td><td>${esc(pl)} <span>${sy[N[k]]||''}</span> ${esc(N[k])}</td><td>${f(r.lag_ms,0,' ms')}</td><td>${f(r.os,0,'%')}</td><td>${f(r.settle,0,' ms')}</td><td>${f(r.sse,1,'')}</td><td>${r.drive!=null&&pm?Math.round(100*r.drive/pm)+'%':'-'}</td></tr>`;first=false;}}}
+ return h+'</table>';}
 function tuneResultHtml(s){let h='';const r=s.result;
+ if(r&&r.joint){h=`<div class="tverd ${r.ok?'ok':'bad'}"><b class="gs ${r.ok?'good':'warn'}">${r.ok?'✓':'!'}</b> <b>Motors ${r.motors.map(n=>esc(mshort(n-1))).join(', ')} together:</b> ${r.ok?'each does as well as alone.':esc(r.issues.join('; '))+'.'}`+
+   (r.suggest&&r.suggest.length?'<ul>'+r.suggest.map(x=>'<li>'+esc(x)+'</li>').join('')+'</ul>':'')+'</div>';
+  h+=jointTable(r.rows,r.names,r.values)+`<div class="muted" style="font-size:12.5px">Test moves ±${r.amp} counts at ${r.ramp_v} counts/s; rows shaded where a motor does worse than alone. Nothing was changed.</div>`;
+  return h;}
  if(r&&r.check){const D=resDirs(r);
   h=`<div class="tverd ${r.ok?'ok':'bad'}"><b class="gs ${r.ok?'good':'warn'}">${r.ok?'✓':'!'}</b> <b>${esc(mfull(r.motor-1))}:</b> ${r.ok?'these values work'+(r.seated?' with you in the seat.':'.'):esc(r.issues.join('; '))+'.'}`+
    (r.suggest&&r.suggest.length?'<ul>'+r.suggest.map(x=>'<li>'+esc(x)+'</li>').join('')+'</ul>':'')+'</div>';
@@ -12956,7 +14288,12 @@ function tuneResultHtml(s){let h='';const r=s.result;
   if(r.notes&&r.notes.length)h+='<ul style="margin:0 0 10px;padding-left:18px;font-size:13px">'+r.notes.map(x=>'<li>'+esc(x)+'</li>').join('')+'</ul>';}
  if(s.can_revert){const rm=s.revert_motor;h+=`<div style="display:flex;gap:10px;flex-wrap:wrap"><button class="btn b-grey" data-k="trevert" onclick="tuneRevert()">Revert${r&&r.check&&rm?' '+esc(mshort(rm-1)):''}</button><button class="btn b-red" data-k="sav" onclick="saveEeprom()">Save to EEPROM</button></div>`;}
  return h||'<div class="muted">The values auto-tune found, or what Check says, appear here.</div>';}
-function resultText(s){const r=s.result;if(!r)return'';const D=resDirs(r),L=[];
+function resultText(s){const r=s.result;if(!r)return'';
+ if(r.joint){const L=[`Test of motors ${r.motors.join(', ')} together: `+(r.ok?'each does as well as alone.':r.issues.join('; ')+'.')];(r.suggest||[]).forEach(x=>L.push('  Suggestion: '+x));
+  for(const n of Object.keys(r.rows||{}))for(const ph of ['solo','together','opposite']){const X=r.rows[n][ph];if(!X)continue;const N=r.names[n];
+   L.push(`  ${mfull(+n-1)}, ${{solo:'alone',together:'together',opposite:'twisted'}[ph]}: `+['p','m'].map(k=>{const x=X[k]||{};return `${N[k]} lag ${x.lag_ms==null?'-':Math.round(x.lag_ms)+' ms'}, overshoot ${Math.round(x.os||0)}%, off by ${(+(x.sse||0)).toFixed(1)}`;}).join(' | '));}
+  return L.join('\n');}
+ const D=resDirs(r),L=[];
  const fig=x=>x?`lag ${x.lag_ms==null?'-':Math.round(x.lag_ms)+' ms'}, overshoot ${Math.round(x.os)}%, settle ${Math.round(x.settle)} ms, off by ${(+x.sse).toFixed(1)}`:'-';
  if(r.check){L.push(`Check of ${mfull(r.motor-1)}: `+(r.ok?'these values work.':r.issues.join('; ')+'.'));(r.suggest||[]).forEach(x=>L.push('  Suggestion: '+x));
   L.push(`  Values: Kp ${r.values.kp}, Ki ${r.values.ki}, Kd ${r.values.kd}, Ks ${r.values.ks}, PWMmin ${r.values.pwmmin}, PWMmax ${r.values.pwmmax}, dead zone ${r.values.dz}`);}
@@ -13035,6 +14372,12 @@ function sweepTip(r,D,lt){const f=(x,d,u)=>x==null?'-':(+x).toFixed(d)+u;
  return `<b>Kp ${r.kp}</b> ${r.good?'<span class="gs good">✓ calm</span>':'<span class="gs bad">✕ not chosen: too lively or too far off</span>'}`+D.map(d=>{const q=r[d.k]||{};
   return `<br><span class="${d.cls}">${d.sym}</span> ${esc(d.name)}: lag ${f(q.lag_ms,0,' ms')}, over ${f(q.os,0,'%')}, settle ${f(q.settle,0,' ms')}, off by ${f(q.sse,1,'')}`+(q.behind?', falls behind':'');}).join('');}
 function tlRender(s){const lv=s.live||{},key=JSON.stringify([s.state,s.mode,s.motor,lv]);if(tlRender.k===key)return;tlRender.k=key;
+ if(s.mode==='joint'&&lv.phases){                       // 2.9: every motor together - the figures so far
+  $('tl_sub').textContent='Test together - motors '+(s.motors||[]).join(', ')+(s.state==='running'?'':' ('+({done:'finished',aborted:'stopped',error:'error'}[s.state]||s.state)+')');
+  const ph=lv.phases,ci=ph.findIndex(p=>p[0]===lv.phase),fin=s.state==='done';
+  $('tl_steps').innerHTML=ph.map((p,i)=>`<span class="${fin||i<ci?'done':(i===ci&&s.state==='running'?'on':'')}">${esc(p[1])}</span>`).join('');
+  $('tl_body').innerHTML=lv.jrows?jointTable(lv.jrows,lv.jnames||null,(s.result||{}).values||null)+'<div class="muted" style="font-size:12.5px">Each motor alone first, then all together, then twisted: a row turns amber where a motor does worse than alone.</div>':'<div class="tempty">Each motor alone first, then all together, then the front lifts opposite each other.</div>';
+  return;}
  $('tl_sub').textContent=s.state==='idle'||!lv.phases?'idle':(s.mode==='check'?'Check':'Auto-tune')+' - '+mfull(s.motor-1)+(s.state==='running'?'':' ('+({done:'finished',aborted:'stopped',error:'error'}[s.state]||s.state)+')');
  const ph=lv.phases||[],cur=lv.phase,ci=ph.findIndex(p=>p[0]===cur),fin=s.state==='done';
  $('tl_steps').innerHTML=ph.map((p,i)=>`<span class="${fin||i<ci?'done':(i===ci&&s.state==='running'?'on':'')}">${esc(p[1])}</span>`).join('');
@@ -13766,7 +15109,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"connected": self.board.connected, "host": self.cfg.get("host"),
                         "samples": self.board.since(since, limit=1500), "fw": self._fw(),
                         "fwnum": (self.board.fw_cache or [0, 0])[1],
-                        "gen": {"mode": self.gen.mode, "motor": self.gen.motor},
+                        "gen": {"mode": self.gen.mode, "motor": self.gen.motor, "combo": self.gen.combo},
                         "scanning": self.finder.scanning, "watch": self.monitor.summary(),
                         "diag": {"state": self.diag.state, "motor": None if self.diag.motor is None else self.diag.motor,
                                  "prompt": self.diag.prompt is not None},
@@ -13779,6 +15122,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(self.cfg.public())
         elif u.path == "/usb/status":                    # 2.8: the USB cable
             self._json(self._usb_status())
+        elif u.path == "/usb/browser":                   # 2.9: the page's own USB link (Web Serial over a WebSocket)
+            usb_browser_link(self)
         elif u.path == "/usb-bridge.ps1":                # 2.8: the Windows bridge, with this page's address in it
             host = re.sub(r"[^A-Za-z0-9.:\[\]_-]", "", self.headers.get("Host") or "")[:100]
             if not host:
@@ -13985,7 +15330,9 @@ class Handler(BaseHTTPRequestHandler):
         b = self.board
         last = dict(b.usb_last, ago=round(time.time() - b.usb_last["until"])) if b.usb_last else None
         return {"allowed": bool(self.cfg.get("usb_link")), "link": b.link_info(), "last": last, "want": b.want_usb(),
-                "busy": Handler.usb_busy() if Handler.usb_busy else None}
+                "busy": Handler.usb_busy() if Handler.usb_busy else None,
+                "module_resetting": b.module_resetting(), "module_reset_ok": b.module_reset_ok(),   # 2.9
+                "owner": b.usb_owner()}                                                             # 2.9 (fw 2.0)
 
     def _usb_link(self):
         """2.8: a bridge on the PC with the USB cable. Answers, then the connection carries the board's bytes both ways
@@ -14009,6 +15356,11 @@ class Handler(BaseHTTPRequestHandler):
             why = f"Another USB bridge is linked already ({u.get('computer') or '?'}, {u.get('port') or '?'})."
         elif b.usb_pending:
             why = "Another USB bridge is linking right now."
+        elif b.module_resetting():                       # 2.9
+            why = "The board is restarting its USB chip to clear a USB stall - the port comes back in a few seconds."
+        elif info["probe"] == "none" and b.link != "usb" and b.module_reset_now():   # 2.9: stalled before the link
+            why = ("Nothing comes back from the board over USB: its USB output has stalled (a known UNO R4 WiFi problem). "
+                   "The page asked the board to restart its USB chip - " + b.module_after_text())
         else:
             why = Handler.usb_busy() if Handler.usb_busy else None
         if why:
@@ -14067,6 +15419,61 @@ class Handler(BaseHTTPRequestHandler):
             return
         if p == "/update/check":
             self._json(self.upd.check())
+            return
+        if p == "/board/reboot":                         # 2.9 / firmware 2.0: the header's Restart button
+            if self.tuner.running() or self.seat.state != "idle" or (self.diag.running() and self.diag.kind == "full"):
+                self._json({"ok": False, "error": "Auto-tune, Seat setup or the full check is running - stop it first."})
+                return
+            self.gen.set(mode="off")
+            ok, msg = self.board.reboot()
+            self._json({"ok": ok, "error": None if ok else msg})
+            return
+        if p == "/usb/owner":                            # 2.9 / firmware 2.0: who gets the board's USB connector
+            try:
+                mode = int(req.get("mode"))
+            except (TypeError, ValueError):
+                mode = -1
+            if mode not in (0, 1, 2):
+                self._json({"ok": False, "error": "mode must be 0, 1 or 2."}, 400)
+                return
+            ok, msg = self.board.set_usb_owner(mode)
+            self._json({"ok": ok, "error": None if ok else msg, "what": msg if ok else None, **self._usb_status()})
+            return
+        if p == "/usb/chip-restart":                     # 2.9: the browser's probe got nothing back - clear the stall
+            b = self.board
+            if b.module_resetting():
+                self._json({"ok": True, "already": True, **self._usb_status()})
+            elif b.link == "usb":
+                self._json({"ok": False, "error": "The page is on the cable right now.", **self._usb_status()})
+            elif not b.module_reset_ok():
+                if b.usb_native():
+                    err = ("The board's USB port is the main chip's own (firmware 2.0): there is no USB chip in the way "
+                           "to restart. Unplug the USB cable and plug it back in, or press the board's RESET button.")
+                else:
+                    err = ("The board runs firmware " + str(b.fw_known or b.fw_version or "?") + ": unplug the USB cable "
+                           "and plug it back in. Firmware 2.0 takes the WiFi chip out of the USB path, so this doesn't "
+                           "happen any more.")
+                self._json({"ok": False, "error": err, **self._usb_status()})
+            elif not b.module_reset_now():
+                ago = time.time() - b.module_reset_at
+                k = b.fw_known or b.fw_version
+                if ago < 60 and k and vkey(k) < (1, 9, 8):      # 2.9: 1.9.7 gets stuck after its restart
+                    err = (f"The board's USB chip was restarted {ago:.0f} s ago; on firmware 1.9.7 the board then gets "
+                           "stuck retrying WiFi and answers nothing: press the board's RESET button. Firmware 2.0 "
+                           "fixes this.")
+                elif ago < 60:
+                    err = (f"The board's USB chip was restarted {ago:.0f} s ago and it still answers nothing on the "
+                           "cable: wait a moment and press Connect again, or press the board's RESET button.")
+                else:
+                    err = "The page can't reach the board right now."
+                self._json({"ok": False, "error": err, **self._usb_status()})
+            else:
+                self._json({"ok": True, **self._usb_status()})
+            return
+        if p == "/usb/browser/check":                    # 2.9: may the page link the cable itself now?
+            info = usb_browser_info(self, {k: [str(v)] for k, v in req.items()})
+            bad = usb_browser_check(self, info)
+            self._json({"ok": not bad, "error": bad[0] if bad else None, **self._usb_status()})
             return
         if p == "/usb/standby":                          # 2.8.1: a bridge with the port closed asks whether to link
             b, h = self.board, self.headers
@@ -14142,17 +15549,31 @@ class Handler(BaseHTTPRequestHandler):
                 return
             try:
                 centre = float(req.get("centre", 512))
-                was = self.gen.mode
+                combo = str(req.get("combo") or "")
+                plan = []
+                if combo and req.get("mode", "off") != "off":
+                    fwfl = (self.board.fw_cache or [0, 0])[0]
+                    cp = combo_plan(self.cfg, combo, fwfl)
+                    if not cp:
+                        self._json({"ok": False, "error": "This rig hasn't the motors for that (Settings, Rig layout)."})
+                        return
+                    # each motor around its own centre (the level seat with a seat set-up), moved by the Offset's
+                    # distance from 512
+                    plan = [(m, sg, ph, self.board.centre(m) + (centre - 512)) for m, sg, ph in cp]
+                was = (self.gen.mode, self.gen.combo)
                 self.gen.set(motor=int(req.get("motor", 0)) % 3, mode=str(req.get("mode", "off")),
                              amp=float(req.get("amp", 200)), period=float(req.get("period", 2.0)),
-                             value=float(req.get("value", centre)), centre=centre)
-                if self.gen.mode != was:
-                    self.events.add("test", f"Test signal {self.gen.mode} on motor {self.gen.motor + 1}" if
-                                    self.gen.mode != "off" else "Test signal stopped.", quiet=True)
+                             value=float(req.get("value", centre)), centre=centre, combo=combo if plan else "",
+                             plan=plan)
+                if (self.gen.mode, self.gen.combo) != was:
+                    who = (f"motors {'+'.join(str(m + 1) for m, *_ in plan)} ({combo})" if plan else
+                           f"motor {self.gen.motor + 1}")
+                    self.events.add("test", f"Test signal {self.gen.mode} on {who}" if self.gen.mode != "off" else
+                                    "Test signal stopped.", quiet=True)
             except (TypeError, ValueError):
                 self._json({"ok": False, "error": "Check the test-signal numbers."})
                 return
-            self._json({"ok": True})
+            self._json({"ok": True, "motors": [m + 1 for m, *_ in plan] if plan else [self.gen.motor + 1]})
         elif p == "/manual/move":                        # 2.4: a motor card's knob dragged
             try:
                 m, pos = int(req.get("motor", -1)), float(req.get("pos"))
@@ -14261,7 +15682,7 @@ class Handler(BaseHTTPRequestHandler):
             except (TypeError, ValueError):
                 self._json({"ok": False, "error": "bad parameters"})
                 return
-            mode = "check" if req.get("mode") == "check" else "tune"
+            mode = req.get("mode") if req.get("mode") in ("check", "joint") else "tune"
             rider = "seated" if req.get("rider") == "seated" else "empty"
             unit = "kg" if req.get("rider_unit") == "kg" else "lb"
             if self.diag.running():
@@ -14280,6 +15701,7 @@ class Handler(BaseHTTPRequestHandler):
                 who = "you in the seat" if rider == "seated" else (f"seat empty, rider {kg_text(kg, unit)}" if kg
                                                                    else "seat empty")
                 self.events.add("tune", (f"Check of motor {motor + 1}'s values started" if mode == "check" else
+                                         "Test of every motor together started" if mode == "joint" else
                                          f"Auto-tune of motor {motor + 1} started") +
                                 f" (style {req.get('style', 'normal')}, travel ±{amp}, {who}).", motor=motor + 1)
             self._json({"ok": ok, "error": None if ok else msg})

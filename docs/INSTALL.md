@@ -39,7 +39,7 @@ You can also skip the address: the page's **Settings, Find board on network** lo
    opens, type (use the name of the file you downloaded):
 
    ```bat
-   py smc3_scope_v2.8.py --bind 0.0.0.0 --web 8198 --host 192.168.1.50
+   py smc3_scope_v2.9.py --bind 0.0.0.0 --web 8198 --host 192.168.1.50
    ```
 
    `--host` is your board's address (you can leave it out and set it in the page). Keep this window open: closing
@@ -57,7 +57,7 @@ Settings, profiles, backups and diagnostics are kept in the folder `smc3-scope-d
 ```bat
 @echo off
 cd /d "%~dp0"
-start "smc3-scope" /min py smc3_scope_v2.8.py --bind 0.0.0.0 --web 8198
+start "smc3-scope" /min py smc3_scope_v2.9.py --bind 0.0.0.0 --web 8198
 ```
 
 press Win+R, type `shell:startup`, Enter, and put a shortcut to `smc3-scope.bat` in the folder that opens.
@@ -77,8 +77,8 @@ in the `.bat` too). Your settings stay - they're in `smc3-scope-data`.
 
    ```sh
    mkdir -p ~/smc3-scope && cd ~/smc3-scope
-   curl -LO https://github.com/winreboot/smc3-r4/releases/latest/download/smc3_scope_v2.8.py
-   python3 smc3_scope_v2.8.py --bind 0.0.0.0 --web 8198 --host 192.168.1.50
+   curl -LO https://github.com/winreboot/smc3-r4/releases/latest/download/smc3_scope_v2.9.py
+   python3 smc3_scope_v2.9.py --bind 0.0.0.0 --web 8198 --host 192.168.1.50
    ```
 
 3. **Open** `http://<this computer's address>:8198` (or <http://localhost:8198> on the same machine). A Mac asks
@@ -96,7 +96,7 @@ Wants=network-online.target
 [Service]
 User=pi
 WorkingDirectory=/home/pi/smc3-scope
-ExecStart=/usr/bin/python3 /home/pi/smc3-scope/smc3_scope_v2.8.py --bind 0.0.0.0 --web 8198
+ExecStart=/usr/bin/python3 /home/pi/smc3-scope/smc3_scope_v2.9.py --bind 0.0.0.0 --web 8198
 Restart=always
 RestartSec=5
 
@@ -242,13 +242,68 @@ It needs this machine to reach `api.github.com` and GitHub's download servers. U
 
 ## USB cable for calibration
 
-From page 2.8 with firmware 1.9.5 on the board (1.9.6 recommended), the page can talk to the board over its USB cable instead of WiFi -
-for auto-tune, the full check and Seat setup. The board's WiFi module now and then holds the board up for a second
-or more; on the cable nothing waits. Only with SimHub closed: one program at a time can have the USB port.
+From page 2.8 with firmware 1.9.5 on the board (2.0 recommended), the page can talk to the board over its USB cable
+instead of WiFi - for auto-tune, the full check and Seat setup. The board's WiFi module now and then holds the board
+up for a second or more; on the cable nothing waits. Only with SimHub closed: one program at a time can have the USB
+port.
+
+### Firmware 2.0: the board's own USB port
+
+On the UNO R4 WiFi the USB connector normally belongs to the board's WiFi chip, which relays the bytes to the main
+chip. That relay stalls now and then (the board's USB output dies until a replug) and used to lose bytes. **Firmware
+2.0 gives the connector to the main chip itself**: SimHub and the page then talk to it directly, and there is no
+stall to clear. What changes on the PC:
+
+- **A new COM port, once.** After the first start of 2.0, Windows plays its unplug and plug sounds and a new COM port
+  appears (the browser's port list calls it UNO R4 WiFi). In SimHub, choose it in the SMC3 output (the baud rate doesn't matter on
+  this port). The page's browser link asks which port once more.
+- **Arduino IDE uploads go through the WiFi chip.** Before an upload, give it the connector:
+  1. on the page: Settings, USB cable, *Who has the board's USB connector*, press **WiFi chip until the next reset**;
+     the old COM port comes back, upload as always, and the board is back on its own port after the upload; or
+  2. without the page: press the board's **RESET twice, about a second apart** (slower than the bootloader's own
+     double-tap). Same effect, until the next reset.
+
+  Firmware updates from the page over WiFi (Settings, Firmware update) need none of this.
+- **Going back:** **WiFi chip (classic)** on the same card puts the connector back where it was (saved on the board).
+  On that setting the page clears a stall by itself: it has the board restart the WiFi chip (never while SimHub sends
+  positions), the port comes back as after a replug and the link follows in about 10 s.
+
+### From the browser (page 2.9)
+
+In Chrome, Edge, Brave or Firefox 151+ on the PC the board is plugged into, the page opens the port itself (Web
+Serial) - no bridge, nothing to install:
 
 1. Close SimHub.
-2. On the PC the board is plugged into, open the page in a browser, **Settings, USB cable**, press **Copy**, then
-   press **Win+R**, paste and press Enter. The line looks like this (with your page's address):
+2. Open the page and flip the switch at the top to **USB**. The browser asks which port: pick the Arduino (with
+   firmware 2.0 its new port). It asks only once; from then on the switch links and lets go without asking.
+3. Calibrate. The page links again by itself when the cable comes back, and reopens the port when the board goes
+   quiet.
+4. When you're done, flip the switch to **WiFi** (the port is free at once) and start SimHub.
+
+Browsers open USB ports only from a **secure** page: `https://`, or `localhost`. A page at `http://192.168.1.20:8198`
+(a NAS, a Raspberry Pi) isn't one, so on the sim PC do one of these, once:
+
+- **Allow the address in the browser.** Open `chrome://flags/#unsafely-treat-insecure-origin-as-secure` (Edge:
+  `edge://flags/...`, Brave: `brave://flags/...`), type the page's address (`http://192.168.1.20:8198`) into its box,
+  set it to **Enabled** and press **Relaunch**. Firefox has no such flag; use the next way there.
+- **Or reach the page as localhost.** In PowerShell *run as administrator*:
+
+      netsh interface portproxy add v4tov4 listenaddress=127.0.0.1 listenport=8198 connectaddress=192.168.1.20 connectport=8198
+
+  Then open `http://localhost:8198` on the sim PC. To undo it:
+  `netsh interface portproxy delete v4tov4 listenaddress=127.0.0.1 listenport=8198`.
+
+Settings, USB cable shows these steps with your page's address filled in whenever the page isn't a secure one. A page
+running on the sim PC itself is reached as `localhost` and needs neither.
+
+### The bridge (any browser, or another PC)
+
+For Safari, a phone or a browser on another PC than the cable, a small bridge on the PC with the cable links it to the
+page:
+
+1. Close SimHub.
+2. On the PC the board is plugged into, open the page in a browser, **Settings, USB cable**, *Or: the bridge*, press
+   **Copy**, then press **Win+R**, paste and press Enter. The line looks like this (with your page's address):
 
        powershell -NoProfile -ExecutionPolicy Bypass -Command "irm http://192.168.1.20:8198/usb-bridge.ps1 | iex"
 
@@ -261,18 +316,34 @@ or more; on the cable nothing waits. Only with SimHub closed: one program at a t
 
 The page can be anywhere on your network (the NAS, a Raspberry Pi): only the bridge runs on the PC with the cable.
 
-**Firmware 1.9.6.** 1.9.5 loses a byte on the USB port now and then while it controls the motors - often enough that
-the page's commands over the cable arrive damaged and the link drops out after a while (the page's events say
-"... bytes of unreadable data arrived on the USB port"). 1.9.6 fixes that; install it before using the cable.
+**Download the bridge (.ps1)** on the same card gives you the script as a file to keep on that PC (right-click, Run
+with PowerShell - it asks for the page's address). On macOS and Linux, or Windows with Python and pyserial, the page
+file is the bridge too:
 
-**Nothing comes back from the board?** If the bridge says "No answer from the board on COM4: nothing comes back over
-USB" (and the page later "The board didn't answer on COM4 in 45 s"), the board's own USB chip (an ESP32-S3) isn't
-passing the board's answers on to the PC. On a board whose USB chip ran firmware older than 0.6.0, updating that chip
-fixed it. The Arduino IDE's Firmware Updater can't do it in this state (it needs those answers itself), but Arduino's
-standalone updater can - it talks to the USB chip alone and leaves the sketch, its settings and the WiFi details as
-they are:
+    python3 smc3_scope_v2.9.py --usb-bridge /dev/ttyACM0 --page http://192.168.1.20:8198
 
-1. Switch the rig's motor power off; close SimHub, the Arduino IDE and the bridge.
+**Settings, USB cable** can also turn bridges away (WiFi only). Firmware updates from the page still go over WiFi.
+
+To have the bridge waiting from the moment Windows starts, make a shortcut in the Startup folder (Win+R,
+`shell:startup`) with this target (your page's address), and the switch works whenever you want it:
+
+    powershell -WindowStyle Minimized -NoProfile -ExecutionPolicy Bypass -Command "$env:SMC3_STANDBY='1'; irm http://192.168.1.20:8198/usb-bridge.ps1 | iex"
+
+### Older firmware
+
+**Firmware 1.9.6 or newer.** 1.9.5 loses a byte on the USB port now and then while it controls the motors - often
+enough that the page's commands over the cable arrive damaged and the link drops out after a while (the page's events
+say "... bytes of unreadable data arrived on the USB port").
+
+**Nothing comes back from the board?** (While the WiFi chip has the connector: firmware older than 2.0, or 2.0 set to
+classic.) If the bridge says "No answer from the board on COM4: nothing comes back over USB" (and the page later "The
+board didn't answer on COM4 in 45 s"), the board's own USB chip (an ESP32-S3) isn't passing the board's answers on to
+the PC. On a board whose USB chip ran firmware older than 0.6.0, updating that chip fixed it. The Arduino IDE's
+Firmware Updater can't do it in this state (it needs those answers itself), but Arduino's standalone updater can - it
+talks to the USB chip alone and leaves the sketch, its settings and the WiFi details as they are:
+
+1. Switch the rig's motor power off; close SimHub, the Arduino IDE and the bridge. With firmware 2.0, give the WiFi
+   chip the connector first (**WiFi chip until the next reset**, or RESET twice), or the updater won't find it.
 2. Download `unor4wifi-update-windows.zip` from the latest release at
    [github.com/arduino/uno-r4-wifi-usb-bridge/releases](https://github.com/arduino/uno-r4-wifi-usb-bridge/releases),
    extract it and run `update.bat` (Windows may ask: More info, Run anyway). Pick the "USB Serial Device" port; when
@@ -284,18 +355,6 @@ If `update.bat` says it can't put the board in ESP mode: unplug everything, conn
 on the 6-pin header next to the USB-C socket with a jumper wire, plug in the USB cable only, and in that folder run
 `bin\espflash write-bin -b 115200 0x0 (Get-Item .\firmware\UNOR4-WIFI-S3-*.bin).FullName` in PowerShell; then unplug,
 remove the jumper and plug everything back in.
-**Download the bridge (.ps1)** on the same card gives you the script as a file to keep on that PC (right-click, Run
-with PowerShell - it asks for the page's address). On macOS and Linux, or Windows with Python and pyserial, the page
-file is the bridge too:
-
-    python3 smc3_scope_v2.8.py --usb-bridge /dev/ttyACM0 --page http://192.168.1.20:8198
-
-**Settings, USB cable** can also turn bridges away (WiFi only). Firmware updates from the page still go over WiFi.
-
-To have the bridge waiting from the moment Windows starts, make a shortcut in the Startup folder (Win+R,
-`shell:startup`) with this target (your page's address), and the switch works whenever you want it:
-
-    powershell -WindowStyle Minimized -NoProfile -ExecutionPolicy Bypass -Command "$env:SMC3_STANDBY='1'; irm http://192.168.1.20:8198/usb-bridge.ps1 | iex"
 
 ---
 
@@ -328,8 +387,10 @@ whenever you change them there; otherwise what you set in the page stays.
 | Firmware update from the page can't start | The page must be reachable from the board: `--bind 0.0.0.0`, firewall open, and in Docker the same port number on both sides. The board's WiFi module needs firmware 0.4.0 or newer. |
 | Auto-tune says "WiFi hiccup during that move - doing it again", or stops with "The WiFi link to the board kept stalling" | The board's WiFi drops out for a second or more now and then. Put the board closer to the router (or an access point), keep the 2.4 GHz channel clear, and update the board's WiFi module (Arduino IDE, Tools, Firmware Updater). A few repeated moves are harmless. |
 | USB bridge: "COM5 is in use or missing" | Close SimHub (and SMC3Utils, the Arduino IDE's Serial Monitor) - only one program can have the port. Check the board is plugged into this PC. |
-| USB bridge: "needs firmware 1.9.5 or newer" | The board answers on the cable but its firmware can't send the page's data over USB. Install SMC3_R4 1.9.6 (Settings, Firmware update, or the Arduino IDE), then run the bridge again. |
-| USB bridge: "the page's commands arrive damaged" | Firmware 1.9.5 loses bytes on the USB port: install 1.9.6 (above). |
+| USB bridge: "needs firmware 1.9.5 or newer" | The board answers on the cable but its firmware can't send the page's data over USB. Install SMC3_R4 2.0 (Settings, Firmware update, or the Arduino IDE), then run the bridge again. |
+| USB bridge: "the page's commands arrive damaged" | Firmware 1.9.5 loses bytes on the USB port: install 2.0 (above). |
+| The browser's port list has no Arduino, or Connect does nothing | The page must be a secure one (https or localhost; see [From the browser](#from-the-browser-page-29)). With firmware 2.0 pick the board's new port; SimHub, the Arduino IDE or a bridge must not have the port. |
+| The Arduino IDE can't upload (firmware 2.0) | The upload goes through the WiFi chip: Settings, USB cable, **WiFi chip until the next reset**, or press RESET twice about a second apart, then upload. |
 | USB bridge: "No answer from the board on COM4: nothing comes back over USB" | Update the board's USB chip with Arduino's standalone updater (above, "Nothing comes back from the board?"). |
 | USB bridge: "Can't reach the page" | Use the page's plain `http://` address as in your browser (not https or a reverse proxy). The page must listen on the network (`--bind 0.0.0.0`; the Docker image does). |
 | The switch stays orange ("switching") | The bridge can't open the port: hover over the switch - usually SimHub (or SMC3Utils, the Serial Monitor) still has it. Close it; the bridge links by itself. Flip back to WiFi to cancel. |
