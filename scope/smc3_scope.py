@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-smc3_scope v2.9.1 - live scope, tuner and auto-tuner for the SMC3_R4 motion controller (Arduino UNO R4 WiFi).
+smc3_scope v2.9.2 - live scope, tuner and auto-tuner for the SMC3_R4 motion controller (Arduino UNO R4 WiFi).
 
 Connects to the board's TCP telemetry port, keeps a rolling buffer of samples and serves a web page with live
 charts, a parameter editor (sends ordinary SMC3 commands back to the board), test signals and a per-motor
@@ -17,6 +17,19 @@ or, on Windows with nothing installed, the PowerShell bridge from Settings, USB 
 Every option can also come from the environment (Docker): SMC3_HOST, SMC3_PORT, SMC3_WEB_PORT, SMC3_BIND,
 SMC3_DATA_DIR.  Settings changed in the page (board address, theme, auto-find) are saved to
 <data dir>/config.json and survive restarts and upgrades.  Standard-library Python 3.8+ only.
+
+v2.9.2: honest labels and a fuller sensor comparison, from a review of 2.9.1 (page only, firmware 2.1 stays). The
+        graphs' Drive line is called Drive (calc.): it is the PWM the board's output stage should send by its own
+        rule, calculated from the telemetry and the settings, not read back from the board (the page can't tell
+        whether the motor supply is on). The Sensor check calls its P / D split an estimate (P from Kp x error; the
+        rest is D and I with the board's rounding and clipping, which the board doesn't report apart), says that the
+        board's raw readings come as a summary (extremes and counts at 4 kHz / Fpid divider, not a waveform), and
+        measures an event's length from the samples' timestamps instead of 10 ms x samples. A, B and C side by side
+        now report all three parts - the sensor side on its own (A), what the motor power adds (B over A) and what
+        holding adds (C over B), each as sqrt(new^2 - previous^2) and a ratio - instead of naming the first cause
+        only, and say when the checks were taken at different positions or days apart. Auto-tune: when the noise at
+        rest would need a dead zone over 4 it says so (NOISY INPUT, in the log and the result) instead of quietly
+        capping, and a new 'Stop if too noisy' option stops the tune there.
 
 v2.9.1: the 2.9.1 betas below, tested on a rig, with firmware 2.1 (tested as 2.1b1). In short: the LED matrix can
         play one of five little games while idle (Settings, LED matrix, While idle; firmware 2.1). Test signals fade
@@ -318,7 +331,7 @@ v1.4: settings dialog (board address, port, find-board scan, auto-find), day/nig
       fixed a thread race that made the page flash "not reachable".
 """
 
-VERSION = "2.9.1"
+VERSION = "2.9.2"
 
 import argparse
 import base64
@@ -2069,6 +2082,7 @@ class Tuner:
         self.lo, self.hi = 100, 923              # where targets may go: Clip window + travel limits (firmware 1.9)
         self.events = None
         self.noise_sd = 0.5                      # the pot's noise at rest (1 sigma, counts), measured at the start
+        self.stop_noisy = False                  # 2.9.2: stop when the noise needs a dead zone over 4
         self.fwin = collections.deque(maxlen=5)  # the last 5 pot readings: per-reading checks use their median (2.4.1)
         self.ramp_v = None                       # test moves follow a ramp at this speed (counts/s, page 2.5)
         self.dn = {1: "higher", -1: "lower"}     # what each direction is called on this rig
@@ -2101,7 +2115,7 @@ class Tuner:
                 "motors": [m + 1 for m in getattr(self, "jm", [])] if self.mode == "joint" else None}
 
     def start(self, motor, amp, style, do_friction, do_ki, do_kd, rider="empty", rider_kg=0.0, unit="lb",
-              mode="tune"):
+              mode="tune", stop_noisy=False):
         with self.slock:
             if self.running():
                 return False, "An auto-tune is already running."
@@ -2111,6 +2125,7 @@ class Tuner:
                 return False, ("The page is still putting back the settings from the last auto-tune (the link dropped "
                                "during it) - try again in a few seconds.")
             self.motor, self.mode = motor, (mode if mode in ("check", "joint") else "tune")
+            self.stop_noisy = bool(stop_noisy)           # 2.9.2: stop instead of capping the dead zone at 4
             if self.mode == "joint":                     # 2.9: every motor in use, together
                 self.jm = list(range(int(self.board.cfg.get("motors") or 3)))
                 if len(self.jm) < 2:
@@ -2939,15 +2954,35 @@ class Tuner:
         plain = _std(allr) * 1.12
         self.noise_sd = max(0.3, sigma)
         varies = len(sig) == 3 and max(sig) > 0.6 and max(sig) > 2.0 * max(0.15, min(sig))
+        # 2.9.2: the dead zone that would cover the noise (3 sigma + 1), and the cap of 4 - a bigger dead zone would
+        # cost accuracy on every move, so over the cap the tune says so (and stops, if asked to) instead of quietly
+        # capping: the fix is the signal, not the dead zone
+        want = int(max(1, math.ceil(3 * sigma) + 1))
         self._lv(noise={"sd": round(sigma, 2), "glitchy": plain > max(2.0, 2.0 * sigma),
-                        "windows": [round(x, 2) for x in sig]})
+                        "windows": [round(x, 2) for x in sig], "dz_wanted": want, "dz_cap": 4,
+                        "capped": want > 4})
         if do_friction:
-            p["dz"] = int(min(4, max(1, math.ceil(3 * sigma) + 1)))
+            p["dz"] = int(min(4, want))
             self.say(f"{sn} noise at rest ±{sigma:.2f} counts (three readings of 1 s: "
-                     f"{', '.join(f'±{x:.2f}' for x in sig)}) -> dead zone {p['dz']}.")
+                     f"{', '.join(f'±{x:.2f}' for x in sig)}) -> dead zone {p['dz']}"
+                     + (f" (capped: ±{sigma:.2f} would need {want} to cover it)." if want > 4 else "."))
         else:
             self.say(f"{sn} noise at rest ±{sigma:.2f} counts (three readings of 1 s: "
                      f"{', '.join(f'±{x:.2f}' for x in sig)}).")
+        if want > 4:
+            self.say(f"NOISY INPUT: ±{sigma:.2f} counts would need a dead zone of {want} to keep the motor still"
+                     + (", and the tune caps it at 4 (a bigger one costs accuracy on every move)" if do_friction else
+                        f" (yours stays {p.get('dz', '-')}, as asked)")
+                     + f". Expect the motor to tick or hunt while holding. The fix is the signal, not the dead zone: "
+                     f"Diagnostics, Sensor check (A, B and C) shows whether it is the {sn.lower()} side, the motor "
+                     f"supply or the drive."
+                     + ("" if self.stop_noisy else " Tick 'Stop if too noisy' in the auto-tune settings to have the "
+                                                  "tune stop here instead."))
+            if self.stop_noisy:
+                raise TuneAbort(f"Stopped: the {sn.lower()} is too noisy to tune well (±{sigma:.2f} counts needs a "
+                                f"dead zone of {want}, over the cap of 4). Fix the signal first - Diagnostics, "
+                                f"Sensor check A / B / C tells where it comes from - or untick 'Stop if too noisy' "
+                                f"to tune anyway with dead zone 4.")
         if varies:
             self.say("The noise comes and goes (the readings differ more than twice over): the limits below use the "
                      "middle one, and the Kp sweep checks restless holds against a gentler Kp before believing them. "
@@ -3428,6 +3463,11 @@ class Tuner:
         self._ramp_to(c)
         self._settle(c, 3.0)
         keys = ["kp", "ki", "kd", "ks", "pwmmin", "dz"]
+        nz = self.live.get("noise") or {}
+        if nz.get("capped") and do_friction:         # 2.9.2: say it in the result too, not only in the log
+            notes.append(f"The {'sensor' if hall_sensor(b.cfg) else 'pot'} noise at rest (±{nz['sd']:.2f} counts) "
+                         f"would need a dead zone of {nz['dz_wanted']}; it is capped at 4, so the motor may tick or "
+                         f"hunt while holding. Fix the signal (Diagnostics, Sensor check A / B / C), then tune again.")
         if r_final.get("seat_os") is not None:
             if r_final["seat_os"] >= 25 and r_final["seat_os"] >= r_final.get("motor_os", 0) + 20:
                 notes.append(f"The seat itself still bounces ({r_final['seat_os']:.0f}% overshoot) after the motor "
@@ -3455,7 +3495,7 @@ class Tuner:
                        "final": _slim(r_final), "dirs": {"p": _slim(r_final["dp"]), "m": _slim(r_final["dm"])},
                        "small": {"p": _slim(r_fsmall["dp"]), "m": _slim(r_fsmall["dm"])},
                        "names": {"p": self.dn[1], "m": self.dn[-1]}, "ramp_v": self.ramp_v, "pwmmax": p["pwmmax"],
-                       "notes": notes}
+                       "notes": notes, "noise": self.live.get("noise")}     # 2.9.2: the noise, and whether it capped dz
         for note in notes:
             self.say("Note: " + note)
         self.say("Done. The new values are running now but NOT saved - try them in a game, then press "
@@ -4495,9 +4535,11 @@ def rest_noise(fs):
 
 # ---- 2.9.1: what the pot (or contactless sensor) does while nothing is commanded to move ----------------------
 STILL_SRC = ("telemetry at 100 Hz: the feedback the PID used (after the firmware's glitch filter, 1.9.4+), the PID "
-             "output before PWMmin, and the drive to the motor worked out from them (dead zone, PWMmin, PWMmax, "
-             "PWMrev as the page last read or sent them). Raw readings at 4 kHz: only the lowest, highest and "
-             "biggest single-cycle change the board itself saw ([rdd]), and its count of jumps over 16 counts.")
+             "output before PWMmin, and the drive to the motor CALCULATED from them and the settings (dead zone, "
+             "PWMmin, PWMmax, PWMrev as the page last read or sent them) - not read back from the board. Raw "
+             "readings: a summary only - the lowest, highest and biggest single-cycle change the board itself saw "
+             "([rdd]) at 4 kHz / Fpid divider, and its count of jumps over 16 counts - not the readings themselves. "
+             "P / rest split of the PID output: an estimate (P = Kp x error / PowerScale).")
 
 
 def _pct(xs, q):
@@ -4578,6 +4620,10 @@ def still_stats(samples, m, kp=None, win_s=1.0):
                 "jumps_per_s": {str(k): round(sum(1 for x in ad if x > k) / dur, 2) if dur > 0 else None
                                 for k in (2, 4, 8, 16)}})
     th = max(4.0 * s_med, 1.0)
+    # 2.9.2: an event's length comes from the samples' own timestamps (plus one sample period), not from a count of
+    # samples x 10 ms - late or missing frames would stretch or shrink it otherwise
+    step_s = statistics.median(b - a for a, b in zip(ts, ts[1:])) if len(ts) > 1 else 0.01
+    out["sample_ms"] = round(step_s * 1000, 1)
     ev, k = [], 0
     while k < len(xs):
         if abs(resid[k]) <= th:
@@ -4587,9 +4633,10 @@ def still_stats(samples, m, kp=None, win_s=1.0):
         while k + 1 < len(xs) and (abs(resid[k + 1]) > th or (k + 2 < len(xs) and abs(resid[k + 2]) > th)):
             k += 1
         n = k - a + 1
+        ms = int(round((ts[k] - ts[a] + step_s) * 1000))
         peak = max(resid[a:k + 1], key=abs)
-        kind = "impulse" if n <= 2 else ("burst" if n <= 50 else "shift")
-        ev.append({"t": round(ts[a] - ts[0], 2), "ms": n * 10, "peak": round(peak, 2), "kind": kind})
+        kind = "impulse" if ms <= 25 else ("burst" if ms <= 500 else "shift")
+        ev.append({"t": round(ts[a] - ts[0], 2), "ms": ms, "n": n, "peak": round(peak, 2), "kind": kind})
         k += 1
     out["event_threshold"] = round(th, 2)
     out["events"] = ev[:60]
@@ -4616,8 +4663,9 @@ def still_stats(samples, m, kp=None, win_s=1.0):
     out["verdict_levels"] = ("quiet: sigma <= 1 count and fewer than 3 bursts or impulses per 10 s; jitter: sigma "
                              "over 1 count, 'comes and goes' when the worst 1 s window is 2.5x the quietest; drift: "
                              "0.5 counts/s or more")
-    # PID output, and which term carries the jitter: P from the telemetry's goal and feedback exactly (the board's own
-    # arithmetic), the rest (D, and I) is what is left of the PID output
+    # PID output, and which term carries the jitter: P is ESTIMATED from the telemetry's goal and feedback with the
+    # board's formula (Kp x error / PowerScale), the rest is what is left of the PID output - D and I, but also the
+    # board's integer rounding and clipping, which the board doesn't report separately (2.9.2 says so in the result)
     ps = [s["m"][m]["p"] for s in xs]
     out["pid"] = {"std": round(_std(ps), 2), "sigma": round(robust_sigma(ps) or 0.0, 2),
                   "p99_abs": round(_pct([abs(x) for x in ps], 99), 1)}
@@ -4628,7 +4676,10 @@ def still_stats(samples, m, kp=None, win_s=1.0):
         if len(R) > 20:
             sp, sr = _std(Pk), _std([r - _mean(R) for r in R])
             out["pid"].update({"p_term_std": round(sp, 2), "rest_std": round(sr, 2), "kp": kp,
-                               "p_share": round(sp * sp / (sp * sp + sr * sr), 2) if sp + sr > 0 else None})
+                               "p_share": round(sp * sp / (sp * sp + sr * sr), 2) if sp + sr > 0 else None,
+                               "note": "P estimated as Kp x (goal - feedback) / PowerScale from the telemetry; "
+                                       "'rest' = PID output - that estimate: D and I, with the board's rounding "
+                                       "and clipping. The board doesn't report P, I and D separately."})
     dv = [s["m"][m].get("d") for s in xs]
     st = [s["m"][m].get("o") for s in xs]
     if all(v is not None for v in dv):
@@ -4642,15 +4693,21 @@ def still_stats(samples, m, kp=None, win_s=1.0):
     return out
 
 
-def raw_window(raw, m):
-    """The board's own raw readings of motor m since raw_mark() (4 kHz, before the glitch filter), or None."""
+def raw_window(raw, m, div=1):
+    """The board's own raw readings of motor m since raw_mark(): a SUMMARY (lowest, highest, biggest step between
+    two readings, jumps over 16 counts) of every reading before the glitch filter - not a recording of them. The
+    board reads the pot once per control cycle: 4 kHz with Fpid divider 1, 4000 / div otherwise (2.9.2 says which).
+    None without frames."""
     if not raw or not raw.get("frames") or raw["m"][m] is None:
         return None
     a = raw["m"][m]
+    div = max(1, int(div or 1))
+    hz = 4000 // div
     full = a["glitches"] >= 65535 or (a["glitches0"] or 0) >= 65535     # the board's counter stops at 65535
-    return {"source": "board [rdd]: every reading at 4 kHz, before the glitch filter", "seconds":
-            round(time.time() - raw["t0"], 1), "frames": raw["frames"], "min": a["min"], "max": a["max"],
-            "p2p": round(a["max"] - a["min"], 1), "biggest_step": a["step"],
+    return {"source": f"board [rdd]: a summary of every reading at {hz} Hz (4 kHz / Fpid divider {div}), before "
+                      "the glitch filter - extremes and counts, not a waveform",
+            "rate_hz": hz, "divider": div, "seconds": round(time.time() - raw["t0"], 1), "frames": raw["frames"],
+            "min": a["min"], "max": a["max"], "p2p": round(a["max"] - a["min"], 1), "biggest_step": a["step"],
             "jumps_over_16": None if full else max(0, a["glitches"] - a["glitches0"]), "counter_full": full}
 
 
@@ -6425,7 +6482,7 @@ class Diagnostics:
                 row["pid_noise_at_rest"] = round(robust_sigma(ps) or 0.0, 2)
             if still:                                   # 2.9.1: the same 3 s in detail, and the raw readings
                 row["still"] = still_stats(got, m, b.pm.get(f"Kp{n}"))
-                rw = raw_window(b.raw, m)
+                rw = raw_window(b.raw, m, got[-1].get("div") or 1)
                 if rw:
                     row["raw"] = rw
             live["motors"].append(row)
@@ -6524,7 +6581,7 @@ class Diagnostics:
         for n in motors:
             m = n - 1
             fb = still_stats(got, m, b.pm.get(f"Kp{n}")) or {}
-            row = {"motor": n, "feedback": fb, "raw": raw_window(raw, m),
+            row = {"motor": n, "feedback": fb, "raw": raw_window(raw, m, got[-1].get("div") or 1),
                    "off_share": round(sum(1 for x in got if x["dis"][m]) / len(got), 3)}
             rows.append(row)
             if cond == "B" and row["off_share"] < 0.95:
@@ -7471,10 +7528,21 @@ def _events10(fb):
     return 10.0 * (ec.get("burst", 0) + ec.get("impulse", 0)) / max(0.1, fb.get("seconds") or 10.0)
 
 
+def _extra_sigma(new, prev):
+    """2.9.2: how much noise a condition adds over the one before it, if the two sources are independent:
+    sqrt(sigma_new^2 - sigma_prev^2) (0 when the new one is quieter), and the plain ratio."""
+    a, b = float(new["sigma"]), float(prev["sigma"])
+    return round(math.sqrt(max(0.0, a * a - b * b)), 2), round(a / b, 1) if b > 0.05 else None
+
+
 def sensor_compare(caps):
-    """2.9.1: the newest sensor check of each condition (A, B, C), per motor - what each says and where the noise
-    comes from (the spec's rules: noisy already in A = the sensor side; quiet in A but not in B = the motor supply
-    or its ground; only in C = the drive / the control loop). caps: newest first."""
+    """The newest sensor check of each condition (A, B, C), per motor - what each says and where the noise comes
+    from. 2.9.1 named the first cause only (noisy in A = the sensor side; else worse in B = the motor supply or its
+    ground; else worse in C = the drive). 2.9.2 reports all three parts side by side - the sensor side's own noise
+    (A), what switching the motor power on adds (B over A) and what holding adds (C over B) - because they add up:
+    a rig can have a bit of each. The extra of each step is sqrt(new^2 - previous^2) (independent sources add in
+    squares) next to the plain ratio, and the comparison says when the checks were taken at different positions or
+    far apart in time. caps: newest first."""
     latest = {}
     for c in caps:
         if c.get("cond") in SENSOR_CONDS and c["cond"] not in latest:
@@ -7492,37 +7560,98 @@ def sensor_compare(caps):
             cell[k] = {"when": c["when"], "sigma": fb.get("sigma"), "worst": fb.get("sigma_worst"),
                        "p2p": fb.get("p2p"), "events10": round(_events10(fb), 1), "drift": fb.get("drift_per_s"),
                        "verdict": fb.get("verdict"), "raw_p2p": raw.get("p2p"), "raw_step": raw.get("biggest_step"),
+                       "raw_hz": raw.get("rate_hz"),
                        "raw_jumps": raw.get("jumps_over_16"), "pid": (fb.get("pid") or {}).get("std"),
                        "p_share": (fb.get("pid") or {}).get("p_share"),
-                       "braked": (fb.get("drive") or {}).get("braked"), "off": (fb.get("drive") or {}).get("off")}
-        table.append({"motor": n, "conds": cell})
+                       "braked": (fb.get("drive") or {}).get("braked"), "off": (fb.get("drive") or {}).get("off"),
+                       "pos": fb.get("mean")}
         noisy = lambda x: x["sigma"] > 1.0 or x["events10"] >= 3
         worse = lambda x, y: x["sigma"] > 1.5 * y["sigma"] + 0.2 or x["events10"] >= y["events10"] + 3
         A, B, C = cell.get("A"), cell.get("B"), cell.get("C")
-        if A and noisy(A):
-            advice.append((n, "warn", f"Motor {n}: noisy already with the motor power off (A: ±{A['sigma']:.2f}, "
-                           f"{A['events10']:.0f} events per 10 s) - so it's the sensor side: its 5 V and GND, the cable "
-                           f"and connectors, or the Arduino's analog input. The motors can't be the cause."))
-        elif A and B and worse(B, A):
-            advice.append((n, "warn", f"Motor {n}: quiet with the motor power off (A: ±{A['sigma']:.2f}) but not with "
-                           f"it on (B: ±{B['sigma']:.2f}, {B['events10']:.0f} events per 10 s) while nothing is driven - "
-                           f"the bridges' supply or ground gets into the sensor: the sensor's GND straight to the "
-                           f"Arduino, never through a motor bridge's ground; its cable away from the motor and supply "
-                           f"cables."))
-        elif C and (A or B) and worse(C, B or A):
-            ref = B or A
-            advice.append((n, "warn", f"Motor {n}: quiet while not driven ({'B' if B else 'A'}: ±{ref['sigma']:.2f}) "
-                           f"but not while holding (C: ±{C['sigma']:.2f}, {C['events10']:.0f} events per 10 s) - the "
-                           f"drive itself: motor current through a shared ground wire, the motor's vibration on the "
-                           f"sensor's mount, or the control loop dithering (Kp, Kd, dead zone)."))
-        elif len(cell) >= 2:
-            advice.append((n, "ok", f"Motor {n}: the same in " + ", ".join(sorted(cell)) + " (" + ", ".join(
-                f"{k} ±{v['sigma']:.2f}" for k, v in sorted(cell.items())) + ") - the motor power and the drive "
-                "don't add noise."))
+        parts, cautions = [], []
+        # the sensor side on its own (A), or the quietest condition there is when A is missing
+        base = A or B or C
+        if A:
+            parts.append({"part": "sensor", "cond": "A", "sigma": A["sigma"], "events10": A["events10"],
+                          "level": "warn" if noisy(A) else "ok",
+                          "text": (f"the sensor side on its own (A, motor power off): ±{A['sigma']:.2f} counts, "
+                                   f"{A['events10']:.0f} events per 10 s")})
+        # what the motor power adds (B over A)
+        if A and B:
+            ex, ratio = _extra_sigma(B, A)
+            B["extra"], B["ratio"] = ex, ratio
+            parts.append({"part": "supply", "cond": "B", "over": "A", "sigma": B["sigma"], "extra": ex,
+                          "ratio": ratio, "events10": B["events10"], "level": "warn" if worse(B, A) else "ok",
+                          "text": (f"the motor power on, motors switched off (B): ±{B['sigma']:.2f}" +
+                                   (f" - adds about ±{ex:.2f} over A ({ratio}x)" if worse(B, A) else
+                                    " - adds nothing worth the name over A"))})
+        # what holding adds (C over B, or over A without a B)
+        ref = B or A
+        if C and ref:
+            ex, ratio = _extra_sigma(C, ref)
+            C["extra"], C["ratio"], C["over"] = ex, ratio, "B" if B else "A"
+            parts.append({"part": "drive", "cond": "C", "over": "B" if B else "A", "sigma": C["sigma"], "extra": ex,
+                          "ratio": ratio, "events10": C["events10"], "level": "warn" if worse(C, ref) else "ok",
+                          "text": (f"holding (C): ±{C['sigma']:.2f}" +
+                                   (f" - adds about ±{ex:.2f} over {'B' if B else 'A'} ({ratio}x)" if worse(C, ref)
+                                    else f" - adds nothing worth the name over {'B' if B else 'A'}"))})
+        # comparable? different positions, or checks far apart, make the differences less telling
+        have = [(k, v) for k, v in sorted(cell.items())]
+        if len(have) >= 2:
+            pos = [v["pos"] for _, v in have if v.get("pos") is not None]
+            if pos and max(pos) - min(pos) > 40:
+                cautions.append("taken at different positions (" + ", ".join(
+                    f"{k} at {v['pos']:.0f}" for k, v in have if v.get("pos") is not None) + ")")
+            days = _days_apart([v["when"] for _, v in have])
+            if days is not None and days > 7:
+                cautions.append(f"taken {days:.0f} days apart")
+        table.append({"motor": n, "conds": cell, "parts": parts, "cautions": cautions})
+        if not parts:
+            continue
+        fixes = {"sensor": ("the sensor side: its 5 V and GND, the cable and connectors, or the Arduino's analog "
+                            "input - the motors can't be the cause of this part"),
+                 "supply": ("the bridges' supply or ground gets into the sensor: the sensor's GND straight to the "
+                            "Arduino, never through a motor bridge's ground; its cable away from the motor and "
+                            "supply cables"),
+                 "drive": ("the drive itself: motor current through a shared ground wire, the motor's vibration on "
+                           "the sensor's mount, or the control loop dithering (Kp, Kd, dead zone)")}
+        bad = [q for q in parts if q["level"] == "warn"]
+        head = f"Motor {n}: " + "; ".join(q["text"] for q in parts) + "."
+        if bad:
+            names = {"sensor": "the sensor side", "supply": "the motor supply", "drive": "the drive"}
+            tail = " Where it comes from: " + (fixes[bad[0]["part"]] if len(bad) == 1 else "; ".join(
+                f"({i + 1}) {fixes[q['part']]}" for i, q in enumerate(bad))) + "."
+            if len(bad) > 1:
+                big = max(bad, key=lambda q: q.get("extra", q["sigma"]) or 0)
+                tail = (f" More than one source ({', '.join(names[q['part']] for q in bad)}; the biggest is "
+                        f"{names[big['part']]}) - fix that one first, then record again." + tail)
+            level = "warn"
+        else:
+            tail = " The motor power and the drive don't add noise." if len(parts) > 1 else ""
+            level = "ok"
+        if cautions:
+            tail += " Compare with care: " + "; ".join(cautions) + "."
+        advice.append((n, level, head + tail))
     missing = [k for k in SENSOR_CONDS if k not in latest]
     return {"latest": {k: {"name": v["name"], "when": v["when"], "note": v.get("note")} for k, v in latest.items()},
             "table": table, "advice": [{"motor": a, "level": b, "text": c} for a, b, c in advice],
-            "missing": missing}
+            "missing": missing,
+            "method": "extra of each step = sqrt(sigma_new^2 - sigma_previous^2), assuming independent sources; "
+                      "the plain ratio is given too"}
+
+
+def _days_apart(whens):
+    """Days between the earliest and the latest of some 'when' texts (YYYY-MM-DD HH:MM...), or None."""
+    ds = []
+    for w in whens:
+        try:
+            ds.append(time.mktime(time.strptime(str(w)[:16], "%Y-%m-%d %H:%M")))
+        except (ValueError, TypeError):
+            try:
+                ds.append(time.mktime(time.strptime(str(w)[:10], "%Y-%m-%d")))
+            except (ValueError, TypeError):
+                pass
+    return (max(ds) - min(ds)) / 86400.0 if len(ds) >= 2 else None
 
 
 def analyze_sensor(rep, history):
@@ -7563,12 +7692,15 @@ def analyze_sensor(rep, history):
             jtxt = ("its count of jumps over 16 counts is full (65,535 since it started - restart the board to count "
                     "again)" if raw.get("counter_full") else f"{raw['jumps_over_16']} jumps over 16 counts")
             if gap > max(8.0, 4 * fb["sigma"]) or raw["jumps_over_16"] or raw.get("counter_full"):
+                hz = raw.get("rate_hz") or 4000
                 add("warn", f"Motor {n}: the raw readings jump more than the feedback the PID used",
-                    f"At 4 kHz, before the glitch filter, the board saw readings from {raw['min']:.1f} to "
-                    f"{raw['max']:.1f} ({raw['p2p']:.1f} apart; biggest change between two readings "
-                    f"{raw['biggest_step']:.1f} counts in 1/4 ms; {jtxt}), while "
-                    f"the 100 Hz feedback spans {fb['p2p']:.1f}: short spikes the glitch filter held back or that fall "
-                    f"between the 100 Hz samples. Spikes that fast are electrical, not movement.",
+                    f"Reading the pot {hz} times a second, before the glitch filter, the board saw readings from "
+                    f"{raw['min']:.1f} to {raw['max']:.1f} ({raw['p2p']:.1f} apart; biggest change between two "
+                    f"readings {raw['biggest_step']:.1f} counts in {1000.0 / hz:g} ms; {jtxt}), while the feedback "
+                    f"in the telemetry ({fb.get('rate_hz') or 100:.0f} Hz) spans {fb['p2p']:.1f}: short spikes the "
+                    f"glitch filter held back or that fall between the telemetry's samples. Spikes that fast are "
+                    f"electrical, not movement. (The board reports extremes and counts of its readings, not the "
+                    f"readings themselves, so how long a spike lasted isn't known.)",
                     sensor_advice(scfg, pins.get(n, "A0"), "glitch"), n, "sensor_raw")
             else:
                 add("ok", f"Motor {n}: raw readings agree with the feedback ({raw['p2p']:.1f} vs {fb['p2p']:.1f} "
@@ -7577,11 +7709,14 @@ def analyze_sensor(rep, history):
         if cond != "A" and dv and dv["off"] < 0.5:
             who = ""
             if pid.get("p_share") is not None and pid.get("std", 0) > 1:
-                who = (f" - mostly the P term (Kp {pid['kp']} x the feedback's jitter: ±{pid['p_term_std']:.1f})"
+                # 2.9.2: P is an estimate from the telemetry; the rest is D and I with the board's rounding and
+                # clipping - the texts say so, since the board doesn't report the terms separately
+                who = (f" - mostly P by estimate (Kp {pid['kp']} x the feedback's jitter: ±{pid['p_term_std']:.1f})"
                        if pid["p_share"] >= 0.6 else
-                       f" - mostly D (and I): ±{pid['rest_std']:.1f}, against ±{pid['p_term_std']:.1f} from P"
+                       f" - mostly the rest (D and I, with rounding and clipping - the board doesn't tell them apart): "
+                       f"±{pid['rest_std']:.1f}, against ±{pid['p_term_std']:.1f} estimated for P"
                        if pid["p_share"] <= 0.4 else
-                       f" - P (±{pid['p_term_std']:.1f}) and D/I (±{pid['rest_std']:.1f}) alike")
+                       f" - P (±{pid['p_term_std']:.1f}, estimated) and the rest (±{pid['rest_std']:.1f}) alike")
             dtxt = (f"PID output jitters ±{pid.get('std', 0):.1f}{who}. The motor was braked "
                     f"{100 * dv['braked']:.0f}% of the time, driven {100 * dv['driven']:.0f}% (drive ±{dv['std']:.1f} "
                     f"PWM, {dv['switches_per_s']} switches per s).")
@@ -7594,7 +7729,8 @@ def analyze_sensor(rep, history):
             elif pid.get("std", 0) > 3 and dv["braked"] > 0.8:
                 add("info", f"Motor {n}: the orange PID line jitters, but the motor is braked", dtxt + " Inside the "
                     "dead zone the board shorts the motor (PWM 0) whatever the PID output says, so that jitter "
-                    "doesn't reach it - the Drive line in the graphs shows what does.", code="sensor_pid", motor=n)
+                    "doesn't reach it - the Drive (calc.) line in the graphs shows what should, by the board's rule.",
+                    code="sensor_pid", motor=n)
             else:
                 add("ok", f"Motor {n}: holds with little drive ({100 * dv['braked']:.0f}% braked)", dtxt,
                     code="sensor_drive_ok", motor=n)
@@ -13602,7 +13738,7 @@ details.oks .flist{margin-top:6px}
     <span data-k="lg_t" data-l="t" onclick="legTog('t')"><i style="background:var(--c-t)"></i>Target</span>
     <span data-k="lg_g" data-l="g" onclick="legTog('g')"><i style="background:var(--c-g)"></i>Goal</span>
     <span data-k="lg_p" data-l="p" onclick="legTog('p')"><i style="background:var(--c-p)"></i>PID out</span>
-    <span data-k="lg_d" data-l="d" onclick="legTog('d')"><i class="dash" style="background:var(--c-d)"></i>Drive</span>
+    <span data-k="lg_d" data-l="d" onclick="legTog('d')"><i class="dash" style="background:var(--c-d)"></i>Drive (calc.)</span>
     <span data-k="lg_f" data-l="f" onclick="legTog('f')"><i style="background:var(--c-f)"></i>Feedback</span>
    </div>
    <div class="gctl">
@@ -13692,6 +13828,7 @@ details.oks .flist{margin-top:6px}
    <label class="chk" data-k="tfr"><input type="checkbox" id="tfr" checked><span>PWMmin + dead zone</span></label>
    <label class="chk" data-k="tki"><input type="checkbox" id="tki" checked><span>Ki if needed</span></label>
    <label class="chk" data-k="tkd"><input type="checkbox" id="tkd" checked><span>Kd if it helps</span></label>
+   <label class="chk" data-k="tnoisy"><input type="checkbox" id="tnoisy"><span>Stop if too noisy</span></label>
   </div>
   <div class="acts">
    <button class="btn b-green" id="tstart" data-k="tstart" onclick="tuneConfirm()">Start Auto-Tune</button>
@@ -14222,6 +14359,7 @@ const TIPS={
  tamp:"Size of the test moves, in counts either side of centre - each way. Bigger moves give a more realistic tune but move you more. 80-150 is sensible; it is reduced automatically if the Clip window is narrow.",
  tstyle:"How the sweet spot is picked: the <b>lowest</b> Kp that tracks almost as well as the best one.<br><br><b>Gentle</b> - smoothest (within 30% of the best response, ~5% overshoot).<br><b>Normal</b> - balanced (15%, ~10%).<br><b>Firm</b> - snappiest, more road detail (5%, ~15%).<br><br>Whatever the style, it never leaves the seat more than 12 counts short.",
  tfr:"Measure the minimum drive that moves the motor (PWMmin) and the pot noise (dead zone). Leave on unless you want to keep your own values.",
+ tnoisy:"<b>Stop if too noisy.</b> The dead zone is set to 3 x the noise + 1, capped at 4 (a bigger one costs accuracy on every move). When the noise at rest would need more than 4, the tune says so in its log and carries on with 4 - tick this to have it stop there instead, so you fix the signal first (Diagnostics, Sensor check A / B / C tells where the noise comes from).",
  tki:"Add Ki only if the motor settles short of the target (usually lifting your weight).",
  tkd:"Try a little damping (Kd with Ks 4) and keep it only if it clearly reduces overshoot without adding noise.",
  tstart:"Shows a short checklist, then starts. Takes about 2-3 minutes.",
@@ -14281,7 +14419,7 @@ const TIPS={
  lg_g:"<b>Goal</b> - the target after the firmware's smoothing filter. This is what the motor actually chases.",
  lg_f:"<b>Feedback</b> - where the pot says the motor really is. Good tuning = green sits on blue.",
  lg_p:"<b>PID output</b> before PWMmin is added (the orange numbers on the left: PWM, middle line = 0, top/bottom = full ±255). Pinned at the edge means the motor is giving everything it is allowed. It reacts to every bit of pot noise (Kp × error, and Kd) - whether that reaches the motor shows in the Drive line. Click to hide or show.",
- lg_d:"<b>Drive</b> (dashed): what the board's output stage sends to the motor - PWMmin added, PWMmax as the limit, and <b>0 while it is braked</b> inside the dead zone (the bridge shorts the motor). The PID out line can jitter with pot noise while this stays at 0: then that jitter doesn't reach the motor. Worked out from the telemetry and the settings the page last read or sent - not measured on the bridge. Click to hide or show.",
+ lg_d:"<b>Drive (calculated)</b> (dashed): the PWM the board's output stage should send to the motor by its own rule - PWMmin added, PWMmax as the limit, and <b>0 while it is braked</b> inside the dead zone (the bridge shorts the motor). The PID out line can jitter with pot noise while this stays at 0: then that jitter doesn't reach the motor. <b>Calculated</b> from the telemetry and the settings the page last read or sent, not read back from the board or measured on the bridge: the page can't tell whether the motor supply is on, and doesn't see soft start. Click to hide or show.",
  mpos:"<b>Position</b> - where the motor is being sent (the smoothed goal, 0-1023). The green tick on the bar is where it really is.",
  knob:"<b>Drag to move this motor</b> (firmware 1.9). The page takes the seat from SimHub while you do: every motor holds where it is and SimHub's motion is ignored until you press <b>Resume SimHub</b> (Quick Controls). The motor follows at up to 200 counts/s, easing in and out, and stops at its Clip window and travel limits (hatched). The thin line marks where it is going.<br><br>Arrow keys move it 5 counts, with Shift 25. Keep clear of the seat while you move it.",
  mcenter:"<b>Return to center</b> (firmware 1.9): every motor goes back to its neutral position - SimHub's 0, the level seat with the rear centred (your Seat setup's level, if you made one) - gently, at up to 120 counts/s. The page keeps the seat there: SimHub's motion is ignored until you press <b>Resume SimHub</b>.",
@@ -14329,7 +14467,7 @@ const TIPS={
  sy_err:"Safety cutoffs, a slow control loop or a lost connection show up here - and problems the page noticed while you drove (click to see them).",
  dg_problem:"Describe what goes wrong, in your own words: which motor, when (starting SimHub, over kerbs, after a while...), what it does. It goes at the top of the file, so whoever reads it knows what to look for.",
  s_sensor:"<b>What tells the board where each motor is.</b> A potentiometer's wiper can wear and lose contact; a contactless Hall-effect sensor (like the TT Electronics 6127) can't - its jumps come from the wiring, its 5 V and GND, or the motor supply. Diagnostics and auto-tune give the advice that fits.",
- dg_sensor:"<b>Sensor check</b> - nothing moves. Records 10 s of every motor's feedback, PID output and drive, and the board's raw readings at 4 kHz, under one condition you set up: <b>A</b> motor power switched off, <b>B</b> motor power on but the motors switched off (Disable Motors), <b>C</b> motors on, holding. Each check is saved; with two or three of them the result says where the noise comes from - the sensor side, the motor supply, or the drive. Pause SimHub first.",
+ dg_sensor:"<b>Sensor check</b> - nothing moves. Records 10 s of every motor's feedback, PID output and calculated drive from the telemetry (100 Hz), plus a summary of the board's own raw readings (every control cycle: lowest, highest, biggest step, jumps - not a waveform), under one condition you set up: <b>A</b> motor power switched off, <b>B</b> motor power on but the motors switched off (Disable Motors), <b>C</b> motors on, holding. Each check is saved; with two or three of them the result says how much of the noise is the sensor side (A), the motor supply (what B adds) and the drive (what C adds). Pause SimHub first.",
  dg_cond:"Set the rig up like this before you press Sensor check: <b>A</b> switch the motor power supply off (the Arduino stays on), <b>B</b> motor power on, press Disable Motors, <b>C</b> motor power on, motors enabled and holding.",
  dg_quick:"<b>Quick check</b> - nothing moves. Reads every setting, the board's own counters (firmware 1.7), listens to the motors for 3 seconds, and adds what the page noticed while you drove. About 5 seconds; safe while SimHub runs.",
  dg_full:"<b>Full check</b> - moves each motor a little, one at a time: which way it goes, how much drive it needs each way, whether another motor moves instead (swapped wiring), and how it answers a small step. Stop SimHub's motion output first. About a minute.",
@@ -14400,7 +14538,7 @@ function buildMotorCards(){document.querySelectorAll('.motor').forEach(c=>{const
  <div class="mpos" data-k="mpos"><span>Position</span><b id="mp${m}">-</b></div>
  <div class="track" id="tk${m}"><div class="zone zl" id="zl${m}"></div><div class="zone zr" id="zr${m}"></div><div class="fill" id="mf${m}"></div><div class="fb" id="mt${m}"></div><div class="mgoal" id="mg${m}"></div><div class="knob" id="mk${m}" data-k="knob" tabindex="0" role="slider" aria-label="Motor ${m+1} position" aria-valuemin="0" aria-valuemax="1023"></div></div>
  <div class="scale"><span>0</span><span>1023</span></div>
- <div class="rows"><div data-k="lg_f"><span>Feedback (fb)</span><b id="mfb${m}">-</b></div><div><span>Error (err)</span><b id="me${m}">-</b></div><div data-k="lg_p"><span>PID Out</span><b id="mo${m}">-</b></div><div data-k="lg_d"><span>Drive</span><b id="md${m}">-</b></div></div>`;bindKnob(m);});}
+ <div class="rows"><div data-k="lg_f"><span>Feedback (fb)</span><b id="mfb${m}">-</b></div><div><span>Error (err)</span><b id="me${m}">-</b></div><div data-k="lg_p"><span>PID Out</span><b id="mo${m}">-</b></div><div data-k="lg_d"><span>Drive (calc.)</span><b id="md${m}">-</b></div></div>`;bindKnob(m);});}
 function buildCharts(){let h='';for(let m=0;m<3;m++)h+=`<div class="chart" data-m="${m}" data-k="chartsel" onclick="setSel(${m})"><span class="tab"><span id="ct${m}">Motor ${m+1}</span><em id="tag${m}"></em></span><canvas id="c${m}"></canvas><div class="ro"><span>goal</span><b id="rg${m}">-</b><span>fb</span><b id="rf${m}">-</b><span>err</span><b id="re${m}">-</b><span>pid</span><b id="rp${m}">-</b><span>drv</span><b id="rd${m}">-</b></div></div>`;
  h+=`<div class="chart seatc" id="seatc" data-k="seatchart" hidden><span class="tab"><svg id="hz" viewBox="0 0 34 18"><path id="hzg" fill="#8a5a24"/><line id="hzl" stroke="#fff" stroke-width="1.4"/><path d="M12 9h4M18 9h4" stroke="#ffd34d" stroke-width="1.6"/></svg><span>Seat angle</span></span><canvas id="c3"></canvas><div class="ro"><span>roll</span><b id="sr">-</b><span>pitch</span><b id="sp">-</b><span>range</span><b id="srng">-</b><span>speed</span><b id="sv">-</b></div></div>`;
  $('charts').innerHTML=h;}
@@ -15304,7 +15442,7 @@ function tuneConfirm(mode){if(mode==='joint'){tuneConfirm.mode='joint';const n=(
  $('mt_time').innerHTML=chk?'Takes about 30 s. Nothing is changed.':'Takes about 2-3 minutes. Nothing is saved until you press <b>Save to EEPROM</b>; <b>Revert</b> undoes it.';
  $('mt_go').textContent=chk?'Start check':'Start auto-tune';openModal('mTune');}
 async function tuneStart(){closeModal('mTune');
- const r=await post('/tune/start',{motor:+$('tm').value,amp:+$('tamp').value,style:$('tstyle').value,friction:$('tfr').checked,ki:$('tki').checked,kd:$('tkd').checked,
+ const r=await post('/tune/start',{motor:+$('tm').value,amp:+$('tamp').value,style:$('tstyle').value,friction:$('tfr').checked,ki:$('tki').checked,kd:$('tkd').checked,noisy_stop:$('tnoisy').checked,
   rider:$('trider').value,rider_kg:riderKg(),rider_unit:$('tunit').value,mode:tuneConfirm.mode||'tune'});if(!r.ok)alert(r.error);else tunePoll.fast=6;}
 // Space or Esc stops a running auto-tune or check (you may be in the seat)
 document.addEventListener('keydown',e=>{if(!tuneRunning||curView==='seat')return;const tg=(e.target&&e.target.tagName)||'';
@@ -15463,7 +15601,7 @@ function tlRender(s){const lv=s.live||{},key=JSON.stringify([s.state,s.mode,s.mo
  // facts: pot noise, minimum drive, top speed, who's in the seat
  const nz=lv.noise,pw=lv.pwmmin,sp=lv.speed,rd=lv.rider||{};
  h+='<div class="tfacts">';
- h+=`<div class="tfact">Pot noise<b>${nz?'±'+nz.sd.toFixed(2)+' counts':'-'}</b>${nz?'dead zone '+((lv.now||{}).dz??'-')+(nz.glitchy?' · <span class="gs warn">! glitches</span>':''):''}</div>`;
+ h+=`<div class="tfact">Pot noise<b>${nz?'±'+nz.sd.toFixed(2)+' counts':'-'}</b>${nz?'dead zone '+((lv.now||{}).dz??'-')+(nz.capped?' <span class="gs warn">! capped, needs '+nz.dz_wanted+'</span>':'')+(nz.glitchy?' · <span class="gs warn">! glitches</span>':''):''}</div>`;
  if(pw){const pos=x=>Math.max(0,Math.min(100,100*x/Math.max(1,pw.cap)));
   h+=`<div class="tfact">Minimum drive (PWMmin)<b>${D.map(d=>`<span class="${d.cls}">${d.sym}</span> ${pw[d.k]??'…'}`).join(' &nbsp; ')}</b><div class="mm" role="img" aria-label="PWM tried ${pw.trying} of ${pw.cap}">${cur==='pwmmin'&&s.state==='running'?`<i style="left:${pos(pw.trying)}%"></i>`:''}${D.map(d=>pw[d.k]!=null?`<em class="${d.cls}" style="left:${pos(pw[d.k])}%">${d.sym}</em>`:'').join('')}</div>${cur==='pwmmin'&&s.state==='running'?'trying PWM '+pw.trying:'0 - '+pw.cap}</div>`;}
  h+=`<div class="tfact">Top speed<b>${sp?D.map(d=>`<span class="${d.cls}">${d.sym}</span> ${sp[d.k]??'-'}`).join(' &nbsp; ')+' <small class="muted">counts/s</small>':'-'}</b>${sp?'tests at '+sp.ramp+' counts/s ('+sp.share+'%)':''}</div>`;
@@ -15519,9 +15657,12 @@ async function sensorTable(){let c;try{c=await (await fetch('/diag/sensor')).jso
  for(const t of c.table){const row=(lbl,fn)=>'<tr><td>'+lbl+'</td>'+K.map(k=>`<td>${t.conds[k]?fn(t.conds[k]):'-'}</td>`).join('')+'</tr>';
   h+=`<tr class="mrow"><td colspan="4"><span class="mtag m${t.motor}">${esc(mshort(t.motor-1))}</span></td></tr>`+
    row('Noise ±counts (worst 1 s)',x=>`${f(x.sigma,2)} <span class="muted">(${f(x.worst,2)})</span>`)+row('Bursts + impulses / 10 s',x=>f(x.events10,0))+
-   row('Lowest to highest (raw at 4 kHz)',x=>`${f(x.p2p,1)} <span class="muted">(${f(x.raw_p2p,1)})</span>`)+row('Biggest raw step, 1/4 ms',x=>f(x.raw_step,1))+
-   row('PID jitter ± (P share)',x=>`${f(x.pid,1)} <span class="muted">(${x.p_share==null?'-':Math.round(x.p_share*100)+'%'})</span>`)+row('Braked',x=>x.off>0.5?'motor off':(x.braked==null?'-':Math.round(x.braked*100)+'%'))+row('What it looks like',x=>esc(x.verdict||'-'));}
+   row('Added over the one before',x=>x.extra==null?'-':(x.extra>0?'±'+f(x.extra,2)+' <span class="muted">('+x.ratio+'x '+esc(x.over||'A')+')</span>':'nothing'))+
+   row('Lowest to highest (board raw)',x=>`${f(x.p2p,1)} <span class="muted">(${f(x.raw_p2p,1)})</span>`)+row('Biggest raw step, one reading',x=>`${f(x.raw_step,1)}${x.raw_hz?' <span class="muted">('+(1000/x.raw_hz)+' ms)</span>':''}`)+
+   row('PID jitter ± (P share, estimated)',x=>`${f(x.pid,1)} <span class="muted">(${x.p_share==null?'-':Math.round(x.p_share*100)+'%'})</span>`)+row('Braked (calculated)',x=>x.off>0.5?'motor off':(x.braked==null?'-':Math.round(x.braked*100)+'%'))+row('What it looks like',x=>esc(x.verdict||'-'));
+  if(t.cautions&&t.cautions.length)h+=`<tr><td colspan="4" class="muted">Compare with care: ${esc(t.cautions.join('; '))}</td></tr>`;}
  h+='</tbody></table></div>';if(c.missing&&c.missing.length)h+=`<p class="muted" style="margin:6px 0 0">Not recorded yet: ${c.missing.join(', ')}. Set the rig up that way, pick it next to Sensor check and run it.</p>`;
+ h+='<p class="muted" style="margin:6px 0 0">A is the sensor side on its own; what B adds over A is the motor supply, what C adds over B is the drive - they add up, so a rig can have some of each. "Added" is &radic;(new&sup2; &minus; previous&sup2;). The board raw row is a summary of every reading the board took (extremes and counts), not a recording; P share is estimated from the telemetry; Braked is calculated from the settings, not measured on the bridge.</p>';
  box.innerHTML=h;}
 function copySummary(){const t=diagRes&&diagRes.summary;if(!t)return;
  const done=()=>toast('Summary copied - paste it into a chat or message.');
@@ -16807,7 +16948,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.backups.add("auto", f"Before auto-tune of motor {motor + 1}", self.board.read_params())
             ok, msg = self.tuner.start(motor, amp, str(req.get("style", "normal")),
                                        bool(req.get("friction", True)), bool(req.get("ki", True)),
-                                       bool(req.get("kd", True)), rider, kg, unit, mode)
+                                       bool(req.get("kd", True)), rider, kg, unit, mode,
+                                       bool(req.get("noisy_stop", False)))
             if ok:
                 who = "you in the seat" if rider == "seated" else (f"seat empty, rider {kg_text(kg, unit)}" if kg
                                                                    else "seat empty")

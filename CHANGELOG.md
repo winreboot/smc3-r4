@@ -3,6 +3,33 @@
 `smc3_scope` (the page) and `SMC3_R4` (the firmware) are versioned separately. The page works with older
 firmware too; the notes say which firmware a feature needs.
 
+## Page 2.9.2
+
+Page only; firmware 2.1 stays. From a technical review of 2.9.1 (its four smallest, surest points - the rest is
+noted under [docs/LESSONS-LEARNED.md](docs/LESSONS-LEARNED.md) for later).
+
+- **Honest labels.** The graphs' Drive line is now **Drive (calc.)**: the PWM the board's output stage should send
+  by its own rule, calculated from the telemetry and the settings the page last read or sent - not read back from
+  the board and not measured on the bridge (the page can't tell whether the motor supply is on, and doesn't see
+  soft start). The Sensor check calls its P / D split an **estimate**: P from Kp × error, the rest D and I together
+  with the board's integer rounding and clipping, which the board doesn't report apart. The board's raw readings are
+  described as what they are - a **summary** (lowest, highest, biggest step, jumps over 16 counts) of every reading
+  at 4 kHz ÷ Fpid divider, not a recording - and the report says the rate the board really used.
+- **Sensor checks side by side report all three parts.** 2.9.1 named the first cause only (noisy in A → the sensor
+  side, else worse in B → the supply, else worse in C → the drive), so a rig with a bit of each heard about one. Now
+  each motor gets the sensor side on its own (A), **what the motor power adds** (B over A) and **what holding adds**
+  (C over B), each as √(new² − previous²) with the plain ratio, a new table row *Added over the one before*, and the
+  advice names every source that matters, biggest first. The comparison says when the checks were taken at different
+  positions or days apart.
+- **Event lengths from the samples' timestamps.** An impulse or burst was n samples × 10 ms; late or missing
+  telemetry frames stretched it. It is now measured from the samples' own times (plus one sample period), and the
+  report carries the sample period it saw.
+- **Auto-tune says when it caps the dead zone.** The dead zone is 3 × the noise + 1, capped at 4 (a bigger one
+  costs accuracy on every move). Over the cap the tune used to carry on quietly; now its log says **NOISY INPUT**
+  with the dead zone the noise would need, the gauge shows *capped*, the result notes it, and a new **Stop if too
+  noisy** tick box (off by default) stops the tune there instead, so the signal gets fixed first (the Sensor check
+  tells where the noise comes from).
+
 ## Page 2.9.1, firmware 2.1
 
 Tested on a rig as four page betas (2.9.1b1-2.9.1b4) and one firmware beta (2.1b1); all of them are in this release.

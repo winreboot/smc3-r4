@@ -1,4 +1,4 @@
-# SMC3 R4 USB bridge (smc3_scope 2.9.1): lets the smc3_scope page talk to the board over the USB cable instead
+# SMC3 R4 USB bridge (smc3_scope 2.9.2): lets the smc3_scope page talk to the board over the USB cable instead
 # of WiFi - for calibration (auto-tune, the full check, Seat setup) with SimHub closed. Windows PowerShell 5.1 or
 # PowerShell 7, nothing to install. Needs firmware 1.9.5 or newer on the board (2.0 recommended).
 #   From the page: Settings, USB cable - press Win+R and paste the line shown there.
@@ -162,7 +162,7 @@ function Smc3-Bridge {
 
     $id = [guid]::NewGuid().ToString('N').Substring(0, 12)
     $hdr = @{ 'X-SMC3' = '1'; 'X-SMC3-Bridge' = $id; 'X-SMC3-Computer' = [string]$env:COMPUTERNAME;
-              'X-SMC3-Port' = $smc3Port; 'X-SMC3-Bridge-Version' = 'ps-2.9.1' }
+              'X-SMC3-Port' = $smc3Port; 'X-SMC3-Bridge-Version' = 'ps-2.9.2' }
     $kuOff = [byte[]](0x5B, 0x6B, 0x55, 0x00, 0x5D)
     $bufS = New-Object byte[] 4096
     $bufN = New-Object byte[] 4096
@@ -257,7 +257,7 @@ function Smc3-Bridge {
             $ns.WriteTimeout = 5000                    # 2.8.2
             $req = "POST /usb/link HTTP/1.1`r`nHost: " + $uri.Authority + "`r`nX-SMC3: 1`r`nX-SMC3-Bridge: " + $id +
                    "`r`nX-SMC3-Computer: " + $env:COMPUTERNAME + "`r`nX-SMC3-Port: " + $smc3Port +
-                   "`r`nX-SMC3-Bridge-Version: ps-2.9.1`r`nX-SMC3-Probe: " + $probe + "`r`nContent-Length: 0`r`n`r`n"
+                   "`r`nX-SMC3-Bridge-Version: ps-2.9.2`r`nX-SMC3-Probe: " + $probe + "`r`nContent-Length: 0`r`n`r`n"
             $rb = [System.Text.Encoding]::ASCII.GetBytes($req)
             $head = ''
             try {

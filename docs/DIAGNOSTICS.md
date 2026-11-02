@@ -60,23 +60,34 @@ For each motor:
 - **Feedback** (the 100 Hz telemetry, after the firmware's glitch filter): the noise as a median spread in 1 s
   windows with each window's creep taken out (quietest, worst, and the worst 250 ms), lowest to highest, drift,
   steps between readings over 2 / 4 / 8 / 16 counts per second, and **events** - runs of readings off the window's
-  line by more than max(4 × the noise, 1 count): an impulse lasts up to 20 ms, a burst 30-500 ms, longer is a shift.
+  line by more than max(4 × the noise, 1 count): an impulse lasts up to 25 ms, a burst up to 500 ms, longer is a
+  shift - measured from the samples' own timestamps plus one sample period (page 2.9.2; before, n samples × 10 ms),
+  and `sample_ms` says the period it saw.
   A verdict - quiet, impulses, bursts, continuous jitter, jitter that comes and goes, slow drift, shifts - with the
   levels it used (starting values; this rig's own A/B/C checks are the real reference).
-- **Raw readings** (from the board, firmware 1.7 and newer): every reading at 4 kHz before the glitch filter, over the
-  same 10 s - lowest, highest and the biggest change between two readings, and the jumps over 16 counts. (The board's
+- **Raw readings** (from the board, firmware 1.7 and newer): a *summary* of every reading before the glitch filter
+  over the same 10 s - lowest, highest, the biggest change between two readings, and the jumps over 16 counts - not
+  the readings themselves, so how long a spike lasted isn't known. The board reads the pot once per control cycle:
+  4 kHz with Fpid divider 1, 4000 ÷ divider otherwise; `rate_hz` and `divider` say which (page 2.9.2). (The board's
   count stops at 65,535; the report says when it's full.)
-- **PID output**: its jitter, split into the P term (Kp × error, from the telemetry with the board's own arithmetic)
-  and the rest (D, and I).
-- **Drive**: how much of the time the motor was braked (inside the dead zone the bridge shorts it, PWM 0), driven, on
-  PWMrev or switched off, the drive's own jitter and how often it switched - worked out from the telemetry and the
-  settings the page last read or sent, the way the firmware's output stage does it.
+- **PID output**: its jitter, split into an *estimated* P term (Kp × error ÷ PowerScale, from the telemetry with the
+  board's formula) and the rest - D and I, together with the board's integer rounding and clipping, which it doesn't
+  report apart. `p_share` is the estimate's share of the variance; a `note` in the file says so (page 2.9.2).
+- **Drive (calc.)**: how much of the time the motor was braked (inside the dead zone the bridge shorts it, PWM 0),
+  driven, on PWMrev or switched off, the drive's own jitter and how often it switched - calculated from the telemetry
+  and the settings the page last read or sent, the way the firmware's output stage does it; not read back from the
+  board and not measured on the bridge.
 
 Each check is saved as a report (`..._sensor_A.json` and so on) and its recording can be downloaded as CSV. With two
-or three conditions recorded, the result puts the newest A, B and C side by side and says where the noise comes
-from: noisy already in A - the sensor side (its 5 V and GND, the cable, the connectors); quiet in A but not in B - the
-motor supply or its ground; quiet in A and B but not in C - the drive itself (motor current in a shared ground, the
-motor's vibration) or the control loop dithering.
+or three conditions recorded, the result puts the newest A, B and C side by side and reports three parts for each
+motor (page 2.9.2; 2.9.1 named the first cause only): the sensor side on its own (A: its 5 V and GND, the cable, the
+connectors), what the motor power adds (B over A: the supply or its ground getting into the sensor) and what holding
+adds (C over B: motor current in a shared ground, the motor's vibration, or the control loop dithering). Each added
+part is √(new² − previous²), which assumes the sources are independent, next to the plain ratio; a part counts when
+the new condition is 1.5 × the previous + 0.2 counts noisier or has 3 more events per 10 s. The advice names every
+part that counts, biggest first, and says *compare with care* when the checks were taken at positions more than 40
+counts apart or more than 7 days apart. The file holds it under `compare`: `table[].parts`, `table[].cautions`,
+`method`.
 
 ## What the page notices while you drive
 

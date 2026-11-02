@@ -1,6 +1,6 @@
 # Lessons learned
 
-Notes from getting the USB cable link, auto-tune and the diagnostics to work on a real rig: page 2.8 to 2.9.1,
+Notes from getting the USB cable link, auto-tune and the diagnostics to work on a real rig: page 2.8 to 2.9.2,
 firmware 1.9.5 to 2.1.
 What broke, why, how it was fixed, and what to do differently next time. The changes themselves are in the
 [CHANGELOG](../CHANGELOG.md).
@@ -23,6 +23,10 @@ What broke, why, how it was fixed, and what to do differently next time. The cha
 | Auto-tune's quick move jolted the seat | The target jumped, so full power came on at once | page 2.9.1 |
 | Orange spikes in the graphs while the seat held still looked like kicks | The orange line is the PID output before the output stage; inside the dead zone the motor is braked whatever it says | page 2.9.1: the Drive line |
 | (found reading a report) "0 jumps over 16 counts" while the board counted more than one a second | The board's counter is 16 bits and was full (65,535 in 13 h on all three motors) | page 2.9.1 |
+| (found by a review) A rig with sensor noise, supply noise and drive noise heard about one of them | The A/B/C comparison stopped at the first cause | page 2.9.2 |
+| (found by a review) "What the motor really gets" for a line the page calculates | The words claimed a measurement; the number was a calculation from telemetry and settings | page 2.9.2 |
+| (found by a review) An event's length off when telemetry frames came late | n samples × 10 ms instead of the samples' own times | page 2.9.2 |
+| (found by a review) Auto-tune capped the dead zone at 4 without a word | A silent cap over 3 × noise + 1 | page 2.9.2 |
 
 ## The UNO R4 WiFi's USB port
 
@@ -128,7 +132,7 @@ side) and more friction in the right gearbox. Auto-tune has to cope with both ki
   the rig overshot going down at Kp 149, which its simple sag model has no inertia for. The settings that already
   worked by hand pointed at the better fix.
 
-## Seeing what the motor really gets
+## Seeing what the motor gets - and saying how well you see it
 
 - **The PID output is not the drive.** Inside the dead zone the bridge brakes the motor; outside it PWMmin is added
   and PWMmax caps it. An outside review proposed firmware instrumentation (a 1 kHz trace) to show what the motor gets;
@@ -140,6 +144,26 @@ side) and more friction in the right gearbox. Auto-tune has to cope with both ki
   view of any stretch of time (the Sensor check's 10 s), with no new firmware.
 - **Say where a number comes from.** The noise in the telemetry is the feedback after the glitch filter, at 100 Hz -
   not the raw sensor. Every number in the Sensor check says which it is.
+- **And say how sure it is.** A second review (of 2.9.1) pointed out that "what the motor really gets" overclaimed:
+  the Drive line is the output stage's rule applied to telemetry and settings - it can't see whether the motor supply
+  is plugged in, nor soft start - and the "P / D split" is an estimate of P with everything else lumped as "the
+  rest". The numbers were right; the words were not. 2.9.2 renamed them (*Drive (calc.)*, *estimated*), and called
+  the board's raw figures what they are: a summary of extremes and counts, not a waveform. A measured value, a
+  calculated one and an estimate deserve different words even when they sit in the same table.
+- **Report every cause, not the first one.** The A/B/C comparison was an if/elif chain: noisy in A, else worse in B,
+  else worse in C. A rig with a bit of each heard about one. Noise sources add in squares, so what a condition adds
+  over the previous one is √(new² − previous²); reporting all three parts, biggest first, is both more honest and
+  more useful. A first-match rule is a shortcut that silently drops information.
+- **Durations come from timestamps, not counts.** An event's length was n samples × 10 ms, which assumes every frame
+  arrived on time. The rate and the gaps were already measured; using the samples' own times costs nothing.
+- **A silent cap is a hidden decision.** The dead zone was capped at 4 for good reason (accuracy), but over the cap the
+  tune just carried on. Now it says so, shows the dead zone the noise would need, and can stop if asked. Anything a
+  procedure decides on the user's behalf should be visible in its log and result.
+- **What the review asked for and what waited.** The same review asked for a high-rate capture from the firmware (the
+  only way to see a spike's shape), the firmware reporting its output mode and P/I/D terms, a noise gate before
+  tuning with repeated final trials and a confidence score, and per-motor sensor settings. All reasonable; all
+  deferred until a problem on the rig calls for them, because each touches the ISR, the serial budget or the length
+  of auto-tune, and the current tune results are consistent run to run.
 - **A full counter counts nothing.** A 16-bit count stops at 65,535; after that a difference of 0 means "unknown",
   not "none".
 - **Compare conditions, not numbers.** The same noise measured with the motor power off (A), on but not driving (B)

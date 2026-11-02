@@ -22,8 +22,8 @@ The page lets you:
   board without WiFi's hiccups;
 - **run test signals on several motors at once** (twist, heave, corner, wave) and test every motor moving together -
   each one fades in and out, no kick at the start;
-- see **what each motor really gets** (the drive, 0 while braked) next to the PID output, and run a **sensor check**
-  that tells the sensor's own noise, the motor supply's and the drive's apart;
+- see **the drive the board's output stage sends** (calculated: 0 while braked) next to the PID output, and run a
+  **sensor check** that tells the sensor's own noise, the motor supply's and the drive's apart;
 - let the LED matrix **play a little game while the rig is idle** (ping pong, brick breaker, missile defense, snake,
   meteor dodge);
 - **restart the board** from the page - never while SimHub is driving.
@@ -102,13 +102,15 @@ The expand button opens the graphs full width; pressing it again returns to the 
 
 ![Live graphs, 10 second window](docs/img/live-graphs.png)
 
-**Drive** (page 2.9.1): next to the orange PID output, a thin dotted line shows what the motor really gets - PWMmin
-added, PWMmax as the limit, and **0 while it is braked** inside the dead zone, where the bridge shorts the motor
-whatever the PID says. The orange line can jitter with sensor noise while the motor gets nothing; the dotted one
-shows when it doesn't. The motor cards and the readouts next to the graphs show it too (*braked*, *+45*, *off*).
-Click a legend entry to hide or show its line.
+**Drive (calc.)** (page 2.9.1, named so since 2.9.2): next to the orange PID output, a thin dotted line shows the
+PWM the board's output stage sends by its own rule - PWMmin added, PWMmax as the limit, and **0 while it is braked**
+inside the dead zone, where the bridge shorts the motor whatever the PID says. The orange line can jitter with
+sensor noise while the motor gets nothing; the dotted one shows when it doesn't. It is calculated by the page from
+the telemetry and the settings, not read back from the board: it can't tell whether the motor supply is on. The
+motor cards and the readouts next to the graphs show it too (*braked*, *+45*, *off*). Click a legend entry to hide
+or show its line.
 
-![Live graphs: a sine fading in on motor 1, the dotted Drive line next to the PID output](docs/img/drive-line_v2.9.1.png)
+![Live graphs: a sine fading in on motor 1, the dotted Drive (calc.) line next to the PID output](docs/img/drive-line_v2.9.2.png)
 
 ### Seat angle (motion sensor)
 
@@ -467,13 +469,15 @@ and the **event log** shows what led up to it.
 
 **Sensor check** (page 2.9.1): nothing moves. It records 10 s of every motor under one condition you set up -
 **A** motor power switched off, **B** motor power on but the motors switched off (Disable Motors), **C** holding -
-and reports the feedback's noise (quietest and worst second), drift, impulses and bursts, the board's own raw
-readings at 4 kHz over the same time, how much of the PID output's jitter is the P term and how much D, and how often
-the motor was braked or driven. With two or three conditions recorded, it puts them side by side and says where the
-noise comes from: the sensor side (already in A), the motor supply or its ground (quiet in A, not in B), or the
-drive and the control loop (only in C). Each check is saved, the recording also as CSV.
+and reports the feedback's noise (quietest and worst second), drift, impulses and bursts (their lengths from the
+samples' timestamps), a summary of the board's own raw readings over the same time (lowest, highest, biggest step
+and jumps, at 4 kHz ÷ Fpid divider), an estimate of how much of the PID output's jitter is the P term and how much
+the rest (D and I, with the board's rounding), and how often the motor was braked or driven. With two or three
+conditions recorded, it puts them side by side and reports all three parts: the sensor side on its own (A), what the
+motor power adds (B over A) and what holding adds (C over B) - they add up, so a rig can have some of each. Each
+check is saved, the recording also as CSV.
 
-![Sensor check: motor 1 quiet with the motor power off, noisy with it on - the A, B and C checks side by side](docs/img/sensor-check_v2.9.1.png)
+![Sensor check: motor 1 quiet with the motor power off, noisy with it on - the A, B and C checks side by side, with what each condition adds](docs/img/sensor-check_v2.9.2.png)
 
 See [docs/DIAGNOSTICS.md](docs/DIAGNOSTICS.md) for every check and the file format, and
 [docs/examples/diagnostics-full-check.json](docs/examples/diagnostics-full-check.json) for a real file from the
@@ -594,7 +598,7 @@ board on network**).
 [latest release](https://github.com/winreboot/smc3-r4/releases/latest) and run
 
 ```sh
-python3 smc3_scope_v2.9.1.py --host 192.168.1.50 --bind 0.0.0.0 --web 8198
+python3 smc3_scope_v2.9.2.py --host 192.168.1.50 --bind 0.0.0.0 --web 8198
 ```
 
 (`py` instead of `python3` on Windows). `--bind 0.0.0.0` makes the page reachable from other devices; without it,
