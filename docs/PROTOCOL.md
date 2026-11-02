@@ -29,11 +29,11 @@ are two separate bytes. The same commands work over USB (SimHub, SMC3Utils) and 
 | Command | Since | Meaning |
 |---|---|---|
 | `[rd$]` | 1.3 | Worst control-interrupt time in µs since the last read |
-| `[rd!]` | 1.4 | Build flags (bit0 REVERSE_MOTOR1; since 1.7 also bit1 MODE2, bit2 IMU, bit3 LED matrix, bit4 static IP; since 1.9.4 bit5 pot glitch filter; since 2.0 bit6 the main chip has the USB connector now, bit7 that is the saved setting) and firmware number (17 = 1.7, 20 = 2.0) |
+| `[rd!]` | 1.4 | Build flags (bit0 REVERSE_MOTOR1; since 1.7 also bit1 MODE2, bit2 IMU, bit3 LED matrix, bit4 static IP; since 1.9.4 bit5 pot glitch filter; since 2.0 bit6 the main chip has the USB connector now, bit7 that is the saved setting) and firmware number (17 = 1.7, 20 = 2.0, 21 = 2.1) |
 | `[dis]` `[di1]`–`[di3]` | 1.5 | Disable all motors or one (brake, stay off until enabled) |
 | `[fab]` / `[rdf]` | 1.6 | Smoothing shift a (0–8, time constant 2^a / 4 ms at Fpid/1) and max speed b × 100 counts/s (0 = off) / read them |
 | `[rdd]` | 1.7 | Diagnostics frame (below). WiFi only. Version 2 since 1.8. |
-| `[lvf]` / `[rdl]` | 1.8 | LED matrix view v (0 motor bars, 1 seat horizon, 2 quiet) and flags f (bit0 idle trace, bit1 address every minute) / read them. Saved at once. |
+| `[lvf]` / `[rdl]` | 1.8 | LED matrix view v (0 motor bars, 1 seat horizon, 2 quiet) and flags f (bit0 idle view on, bit1 address every minute; 2.1: bits 2-4 what plays while idle - 0 the trace, 1 ping pong, 2 brick breaker, 3 missile defense, 4 snake, 5 meteor dodge, 6 a different one each time) / read them. Saved at once. 2.1: `[lvf]` with bit0 set shows the chosen one at once, for 15 s or until a position command comes (not while SimHub sends positions). Older firmware keeps bits 2-4 and shows the trace. |
 | `[ift]` / `[rdi]` | 1.8 | Motion sensor flags f (bit0 on, bit1 swap roll/pitch, bit2 invert roll, bit3 invert pitch) and tilt limit t degrees (0 = off), saved at once / read: state (bits 0-3 as set, bit4 angles arriving, bit5 sensor found, bit6 setting up) and tilt limit. |
 | `[iL?]` `[iC?]` | 1.8 | Level now (the current angles count as 0°/0°) / clear the level. |
 | `[iSr]` | 1.8 | Set the sensor up through D1: angles only, rate code r (0 = 100 Hz), 115200 baud, saved in the sensor. 1.9: r = WitMotion rate code in bits 0-3 (0x09 = 100 Hz), bit6 set = angles + gyro + acceleration (0x49). |
@@ -265,7 +265,7 @@ Why off: 4 = tilt limit (1.8), 5 = switched off for a firmware update (1.9.2).
 | Address | Content |
 |---|---|
 | 56 | 0xA6 = this block is valid |
-| 57, 58 | Matrix view, matrix flags |
+| 57, 58 | Matrix view, matrix flags (2.1: bits 2-4 the idle animation) |
 | 59, 60 | Sensor flags, tilt limit (degrees) |
 | 61-62, 63-64 | Level offsets for roll and pitch, int16 ×100, big-endian |
 | 65 | Baud-rate index that last worked (9600, 115200, 230400, 57600, 38400, 19200, 4800) |

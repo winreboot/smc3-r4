@@ -42,13 +42,13 @@ python3 smc3_scope.py --host 192.168.1.50 --bind 0.0.0.0 --web 8198
 
 | File | What it holds |
 |---|---|
-| `config.json` | Settings made in the page: board address, theme, motors in use, motor names, what motor 3 does (traction loss or a lift), which way the rear goes and each lift goes for higher numbers (and which way each lift's corner sank in the last full check), auto-tune's "who's in the seat" and rider's weight, and the test-move speed auto-tune measured for each motor (Check uses it). |
+| `config.json` | Settings made in the page: board address, theme, motors in use, motor names, what motor 3 does (traction loss or a lift), which way the rear goes and each lift goes for higher numbers (and which way each lift's corner sank in the last full check), auto-tune's "who's in the seat" and rider's weight, the test-move speed auto-tune measured for each motor (Check uses it), and the kind of position sensors - pots or contactless Hall sensors (2.9.1). |
 | `seat.json` | The last Seat setup: where the seat is level (and the rear centred), how each motor tilts it, how far the rear slide turns it per count, the ends found and the limits saved. The 3D view uses it; the limits themselves live on the board. |
 | `profiles.json` | Named profiles. |
 | `backups.json` | Backups of the board settings: every Save to EEPROM, every bigger change, and manual ones. |
 | `diagnostics/events.jsonl` | The event log. |
 | `diagnostics/incidents/` | Problems the watcher noticed, each with a few seconds of telemetry. The newest 40 are kept. |
-| `diagnostics/reports/` | Diagnostics files from the quick and full checks. The newest 20 are kept. |
+| `diagnostics/reports/` | Diagnostics files from the quick and full checks and the Sensor checks (2.9.1: `..._sensor_A.json` and so on, each with its 10 s recording, downloadable as CSV). The newest 20 are kept. |
 | `updates/` | A newer page downloaded from GitHub (Settings, Updates, 2.7) and `state.json`: which file, and whether it started. |
 
 To upgrade, press **Update page** in Settings, Updates - or rebuild with the new `smc3_scope.py`. Keep the data

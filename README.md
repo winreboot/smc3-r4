@@ -20,7 +20,12 @@ The page lets you:
 - **calibrate over the USB cable** instead of WiFi, with SimHub closed: flip the WiFi / USB switch at the top of the
   page (Chrome, Edge, Brave, Firefox 151+; or a bridge started with one line in Win+R), and the page talks to the
   board without WiFi's hiccups;
-- **run test signals on several motors at once** (twist, heave, corner, wave) and test every motor moving together;
+- **run test signals on several motors at once** (twist, heave, corner, wave) and test every motor moving together -
+  each one fades in and out, no kick at the start;
+- see **what each motor really gets** (the drive, 0 while braked) next to the PID output, and run a **sensor check**
+  that tells the sensor's own noise, the motor supply's and the drive's apart;
+- let the LED matrix **play a little game while the rig is idle** (ping pong, brick breaker, missile defense, snake,
+  meteor dodge);
 - **restart the board** from the page - never while SimHub is driving.
 
 It knows two kinds of rig: **two front lifts plus a traction-loss motor** (motors 1 and 2 lift the front corners,
@@ -40,7 +45,7 @@ can use the USB cable instead (page 2.8, firmware 1.9.5; 2.0 recommended - it gi
 
 | Folder | What it is |
 |---|---|
-| [`firmware/SMC3_R4`](firmware/SMC3_R4) | Firmware for the **Arduino UNO R4 WiFi**. It speaks the SMC3 v0.70 protocol, so SimHub, SimTools, FlyPT Mover and SMC3Utils work unchanged. It adds a 4 kHz control loop, 14-bit pot readings, quiet 25 kHz PWM, target smoothing, a fixed PID, WiFi telemetry at 100 samples a second, an LED matrix that shows live motor bars and problems in words, a level trim with travel limits and end stops for each motor, a soft start, firmware updates over WiFi from the page, its own USB port (2.0: no WiFi chip in between), and an optional WT901C motion sensor with tilt limits for each direction. |
+| [`firmware/SMC3_R4`](firmware/SMC3_R4) | Firmware for the **Arduino UNO R4 WiFi**. It speaks the SMC3 v0.70 protocol, so SimHub, SimTools, FlyPT Mover and SMC3Utils work unchanged. It adds a 4 kHz control loop, 14-bit pot readings, quiet 25 kHz PWM, target smoothing, a fixed PID, WiFi telemetry at 100 samples a second, an LED matrix that shows live motor bars and problems in words, a level trim with travel limits and end stops for each motor, a soft start, firmware updates over WiFi from the page, its own USB port (2.0: no WiFi chip in between), games on the LED matrix while idle (2.1), and an optional WT901C motion sensor with tilt limits for each direction. |
 | [`scope/`](scope) | `smc3_scope.py`: the page server. It's one file using only the Python standard library, with a Dockerfile and compose files for a NAS or any PC. A ready-made Docker image is on `ghcr.io/winreboot/smc3-scope`; step by step for Windows, Mac, Linux, Raspberry Pi, Docker and Synology: [docs/INSTALL.md](docs/INSTALL.md). |
 | [`tools/simboard.py`](tools/simboard.py) | A simulated rig. You can try everything without hardware, and inject faults (reversed motor, swapped wiring, glitchy pot and more). |
 | [`firmware/SMC3_smooth`](firmware/SMC3_smooth) | The original SMC3 for the **UNO R3**, with target smoothing and the PID fixes, for anyone staying on an R3. |
@@ -96,6 +101,14 @@ The expand button opens the graphs full width; pressing it again returns to the 
 ![Motors view](docs/img/motors.png)
 
 ![Live graphs, 10 second window](docs/img/live-graphs.png)
+
+**Drive** (page 2.9.1): next to the orange PID output, a thin dotted line shows what the motor really gets - PWMmin
+added, PWMmax as the limit, and **0 while it is braked** inside the dead zone, where the bridge shorts the motor
+whatever the PID says. The orange line can jitter with sensor noise while the motor gets nothing; the dotted one
+shows when it doesn't. The motor cards and the readouts next to the graphs show it too (*braked*, *+45*, *off*).
+Click a legend entry to hide or show its line.
+
+![Live graphs: a sine fading in on motor 1, the dotted Drive line next to the PID output](docs/img/drive-line_v2.9.1.png)
 
 ### Seat angle (motion sensor)
 
@@ -172,6 +185,10 @@ around its own centre - **Twist** moves the two front lifts opposite each other 
 up: the most twist), **Heave** the lifts together, **Corner** the front lifts opposite each other with the rear slide,
 **Wave** every motor in turn, a third of a cycle apart.
 
+Every signal **starts and stops gently** (page 2.9.1): each motor fades in from where it is over half a period, and
+**Stop** eases it back to its centre. A new amplitude or offset slides in while it runs, and a new period carries on
+from where the cycle is. Only the **Step** preset steps.
+
 ![Test Signal with the Together list, and the Twist, Heave, Corner and Wave presets](docs/img/presets-together_v2.9.png)
 
 ![Twist running: Left and Right move opposite each other and the seat rolls](docs/img/twist-dashboard_v2.9.png)
@@ -235,6 +252,13 @@ supply that sags, more overshoot or ringing to a frame that flexes - and changes
 A crackling pot (bursts of readings a few counts off, whatever the Kp) doesn't end the Kp sweep early (page 2.9): the
 hold is judged over most of a second with a median spread, against what the pot does at the gentlest Kps.
 
+**A lift that sinks under its own weight** (page 2.9.1) - a gearbox that the seat can drive backwards, or a heavy
+corner - goes down with no drive at all, so "the easier way" there is gravity, not the motor's friction. Auto-tune
+sees it in the minimum-drive step and sets PWMmin from what lifting takes (80% of it), holds the seat with a Kp that
+can, and doesn't take the seat sinking under a weak drive for a motor wired backwards. If the seat sinks towards what
+your full-check answer calls "up", it says the answer looks the wrong way round and uses the other way for the run.
+The quick move for the top speed eases in instead of jumping, and the noise at rest is measured three times.
+
 | Checklist first | Running | Result |
 |---|---|---|
 | ![](docs/img/autotune-checklist.png) | ![](docs/img/autotune-running.png) | ![](docs/img/autotune-result.png) |
@@ -291,6 +315,12 @@ The same card says what **motor 3** does:
 - **Lifts the seat, like motors 1 and 2**: three lifts.
 
 Seat setup, the full check, auto-tune, the recommendations and the 3D view follow it.
+
+**Position sensors** (page 2.9.1): potentiometers, or contactless Hall-effect sensors such as the TT Electronics
+6127. Diagnostics and auto-tune give the advice that fits: a pot's wiper can wear and lose contact, a contactless
+sensor can't - its jumps come from the wiring, its 5 V and GND, or the motor supply.
+
+<img src="docs/img/position-sensors_v2.9.1.png" width="520" alt="Motor names card with Position sensors: Contactless Hall sensors">
 
 ![Settings with motor names](docs/img/settings.png)
 
@@ -356,7 +386,17 @@ the firmware's own drawing code:
 - **Motor bars:** each motor's position, live. A dot blinks where a motor should be when it falls behind. A dash
   at the bottom means it's switched off on purpose.
 - **Problems** scroll in words, again and again while they last: `ERROR E3 MOTOR 3 CUTOFF`, `ERROR E4 TILT LIMIT`,
-  `ERROR E9 NO WIFI` and so on. The page's Help explains every code and what to do:
+  `ERROR E9 NO WIFI` and so on. The page's Help explains every code and what to do.
+- **While idle** (firmware 2.1): after 20 s without positions the matrix can play one of five little games that play
+  themselves, or a different one each time - instead of the slow trace. The motor bars are back the moment a position
+  arrives. Settings, LED matrix, **While idle** has a live preview (the firmware's own game code, in the browser), and
+  **Apply** has the board play it for 15 s at once.
+
+| Ping pong | Brick breaker | Missile defense | Snake | Meteor dodge |
+|---|---|---|---|---|
+| <img src="docs/img/matrix-ping-pong_v2.1.gif" width="160"> | <img src="docs/img/matrix-brick-breaker_v2.1.gif" width="160"> | <img src="docs/img/matrix-missile-defense_v2.1.gif" width="160"> | <img src="docs/img/matrix-snake_v2.1.gif" width="160"> | <img src="docs/img/matrix-meteor-dodge_v2.1.gif" width="160"> |
+
+<img src="docs/img/led-idle_v2.9.1.png" width="560" alt="Settings, LED matrix: While idle - Snake, with the live preview">
 
 ![LED matrix error codes in Help](docs/img/help-errors.png)
 
@@ -424,6 +464,16 @@ Each one keeps a few seconds of data from before and after. A badge and a System
 and the **event log** shows what led up to it.
 
 <img src="docs/img/noticed-badge.png" height="560" alt="Badge and System Status"> <img src="docs/img/diag-side.png" height="560" alt="Problems noticed, saved reports and event log">
+
+**Sensor check** (page 2.9.1): nothing moves. It records 10 s of every motor under one condition you set up -
+**A** motor power switched off, **B** motor power on but the motors switched off (Disable Motors), **C** holding -
+and reports the feedback's noise (quietest and worst second), drift, impulses and bursts, the board's own raw
+readings at 4 kHz over the same time, how much of the PID output's jitter is the P term and how much D, and how often
+the motor was braked or driven. With two or three conditions recorded, it puts them side by side and says where the
+noise comes from: the sensor side (already in A), the motor supply or its ground (quiet in A, not in B), or the
+drive and the control loop (only in C). Each check is saved, the recording also as CSV.
+
+![Sensor check: motor 1 quiet with the motor power off, noisy with it on - the A, B and C checks side by side](docs/img/sensor-check_v2.9.1.png)
 
 See [docs/DIAGNOSTICS.md](docs/DIAGNOSTICS.md) for every check and the file format, and
 [docs/examples/diagnostics-full-check.json](docs/examples/diagnostics-full-check.json) for a real file from the
@@ -496,6 +546,13 @@ pot that still glitches is losing contact (wear) - no filter fixes that: fit a c
 Bourns 6639S-1-103, 10 kΩ) or a contactless Hall-effect sensor with a 0-5 V output (for example TT Electronics
 6127V1A180L.5FS), keeping its travel away from the ends of its range. The same drawing is in the page's Help.
 
+**Contactless sensors** have no wiper, so when one jumps it's the wiring: its 5 V and GND (straight to the Arduino,
+never through a motor bridge's ground), a crimp or solder joint, or the motor PWM getting into the signal wire. The
+same filter fits them (a 6127 drives a load of 1 kΩ or more), plus 100 nF across the sensor's 5 V and GND right at
+the sensor. A 6127 with output code V1 puts out 0.2-4.8 V over its electrical angle (180° for an A180): keep the
+motor's travel inside it. Choose them under Settings, Motor names, Position sensors, and use Diagnostics, **Sensor
+check** with the motor power off and on to see whether the noise is the sensor's or the motor supply's.
+
 ## Getting started
 
 ### 1. Flash the firmware
@@ -537,7 +594,7 @@ board on network**).
 [latest release](https://github.com/winreboot/smc3-r4/releases/latest) and run
 
 ```sh
-python3 smc3_scope_v2.9.py --host 192.168.1.50 --bind 0.0.0.0 --web 8198
+python3 smc3_scope_v2.9.1.py --host 192.168.1.50 --bind 0.0.0.0 --web 8198
 ```
 
 (`py` instead of `python3` on Windows). `--bind 0.0.0.0` makes the page reachable from other devices; without it,
@@ -631,6 +688,7 @@ noise. To see what the diagnostics find, add a fault:
   - 1.9.6: no more lost bytes on the USB port (the serial receive interrupts come before the PID interrupt).
   - 2.0: its own USB port - the main chip has the USB connector, so the WiFi chip's USB stall and lost bytes are
     gone; the page's Restart button; nothing restarts the board or its chips while SimHub sends positions.
+  - 2.1: games on the LED matrix while idle.
 
   See the [CHANGELOG](CHANGELOG.md).
 - New commands are documented in [docs/PROTOCOL.md](docs/PROTOCOL.md). They go over WiFi; USB stays plain SMC3

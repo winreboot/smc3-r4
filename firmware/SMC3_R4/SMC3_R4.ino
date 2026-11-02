@@ -41,9 +41,21 @@
 // Pots: wiper must stay within 0-5 V (the R4 is a 5 V board, so existing wiring is fine).
 //****************************************************************************************************************
 
-#define FW_VERSION     "2.0"           // shown in the USB boot banner; [ver] still answers 70 for SMC3Utils
-#define FW_VERSION_NUM 20              // reported by [rd!] so smc3_scope can check what it is talking to (1.9.x = 19, 2.0 = 20)
-#define FW_CAPS        "SMC3CAPS:ota1,wifimem1,usbpage1,modreset2,nativeusb1,reboot1"   // 1.9.2: what this build can do - smc3_scope looks for it in a .bin
+#define FW_VERSION     "2.1"           // shown in the USB boot banner; [ver] still answers 70 for SMC3Utils
+#define FW_VERSION_NUM 21              // reported by [rd!] so smc3_scope can check what it is talking to (1.9.x = 19, 2.0 = 20, 2.1 = 21)
+#define FW_CAPS        "SMC3CAPS:ota1,wifimem1,usbpage1,modreset2,nativeusb1,reboot1,idleanim1"   // 1.9.2: what this build can do - smc3_scope looks for it in a .bin
+
+// v2.1: idle animations - tested on a rig as 2.1b1, nothing else changed since.  While idle (no position commands
+//                for 20 s) the matrix can play one of five small games instead of the oscilloscope trace: ping pong,
+//                brick breaker, missile defense, snake, meteor dodge - or a different one each time (and every
+//                45 s).  They play themselves, one step per matrix frame (LED_FPS), fixed-size state, nothing
+//                blocks. Chosen with LedFlags bits 2-4 ([lvf], saved at once in EEPROM 58 as before): 0 the trace,
+//                1-5 a game, 6 a different one each time; bit 0 still switches the idle view on.  Older firmware
+//                keeps those bits and shows the trace.  A game plays over the motor bars or the seat horizon (the
+//                trace, as before, only over the bars or a horizon without a sensor). [lvf] with bit 0 shows the
+//                chosen one at once, for 15 s or until a position command comes (not while SimHub is sending
+//                positions). smc3_scope's LED card runs the same code in JavaScript for its preview. FW_CAPS says
+//                "idleanim1"; [rd!] answers 21.  Nothing else changed.
 
 // v2.0 changes: the board's USB connector belongs to the main chip, and the page can restart the board.  Tested on
 //                a rig as 2.0b1 and 2.0b2; 2.0 also carries 1.9.7 and 1.9.8 (test builds, never released on their
@@ -641,6 +653,9 @@ uint8_t       TiltLimitDeg = 0;               // 1.8's single tilt limit, still 
 int16_t       LevelRoll_x100 = 0, LevelPitch_x100 = 0;   // "Level now": raw sensor angles that count as level
 uint8_t       LedView  = LED_DEFAULT_VIEW;
 uint8_t       LedFlags = LED_DEFAULT_FLAGS;
+bool          IdleShowing = false;             // 2.1: the idle animation is on the matrix now
+unsigned long IdlePreviewFrom = 0;            // 2.1: [l] chose an animation: shown at once for a while
+unsigned long IdlePreviewUntil = 0;
 
 float         ImuRawRoll = 0, ImuRawPitch = 0, ImuYaw = 0;    // as the sensor sends them, degrees
 float         SeatRoll = 0, SeatPitch = 0;                     // levelled and turned the way the sensor is mounted
@@ -1837,8 +1852,13 @@ void ParseCommand(const unsigned int *buf, uint8_t source)
             if (b1 <= 2)
             {
                 LedView = b1;
-                LedFlags = b2;
+                LedFlags = b2;                                   // 2.1: bits 2-4 = the idle animation (0 = the trace)
                 WriteBoardSettings();
+                bool simhub = LastUsbTargetMillis && (millis() - LastUsbTargetMillis) < 10000;
+                if ((b2 & 1) && !simhub)                         // 2.1: show it now, for 15 s or until a position comes
+                {
+                    IdlePreviewFrom = millis(); IdlePreviewUntil = IdlePreviewFrom + 15000UL; IdleShowing = false;
+                }
             }
             break;
         case 'i':                                                // 1.8: motion sensor
@@ -3225,6 +3245,637 @@ void DrawIdleTrace(unsigned long now)
     }
 }
 
+// ---- 2.1: idle animations - five small games that play themselves while the rig waits -------------------------
+// LedFlags bits 2-4 choose what the matrix shows while idle (bit 0 on): 0 the oscilloscope trace (as before), 1 ping
+// pong, 2 brick breaker, 3 missile defense, 4 snake, 5 meteor dodge, 6 a different one each time (and every 45 s).
+// One step per matrix frame (LED_FPS, 20 a second); everything is fixed-size, nothing blocks. smc3_scope's LED card
+// runs the same code in JavaScript for its preview - keep the two in step.
+#define IG_TRACE   0
+#define IG_ROTATE  6
+#define IG_GAMES   5
+#define IG_ROT_FRAMES 900                       // a different one every 45 s in IG_ROTATE
+
+uint32_t IgSeed = 0x2F6B1D3Bu;
+uint8_t  IgGame = 1;                            // 1..5: the game playing now
+uint8_t  IgLast = 0;                            // IG_ROTATE: the one before
+uint16_t IgF = 0;                               // frames since the game started
+uint16_t IgRun = 0;                             // frames since the idle animation started (IG_ROTATE)
+
+static inline uint32_t IgRand()
+{
+    IgSeed ^= IgSeed << 13; IgSeed ^= IgSeed >> 17; IgSeed ^= IgSeed << 5;
+    return IgSeed;
+}
+static inline int IgRnd(int n) { return (int)(IgRand() % (uint32_t)n); }
+static inline int IgAbs(int v) { return v < 0 ? -v : v; }
+static inline int IgSgn(int v) { return (v > 0) - (v < 0); }
+static inline int IgClamp(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
+static inline void IgPx(int x, int y) { FramePixel(y, x, 1); }
+
+// a straight line from (x0,y0) to (x1,y1), one cell per step (Bresenham); returns the number of cells
+int IgLine(int x0, int y0, int x1, int y1, int8_t *xs, int8_t *ys, int maxn)
+{
+    int dx = IgAbs(x1 - x0), dy = -IgAbs(y1 - y0), sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1, err = dx + dy, n = 0;
+    while (n < maxn)
+    {
+        xs[n] = (int8_t)x0; ys[n] = (int8_t)y0; n++;
+        if (x0 == x1 && y0 == y1) { break; }
+        int e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+    return n;
+}
+
+// ---- 1: ping pong - two paddles rally; now and then one misses, blinks, and the ball is served again ----
+struct IgPong { int8_t pl, pr, bx, by, dx, dy, pause, blink, serve, hits, missAfter, missSide; } Pg;
+
+void IgPongStart()
+{
+    Pg.pl = 2; Pg.pr = 3; Pg.bx = 5; Pg.by = 3; Pg.dx = 1; Pg.dy = 1;
+    Pg.pause = 0; Pg.blink = -1; Pg.serve = 1; Pg.hits = 0; Pg.missAfter = 9; Pg.missSide = 1;
+}
+
+void IgPongDraw(bool ball, bool showL, bool showR)
+{
+    for (int i = 0; i < 3; i++) { if (showL) { IgPx(0, Pg.pl + i); } if (showR) { IgPx(11, Pg.pr + i); } }
+    if (ball) { IgPx(Pg.bx, Pg.by); }
+}
+
+void IgPongStep()
+{
+    if (Pg.pause > 0)
+    {
+        Pg.pause--;
+        bool off = (Pg.pause / 3) % 2;
+        IgPongDraw(false, !(Pg.blink == 0 && off), !(Pg.blink == 1 && off));
+        if (Pg.pause == 0)
+        {
+            Pg.bx = Pg.serve == 1 ? 6 : 5; Pg.by = (int8_t)(2 + IgRnd(4)); Pg.dx = Pg.serve; Pg.dy = IgRnd(2) ? 1 : -1;
+        }
+        return;
+    }
+    bool late = Pg.hits >= Pg.missAfter;                       // the next one gets missed
+    if ((IgF % 2) == 0)                                        // the ball: 10 cells a second
+    {
+        int ny = Pg.by + Pg.dy;
+        if (ny < 0 || ny > 7) { Pg.dy = -Pg.dy; ny = Pg.by + Pg.dy; }
+        int nx = Pg.bx + Pg.dx;
+        if (nx == 0 || nx == 11)
+        {
+            int side = nx == 0 ? 0 : 1, top = side == 0 ? Pg.pl : Pg.pr;
+            if (top <= ny && ny <= top + 2 && !(late && side == Pg.missSide))
+            {
+                Pg.hits++;
+                Pg.dx = -Pg.dx;
+                int off = ny - top;                            // where it hits the paddle sets the angle
+                Pg.dy = off == 0 ? -1 : (off == 2 ? 1 : IgRnd(3) - 1);
+                nx = Pg.bx + Pg.dx;
+                if (ny + Pg.dy < 0 || ny + Pg.dy > 7) { Pg.dy = -Pg.dy; }
+            }
+            else                                               // missed: that paddle blinks, then a new serve
+            {
+                Pg.bx = (int8_t)nx; Pg.by = (int8_t)ny;
+                IgPongDraw(true, true, true);
+                Pg.hits = 0; Pg.missAfter = (int8_t)(7 + IgRnd(5)); Pg.pause = 24; Pg.blink = (int8_t)side;
+                Pg.serve = side == 0 ? -1 : 1; Pg.missSide ^= 1;
+                return;
+            }
+        }
+        Pg.bx = (int8_t)nx; Pg.by = (int8_t)ny;
+    }
+    else                                                       // the paddles follow the ball, one cell a step
+    {
+        int tl = Pg.dx < 0 ? IgClamp(Pg.by - 1, 0, 5) : 2, tr = Pg.dx > 0 ? IgClamp(Pg.by - 1, 0, 5) : 2;
+        if (late && Pg.missSide == 1 && Pg.dx > 0 && Pg.bx > 7) { tr = Pg.pr; }   // (this one is too late)
+        if (late && Pg.missSide == 0 && Pg.dx < 0 && Pg.bx < 4) { tl = Pg.pl; }
+        Pg.pl += IgSgn(tl - Pg.pl); Pg.pr += IgSgn(tr - Pg.pr);
+    }
+    IgPongDraw(true, true, true);
+}
+
+// ---- 2: brick breaker - two rows of bricks; the player aims its bounces at the bricks that are left ----
+#define IG_X 0                                 // a ball: int8_t[4] = x, y, dx, dy (plain arrays: the Arduino IDE writes
+#define IG_Y 1                                 //  prototypes for every function, ahead of any struct)
+#define IG_DX 2
+#define IG_DY 3
+struct IgBrk { uint16_t bricks; int8_t px, aim, plannedFor, flash; int8_t b[4]; } Bk;   // px: the paddle's left cell, -1..10
+
+static inline bool IgBrick(uint16_t bk, int x, int y) { return y >= 0 && y <= 1 && x >= 0 && x <= 11 && (bk >> (y * 6 + x / 2)) & 1; }
+
+// one step of a ball: walls, ceiling, bricks (it bounces off the brick it breaks). The paddle is the caller's.
+bool IgBallStep(int8_t *b, uint16_t *bk)
+{
+    if (b[IG_X] + b[IG_DX] < 0 || b[IG_X] + b[IG_DX] > 11) { b[IG_DX] = (int8_t)-b[IG_DX]; }
+    if (b[IG_Y] + b[IG_DY] < 0) { b[IG_DY] = 1; }
+    int x = b[IG_X], y = b[IG_Y], nx = x + b[IG_DX], ny = y + b[IG_DY];
+    if (IgBrick(*bk, x, ny))       { *bk &= (uint16_t)~(1u << (ny * 6 + x / 2)); b[IG_DY] = (int8_t)-b[IG_DY]; return true; }
+    if (IgBrick(*bk, nx, y))       { *bk &= (uint16_t)~(1u << (y * 6 + nx / 2)); b[IG_DX] = (int8_t)-b[IG_DX]; return true; }
+    if (IgBrick(*bk, nx, ny))      { *bk &= (uint16_t)~(1u << (ny * 6 + nx / 2)); b[IG_DY] = (int8_t)-b[IG_DY]; return true; }
+    b[IG_X] = (int8_t)nx; b[IG_Y] = (int8_t)ny;
+    return false;
+}
+
+int IgBrkLanding()                                             // where the ball comes down to row 6
+{
+    int8_t b[4]; memcpy(b, Bk.b, 4); uint16_t bk = Bk.bricks;
+    for (int i = 0; i < 80; i++)
+    {
+        if (b[IG_DY] > 0 && b[IG_Y] == 6) { return b[IG_X]; }
+        IgBallStep(b, &bk);
+    }
+    return b[IG_X];
+}
+
+// From the paddle at lx, sent off with d (-1, 0, +1): the steps until it breaks a brick (999: it doesn't on the way up).
+// back: where it comes down again when it doesn't.
+int IgBrkTry(int lx, int d, uint16_t bk, int *back)
+{
+    int8_t b[4] = {(int8_t)lx, 6, (int8_t)d, -1};
+    for (int t = 0; t < 40; t++)
+    {
+        if (IgBallStep(b, &bk)) { return t; }
+        if (b[IG_Y] >= 6 && b[IG_DY] > 0) { break; }
+    }
+    *back = b[IG_X];
+    return 999;
+}
+
+int IgBrkPlan(int lx)                                          // which part of the paddle (-1, 0, +1) breaks a brick soonest
+{
+    static const int8_t tries[3] = {0, -1, 1};
+    int best = 0, bestT = 999;
+    for (int k = 0; k < 3; k++)                                // this bounce, or the one after it
+    {
+        int d = tries[k], back = lx;
+        if (lx - d < 0 || lx - d > 11) { continue; }          // (the paddle's middle must be on the matrix)
+        int t = IgBrkTry(lx, d, Bk.bricks, &back);
+        if (t == 999)
+        {
+            for (int k2 = 0; k2 < 3; k2++)
+            {
+                int d2 = tries[k2], back2 = back;
+                if (back - d2 < 0 || back - d2 > 11) { continue; }
+                int t2 = IgBrkTry(back, d2, Bk.bricks, &back2);
+                if (t2 < 999 && 40 + t2 < t) { t = 40 + t2; }
+            }
+        }
+        if (t < bestT) { best = d; bestT = t; }
+    }
+    if (bestT == 999)                                          // nothing within two bounces: try something else
+    {
+        best = tries[IgRnd(3)];
+        if (lx - best < 0 || lx - best > 11) { best = 0; }
+    }
+    return best;
+}
+
+void IgBrkStart()
+{
+    Bk.bricks = 0x0FFF; Bk.px = (int8_t)(2 + IgRnd(6)); Bk.aim = 0; Bk.plannedFor = -1; Bk.flash = 0;   // a different
+    Bk.b[IG_X] = (int8_t)(Bk.px + 1); Bk.b[IG_Y] = 6; Bk.b[IG_DX] = IgRnd(2) ? 1 : -1; Bk.b[IG_DY] = -1;   // serve each wall
+}
+
+void IgBrkDraw()
+{
+    for (int y = 0; y < 2; y++) { for (int x = 0; x < 12; x++) { if (IgBrick(Bk.bricks, x, y)) { IgPx(x, y); } } }
+    for (int k = 0; k < 3; k++) { IgPx(Bk.px + k, 7); }
+    IgPx(Bk.b[IG_X], Bk.b[IG_Y]);
+}
+
+void IgBrkStep()
+{
+    if (Bk.flash > 0)                                          // cleared: the wall blinks, then it starts over
+    {
+        Bk.flash--;
+        for (int k = 0; k < 3; k++) { IgPx(Bk.px + k, 7); }
+        if ((Bk.flash / 4) % 2 == 0) { for (int y = 0; y < 2; y++) { for (int x = 0; x < 12; x++) { IgPx(x, y); } } }
+        if (Bk.flash == 0) { IgBrkStart(); IgF = 0; }
+        return;
+    }
+    if (IgF < 10) { IgBrkDraw(); return; }
+    if ((IgF % 2) == 0)                                        // the ball: 10 cells a second
+    {
+        if (Bk.b[IG_DY] > 0 && Bk.b[IG_Y] == 6)                // on the paddle: the part it hits sets the way back
+        {
+            Bk.b[IG_DX] = (int8_t)IgClamp(Bk.b[IG_X] - (Bk.px + 1), -1, 1); Bk.b[IG_DY] = -1; Bk.plannedFor = -1;
+        }
+        IgBallStep(Bk.b, &Bk.bricks);
+        if (Bk.bricks == 0) { Bk.flash = 32; IgBrkDraw(); return; }
+    }
+    if (Bk.b[IG_DY] > 0)                                       // the player: under the ball, with the part that aims best
+    {
+        int lx = IgBrkLanding();
+        if (Bk.plannedFor != lx) { Bk.aim = (int8_t)IgBrkPlan(lx); Bk.plannedFor = (int8_t)lx; }
+        int want = IgClamp(lx - 1 - Bk.aim, -1, 10);          // (the paddle may hide one cell off the edge, so it
+        if (lx - want != 1 + Bk.aim) { want = IgClamp(lx - 1, -1, 10); }   //  can send a ball at the wall straight up)
+        Bk.px += IgSgn(want - Bk.px);                          // (twice the ball's speed: it always gets there)
+    }
+    else if ((IgF % 2) == 1) { Bk.px += IgSgn(IgClamp(Bk.b[IG_X] - 1, -1, 10) - Bk.px); }   // going up: drift under it
+    IgBrkDraw();
+}
+
+// ---- 3: missile defense - missiles come down at four cities, the base shoots them down; once a wave one gets through
+#define IG_MD_MIS 4
+#define IG_MD_INT 3
+#define IG_MD_BLA 3
+struct IgMis   { int8_t x0, x1, len, i, rate, watched, through, used; int8_t xs[20], ys[20]; };
+struct IgInt   { int8_t len, i, used; int8_t xs[16], ys[16]; };
+struct IgBlast { int8_t x, y, age, used; };
+struct IgMd
+{
+    IgMis m[IG_MD_MIS]; IgInt it[IG_MD_INT]; IgBlast bl[IG_MD_BLA];
+    uint8_t alive, hitCity, hitAge, spawned, throughAt, restore, restoreF;
+    uint16_t nextSpawn;
+} Md;
+static const int8_t IgCityX[4][2] = {{0, 1}, {3, -1}, {8, -1}, {10, 11}};   // each city's cells on row 7
+
+void IgMdStart()
+{
+    memset(&Md, 0, sizeof(Md));
+    Md.alive = 0x0F; Md.hitCity = 255; Md.nextSpawn = 5; Md.throughAt = (uint8_t)(6 + IgRnd(6)); Md.restore = 0;
+}
+
+bool IgMdCity(int c, int x) { return IgCityX[c][0] == x || IgCityX[c][1] == x; }
+
+void IgMdStep()
+{
+    if (Md.restore > 0)                                        // end of the wave: the cities come back, one by one
+    {
+        Md.restoreF++;
+        if (Md.restoreF % 6 == 0) { for (int c = 0; c < 4; c++) { if (!((Md.alive >> c) & 1)) { Md.alive |= (uint8_t)(1 << c); break; } } }
+        if (Md.alive == 0x0F && Md.restoreF >= 34) { IgMdStart(); IgF = 0; }
+    }
+    else if (IgF >= Md.nextSpawn && Md.spawned < 14)           // a new one comes in
+    {
+        for (int k = 0; k < IG_MD_MIS; k++)
+        {
+            IgMis &m = Md.m[k];
+            if (m.used) { continue; }
+            int c = IgRnd(4);
+            for (int t = 0; t < 4 && !((Md.alive >> c) & 1); t++) { c = (c + 1) & 3; }
+            int tx = IgCityX[c][IgCityX[c][1] >= 0 ? IgRnd(2) : 0];
+            m.used = 1; m.i = 0; m.rate = (int8_t)(5 + IgRnd(2)); m.watched = 0;
+            m.through = (Md.spawned == Md.throughAt) ? 1 : 0;
+            m.len = (int8_t)IgLine(IgRnd(12), 0, tx, 7, m.xs, m.ys, 20);
+            Md.spawned++;
+            break;
+        }
+        Md.nextSpawn = (uint16_t)(IgF + 15 + IgRnd(16));
+    }
+    else if (Md.spawned >= 14)                                 // all in: the wave ends once the sky is clear
+    {
+        bool busy = false;
+        for (int k = 0; k < IG_MD_MIS; k++) { busy |= Md.m[k].used; }
+        for (int k = 0; k < IG_MD_INT; k++) { busy |= Md.it[k].used; }
+        for (int k = 0; k < IG_MD_BLA; k++) { busy |= Md.bl[k].used; }
+        if (!busy && Md.hitAge == 0) { Md.restore = 1; Md.restoreF = 0; }
+    }
+    for (int k = 0; k < IG_MD_MIS; k++)                        // incoming: one cell every 5-6 frames
+    {
+        IgMis &m = Md.m[k];
+        if (!m.used) { continue; }
+        if (IgF % m.rate == 0 && m.i < m.len - 1) { m.i++; }
+        if (m.ys[m.i] >= 3 && !m.watched && !m.through)       // the base fires at it, a little ahead
+        {
+            m.watched = 1;
+            int lead = m.i + 2 < m.len - 1 ? m.i + 2 : m.len - 1;
+            int ax = m.xs[lead], ay = m.ys[lead];
+            for (int j = 0; j < IG_MD_INT; j++)
+            {
+                IgInt &t = Md.it[j];
+                if (t.used) { continue; }
+                t.used = 1; t.i = 0; t.len = (int8_t)IgLine(ax <= 5 ? 5 : 6, 5, ax, ay, t.xs, t.ys, 16);
+                break;
+            }
+        }
+    }
+    for (int j = 0; j < IG_MD_INT; j++)                        // outgoing: one cell a frame
+    {
+        IgInt &t = Md.it[j];
+        if (!t.used) { continue; }
+        t.i++;
+        if (t.i >= t.len - 1)
+        {
+            t.used = 0;
+            for (int q = 0; q < IG_MD_BLA; q++)
+            {
+                if (Md.bl[q].used) { continue; }
+                Md.bl[q].used = 1; Md.bl[q].age = 0; Md.bl[q].x = t.xs[t.len - 1]; Md.bl[q].y = t.ys[t.len - 1];
+                break;
+            }
+        }
+    }
+    static const int8_t rad[9] = {0, 1, 1, 2, 2, 2, 1, 1, 0};
+    for (int q = 0; q < IG_MD_BLA; q++)                        // a blast takes out what it catches
+    {
+        IgBlast &b = Md.bl[q];
+        if (!b.used) { continue; }
+        b.age++;
+        int r = rad[b.age / 2 < 8 ? b.age / 2 : 8];
+        for (int k = 0; k < IG_MD_MIS; k++)
+        {
+            IgMis &m = Md.m[k];
+            if (m.used && IgAbs(m.xs[m.i] - b.x) + IgAbs(m.ys[m.i] - b.y) <= (r > 1 ? r : 1)) { m.used = 0; }
+        }
+        if (b.age >= 18) { b.used = 0; }
+    }
+    for (int k = 0; k < IG_MD_MIS; k++)                        // one that got through
+    {
+        IgMis &m = Md.m[k];
+        if (!m.used || m.i < m.len - 1) { continue; }
+        m.used = 0;
+        for (int c = 0; c < 4; c++)
+        {
+            if (((Md.alive >> c) & 1) && IgMdCity(c, m.xs[m.len - 1])) { Md.alive &= (uint8_t)~(1 << c); Md.hitCity = (uint8_t)c; Md.hitAge = 1; }
+        }
+    }
+    // draw: the base, the cities, a city that was just hit, the trails, the interceptors, the blasts
+    IgPx(5, 7); IgPx(6, 7); IgPx(5, 6); IgPx(6, 6);
+    for (int c = 0; c < 4; c++) { if ((Md.alive >> c) & 1) { for (int e = 0; e < 2; e++) { if (IgCityX[c][e] >= 0) { IgPx(IgCityX[c][e], 7); } } } }
+    if (Md.hitAge > 0)
+    {
+        if (Md.hitAge < 24 && ((Md.hitAge / 3) % 2) == 0)
+        {
+            for (int e = 0; e < 2; e++) { int x = IgCityX[Md.hitCity][e]; if (x >= 0) { IgPx(x, 7); IgPx(x, 6); } }
+        }
+        Md.hitAge = Md.hitAge >= 24 ? 0 : Md.hitAge + 1;
+    }
+    for (int k = 0; k < IG_MD_MIS; k++) { IgMis &m = Md.m[k]; if (m.used) { for (int p = 0; p <= m.i; p++) { IgPx(m.xs[p], m.ys[p]); } } }
+    for (int j = 0; j < IG_MD_INT; j++) { IgInt &t = Md.it[j]; if (t.used) { IgPx(t.xs[t.i], t.ys[t.i]); } }
+    for (int q = 0; q < IG_MD_BLA; q++)
+    {
+        IgBlast &b = Md.bl[q];
+        if (!b.used) { continue; }
+        int r = rad[b.age / 2 < 8 ? b.age / 2 : 8];
+        if (r == 0) { IgPx(b.x, b.y); continue; }
+        for (int x = b.x - r; x <= b.x + r; x++) { for (int y = b.y - r; y <= b.y + r; y++) { if (IgAbs(x - b.x) + IgAbs(y - b.y) == r) { IgPx(x, y); } } }
+    }
+}
+
+// ---- 4: snake - it hunts a blinking dot and grows; at full length it blinks and starts again ----
+#define IG_SN_MAX 96
+#define IG_SN_FULL 15
+struct IgSnake { uint8_t body[IG_SN_MAX]; uint8_t len, food, done; } Sn;   // body[0] = the head, cell = y * 12 + x
+uint8_t IgPrev[96], IgQ[96], IgPath[96], IgBlocked[96];
+
+// shortest way from a to b around the blocked cells; fills IgPath (first step first) and returns its length, or -1
+int IgBfs(uint8_t a, uint8_t b)
+{
+    memset(IgPrev, 255, sizeof(IgPrev));
+    int qh = 0, qt = 0;
+    IgQ[qt++] = a; IgPrev[a] = a;
+    while (qh < qt)
+    {
+        uint8_t c = IgQ[qh++];
+        if (c == b)
+        {
+            int n = 0;
+            for (uint8_t p = c; p != a; p = IgPrev[p]) { n++; }
+            int k = n;
+            for (uint8_t p = c; p != a; p = IgPrev[p]) { IgPath[--k] = p; }
+            return n;
+        }
+        int cx = c % 12, cy = c / 12;
+        static const int8_t ddx[4] = {1, -1, 0, 0}, ddy[4] = {0, 0, 1, -1};
+        for (int d = 0; d < 4; d++)
+        {
+            int nx = cx + ddx[d], ny = cy + ddy[d];
+            if (nx < 0 || nx > 11 || ny < 0 || ny > 7) { continue; }
+            uint8_t n = (uint8_t)(ny * 12 + nx);
+            if (IgPrev[n] != 255 || IgBlocked[n]) { continue; }
+            IgPrev[n] = c; IgQ[qt++] = n;
+        }
+    }
+    return -1;
+}
+
+void IgSnakeBlock(const uint8_t *body, int from, int to)        // block body[from..to-1]
+{
+    memset(IgBlocked, 0, sizeof(IgBlocked));
+    for (int i = from; i < to; i++) { IgBlocked[body[i]] = 1; }
+}
+
+void IgSnakeFood()
+{
+    uint8_t freeN = 0, pick;
+    memset(IgBlocked, 0, sizeof(IgBlocked));
+    for (int i = 0; i < Sn.len; i++) { IgBlocked[Sn.body[i]] = 1; }
+    for (int c = 0; c < 96; c++) { freeN += !IgBlocked[c]; }
+    pick = (uint8_t)IgRnd(freeN);
+    for (int c = 0; c < 96; c++) { if (!IgBlocked[c]) { if (pick == 0) { Sn.food = (uint8_t)c; return; } pick--; } }
+}
+
+void IgSnakeStart()
+{
+    Sn.len = 3; Sn.body[0] = 4 * 12 + 3; Sn.body[1] = 4 * 12 + 2; Sn.body[2] = 4 * 12 + 1;
+    Sn.food = 4 * 12 + 8; Sn.done = 0;
+}
+
+bool IgSnakeSafe(int n)                                         // after following IgPath[0..n-1], can the head still reach the tail?
+{
+    static uint8_t b[IG_SN_MAX + 1];
+    int len = Sn.len;
+    memcpy(b, Sn.body, len);
+    uint8_t path[IG_SN_MAX];
+    memcpy(path, IgPath, n);
+    for (int i = 0; i < n; i++)
+    {
+        memmove(b + 1, b, len);
+        b[0] = path[i];
+        if (i < n - 1) { /* the tail moves on */ } else { len++; }
+    }
+    if (len > IG_SN_MAX) { len = IG_SN_MAX; }
+    IgSnakeBlock(b, 1, len - 1);
+    bool ok = IgBfs(b[0], b[len - 1]) >= 0;
+    memcpy(IgPath, path, n);
+    return ok;
+}
+
+void IgSnakeStep()
+{
+    if (Sn.done > 0)
+    {
+        Sn.done--;
+        if ((Sn.done / 4) % 2 == 0) { for (int i = 0; i < Sn.len; i++) { IgPx(Sn.body[i] % 12, Sn.body[i] / 12); } }
+        if (Sn.done == 0) { IgSnakeStart(); IgF = 0; }
+        return;
+    }
+    if ((IgF % 3) == 0)                                         // a step every 3 frames
+    {
+        int nxt = -1;
+        IgSnakeBlock(Sn.body, 0, Sn.len - 1);
+        int n = IgBfs(Sn.body[0], Sn.food);
+        if (n > 0 && IgSnakeSafe(n)) { nxt = IgPath[0]; }
+        else                                                    // follow the tail until the way to the dot is safe
+        {
+            IgSnakeBlock(Sn.body, 1, Sn.len - 1);
+            int t = IgBfs(Sn.body[0], Sn.body[Sn.len - 1]);
+            if (t > 0) { nxt = IgPath[0]; }
+            else
+            {
+                IgSnakeBlock(Sn.body, 0, Sn.len - 1);
+                static const int8_t ddx[4] = {1, -1, 0, 0}, ddy[4] = {0, 0, 1, -1};
+                int hx = Sn.body[0] % 12, hy = Sn.body[0] / 12;
+                for (int d = 0; d < 4 && nxt < 0; d++)
+                {
+                    int x = hx + ddx[d], y = hy + ddy[d];
+                    if (x >= 0 && x <= 11 && y >= 0 && y <= 7 && !IgBlocked[y * 12 + x]) { nxt = y * 12 + x; }
+                }
+            }
+        }
+        if (nxt < 0) { Sn.done = 40; }                          // boxed in: blink and start again
+        else
+        {
+            bool eat = nxt == Sn.food;
+            if (eat && Sn.len < IG_SN_MAX) { Sn.len++; }
+            memmove(Sn.body + 1, Sn.body, Sn.len - 1);
+            Sn.body[0] = (uint8_t)nxt;
+            if (eat)
+            {
+                if (Sn.len >= IG_SN_FULL) { Sn.done = 40; }
+                else { IgSnakeFood(); }
+            }
+        }
+    }
+    for (int i = 0; i < Sn.len; i++) { IgPx(Sn.body[i] % 12, Sn.body[i] / 12); }
+    if (!Sn.done && ((IgF / 4) % 2) == 0) { IgPx(Sn.food % 12, Sn.food / 12); }   // the dot blinks
+}
+
+// ---- 5: meteor dodge - a little ship shoots the meteors it can reach and steps out of the way of the rest ----
+#define IG_MT_N 6
+struct IgMeteor { int8_t x, y, rate, used; };
+struct IgShot   { int8_t x, y, used; };
+struct IgBurst  { int8_t x, y, age, used; };
+struct IgMt { int8_t sx; uint16_t nextSpawn; IgMeteor m[IG_MT_N]; IgShot s[2]; IgBurst b[4]; } Mt;
+
+void IgMtStart() { memset(&Mt, 0, sizeof(Mt)); Mt.sx = 5; Mt.nextSpawn = 4; }
+
+void IgMtFire()
+{
+    for (int k = 0; k < 2; k++) { if (!Mt.s[k].used) { Mt.s[k].used = 1; Mt.s[k].x = Mt.sx; Mt.s[k].y = 5; return; } }
+}
+
+int IgMtShots(int x)                                            // shots in the air (in column x, or all with x < 0)
+{
+    int n = 0;
+    for (int k = 0; k < 2; k++) { if (Mt.s[k].used && (x < 0 || Mt.s[k].x == x)) { n++; } }
+    return n;
+}
+
+void IgMtStep()
+{
+    if (IgF >= Mt.nextSpawn)
+    {
+        for (int k = 0; k < IG_MT_N; k++)
+        {
+            if (Mt.m[k].used) { continue; }
+            Mt.m[k].used = 1; Mt.m[k].x = (int8_t)IgRnd(12); Mt.m[k].y = 0; Mt.m[k].rate = (int8_t)(4 + IgRnd(4));
+            break;
+        }
+        Mt.nextSpawn = (uint16_t)(IgF + 8 + IgRnd(11));
+    }
+    for (int k = 0; k < IG_MT_N; k++) { if (Mt.m[k].used && IgF % Mt.m[k].rate == 0) { Mt.m[k].y++; } }
+    for (int k = 0; k < 2; k++) { if (Mt.s[k].used) { Mt.s[k].y--; } }
+    for (int k = 0; k < 2; k++)                                 // a shot meets a meteor: a burst
+    {
+        IgShot &s = Mt.s[k];
+        if (!s.used) { continue; }
+        for (int j = 0; j < IG_MT_N; j++)
+        {
+            IgMeteor &m = Mt.m[j];
+            if (m.used && m.x == s.x && (m.y == s.y || m.y == s.y + 1))
+            {
+                m.used = 0; s.used = 0;
+                for (int q = 0; q < 4; q++) { if (!Mt.b[q].used) { Mt.b[q].used = 1; Mt.b[q].x = m.x; Mt.b[q].y = m.y > s.y ? m.y : s.y; Mt.b[q].age = 0; break; } }
+                break;
+            }
+        }
+    }
+    for (int k = 0; k < 2; k++) { if (Mt.s[k].used && Mt.s[k].y < 0) { Mt.s[k].used = 0; } }
+    for (int k = 0; k < IG_MT_N; k++) { if (Mt.m[k].used && Mt.m[k].y > 7) { Mt.m[k].used = 0; } }
+    int danger = -1, target = -1;                               // the pilot
+    for (int k = 0; k < IG_MT_N; k++)
+    {
+        IgMeteor &m = Mt.m[k];
+        if (!m.used) { continue; }
+        if (danger < 0 && m.y >= 4 && IgAbs(m.x - Mt.sx) <= 1) { danger = k; }
+        if (target < 0 || m.y > Mt.m[target].y) { target = k; }
+    }
+    if ((IgF % 2) == 0)
+    {
+        if (danger >= 0 && IgMtShots(Mt.m[danger].x) == 0)
+        {
+            int dxm = Mt.m[danger].x;
+            if (dxm == Mt.sx) { if ((IgF % 4) == 0 && IgMtShots(-1) < 2) { IgMtFire(); } }
+            else
+            {
+                int step = dxm < Mt.sx ? 1 : -1;                // step away from it
+                if (Mt.sx + step >= 1 && Mt.sx + step <= 10) { Mt.sx += step; }
+            }
+        }
+        else if (target >= 0)
+        {
+            int tgt = IgClamp(Mt.m[target].x, 1, 10);
+            if (tgt != Mt.sx) { Mt.sx += IgSgn(tgt - Mt.sx); }
+            else if (IgMtShots(-1) < 2 && IgMtShots(Mt.sx) == 0) { IgMtFire(); }
+        }
+    }
+    IgPx(Mt.sx - 1, 7); IgPx(Mt.sx, 7); IgPx(Mt.sx + 1, 7); IgPx(Mt.sx, 6);
+    for (int k = 0; k < IG_MT_N; k++) { if (Mt.m[k].used) { IgPx(Mt.m[k].x, Mt.m[k].y); } }
+    for (int k = 0; k < 2; k++) { if (Mt.s[k].used) { IgPx(Mt.s[k].x, Mt.s[k].y); } }
+    for (int q = 0; q < 4; q++)
+    {
+        IgBurst &b = Mt.b[q];
+        if (!b.used) { continue; }
+        b.age++;
+        if (b.age <= 2)      { IgPx(b.x + 1, b.y); IgPx(b.x - 1, b.y); IgPx(b.x, b.y + 1); IgPx(b.x, b.y - 1); }
+        else if (b.age <= 4) { IgPx(b.x + 1, b.y + 1); IgPx(b.x - 1, b.y - 1); IgPx(b.x - 1, b.y + 1); IgPx(b.x + 1, b.y - 1); }
+        else                 { b.used = 0; }
+    }
+}
+
+// ---- which one, and one frame of it ----
+uint8_t IdleMode() { return (uint8_t)((LedFlags >> 2) & 7); }
+
+void IgStart(uint8_t game)
+{
+    IgGame = game; IgF = 0;
+    switch (game)
+    {
+        case 1: IgPongStart(); break;
+        case 2: IgBrkStart(); break;
+        case 3: IgMdStart(); break;
+        case 4: IgSnakeStart(); break;
+        default: IgMtStart(); break;
+    }
+}
+
+void IdleBegin(uint32_t seed)                                    // the matrix just went idle (or a preview starts)
+{
+    IgSeed = seed ? seed : 0x2F6B1D3Bu;
+    IgRun = 0;
+    uint8_t mode = IdleMode();
+    if (mode == IG_ROTATE) { IgLast = (uint8_t)(IgLast % IG_GAMES + 1); IgStart(IgLast); }
+    else if (mode >= 1 && mode <= IG_GAMES) { IgStart(mode); }
+}
+
+void IdleFrame(unsigned long now)                               // one frame of the idle animation (LED_FPS a second)
+{
+    uint8_t mode = IdleMode();
+    if (mode == IG_TRACE || mode > IG_ROTATE) { DrawIdleTrace(now); return; }
+    if (mode == IG_ROTATE && ++IgRun >= IG_ROT_FRAMES) { IgRun = 0; IgLast = (uint8_t)(IgLast % IG_GAMES + 1); IgStart(IgLast); }
+    switch (IgGame)
+    {
+        case 1: IgPongStep(); break;
+        case 2: IgBrkStep(); break;
+        case 3: IgMdStep(); break;
+        case 4: IgSnakeStep(); break;
+        default: IgMtStep(); break;
+    }
+    IgF++;
+}
+
 void UpdateMatrix()
 {
     static unsigned long last = 0;
@@ -3294,10 +3945,22 @@ void UpdateMatrix()
     }
     else
     {
-        bool idle = (now - LastPosMillis) > LED_IDLE_AFTER_MS;
-        if (LedView == 1 && SensorFresh())       { DrawHorizon(); }
+        // 2.1: idle = no position commands for 20 s, or the page just chose an animation (shown at once, until a
+        // position command comes). A game plays over the motor bars or the seat horizon; the trace, as before, not
+        // over a live horizon.
+        bool idle = (now - LastPosMillis) > LED_IDLE_AFTER_MS
+                    || ((long)(IdlePreviewUntil - now) > 0 && (long)(LastPosMillis - IdlePreviewFrom) < 0);
+        uint8_t im = IdleMode();
+        bool anim = idle && (LedFlags & 1) && ErrN == 0 && LedView != 2
+                    && ((im >= 1 && im <= IG_ROTATE) || !(LedView == 1 && SensorFresh()));
+        if (anim != IdleShowing)
+        {
+            IdleShowing = anim;
+            if (anim) { IdleBegin((uint32_t)micros() ^ ((uint32_t)now << 11) ^ 0x9E3779B9u); }
+        }
+        if (anim)                                { IdleFrame(now); }
+        else if (LedView == 1 && SensorFresh())  { DrawHorizon(); }
         else if (LedView == 2)                   { FramePixel(7, 11, (now % 3000UL) < 150); }   // quiet: heartbeat
-        else if (idle && (LedFlags & 1) && ErrN == 0) { DrawIdleTrace(now); }
         else                                     { DrawBars(blink); }
     }
     Matrix.renderBitmap(Frame, 8, 12);

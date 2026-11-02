@@ -163,6 +163,7 @@ ap.add_argument("--fw196", action="store_true", help="firmware 1.9.6")
 ap.add_argument("--fw197", action="store_true", help="firmware 1.9.7: the chip restart of 2.9/b2 (WiFi back 4 s later, no report)")
 ap.add_argument("--fw20", action="store_true", help="firmware 2.0: native USB port (the main chip has the connector), [kZ R] reboot")
 ap.add_argument("--fw20b1", action="store_true", help="the test build 2.0b1 (native USB, no [kZ R] reboot)")
+ap.add_argument("--fw21", action="store_true", help="firmware 2.1: 2.0 + the idle animations (LED flags bits 2-4); [rd!] says 21")
 ap.add_argument("--fw20-esp", action="store_true", help="firmware 2.0 with the WiFi chip on the connector (saved setting 0)")
 ap.add_argument("--fw197-stuck", action="store_true",
                 help="test (page 2.9): firmware 1.9.7 as it really behaved after [kE1] - the board never rejoins WiFi and "
@@ -229,7 +230,7 @@ for st_ in args.start:
     m_, pot_ = st_.split(":")
     START[int(m_) - 1] = float(pot_)
 FW = {"ver": ("1.9" if args.old19 else ("1.9.1" if args.fw191 else ("1.9.3" if args.no_potfilter else
-       ("1.9.4" if args.fw194 else ("1.9.5" if args.fw195 else ("1.9.6" if args.fw196 else ("1.9.7" if (args.fw197 or args.fw197_stuck) else ("2.0b1" if args.fw20b1 else ("2.0" if (args.fw20 or args.fw20_esp) else "1.9.8"))))))))) if args.fw >= 19
+       ("1.9.4" if args.fw194 else ("1.9.5" if args.fw195 else ("1.9.6" if args.fw196 else ("1.9.7" if (args.fw197 or args.fw197_stuck) else ("2.0b1" if args.fw20b1 else ("2.1" if args.fw21 else ("2.0" if (args.fw20 or args.fw20_esp) else "1.9.8")))))))))) if args.fw >= 19
       else f"{args.fw // 10}.{args.fw % 10}"}
 
 
@@ -238,8 +239,9 @@ def _vt(v):
     return tuple(int(x) for x in m.group(1).split(".")) if m else (0,)
 
 
-def fwnum():                                  # what [rd!] and [rdd] report: 19 for 1.9.x, 20 for 2.0
-    return 20 if _vt(FW["ver"]) >= (2, 0) else min(args.fw, 19)
+def fwnum():                                  # what [rd!] and [rdd] report: 19 for 1.9.x, 20 for 2.0, 21 for 2.1
+    v = _vt(FW["ver"])
+    return v[0] * 10 + (v[1] if len(v) > 1 else 0) if v >= (2, 0) else min(args.fw, 19)
 
 
 def native_fw():                              # firmware 2.0: the USB connector can be the main chip's

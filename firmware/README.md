@@ -17,7 +17,7 @@ What the R4 hardware adds:
   settings since 1.6.
 - **A fixed PID**: a real integrator with anti-windup, and a filtered derivative taken on the measured position.
 - **LED matrix**: the IP address at power-up, then live motor bars (or a seat horizon with the motion sensor), an
-  oscilloscope trace while idle, and problems scrolled in words: `ERROR E3 MOTOR 3 CUTOFF`.
+  oscilloscope trace or (2.1) a little game while idle, and problems scrolled in words: `ERROR E3 MOTOR 3 CUTOFF`.
 - **Motion sensor (optional)**: a WitMotion WT901C on Serial1 gives the seat's real angles, tilt limits for each
   direction, gyro and acceleration for the page's 3D view, and the seat's own movement for auto-tune and
   diagnostics. It is switched on and set up from the page, with no recompiling.
@@ -108,6 +108,7 @@ code.
 | <img src="../docs/img/matrix-bars.gif" width="250" alt="Motor bars"> | **Motor bars** (default): each motor's position, live. The two columns of a bar differ by half a pixel between steps. A dot **blinks where a motor should be** when it falls well behind - here motor 2 gets stuck for a moment. |
 | <img src="../docs/img/matrix-horizon.gif" width="250" alt="Seat horizon"> | **Seat horizon** (motion sensor): the edge moves up with the seat's front and tilts with its roll. Without sensor data it shows the motor bars. |
 | <img src="../docs/img/matrix-idle.gif" width="250" alt="Idle trace"> | **Idle:** after 20 s without position commands, the motor-bars view becomes a slow oscilloscope trace. |
+| <img src="../docs/img/matrix-snake_v2.1.gif" width="250" alt="Snake"> | **Or a game while idle** (2.1): ping pong, brick breaker, missile defense, snake or meteor dodge - or a different one each time, 45 s each. They play themselves, one step per matrix frame, and stop the moment a position arrives. Chosen in the page (Settings, LED matrix, While idle), saved in LedFlags bits 2-4. |
 | <img src="../docs/img/matrix-motor-off.gif" width="250" alt="Motor off"> | **A motor switched off on purpose** (Disable Motors, or not in use) is a dash at the bottom - not an error. |
 | <img src="../docs/img/matrix-error-cutoff.gif" width="250" alt="Cutoff error"> | **Problems scroll in words**, again and again while they last, with a moment of the view in between. A motor stopped by its cutoff blinks full height. |
 | <img src="../docs/img/matrix-error-tilt.gif" width="250" alt="Tilt limit"> | **Tilt limit** (motion sensor): the seat pitched past the limit, every motor stopped, `ERROR E4 TILT LIMIT`. |

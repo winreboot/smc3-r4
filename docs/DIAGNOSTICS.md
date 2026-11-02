@@ -19,7 +19,8 @@ Nothing moves, so it's safe while SimHub runs. It takes about 5 seconds.
 - With 1.8, also reads the motion sensor: found or not, baud rate, angles per second, bad packets, tilt limit and
   how often it tripped, level offsets, and what the LED matrix shows.
 - Listens to the motors for 3 seconds: pot noise at rest, buzz (PID jitter), positions, and with the sensor the
-  seat's angle and how much it wobbles while the motors hold still.
+  seat's angle and how much it wobbles while the motors hold still. Page 2.9.1 adds the same numbers as the Sensor
+  check (below) for those 3 s.
 - Adds what the page recorded: the last hour of per-minute statistics (how often each motor ran at its power
   limit, how far it lagged behind SimHub), the problems it noticed, and the event log.
 
@@ -42,6 +43,40 @@ Stop SimHub's motion output and keep the seat empty. Each motor in turn, with th
    then it isn't the rear slide); the answer is kept for the 3D view. If a motor doesn't move at all, you're asked whether it moved, hummed, or did
    nothing. That tells a slipped pot from a jammed motor from no power.
 4. Everything is put back afterwards: settings, positions and which motors were on.
+
+## Sensor check
+
+Page 2.9.1. Nothing moves; pause SimHub's motion output first. It records 10 s of every motor under one condition you
+set up and pick next to the button:
+
+| | Set up | Tells |
+|---|---|---|
+| **A** | Motor power supply switched off (the Arduino and the sensors stay on) | the sensor's own noise, its supply and cable |
+| **B** | Motor power on, Disable Motors pressed (nothing driven) | what the motor supply and its ground add |
+| **C** | Motor power on, motors enabled and holding | what the drive and the control loop add |
+
+For each motor:
+
+- **Feedback** (the 100 Hz telemetry, after the firmware's glitch filter): the noise as a median spread in 1 s
+  windows with each window's creep taken out (quietest, worst, and the worst 250 ms), lowest to highest, drift,
+  steps between readings over 2 / 4 / 8 / 16 counts per second, and **events** - runs of readings off the window's
+  line by more than max(4 × the noise, 1 count): an impulse lasts up to 20 ms, a burst 30-500 ms, longer is a shift.
+  A verdict - quiet, impulses, bursts, continuous jitter, jitter that comes and goes, slow drift, shifts - with the
+  levels it used (starting values; this rig's own A/B/C checks are the real reference).
+- **Raw readings** (from the board, firmware 1.7 and newer): every reading at 4 kHz before the glitch filter, over the
+  same 10 s - lowest, highest and the biggest change between two readings, and the jumps over 16 counts. (The board's
+  count stops at 65,535; the report says when it's full.)
+- **PID output**: its jitter, split into the P term (Kp × error, from the telemetry with the board's own arithmetic)
+  and the rest (D, and I).
+- **Drive**: how much of the time the motor was braked (inside the dead zone the bridge shorts it, PWM 0), driven, on
+  PWMrev or switched off, the drive's own jitter and how often it switched - worked out from the telemetry and the
+  settings the page last read or sent, the way the firmware's output stage does it.
+
+Each check is saved as a report (`..._sensor_A.json` and so on) and its recording can be downloaded as CSV. With two
+or three conditions recorded, the result puts the newest A, B and C side by side and says where the noise comes
+from: noisy already in A - the sensor side (its 5 V and GND, the cable, the connectors); quiet in A but not in B - the
+motor supply or its ground; quiet in A and B but not in C - the drive itself (motor current in a shared ground, the
+motor's vibration) or the control loop dithering.
 
 ## What the page notices while you drive
 
@@ -117,19 +152,21 @@ The newest 20 are kept in `diagnostics/reports/` and can be downloaded from the 
 | Section | Contents |
 |---|---|
 | `about` | What the file is, units, how to read the traces |
-| `made`, `kind`, `problem` | When, quick or full, and what the owner typed |
+| `made`, `kind`, `problem` | When, quick, full or sensor, and what the owner typed |
 | `summary` | The findings as plain text |
 | `findings` | The findings, structured |
 | `board` | Connection, firmware, build options (2.0: who has the USB port), uptime, last start cause, WiFi, USB counters, per-motor counters, motion sensor and LED matrix (1.8), seat set-up: level trim, travel limits, end stops, tilt limits (1.9), soft start (1.9.1), the WiFi module's firmware, WiFi memory and the last update (1.9.2), the last WiFi/USB chip restart (`module_restart`, 1.9.8) |
 | `firmware_update` | The page's own record of the last firmware update: from and to which version, every step, the result |
 | `rig` | Motors in use, motor names, layout (front lifts + rear traction loss, or lifts), which motor is the rear slide and which way it goes for higher numbers |
 | `settings` | Running settings, saved settings (EEPROM), the differences, the last save made from the page |
-| `live` | The 3-second listen |
+| `live` | The 3-second listen (2.9.1: per motor also `still`, the Sensor check's numbers, and `raw`, the board's raw readings) |
+| `capture` | Sensor check: the condition, and per motor `feedback` (noise, events, PID split, drive) and `raw` |
+| `compare` | Sensor check: the newest A, B and C side by side, and what they say |
 | `check` | Full check: per motor the result, the drive needed, step metrics, what you saw, and a 50 Hz trace |
 | `watch` | Statistics for the last hour (including each motor's load map and the seat's range), per minute, and problem counts for 24 hours |
 | `incidents` | Recorded problems; the four newest include traces |
 | `events` | The last 250 events |
-| `telemetry` | The last 10 s at 100 Hz and the last 2 minutes at 5 Hz |
+| `telemetry` | The last 10 s at 100 Hz and the last 2 minutes at 5 Hz; a sensor check's 10 s (`capture`) with every motor's target, goal, feedback, PID output, drive and its state |
 | `scope`, `profiles`, `backups` | Page version and settings, profile names, recent backups |
 
 Traces are CSV text: a `columns` header and one row per sample. `t`, `g`, `f` and `p` are target, goal, feedback

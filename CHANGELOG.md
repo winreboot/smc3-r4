@@ -3,6 +3,73 @@
 `smc3_scope` (the page) and `SMC3_R4` (the firmware) are versioned separately. The page works with older
 firmware too; the notes say which firmware a feature needs.
 
+## Page 2.9.1, firmware 2.1
+
+Tested on a rig as four page betas (2.9.1b1-2.9.1b4) and one firmware beta (2.1b1); all of them are in this release.
+Firmware 2.1 is 2.0 plus the games on the LED matrix - nothing else in it changed, and page 2.9.1 works with 2.0 too.
+What went wrong on the way, and what was learnt from it: [docs/LESSONS-LEARNED.md](docs/LESSONS-LEARNED.md).
+
+- **Games on the LED matrix while idle** (firmware 2.1). After 20 s without positions the matrix can play one of five
+  little games that play themselves - **ping pong**, **brick breaker**, **missile defense**, **snake**, **meteor
+  dodge** - or **a different one each time** (each for 45 s), instead of the oscilloscope trace. The motor bars are
+  back the moment a position arrives; problems and the address still scroll over everything. Settings, LED matrix,
+  **While idle** chooses it, with a live preview that runs the firmware's own game code in the browser; **Apply**
+  has the board play it for 15 s at once. Saved on the board (LedFlags bits 2-4); older firmware keeps the choice and
+  shows the trace.
+- **Test signals start and stop gently.** A wave started wherever its cycle happened to be, so its first command
+  could be up to the full amplitude away from the motor (154 counts in a test) - a hard kick that made the seat
+  jiggle. Now each motor fades in from where it is over half a period (0.8-2 s), every motor of a Together signal
+  (Twist, Heave, Corner, Wave) too; **Stop** eases each one back to its centre; a new amplitude or offset slides in
+  and a new period continues the cycle. The Step preset still steps.
+- **The Drive line.** The graphs show, next to the orange PID output, a thin dotted line for what the motor really
+  gets: PWMmin added, PWMmax as the limit, and **0 while it is braked** inside the dead zone (the bridge shorts the
+  motor whatever the PID says). The orange line can jitter with sensor noise while the motor gets nothing. The motor
+  cards and the readouts by the graphs show it too (*braked*, *+45*, *off*), and a click on a legend entry hides or
+  shows its line. Worked out by the page from what the telemetry already carries, with the firmware's own arithmetic.
+- **Diagnostics, Sensor check.** Nothing moves: 10 s of every motor under one condition you set up - **A** motor
+  power off, **B** motor power on but the motors switched off, **C** holding. For each motor:
+  - the feedback's noise in 1 s windows (quietest, worst, and the worst 250 ms), drift, steps between readings over
+    2 / 4 / 8 / 16 counts, and impulses, bursts and shifts;
+  - the board's own raw readings at 4 kHz over the same 10 s, before the glitch filter: lowest, highest and the
+    biggest change between two readings;
+  - the PID output's jitter split into the P term (Kp × error) and the rest (D, and I);
+  - how much of the time the motor was braked or driven.
+
+  Each check is saved (the recording also as CSV). With two or three of them, the result puts the newest A, B and C
+  side by side and says where the noise comes from: the sensor side (noisy already in A), the motor supply or its
+  ground (quiet in A, not in B), or the drive and the control loop (only in C). The quick check adds the same
+  numbers for its 3 s.
+- **Contactless sensors.** Settings, Motor names, **Position sensors**: potentiometers or contactless Hall-effect
+  sensors (for example TT Electronics 6127). With Hall sensors, Diagnostics and auto-tune don't talk about wipers and
+  worn pots: when one jumps, the advice is its 5 V and GND, the joints, the signal wire and the motor supply, and a
+  reading outside what a 6127 with output code V1 can put out (0.2-4.8 V, about 41-983 counts) is a wiring or sensor
+  fault.
+- **Auto-tune on a lift that sinks under its own weight** (a gearbox that can be driven backwards; on the rig the
+  left corner sank with no drive and took PWM 68 to lift):
+  - it stopped right after the minimum-drive step with "moves AWAY from where it is driven ... wired backwards": the
+    step left Kp 20, which couldn't hold the seat, so it sank while the PID pushed. The step now remembers which way
+    the load pulls and how much lifting takes; the wrong-direction watch doesn't call the seat sinking a wiring fault
+    while the drive against it is below that (above it, as before);
+  - PWMmin is 80% of what lifting took, not the "easier way's" 0 - going down needs no drive because of the seat's
+    weight, not the motor's friction. With 0 the corner hung 42-55 counts below where it was sent and the sweep
+    stopped "too lively";
+  - when the seat sinks towards what the full check's answer calls "up", the run says the answer looks the wrong way
+    round and uses the other way for the rest of the run (the saved answer is left alone).
+- **Auto-tune's quick move** for the top speed no longer jumps the target: it sets off over 0.2 s at 1800
+  counts/s, faster than the motors can go, so the top speed comes out the same without full power slamming on.
+- **Auto-tune's noise at rest** is measured three times for 1 s and the middle one used (one 1.5 s reading before);
+  the log says when they differ more than twice over.
+- The board's count of raw jumps over 16 counts stops at 65,535 (all three motors on the rig got there in 13 h):
+  reports say so instead of counting 0 more.
+- The Restart dialog no longer shows an empty bullet. Texts recommend `SMC3_R4_v2.1.ino`.
+- Simulator: `--fw21` (2.1); the drive and the sensor check work against every simulated firmware.
+
+Update in this order:
+1. **Firmware** (for the games): upload `SMC3_R4_v2.1.ino` with the Arduino IDE (Settings, USB cable, **WiFi chip
+   until the next reset** first), or use **Sketch, Export Compiled Binary** and install the `.bin` in Settings,
+   Firmware update. Same COM port as 2.0.
+2. **Page:** Settings, Updates, **Update page**.
+
 ## Page 2.9, firmware 2.0
 
 Tested on a rig as seven page betas (2.9b1-2.9b7) and four firmware test builds (1.9.7, 1.9.8, 2.0b1, 2.0b2); all of

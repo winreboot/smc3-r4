@@ -1,6 +1,7 @@
 # Lessons learned
 
-Notes from getting the USB cable link and auto-tune to work on a real rig: page 2.8 to 2.9, firmware 1.9.5 to 2.0.
+Notes from getting the USB cable link, auto-tune and the diagnostics to work on a real rig: page 2.8 to 2.9.1,
+firmware 1.9.5 to 2.1.
 What broke, why, how it was fixed, and what to do differently next time. The changes themselves are in the
 [CHANGELOG](../CHANGELOG.md).
 
@@ -16,6 +17,12 @@ What broke, why, how it was fixed, and what to do differently next time. The cha
 | The board got stuck again after a chip restart, even with 1.9.8 | The chip sometimes doesn't talk to the main chip again after it restarts | firmware 2.0: the USB connector belongs to the main chip, no chip restarts |
 | Auto-tune's Kps far too low (52 where it had been 252) on clean moves | A crackling pot read as a restless hold; the limits came from one short noise reading | page 2.9 |
 | (found in the release audit) A 2.0 board would never have been offered 2.0.1, and the finding for 1.9.7 boards never showed | The betas' version key added the beta mark after dropping trailing zeros; one check compared it with a hand-written tuple | page 2.9 |
+| Auto-tune stopped on the left motor: "moves AWAY from where it is driven ... wired backwards" | That corner sinks under its own weight. The minimum-drive step left Kp 20 (and PWMmin 0), which couldn't hold it, so it sank while the PID pushed - and the watch took that for a wiring fault | page 2.9.1 |
+| The next run stopped "too lively" at Kp 149-193 | PWMmin 0, "the easier way", on a seat that goes down by itself: the corner hung 42-55 counts low, which read as overshoot | page 2.9.1 |
+| A test wave kicked the seat as it started | The wave's phase came from a clock running since the page started: its first command could be the whole amplitude away (154 counts in a test) | page 2.9.1 |
+| Auto-tune's quick move jolted the seat | The target jumped, so full power came on at once | page 2.9.1 |
+| Orange spikes in the graphs while the seat held still looked like kicks | The orange line is the PID output before the output stage; inside the dead zone the motor is braked whatever it says | page 2.9.1: the Drive line |
+| (found reading a report) "0 jumps over 16 counts" while the board counted more than one a second | The board's counter is 16 bits and was full (65,535 in 13 h on all three motors) | page 2.9.1 |
 
 ## The UNO R4 WiFi's USB port
 
@@ -100,9 +107,70 @@ upload, or the page's Restart button).
   reproduced the early stops; with the fix the same simulations reached Kp 108-193 where the betas had stopped at
   40-68.
 
+## A seat that sinks under its own weight
+
+On the rig the left front corner sank with no drive at all and took PWM 68 to lift; the right one needed about 50
+to move either way and stayed put when switched off. Most likely more weight on the left (a flight stick on that
+side) and more friction in the right gearbox. Auto-tune has to cope with both kinds of corner.
+
+- **"The easier way" can be gravity.** When a seat moves one way with no drive, that direction's minimum drive says
+  nothing about the motor's friction. PWMmin taken from it (0) left Kp to lift the whole seat: the corner hung 42-55
+  counts low and the sweep read that as overshoot. 2.9.1 takes PWMmin from what moving against the load takes
+  (80% of it) - the value the owner had found by hand.
+- **A safety watch has to know the load.** "Pushed one way, moved the other" is a wiring fault only when the drive
+  was enough to win. A seat sinking under a weak drive is the load winning; the test for a motor wired backwards
+  stays "the wrong way both ways".
+- **Never leave a test setting behind.** The minimum-drive step creeps the motor at Kp 20; that Kp was still in force
+  while it moved back to centre, and it couldn't hold the seat.
+- **Physics can check an answer.** A seat that sinks by itself sinks down. When the full check's answer says those
+  numbers are "up", the answer is probably wrong - auto-tune now says so and uses the other way for its run.
+- **The simulator agreed with the first fix; the rig didn't.** With PWMmin 0 the simulator tuned fine at Kp 700-1200;
+  the rig overshot going down at Kp 149, which its simple sag model has no inertia for. The settings that already
+  worked by hand pointed at the better fix.
+
+## Seeing what the motor really gets
+
+- **The PID output is not the drive.** Inside the dead zone the bridge brakes the motor; outside it PWMmin is added
+  and PWMmax caps it. An outside review proposed firmware instrumentation (a 1 kHz trace) to show what the motor gets;
+  the 100 Hz telemetry already carried everything needed - the goal, the feedback and the PID output, in the units
+  the firmware uses - and the page now works it out exactly. Check what the data you have can answer before adding
+  firmware.
+- **The board already kept the raw picture.** Its diagnostics frame holds the lowest and highest raw reading and the
+  biggest change between two readings since the last time it was asked. Folding every frame in gives the raw 4 kHz
+  view of any stretch of time (the Sensor check's 10 s), with no new firmware.
+- **Say where a number comes from.** The noise in the telemetry is the feedback after the glitch filter, at 100 Hz -
+  not the raw sensor. Every number in the Sensor check says which it is.
+- **A full counter counts nothing.** A 16-bit count stops at 65,535; after that a difference of 0 means "unknown",
+  not "none".
+- **Compare conditions, not numbers.** The same noise measured with the motor power off (A), on but not driving (B)
+  and holding (C) says where it comes from; one number can't.
+- **A filter on the signal can't fix what all the sensors share.** On the rig all three motors showed raw jumps of
+  30-35 counts between readings a quarter of a millisecond apart, with or without the RC filter (1 kΩ + 100 nF, about
+  1.6 kHz). That points at what they have in common - their 5 V and ground, and the motor supply - not at one sensor.
+
+## Contactless sensors
+
+- **Advice has to fit the hardware.** "The wiper is losing contact" is wrong for a contactless Hall-effect sensor,
+  which has none. The page now asks (Settings, Position sensors) instead of assuming a pot.
+- **Know the sensor's output range.** A TT Electronics 6127 with output code V1 puts out 0.2-4.8 V (about 41-983
+  counts) over its electrical angle (180° for the A180), drives a load of 1 kΩ or more, and turns all the way round
+  mechanically. A reading outside that range is a wiring or sensor fault, not a position.
+
+## Test signals and test moves
+
+- **Never start a wave from a free-running clock.** The test signal's phase was the time since the page started, so a
+  wave began wherever its cycle happened to be. Count the cycle from 0, fade in from where each motor is, fade back to
+  the centre on Stop, and slide to a new amplitude or offset.
+- **Don't slam full power on just to measure top speed.** An eased ramp faster than the motor can follow measures the
+  same speed (481 / 420 counts/s against 486 / 425 with the jump, on the same simulated rig) without the jolt.
+- **Test a generator against a recording fake, not telemetry.** The telemetry arrives in bursts, so the steps between
+  readings say more about the WiFi than about the generator. A fake board that records every command with its time
+  showed the old start (154 counts) and the new one (0) plainly.
+
 ## Version numbers
 
-- **Decide how betas sort before the first one ships:** 2.9b1 < 2.9b7 < 2.9 < 2.9.1.
+- **Decide how betas sort before the first one ships:** 2.9b1 < 2.9b7 < 2.9 < 2.9.1b1 < 2.9.1b4 < 2.9.1, and
+  2.0 < 2.1b1 < 2.1 < 2.1.1 for the firmware (tested in Python and in the page's JavaScript).
 - **Pad before adding a mark.** The betas' key dropped trailing zeros and then added the beta/release mark, so
   2.0 became (2, 1) and sorted above 2.0.1 (2, 0, 1, 1). A 2.0 board would never have been offered 2.0.1. 2.9 pads
   every version to four numbers first.
@@ -126,6 +194,12 @@ upload, or the page's Restart button).
   (`docker logs`) that told what the chip did after a restart, which the simulator never could.
 - **The rig has the last word.** The simulator can't reproduce the USB chip; each fix of the cable link went to the
   rig as a beta before it was called done.
+- **One name, one function.** The page is a single file of JavaScript; a new `saveSensor()` for the position sensors
+  was silently replaced by the motion sensor's function of the same name, and the setting did nothing. Search for a
+  name before adding it.
+- **The Arduino IDE adds its own prototypes.** It declares every function before the first one, so a parameter whose
+  type is declared further down fails there and nowhere else ("cannot be used as a function"). The firmware's games
+  use plain arrays as parameters; the PC check mimics the IDE's step.
 - **Betas stay off GitHub.** Each beta was a package for the rig with every file name versioned (`smc3_scope_v2.9b7.py`,
   `SMC3_R4_v2.0b2.ino`), never changed once delivered. The release is the last beta with its version numbers and
   texts promoted, plus the fixes an audit of every version reference turned up.
