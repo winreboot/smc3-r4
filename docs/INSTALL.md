@@ -39,7 +39,7 @@ You can also skip the address: the page's **Settings, Find board on network** lo
    opens, type (use the name of the file you downloaded):
 
    ```bat
-   py smc3_scope_v2.9.2.py --bind 0.0.0.0 --web 8198 --host 192.168.1.50
+   py smc3_scope_v2.9.3.py --bind 0.0.0.0 --web 8198 --host 192.168.1.50
    ```
 
    `--host` is your board's address (you can leave it out and set it in the page). Keep this window open: closing
@@ -57,7 +57,7 @@ Settings, profiles, backups and diagnostics are kept in the folder `smc3-scope-d
 ```bat
 @echo off
 cd /d "%~dp0"
-start "smc3-scope" /min py smc3_scope_v2.9.2.py --bind 0.0.0.0 --web 8198
+start "smc3-scope" /min py smc3_scope_v2.9.3.py --bind 0.0.0.0 --web 8198
 ```
 
 press Win+R, type `shell:startup`, Enter, and put a shortcut to `smc3-scope.bat` in the folder that opens.
@@ -77,8 +77,8 @@ in the `.bat` too). Your settings stay - they're in `smc3-scope-data`.
 
    ```sh
    mkdir -p ~/smc3-scope && cd ~/smc3-scope
-   curl -LO https://github.com/winreboot/smc3-r4/releases/latest/download/smc3_scope_v2.9.2.py
-   python3 smc3_scope_v2.9.2.py --bind 0.0.0.0 --web 8198 --host 192.168.1.50
+   curl -LO https://github.com/winreboot/smc3-r4/releases/latest/download/smc3_scope_v2.9.3.py
+   python3 smc3_scope_v2.9.3.py --bind 0.0.0.0 --web 8198 --host 192.168.1.50
    ```
 
 3. **Open** `http://<this computer's address>:8198` (or <http://localhost:8198> on the same machine). A Mac asks
@@ -96,7 +96,7 @@ Wants=network-online.target
 [Service]
 User=pi
 WorkingDirectory=/home/pi/smc3-scope
-ExecStart=/usr/bin/python3 /home/pi/smc3-scope/smc3_scope_v2.9.2.py --bind 0.0.0.0 --web 8198
+ExecStart=/usr/bin/python3 /home/pi/smc3-scope/smc3_scope_v2.9.3.py --bind 0.0.0.0 --web 8198
 Restart=always
 RestartSec=5
 
@@ -322,7 +322,7 @@ The page can be anywhere on your network (the NAS, a Raspberry Pi): only the bri
 with PowerShell - it asks for the page's address). On macOS and Linux, or Windows with Python and pyserial, the page
 file is the bridge too:
 
-    python3 smc3_scope_v2.9.2.py --usb-bridge /dev/ttyACM0 --page http://192.168.1.20:8198
+    python3 smc3_scope_v2.9.3.py --usb-bridge /dev/ttyACM0 --page http://192.168.1.20:8198
 
 **Settings, USB cable** can also turn bridges away (WiFi only). Firmware updates from the page still go over WiFi.
 

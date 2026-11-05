@@ -3,6 +3,64 @@
 `smc3_scope` (the page) and `SMC3_R4` (the firmware) are versioned separately. The page works with older
 firmware too; the notes say which firmware a feature needs.
 
+## Page 2.9.3, firmware 2.1.1
+
+Tested on a rig as six page betas and five firmware betas; all of them are in this release. Page 2.9.3 works with
+older firmware too - park then stays inside the travel window, and the Motion sensor check has fewer details.
+
+- **Park.** A small **(P)** at the top right of Quick Controls lowers the seat evenly to its park position - every
+  motor arriving at the same time, 60 counts/s for the one with the furthest to go - and switches the motors off there,
+  so no corner sinks on its own while friction holds the other. Lit when parked; pressed again (or Enable Motors), the
+  seat rises evenly back to level and SimHub has it; while it pulses, pressing it stops. After each park the page
+  checks that every motor got there, that nothing moved once the motors were off and, with the motion sensor, that the
+  seat sits at the angles saved with the park position. Needs firmware 1.9 or newer.
+- **Park position** card in Seat Setup and in Settings: **Set the park position** (the page takes the seat; **Lower
+  the lifts 10 / 2**, **Raise 10**, ▼ ▲ per motor, **Level side to side** with the sensor), **Save this as the park
+  position** (the positions and the seat's angles), **Park here now** or **Back up (cancel)**; or type the positions,
+  set the speed, or go back to the default (the low end of each lift's travel window, the rear centred). "Down" is the
+  way each corner sinks.
+- **Park mode** (firmware 2.1.1, `[kP mask]`): while the page parks the seat or sets the park position, those motors
+  may go past their travel limits, Clip window and end stops - anywhere inside the SMC3 cutoff, 8 counts in from it.
+  SMC3's PWMrev push is left out and the tilt limits wait. It lapses 3 s after the page's last refresh; the
+  diagnostics frame's seat flags say when it is on (bit 5).
+- **Motion presets in the 3D view.** A panel at the top of the 3D view moves the real seat while you watch it:
+  **Wave**, **Twist**, **Heave**, **Corner** (until Stop), **Landing** (an airliner's approach, crosswind, flare,
+  touchdown, rollout and braking, 30 s) and **Driving** (a lap with a launch, a hairpin over a kerb, esses, a bumpy
+  straight and a sweeper where the rear steps out, 36 s). **Intensity** 10-100% of each motor's room around level,
+  **Speed** 0.5-2×, **Stop** (holds), **Return to level**, **Resume SimHub**. Each starts from where the seat is,
+  eases in, and no motor moves faster than 1500 counts/s.
+- **Centre the pots** (Seat Setup, with the motion sensor): click the bubble in *Seat now*, or the button. The page
+  levels the seat and shows each motor's level reading on a dial against 512, with its travel each way. Switch a
+  motor off, move its pot's belt one tooth, switch it on: the page works out the new level reading from the sensor
+  and says right way or wrong way, and how many teeth are left - it learns the counts per tooth from the first move.
+  The rear slide gets **Centre is here** and its centre from the sensor's yaw. **Finish** carries on with Seat setup
+  from levelling if a belt moved.
+- **Start over** at the top right of Seat setup: takes the set-up off the board (the tilt limits stay), switches every
+  motor on, waits until each is back, and opens Seat setup at its first step.
+- **End stops past where the seat rests.** The page notes where each motor rests with the motors off; the limits step
+  puts the end stop on that side 25 counts past it (or at the SMC3 cutoff) and says so.
+- **Quick Controls says when Seat setup is open**, with Open Seat setup and Cancel Seat setup. Seat setup left open
+  15 minutes with nothing done gives the seat back to SimHub.
+- **A motor that rests past its end stop comes back** (firmware 2.1.1). At power-up and Enable Motors it creeps back,
+  also with the soft start off (at 60 counts/s); its end stop counts again once it is 16 counts back inside (or after
+  40 s), and until then only a move 24 counts further out than where it started, lasting 25 ms, switches it off - a
+  pot glitch doesn't. While a motor comes back (creeping, from past an end stop, or parked and unparked by the page)
+  and lags its goal by more than 16 counts, its drive may go up to PWMrev, at full power: a heavy corner gets back up
+  from where it sank. A motor that keeps up never gets more than before.
+- **Motion sensor check** (Diagnostics, and **Check (20 s)** in the Motion sensor card): 20 s of the link, nothing
+  moves - a strip (green: angles, amber: looking, labelled with the baud rate tried), every gap and where the sensor
+  was found again, packets and bad checksums per second, angles only or with gyro and acceleration, noise and drift at
+  rest, a report and a CSV. Firmware 2.1.1 adds the board's own view (`[rdj]` → "SM3I"): bytes at any rate, times
+  lost, baud changes, packet types and the set-up's result.
+- **The Motion sensor card's status is one steady line** (Receiving / Looking for the sensor: trying 57600 baud…),
+  red only after 25 s with nothing. **Set up the sensor** goes out only while the board receives the sensor and then
+  says what took. Firmware 2.1.1 keeps the sensor all the time while Use the sensor is ticked, and sends the set-up
+  only to a sensor it receives.
+- **Diagnostics** name a motor that rests past its end stop or past its safety cutoff with the motors off, and a
+  contactless sensor that reaches the end of its output (a TT 6127 puts out about 41-982 counts). The file's `rig`
+  has `rest_with_motors_off`; a Motion sensor check's file has `imu_check`.
+- Firmware 2.1.1's `FW_CAPS` adds `imuinfo1`, `park1` and `recover1`; `[rd!]` still answers 21.
+
 ## Page 2.9.2
 
 Page only; firmware 2.1 stays. From a technical review of 2.9.1 (its four smallest, surest points - the rest is

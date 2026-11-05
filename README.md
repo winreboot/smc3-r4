@@ -26,7 +26,15 @@ The page lets you:
   **sensor check** that tells the sensor's own noise, the motor supply's and the drive's apart;
 - let the LED matrix **play a little game while the rig is idle** (ping pong, brick breaker, missile defense, snake,
   meteor dodge);
-- **restart the board** from the page - never while SimHub is driving.
+- **restart the board** from the page - never while SimHub is driving;
+- **park the seat** with the **(P)** in Quick Controls: it goes down evenly to a park position you set - past the
+  travel limits if it has to - and the motors switch off there, so no corner sinks on its own; it comes back up level
+  when you switch the motors on ([Park](#park));
+- **watch motion presets in the 3D view** - wave, twist, heave, corner, an airliner landing and a lap of a circuit -
+  while the real seat moves ([Motion presets](#motion-presets));
+- **centre the pots**: with the seat level, the page tells you which way to move each pot's belt, and how many
+  teeth, so every motor has the same travel up and down ([Centre the pots](#centre-the-pots));
+- **check the motion sensor's link** second by second, and **start Seat setup over** in one click.
 
 It knows two kinds of rig: **two front lifts plus a traction-loss motor** (motors 1 and 2 lift the front corners,
 motor 3 is mounted horizontally and swings the rear left and right about a pivot at the front - the default), and
@@ -45,7 +53,7 @@ can use the USB cable instead (page 2.8, firmware 1.9.5; 2.0 recommended - it gi
 
 | Folder | What it is |
 |---|---|
-| [`firmware/SMC3_R4`](firmware/SMC3_R4) | Firmware for the **Arduino UNO R4 WiFi**. It speaks the SMC3 v0.70 protocol, so SimHub, SimTools, FlyPT Mover and SMC3Utils work unchanged. It adds a 4 kHz control loop, 14-bit pot readings, quiet 25 kHz PWM, target smoothing, a fixed PID, WiFi telemetry at 100 samples a second, an LED matrix that shows live motor bars and problems in words, a level trim with travel limits and end stops for each motor, a soft start, firmware updates over WiFi from the page, its own USB port (2.0: no WiFi chip in between), games on the LED matrix while idle (2.1), and an optional WT901C motion sensor with tilt limits for each direction. |
+| [`firmware/SMC3_R4`](firmware/SMC3_R4) | Firmware for the **Arduino UNO R4 WiFi**. It speaks the SMC3 v0.70 protocol, so SimHub, SimTools, FlyPT Mover and SMC3Utils work unchanged. It adds a 4 kHz control loop, 14-bit pot readings, quiet 25 kHz PWM, target smoothing, a fixed PID, WiFi telemetry at 100 samples a second, an LED matrix that shows live motor bars and problems in words, a level trim with travel limits and end stops for each motor, a soft start, firmware updates over WiFi from the page, its own USB port (2.0: no WiFi chip in between), games on the LED matrix while idle (2.1), park mode (2.1.1), and an optional WT901C motion sensor with tilt limits for each direction. |
 | [`scope/`](scope) | `smc3_scope.py`: the page server. It's one file using only the Python standard library, with a Dockerfile and compose files for a NAS or any PC. A ready-made Docker image is on `ghcr.io/winreboot/smc3-scope`; step by step for Windows, Mac, Linux, Raspberry Pi, Docker and Synology: [docs/INSTALL.md](docs/INSTALL.md). |
 | [`tools/simboard.py`](tools/simboard.py) | A simulated rig. You can try everything without hardware, and inject faults (reversed motor, swapped wiring, glitchy pot and more). |
 | [`firmware/SMC3_smooth`](firmware/SMC3_smooth) | The original SMC3 for the **UNO R3**, with target smoothing and the PID fixes, for anyone staying on an R3. |
@@ -139,6 +147,39 @@ looks at the mechanics from low down at the back); it also goes full screen. The
 |---|---|
 | ![](docs/img/view3d-rig.png) | ![](docs/img/view3d-side.png) |
 
+#### Motion presets
+
+Page 2.9.3. A panel at the top of the 3D view (at the bottom on a phone) moves the real seat by itself while you watch
+it in 3D:
+
+| Preset | What the seat does | How long |
+|---|---|---|
+| **Wave** | every motor in turn, a third of a cycle apart | until Stop |
+| **Twist** | the front lifts opposite each other: the seat rolls left and right | until Stop |
+| **Heave** | the lifts together, up and down | until Stop |
+| **Corner** | the seat rolls and the rear slides out with it: a left-hander, then a right-hander | until Stop |
+| **Landing** | an airliner: approach in light turbulence, a crosswind (banking and crabbing), the flare, touchdown with a rebound, the nose wheel, rollout rumble, braking, taxi | 30 s |
+| **Driving** | a lap: launch and gear shifts, braking, a left hairpin over a kerb, esses, a bumpy straight, a right sweeper where the rear steps out and is caught | 36 s |
+
+![Motion presets: Corner at 70% in a left-hander - the seat rolls 5° and the rear slides out](docs/img/motion-presets_v2.9.3.jpg)
+
+To try them:
+
+1. Seat empty, open **3D View**.
+2. Set **Intensity** to 20-30% the first time, then press a preset - **Heave** is the gentlest start. Confirm once: the
+   page takes the seat from SimHub, as Return to center does.
+3. Raise **Intensity** while it runs (up to 100%: how much of each motor's room around level a preset may use - the
+   room is the distance to the nearer end of its Clip window or travel limits). **Speed** (0.5-2×) sets how fast Wave,
+   Twist, Heave and Corner go; Landing and Driving play at their own pace. The line under the buttons says what is
+   happening (*Left hairpin*, *Flare*, *Touchdown* ...).
+4. **Stop** holds the seat where it is. **Return to level** glides it back to level. **Resume SimHub** gives the
+   seat back to SimHub.
+
+Every preset starts from where the seat is and eases in over about a second, no motor moves faster than 1500 counts/s,
+and each motor moves around its level - SimHub's centre, so your Seat setup's level. Landing and Driving glide back to
+level when they end. A motor that switches off stops the preset and the others hold; auto-tune, the full check, Seat
+setup and a page update stop it too, and Seat setup, the test signal and the USB cable wait while one runs.
+
 ### Seat setup
 
 **Level first, then the limits.** Seat setup (firmware 1.9) does in a couple of minutes what used to take an
@@ -166,6 +207,117 @@ everything back. Auto-tune, the test signal and the full check stay inside the t
 | Level | Limits | Saved |
 |---|---|---|
 | ![](docs/img/seat-setup-level.png) | ![](docs/img/seat-setup-limits.png) | ![](docs/img/seat-setup-done.png) |
+
+**Start over** (page 2.9.3) sits at the top right of the Seat setup card, always there. One click and one
+confirmation: it takes the set-up off the board (level trim, travel limits and end stops; the tilt limits stay),
+switches every motor on - each creeps back to its position - and opens Seat setup at its first step once every motor
+is back. Next to Start seat setup, **Centre the pots** starts the pot centring below.
+
+![Seat setup: Start over at the top right, Centre the pots next to Start seat setup](docs/img/seat-start_v2.9.3.png)
+
+**End stops past where the seat rests** (page 2.9.3). With the motors off, the seat's weight may take a corner further
+than it ever goes while driving. The page notes where each motor rests with the motors off, and the limits step puts
+the end stop on that side 25 counts past it (or at the SMC3 cutoff, if that is nearer) and says so under the table,
+so that corner can always be switched on again.
+
+**Seat setup is open** (page 2.9.3): whenever it is, Quick Controls says so - SimHub's positions are ignored, and
+Return to center, the USB cable and the full check wait - with **Open Seat setup** and **Cancel Seat setup** right
+there. Left open for 15 minutes with nothing done, it gives the seat back to SimHub by itself.
+
+<img src="docs/img/seat-open-quick_v2.9.3.png" width="300" alt="Quick Controls: Seat setup is open, with Open Seat setup and Cancel Seat setup">
+
+#### Centre the pots
+
+Page 2.9.3, with the motion sensor. With the seat level, every motor should read **512** - the middle of its pot - so
+SimHub has the same travel up and down from level. A level trim moves SimHub's centre but not the Clip window: a motor
+that is level at 587 has 75 counts less travel one way than the other. The cure is mechanical - move the pot's belt a
+tooth - and the page tells you which way and how many teeth.
+
+Step by step:
+
+1. Open **Seat Setup**. Under *Seat now*, click the **bubble** (it says *Click the bubble to centre the pots* when a
+   motor is off centre), or press **Centre the pots**.
+
+<img src="docs/img/seat-bubble_v2.9.3.png" width="320" alt="Seat now: Click the bubble to centre the pots">
+
+2. The page levels the seat with the sensor (about 15 s) and shows a row per motor: a **dial** with how far its level
+   reading is from 512 (green: close enough), its travel from level each way, and what to do.
+
+![Centre the pots: a dial per motor with how far its level reading is from 512](docs/img/pots-centre_v2.9.3.png)
+
+3. Pick a motor whose dial isn't green and press **Switch motor N off**.
+4. Move that pot's belt **one tooth** on the pot's pulley - either way. Keep your hands clear of the rest of the rig.
+5. Press **Switch motor N on**. The motor creeps back to its old reading, so the seat now sits a little off level.
+   From the sensor the page works out the motor's new level reading and says **Right way** (with how many teeth are
+   left) or **Wrong way** (go the other way). From your first tooth it learns how many counts a tooth is, and uses it
+   for the other motors too.
+
+![After one tooth on the Left motor's belt: Right way, one tooth more the same way](docs/img/pots-after_v2.9.3.png)
+
+6. Repeat, one tooth at a time, until the dial is green. **Level again** re-levels the seat whenever you like.
+7. The rear slide (traction loss) has no level, only a centre: the seat pointing straight ahead. The page starts from
+   where SimHub's centre had it - check by eye, and if the seat isn't straight, centre it with **−10 −1 +1 +10** and
+   press **Centre is here**. After a tooth on its belt, the page works out the new centre from the sensor's yaw.
+8. Press **Finish**. If a belt moved, the old set-up no longer fits: it comes off the board and Seat setup carries on
+   from levelling - run **Level automatically**, then find the travel and save. If nothing moved, the old set-up comes
+   back. Nothing is saved before you finish.
+
+### Park
+
+Page 2.9.3, firmware 1.9 or newer; firmware 2.1.1 lets the park position go past the travel limits. With the motors
+off, a heavy corner can sink while friction holds the other, and the seat sits twisted until the next start. **Park**
+lowers the seat evenly first - every motor arriving at its park position at the same time - and switches the motors
+off there, where nothing sinks any further.
+
+<img src="docs/img/park-quick_v2.9.3.png" width="560" alt="Quick Controls: the (P) at the top right, and lit when parked">
+
+**The (P) in Quick Controls** (top right of the card):
+
+- **Press it to park.** It asks first, then the seat goes down evenly at 60 counts/s (for the motor with the furthest to
+  go) and the motors switch off. SimHub waits meanwhile.
+- **Lit** means parked.
+- **Press it again, or Enable Motors, to unpark.** The seat rises evenly back to level, the same way it went down, and
+  then SimHub has it. If a motor can't get back up, the page says which one and where it stopped, and switches the
+  motors off again.
+- **While it pulses** (parking or unparking), pressing it stops: the motors switch off where the seat is.
+
+**After every park the page checks** that each motor got to its park position (or rests against its stop short of
+it), that nothing moved after the motors switched off, and - with the motion sensor - that the seat sits at the same
+angles as when the park position was saved (if not, a pot or its belt may have moved). The message shows in the
+**Park position** card and as a pop-up.
+
+#### Calibrating the park position
+
+The **Park position** card is in **Seat Setup** and in **Settings**. Until you set one, the park position is the low
+end of each lift's travel window, with the rear slide centred. To set your own:
+
+1. Seat empty, motors on. Press **Set the park position**. The page takes the seat from SimHub, and each motor's row
+   gets arrows, the **Park at** position and where it is **Now**.
+2. Press **Lower the lifts 10** (or **Lower 2** for small steps) until the seat sits where it rests by itself when the
+   power is off: on its lowest point, its stops, or wherever it settles. "Down" is the way each corner sinks - from
+   the full check's answer, or else from where it rests with the motors off. **Raise 10** goes back up; the
+   **▼ ▲** arrows on a row move one motor on its own (the rear slide gets −10 −1 +1 +10).
+3. With the motion sensor, press **Level side to side**: it evens the seat out using how each lift tilts it (Seat
+   setup measured that). Press it again until the roll is close to 0.
+
+![Park position card while setting it: arrows per motor, Lower the lifts, Level side to side, Save](docs/img/park-setting_v2.9.3.png)
+
+4. Press **Save this as the park position**. The positions are kept, and with the sensor the seat's angles there.
+5. Press **Park here now** to try it, or **Back up (cancel)** to glide back to where the seat was and give it to
+   SimHub.
+6. Read the message after parking. *Nothing moved when the motors switched off* is what you want. If it says a corner
+   still moved, set the park position lower on that corner (its ▼ arrow) and save again.
+
+![Park position card after parking: the saved position, and nothing moved when the motors switched off](docs/img/park-parked_v2.9.3.png)
+
+You can also type the positions into the **Park at** boxes and press **Save typed values**, change the **Speed**
+(10-300 counts/s), or press **Default** to forget your park position.
+
+**How far down:** with firmware 2.1.1 the board has a **park mode**: while the page parks the seat or you set the park
+position, those motors may go past their travel limits, Clip window and end stops - anywhere inside the SMC3 cutoff
+(Max limit). SMC3's PWMrev push back into the Clip window is left out and the tilt limits wait. Park mode lasts only
+while the page refreshes it every second, and lapses 3 s after the last refresh. With older firmware the park position
+stays inside the travel window, and unpark is Enable Motors: each motor creeps back up by itself.
 
 ### Tuning
 
@@ -341,6 +493,31 @@ acceleration arrive.
 
 ![LED matrix and motion sensor settings](docs/img/settings-board.png)
 
+Since page 2.9.3 the status is **one steady line**: *Receiving 100 angles/s at 115200 baud + gyro + acceleration*
+(amber, with what to do, if it dropped out in the last 2 minutes), or *Looking for the sensor: trying 57600 baud…*
+with when the angles last came - red only after 25 s with nothing. **Set up the sensor** goes out only while the board
+receives the sensor, then checks what took and says so (*Done: 100 angles/s at 115200 baud, with gyro and
+acceleration*, or which part didn't take). With firmware 2.1.1 the board also keeps the sensor all the time while
+**Use the sensor** is ticked.
+
+**Motion sensor check** (page 2.9.3): the **Check (20 s)** button, also in Diagnostics. Nothing moves. It records
+20 s of the link between the board and the sensor and shows it as a strip - green while angles arrive, amber while
+the board looks for the sensor, labelled with the baud rate it tries - with a report and a CSV download:
+
+- whether angles arrive all the time, and every gap: how soon the board switched rate after the last angles, and
+  where it found the sensor again;
+- packets and bad checksums per second, and whether the sensor sends angles only or gyro and acceleration too;
+- the noise and drift of its angles, acceleration and gyro at rest.
+
+It tells a wiring problem (nothing at all arrives) from a sensor at a baud rate the board doesn't try, and from a
+link that keeps dropping out. With firmware 2.1.1 the board adds its own counts (`[rdj]`): bytes received at any
+rate, times it lost the sensor, baud changes and the packet types - so even a silent sensor and garbage on D0 are
+told apart.
+
+<img src="docs/img/sensor-card_v2.9.3.png" width="620" alt="Motion sensor card: receiving 100 angles/s at 115200 baud with gyro and acceleration, and the Check (20 s) button">
+
+<img src="docs/img/sensor-link-check_v2.9.3.png" width="740" alt="Motion sensor check: received all the time, the link strip green for the whole 20 s, Download recording (CSV)">
+
 **Firmware update** (firmware 1.9.2): install new firmware over WiFi - no USB cable, and SimHub can stay open.
 
 1. In the Arduino IDE, open the new `SMC3_R4.ino` and choose **Sketch, Export Compiled Binary**. The WiFi name and
@@ -479,6 +656,11 @@ check is saved, the recording also as CSV.
 
 ![Sensor check: motor 1 quiet with the motor power off, noisy with it on - the A, B and C checks side by side, with what each condition adds](docs/img/sensor-check_v2.9.2.png)
 
+**Motion sensor check** (page 2.9.3): 20 s of the sensor link, nothing moves - see
+[Settings and motor names](#settings-and-motor-names). The quick and full checks also say (page 2.9.3) when a motor
+rests past its end stop or past its safety cutoff with the motors off, and when a contactless sensor reaches the end of
+its output.
+
 See [docs/DIAGNOSTICS.md](docs/DIAGNOSTICS.md) for every check and the file format, and
 [docs/examples/diagnostics-full-check.json](docs/examples/diagnostics-full-check.json) for a real file from the
 simulated rig with a reversed motor, a glitchy pot and play in a linkage.
@@ -598,7 +780,7 @@ board on network**).
 [latest release](https://github.com/winreboot/smc3-r4/releases/latest) and run
 
 ```sh
-python3 smc3_scope_v2.9.2.py --host 192.168.1.50 --bind 0.0.0.0 --web 8198
+python3 smc3_scope_v2.9.3.py --host 192.168.1.50 --bind 0.0.0.0 --web 8198
 ```
 
 (`py` instead of `python3` on Windows). `--bind 0.0.0.0` makes the page reachable from other devices; without it,
@@ -619,6 +801,10 @@ wrong way in a slide (in a right-hand slide it should swing out to the left), ti
 Open **Seat Setup**: level the platform (by itself with the motion sensor), centre the rear slide if you have
 traction loss, let each motor find its safe travel, and save. SimHub's centre is then the level seat, and the limits protect the rig whatever drives it.
 
+With the motion sensor, run [Centre the pots](#centre-the-pots) first: then every motor has the same travel up and
+down from level. Afterwards set the [park position](#calibrating-the-park-position), and park the seat with the
+**(P)** before you switch the rig off.
+
 ### 5. Tune
 
 Run **auto-tune** on each motor: seat empty first, with your weight entered. Then either **Check** with you in the
@@ -628,7 +814,9 @@ top of the page to USB (page 2.9; firmware 2.0 recommended).
 
 **Soft start** (firmware 1.9.1): after the rig has been off the seat may have ridden down a little. At power-up, and
 when you press Enable Motors, each motor creeps back to its position instead of jumping there, then runs normally.
-The speed (60 counts/s by default, or off) is under Settings, Loop, PWM & smoothing. Then
+The speed (60 counts/s by default, or off) is under Settings, Loop, PWM & smoothing. With firmware 2.1.1 a motor that
+rests past its end stop creeps back too (at 60 counts/s even with the soft start off), with up to PWMrev's drive while it
+lags behind. Then
 try the **recommendations** for the sims you play and save them as profiles.
 
 ## Try it without a rig
@@ -671,6 +859,11 @@ noise. To see what the diagnostics find, add a fault:
 | `--usb-stall 30` | the WiFi chip's USB stall: 30 s after the cable link starts nothing comes back until the port re-enumerates |
 | `--pot-crackle 2:3` | motor 2's pot crackles about 3 times a second (bursts the glitch filter can't catch) |
 | `--supply-sag 2.5` | a weak shared motor supply: every motor gets less drive when they all pull at once |
+| `--fw211` | firmware 2.1.1: park mode, coming back up from past an end stop, the board's sensor link report |
+| `--pot-offset 1:-60` | motor 1's pot belt sits 60 counts round (for Centre the pots); `--tooth 37`: counts per belt tooth |
+| `--lift-hard 2:140:0.35` | lifting motor 2 needs more drive past pot 140 (the sunk end of a `--sag` lift: a corner PWMmax alone can't lift) |
+| `--imu-baud 9600` / `--imu-angles-only` | the sensor's baud rate at start / it sends angles only |
+| `--imu-race` | firmware 2.1's sensor timing: the board loses the sensor every few seconds while it is switched on |
 
 ## Compatibility
 
@@ -693,6 +886,9 @@ noise. To see what the diagnostics find, add a fault:
   - 2.0: its own USB port - the main chip has the USB connector, so the WiFi chip's USB stall and lost bytes are
     gone; the page's Restart button; nothing restarts the board or its chips while SimHub sends positions.
   - 2.1: games on the LED matrix while idle.
+  - 2.1.1: park mode - the page may take the seat past the travel limits to park it; a motor that rests past its end
+    stop comes back up when the motors are switched on (also with the soft start off), with up to PWMrev's drive while
+    it lags; the board keeps the motion sensor while Use the sensor is ticked, and reports its link (`[rdj]`).
 
   See the [CHANGELOG](CHANGELOG.md).
 - New commands are documented in [docs/PROTOCOL.md](docs/PROTOCOL.md). They go over WiFi; USB stays plain SMC3

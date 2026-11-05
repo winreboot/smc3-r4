@@ -41,9 +41,28 @@
 // Pots: wiper must stay within 0-5 V (the R4 is a 5 V board, so existing wiring is fine).
 //****************************************************************************************************************
 
-#define FW_VERSION     "2.1"           // shown in the USB boot banner; [ver] still answers 70 for SMC3Utils
+#define FW_VERSION     "2.1.1"         // shown in the USB boot banner; [ver] still answers 70 for SMC3Utils
 #define FW_VERSION_NUM 21              // reported by [rd!] so smc3_scope can check what it is talking to (1.9.x = 19, 2.0 = 20, 2.1 = 21)
-#define FW_CAPS        "SMC3CAPS:ota1,wifimem1,usbpage1,modreset2,nativeusb1,reboot1,idleanim1"   // 1.9.2: what this build can do - smc3_scope looks for it in a .bin
+#define FW_CAPS        "SMC3CAPS:ota1,wifimem1,usbpage1,modreset2,nativeusb1,reboot1,idleanim1,imuinfo1,park1,recover1"   // 1.9.2: what this build can do - smc3_scope looks for it in a .bin
+
+// v2.1.1: park, a motor comes back up from wherever it rests, and the motion sensor stays found.
+//                Park ([kP mask], refreshed by the page, lapses 3 s after the last one): the motors in mask may go
+//                anywhere inside the SMC3 cutoff (8 counts in from it) - past their Clip window, travel limits and
+//                end stops - only the cutoff switches them off, SMC3's PWMrev push is left out and the tilt limits
+//                wait; the page lowers the seat evenly to its park position and switches the motors off there.  The
+//                diagnostics frame's seat flags say when park mode is on (bit 5).  Coming back: Enable Motors (and
+//                power-up) lets a motor that rests past an end stop creep back (also with the soft start off, at
+//                60 counts/s); its end stop counts again once it is 16 counts back inside (or after 40 s), and until
+//                then only a move 24 counts further out than where it started, for 25 ms, switches it off (a pot
+//                glitch doesn't).  While a motor creeps back, isn't back from past an end stop yet, or the page
+//                parks / unparks it, and it lags its goal by more than 16 counts, its drive may go up to PWMrev (and
+//                PWMrev pushes it in from outside the Clip window once its goal is 16 counts inside), at full power.
+//                The motion sensor: the time since its last packet is a signed number (a packet stamped a
+//                millisecond after "now" no longer looks 49 days old and lost); Set up the sensor ([iS]) goes only
+//                to a sensor the board receives and sends the output and rate again at the new baud rate; [rdj]
+//                answers an "SM3I" frame for smc3_scope's Motion sensor check (the baud rate tried and found, bytes at
+//                any rate, times lost, baud changes, packet types, the set-up's result).  FW_CAPS says "imuinfo1",
+//                "park1", "recover1"; [rd!] still answers 21.
 
 // v2.1: idle animations - tested on a rig as 2.1b1, nothing else changed since.  While idle (no position commands
 //                for 20 s) the matrix can play one of five small games instead of the oscilloscope trace: ping pong,
@@ -454,6 +473,12 @@ uint16_t          SoftEaseCycles = 2400;                       // PID cycles to 
 volatile uint8_t  SoftStart[NUM_MOTORS] = {0, 0, 0};           // 1 = still creeping towards its target
 volatile uint16_t SoftTicks[NUM_MOTORS] = {0, 0, 0};           // PID cycles since it started creeping
 volatile int      SoftOutQ[NUM_MOTORS]  = {0, 0, 0};           // how far past an end stop it is, Q4 (0 = inside)
+long              SoftOutStepQ12 = 0;                          // 2.1.1: creeping back from outside with soft start off
+#define SOFT_OUT_RATE 60                                       // ... counts/s
+#define SOFT_OUT_MARGIN 24                                     // 2.1.1: counts further out than it started = going away
+#define SOFT_OUT_MS 25                                         // 2.1.1: ... for this long (a glitch is shorter)
+uint8_t           SoftBad[NUM_MOTORS]   = {0, 0, 0};           // 2.1.1: PID cycles in a row it was too far out (ISR)
+volatile uint8_t  OutBack[NUM_MOTORS]   = {0, 0, 0};           // 2.1.1: switched on from past an end stop, not back yet
 unsigned long     SoftSince[NUM_MOTORS] = {0, 0, 0};           // millis() when it started (gives up after 40 s)
 #define SOFT_MAX_MS  40000UL
 #define SOFT_EE      105                                       // EEPROM 105 = 0xB5 "valid", 106-107 = speed
@@ -668,6 +693,14 @@ unsigned long ImuRateSince = 0;
 uint8_t       ImuBaudIdx = 0;                 // index into ImuBauds[]
 unsigned long ImuBaudSince = 0;               // when that baud rate was set
 unsigned long ImuScanUntil = 0;               // keep looking for the sensor until then even if it is not switched on
+// 2.1.1: what the sensor link did - for smc3_scope's Motion sensor check ([rdj], "SM3I")
+uint32_t      ImuRxBytes = 0;                 // bytes that arrived on D0 since power-up, at any baud rate
+uint16_t      ImuLockLosses = 0;              // times the board lost a sensor it had found (it then looks again)
+uint16_t      ImuScanSteps = 0;               // baud rate changes while looking
+uint16_t      ImuTypesSeen = 0;               // packet types with a good checksum since the last [rdj] (bit n = 0x50 + n)
+uint8_t       ImuLockedIdx = 255;             // the baud rate it last found the sensor at (255 = not yet)
+unsigned long ImuLockedSince = 0;             // when it found it (0 = not found now)
+uint8_t       ImuSetupState = 0;              // [iS]: 0 never, 1 sending, 2 refused (sensor not found), 3 sent
 uint8_t       TiltHits = 0;
 uint16_t      TiltTrips = 0;
 unsigned long TiltGraceUntil = 0;             // no tilt check for a moment after the motors are enabled
@@ -698,6 +731,9 @@ volatile int  TargetHi[NUM_MOTORS] = {923, 923, 923};
 volatile int  CutLo[NUM_MOTORS]    = {23, 23, 23};       // in force: the SMC3 cutoff and the end stops together (ISR)
 volatile int  CutHi[NUM_MOTORS]    = {1000, 1000, 1000};
 int16_t       ValueReg = 0;                              // [w hi lo]
+volatile uint8_t ParkMask = 0;                           // 2.1.1 [kP mask]: motors the page may take past their limits
+unsigned long ParkUntil = 0;                             // ... until then (refreshed by the page)
+#define PARK_MARGIN 8                                    // park targets stay this far inside the SMC3 cutoff
 bool          PageHold = false;                          // [kH n]: SimHub's position commands wait ...
 unsigned long PageHoldUntil = 0;                         // ... until then
 uint32_t      UsbHeldFrames = 0;                         // ... and how many were ignored
@@ -706,7 +742,7 @@ uint32_t      UsbHeldFrames = 0;                         // ... and how many wer
 const uint32_t ImuBauds[] = {9600, 115200, 230400, 57600, 38400, 19200, 4800};
 #define IMU_NBAUDS 7
 #define IMU_FAST_BAUD_IDX 1                   // 115200
-uint8_t       ImuCmd[10][5];                  // sensor set-up commands waiting to be sent, 120 ms apart
+uint8_t       ImuCmd[12][5];                  // sensor set-up commands waiting to be sent, 120 ms apart
 uint8_t       ImuCmdN = 0, ImuCmdPos = 0;
 int8_t        ImuCmdBaudSwitchAt = -1;        // switch our own baud rate before sending this command
 unsigned long ImuCmdLast = 0;
@@ -802,13 +838,20 @@ void UpdateSmoothingRate()
     q = ((long)SoftRate * 4096L / PID_RATE_HZ) * PIDProcessDivider;    // 1.9.1: soft start
     if (SoftRate > 0 && q < 1) { q = 1; }
     SoftStepQ12 = q;
+    q = ((long)SOFT_OUT_RATE * 4096L / PID_RATE_HZ) * PIDProcessDivider;   // 2.1.1: from outside, soft start off
+    SoftOutStepQ12 = q < 1 ? 1 : q;
     long e = (long)PID_RATE_HZ * 6 / 10 / (PIDProcessDivider > 0 ? PIDProcessDivider : 1);
     SoftEaseCycles = (uint16_t)(e < 1 ? 1 : (e > 60000 ? 60000 : e));
 }
 
+static inline bool Creeping(uint8_t m)          // 2.1.1: creeping to its target, or not back from past an end stop yet
+{
+    return (SoftStart[m] || OutBack[m]) && Disable[m] == 0;
+}
+
 bool AnySoftStart()                             // 1.9.1: is any switched-on motor still creeping to its target?
 {
-    for (uint8_t m = 0; m < NUM_MOTORS; m++) { if (SoftStart[m] && Disable[m] == 0) { return true; } }
+    for (uint8_t m = 0; m < NUM_MOTORS; m++) { if (Creeping(m)) { return true; } }
     return false;
 }
 
@@ -840,6 +883,8 @@ void SoftStartFrom(uint8_t m)        // 1.9.1: creep from where the motor is now
     int fb = Feedback_q[m];
     int lo = CutLo[m] << POS_SHIFT, hi = CutHi[m] << POS_SHIFT;
     SoftOutQ[m] = (fb < lo) ? (lo - fb) : ((fb > hi) ? (fb - hi) : 0);
+    OutBack[m] = SoftOutQ[m] > 0 ? 1 : 0;        // 2.1.1: the end-stop exemption, apart from the creep
+    SoftBad[m] = 0;
     SoftTicks[m] = 0;
     SoftStart[m] = 1;
     GoalAcc[m] = (long)fb << 8;                  // Q4 -> Q12: the goal starts exactly where the motor is
@@ -854,7 +899,15 @@ void EnableMotor(uint8_t m)           // loop() only
 {
     if (UpdateRunning()) { return; }   // 1.9.2: not during a firmware update
     TiltGraceUntil = millis() + 1500;  // let the seat come back inside the tilt limit first
-    if (Disable[m] != 0 && SoftRate > 0) { SoftStartFrom(m); }   // 1.9.1: no jump - it creeps to its target
+    // 1.9.1: no jump - it creeps to its target.  2.1.1: from outside its end stops always, also with the soft start
+    // off (a corner that sank while the motors were off comes back slowly instead of being switched off again)
+    int fbe = Feedback_q[m];
+    bool outside = fbe > (CutHi[m] << POS_SHIFT) || fbe < (CutLo[m] << POS_SHIFT);
+    if (Disable[m] != 0)
+    {
+        if (SoftRate > 0 || outside) { SoftStartFrom(m); }
+        else { OutBack[m] = 0; SoftOutQ[m] = 0; }   // 2.1.1: nothing left over from an earlier time
+    }
     DisableReason[m] = DIS_ON;
     Disable[m] = 0;
 #ifdef MODE2
@@ -890,13 +943,14 @@ static inline int SmoothTarget(uint8_t m, int target10)
     if (SoftStart[m])                           // 1.9.1: creeping after power-up / Enable Motors
     {
         long ad = (diff < 0) ? -diff : diff;
-        if (ad <= (2L << 12) || SoftStepQ12 <= 0)
+        long ss = (SoftStepQ12 > 0) ? SoftStepQ12 : SoftOutStepQ12;   // 2.1.1: from outside with soft start off
+        if (ad <= (2L << 12) || ss <= 0)
         {
-            SoftStart[m] = 0;                    // caught up: normal from now on
-        }
+            SoftStart[m] = 0;                    // caught up: normal from now on (2.1.1: OutBack keeps the end-stop
+        }                                        // exemption for a motor that is still outside - with PWMrev back)
         else
         {
-            long lim = SoftStepQ12;
+            long lim = ss;
             uint16_t t = SoftTicks[m];
             if (t < SoftEaseCycles)              // ease in: from standstill to full creeping speed in 0.6 s
             {
@@ -974,7 +1028,19 @@ static inline void SetOutputsMotor(uint8_t m)
     int rev_q     = PWMrev[m]    << PWM_FRAC;
     int lift_q    = LiftFactor[m] << PWM_FRAC;
 
-    bool rev = (PWMrev[m] != 0) && !SoftStart[m];   // 1.9.1: no full-duty "drive back" while creeping
+    // 1.9.1: no PWMrev "drive back" into the Clip window while creeping - 2.1.1: unless the goal is 16 counts inside
+    // already and the motor lags outside (a heavy corner PWMmax can't lift from there): then it comes in and follows
+    // the goal (a motor that keeps up never lags that far, so it creeps as before)
+    const int lagQ = 16 << POS_SHIFT;
+    // 2.1.1: coming back (creeping, past an end stop, or the page parking / unparking it) and lagging its goal: the
+    // drive may go up to PWMrev - a heavy corner PWMmax can't lift from the bottom comes back up
+    if (PWMrev[m] > PWMmax[m] && (SoftStart[m] || OutBack[m] || (ParkMask & (1 << m))) &&
+        ((goal - fb) > lagQ || (fb - goal) > lagQ))
+    {
+        max_q = rev_q;
+    }
+    bool rev = (PWMrev[m] != 0) && !(ParkMask & (1 << m)) &&     // 2.1.1: not while parking
+               (!SoftStart[m] || (fb > clipMax_q && goal < clipMax_q - lagQ) || (fb < clipMin_q && goal > clipMin_q + lagQ));
 #ifdef MODE1
     if ((fb > clipMax_q) && rev)
     {
@@ -1105,18 +1171,25 @@ void PidIsr(timer_callback_args_t *p_args)
         Feedback_q[m] = fb;
 
         bool past = (fb > (CutHi[m] << POS_SHIFT)) || (fb < (CutLo[m] << POS_SHIFT));   // SMC3 cutoff + 1.9 end stops
-        if (past && SoftStart[m] && SoftOutQ[m] > 0)
+        if (past && (SoftStart[m] || OutBack[m]) && SoftOutQ[m] > 0)
         {
             // 1.9.1: creeping back after power-up / Enable Motors from past an END STOP (the seat rode down while the
-            // rig was off) is allowed - as long as it doesn't go 16 counts further out than it has been, and stays
-            // inside the SMC3 cutoff (a broken pot reads 0 or 1023 and still trips at once)
+            // rig was off) is allowed.  2.1.1: as long as it doesn't get SOFT_OUT_MARGIN counts further out than
+            // where it started, and stays inside the SMC3 cutoff - each judged only when it lasts SOFT_OUT_MS: a pot
+            // glitch is shorter, a broken pot (0 or 1023) or a motor running away (wired backwards) is not
             int lo = CutLo[m] << POS_SHIFT, hi = CutHi[m] << POS_SHIFT;
             int out = (fb < lo) ? (lo - fb) : (fb - hi);
             bool hard = (fb > (CutoffLimitMax[m] << POS_SHIFT)) || (fb < (CutoffLimitMin[m] << POS_SHIFT));
-            if (!hard && out <= SoftOutQ[m] + (16 << POS_SHIFT))
+            uint8_t badN = (uint8_t)((SOFT_OUT_MS * (PID_RATE_HZ / 1000) + PIDProcessDivider - 1) / PIDProcessDivider);
+            if (!hard && out <= SoftOutQ[m] + (SOFT_OUT_MARGIN << POS_SHIFT))
             {
                 past = false;
-                if (out < SoftOutQ[m]) { SoftOutQ[m] = out; }
+                SoftBad[m] = 0;
+            }
+            else if (SoftBad[m] < badN)
+            {
+                past = false;
+                SoftBad[m]++;
             }
         }
         else if (!past && SoftOutQ[m] != 0)
@@ -1125,7 +1198,8 @@ void PidIsr(timer_callback_args_t *p_args)
             // may still cross the end stop for a moment
             int lo = CutLo[m] << POS_SHIFT, hi = CutHi[m] << POS_SHIFT;
             int in = (fb - lo < hi - fb) ? (fb - lo) : (hi - fb);
-            SoftOutQ[m] = (in > (16 << POS_SHIFT) || !SoftStart[m]) ? 0 : 1;
+            SoftOutQ[m] = (in > (16 << POS_SHIFT) || !(SoftStart[m] || OutBack[m])) ? 0 : 1;
+            if (SoftOutQ[m] == 0) { OutBack[m] = 0; }   // 2.1.1: back - the end stops count as usual again
         }
         if (past)
         {
@@ -1299,6 +1373,11 @@ void UpdateLimits()
         int clo = (EndLo[m] > CutoffLimitMin[m]) ? EndLo[m] : CutoffLimitMin[m];
         int chi = (EndHi[m] < CutoffLimitMax[m]) ? EndHi[m] : CutoffLimitMax[m];
         if (chi < clo + 8) { clo = CutoffLimitMin[m]; chi = CutoffLimitMax[m]; }
+        if (ParkMask & (1 << m))                 // 2.1.1: parking - anywhere inside the SMC3 cutoff
+        {
+            lo = CutoffLimitMin[m] + PARK_MARGIN; hi = CutoffLimitMax[m] - PARK_MARGIN;
+            clo = CutoffLimitMin[m]; chi = CutoffLimitMax[m];
+        }
         TargetLo[m] = lo;
         TargetHi[m] = hi;
         CutLo[m] = clo;
@@ -1488,6 +1567,12 @@ void SeatCommand(uint8_t f, uint8_t c)
     else if (f == 'S' && c == 'V') { WriteSeatSetup(); }
     else if (f == 'R' && c == 'L') { ReadSeatSetup(); }
     else if (f == 'C' && c == 'L') { ClearSeatSetup(); UpdateLimits(); }
+    else if (f == 'P')                           // 2.1.1 park mode for the motors in c (bits 0-2), 3 s from now
+    {
+        uint8_t mk = c & 7;
+        ParkUntil = millis() + 3000UL;
+        if (mk != ParkMask) { ParkMask = mk; UpdateLimits(); }
+    }
     else if (f == 'H')                           // hold: c x 100 ms (0 = give the seat back to SimHub now)
     {
         PageHold = (c != 0);
@@ -1713,6 +1798,7 @@ static inline bool PageHolds()                   // 1.9: the page has the seat (
 
 #if ENABLE_WIFI
 void SendDiag();
+void SendImuInfo();                              // 2.1.1
 void SendOtaFrame();
 void OtaCommand(uint8_t a, uint8_t b);
 #endif
@@ -1812,6 +1898,7 @@ void ParseCommand(const unsigned int *buf, uint8_t source)
                     case 'i': SendTwoValues('i', SensorState(), TiltLimitDeg); break;  // 1.8: sensor state + tilt limit
 #if ENABLE_WIFI
                     case 'd': if (fromPage) { SendDiag(); } break;         // 1.7: diagnostics frame (the page only)
+                    case 'j': if (fromPage) { SendImuInfo(); } break;      // 2.1.1: the motion sensor link (the page only)
                     case 'u': if (fromPage) { SendOtaFrame(); } break;     // 1.9.2: update state + version text
 #endif
                     default: break;
@@ -2008,7 +2095,8 @@ void UpdateSeatAngles()
 void CheckTilt(unsigned long now)
 {
     bool any = TiltLim_x10[0] || TiltLim_x10[1] || TiltLim_x10[2] || TiltLim_x10[3];
-    if (AnySoftStart()) { TiltGraceUntil = now + 1500; }   // 1.9.1: the seat is still creeping back - wait for it
+    if (AnySoftStart() || ParkMask) { TiltGraceUntil = now + 1500; }   // 1.9.1: the seat is still creeping back - wait for
+                                                // it (2.1.1: and no tilt limit while the page parks the seat)
     if (!(SensorFlags & 1) || !any || (long)(now - TiltGraceUntil) < 0) { TiltHits = 0; return; }
     bool past = (TiltLim_x10[0] && SeatRoll  >  TiltLim_x10[0] * 0.1f) || (TiltLim_x10[1] && SeatRoll  < -TiltLim_x10[1] * 0.1f)
              || (TiltLim_x10[2] && SeatPitch >  TiltLim_x10[2] * 0.1f) || (TiltLim_x10[3] && SeatPitch < -TiltLim_x10[3] * 0.1f);
@@ -2043,6 +2131,7 @@ void PollImu()
     while (Serial1.available() && budget-- > 0)
     {
         uint8_t c = Serial1.read();
+        ImuRxBytes++;                           // 2.1.1: at any baud rate - tells a silent sensor from a wrong rate
         if (n == 0)
         {
             if (c == 0x55) { buf[n++] = c; }
@@ -2062,6 +2151,7 @@ void PollImu()
         unsigned long now = millis();
         ImuLastValid = now;
         ImuPackets++;
+        ImuTypesSeen |= (uint16_t)(1u << (buf[1] - 0x50));   // 2.1.1: which kinds the sensor sends
         if (buf[1] == 0x53)
         {
             int16_t r = (int16_t)((buf[3] << 8) | buf[2]);
@@ -2099,7 +2189,7 @@ void PollImu()
 
 void ImuQueue(uint8_t reg, uint16_t val)
 {
-    if (ImuCmdN >= 10) { return; }
+    if (ImuCmdN >= 12) { return; }
     uint8_t *c = ImuCmd[ImuCmdN++];
     c[0] = 0xFF; c[1] = 0xAA; c[2] = reg; c[3] = (uint8_t)(val & 0xFF); c[4] = (uint8_t)(val >> 8);
 }
@@ -2122,8 +2212,11 @@ void ImuStartSetup(uint8_t rateCode, bool all)
     ImuQueue(0x04, 0x0006);                     // 115200 baud
     ImuQueue(0x00, 0x0000);                     // save (sensors that switch on save)
     ImuCmdBaudSwitchAt = (int8_t)ImuCmdN;
-    ImuQueue(0x69, 0xB588);                     // ... and again at 115200 (sensors that switch at once)
+    ImuQueue(0x69, 0xB588);                     // ... and again at 115200 (sensors that switch at once) - 2.1.1:
+    ImuQueue(0x02, all ? 0x000E : 0x0008);      // the output and the rate too, in case the sensor dropped them
+    ImuQueue(0x03, rateCode);
     ImuQueue(0x00, 0x0000);
+    ImuSetupState = 1;
     ImuCmdLast = millis();
 }
 
@@ -2151,6 +2244,8 @@ void ServiceImu(unsigned long now)
                 ImuCmdN = 0;
                 ImuCmdPos = 0;
                 ImuCmdBaudSwitchAt = -1;
+                ImuSetupState = 3;
+                ImuLockedSince = 0;             // 2.1.1: found afresh at the new rate (not counted as lost)
                 ImuScanUntil = now + 30000;     // if it didn't take, find the sensor again wherever it is
                 ImuBaudSince = now;
             }
@@ -2158,9 +2253,14 @@ void ServiceImu(unsigned long now)
         return;
     }
 
-    bool locked = ImuLastValid != 0 && (now - ImuLastValid) < 3000 && (long)(ImuLastValid - ImuBaudSince) > 0;
+    // 2.1.1: the age is signed.  loop() took "now" before PollImu() stamped the packets with millis(), so the last
+    // one can be a millisecond newer than "now"; unsigned, now - ImuLastValid then wrapped to ~49 days, the sensor
+    // looked silent and the board went looking for it at the next baud rate - every few seconds while it may scan.
+    long age = (long)(now - ImuLastValid);
+    bool locked = ImuLastValid != 0 && age < 3000 && (long)(ImuLastValid - ImuBaudSince) > 0;
     if (locked)
     {
+        if (ImuLockedSince == 0) { ImuLockedSince = now ? now : 1; ImuLockedIdx = ImuBaudIdx; }
         static uint8_t savedIdx = 255;
         if (savedIdx != ImuBaudIdx && EEPROM.read(65) != ImuBaudIdx && EEPROM.read(56) == 0xA6)
         {
@@ -2169,10 +2269,19 @@ void ServiceImu(unsigned long now)
         savedIdx = ImuBaudIdx;
         return;
     }
+    if (ImuLockedSince != 0)                    // 2.1.1: it had the sensor and lost it
+    {
+        ImuLockedSince = 0;
+        if (ImuLockLosses < 65535) { ImuLockLosses++; }
+    }
     // Not receiving: try the next baud rate - while the sensor is switched on, for the first minute after
     // power-up, or for 30 s after the page asked.
     bool scan = (SensorFlags & 1) || now < 60000UL || (long)(ImuScanUntil - now) > 0;
-    if (scan && now - ImuBaudSince >= 1500) { ImuSetBaud(ImuBaudIdx + 1); }
+    if (scan && now - ImuBaudSince >= 1500)
+    {
+        ImuSetBaud(ImuBaudIdx + 1);
+        if (ImuScanSteps < 65535) { ImuScanSteps++; }
+    }
 }
 #endif // IMU_PORT
 
@@ -2211,6 +2320,10 @@ void ImuCommand(uint8_t a, uint8_t b)
 #if IMU_PORT
     else if (a == 'S')
     {
+        // 2.1.1: only to a sensor the board is receiving now - the commands go out at the board's baud rate, and while
+        // it is still looking that is the wrong one (the sensor ignores them, or takes only some)
+        if (ImuCmdN > 0) { return; }
+        if (ImuLockedSince == 0) { ImuSetupState = 2; return; }
         // b = 0: 100 Hz, angles only (1.8).  1.9: low nibble = WitMotion rate code, bit6 = angles + gyro + acceleration
         if (b == 0) { ImuStartSetup(0x09, false); }
         else        { ImuStartSetup((b & 0x0F) ? (b & 0x0F) : 0x09, (b & 0x40) != 0); }
@@ -2538,6 +2651,7 @@ void SendDiag()
     if (TelExtras) { fl |= 4; }
     if (PageHolds()) { fl |= 8; }
     if (UsbPage) { fl |= 16; }
+    if (ParkMask) { fl |= 32; }                  // 2.1.1: park mode on
     *p++ = fl;
     Put32(p, UsbHeldFrames); p += 4;
     Put16(p, ImuAccHz);  p += 2;
@@ -2547,7 +2661,7 @@ void SendDiag()
     Put16(p, ImuTemp_x100); p += 2;
     Put16(p, (int)SoftRate); p += 2;            // version 4 (1.9.1): soft start
     uint8_t cr = 0;
-    for (uint8_t m = 0; m < NUM_MOTORS; m++) { if (SoftStart[m] && Disable[m] == 0) { cr |= (uint8_t)(1 << m); } }
+    for (uint8_t m = 0; m < NUM_MOTORS; m++) { if (Creeping(m)) { cr |= (uint8_t)(1 << m); } }
     *p++ = cr;
     *p++ = (uint8_t)(WifiFw >> 16);              // version 5 (1.9.2): WiFi module firmware, WiFi memory, last update
     *p++ = (uint8_t)(WifiFw >> 8);
@@ -2567,6 +2681,63 @@ void SendDiag()
     size_t len = (size_t)(p - (buf + 6));
     buf[0] = 'S'; buf[1] = 'M'; buf[2] = '3'; buf[3] = 'D';
     buf[4] = 6;
+    buf[5] = (uint8_t)len;
+    PageWrite(buf, 6 + len);
+}
+
+// 2.1.1: "SM3I" - the motion sensor link, for smc3_scope's Motion sensor check ([rdj], the page only).  Little-endian:
+//   'S' 'M' '3' 'I', uint8 version (1), uint8 length (42), then uint8 sensor state ([rdi] byte 1) | uint8 baud index
+//   being tried | uint32 that baud rate | uint8 index it last found the sensor at (255 none) | uint8 number of baud
+//   rates it tries | uint8 why it may look (bit0 switched on, bit1 first minute after power-up, bit2 the page asked)
+//   | uint8 set-up (0 never, 1 sending, 2 refused - not found, 3 sent) | uint16 angles/s | uint16 acceleration/s |
+//   uint16 gyro/s | uint32 good packets | uint16 bad checksums | uint32 bytes received at any rate | uint16 times it
+//   lost the sensor | uint16 baud changes while looking | uint16 packet types since the last [rdj] (bit n = 0x50 + n)
+//   | uint16 ms since the last good packet (65535 none) | uint16 ms since the last angles (65535 none) | uint16 s since
+//   it found the sensor (65535 not found now) | uint32 uptime ms.
+void SendImuInfo()
+{
+    uint8_t buf[6 + 48];
+    uint8_t *p = buf + 6;
+    unsigned long now = millis();
+    *p++ = SensorState();
+#if IMU_PORT
+    *p++ = ImuBaudIdx;
+    Put32(p, ImuBauds[ImuBaudIdx]); p += 4;
+    *p++ = ImuLockedIdx;
+    *p++ = IMU_NBAUDS;
+    uint8_t why = 0;
+    if (SensorFlags & 1) { why |= 1; }
+    if (now < 60000UL) { why |= 2; }
+    if ((long)(ImuScanUntil - now) > 0) { why |= 4; }
+    *p++ = why;
+#else
+    *p++ = 255;
+    Put32(p, 0); p += 4;
+    *p++ = 255;
+    *p++ = 0;
+    *p++ = 0;
+#endif
+    *p++ = ImuSetupState;
+    Put16(p, ImuRateHz); p += 2;
+    Put16(p, ImuAccHz);  p += 2;
+    Put16(p, ImuGyroHz); p += 2;
+    Put32(p, ImuPackets); p += 4;
+    Put16(p, ImuBadSums); p += 2;
+    Put32(p, ImuRxBytes); p += 4;
+    Put16(p, ImuLockLosses); p += 2;
+    Put16(p, ImuScanSteps);  p += 2;
+    Put16(p, ImuTypesSeen);  p += 2;
+    ImuTypesSeen = 0;
+    long av = ImuLastValid ? (long)(now - ImuLastValid) : 65535L;
+    long aa = ImuLastMillis ? (long)(now - ImuLastMillis) : 65535L;
+    long ls = ImuLockedSince ? (long)(now - ImuLockedSince) / 1000L : 65535L;
+    Put16(p, (int)constrain(av, 0L, 65535L)); p += 2;
+    Put16(p, (int)constrain(aa, 0L, 65535L)); p += 2;
+    Put16(p, (int)constrain(ls, 0L, 65535L)); p += 2;
+    Put32(p, (uint32_t)now); p += 4;
+    size_t len = (size_t)(p - (buf + 6));
+    buf[0] = 'S'; buf[1] = 'M'; buf[2] = '3'; buf[3] = 'I';
+    buf[4] = 1;
     buf[5] = (uint8_t)len;
     PageWrite(buf, 6 + len);
 }
@@ -4108,6 +4279,7 @@ void loop()
 
     // Comms timeout -> quarter power, as in the original (PowerScale 9 instead of 7) - 1.9.1: not while a motor is
     // still creeping to its position after power-up (it may need full power to lift the seat back)
+    if (ParkMask && (long)(ParkUntil - now) <= 0) { ParkMask = 0; UpdateLimits(); }   // 2.1.1: the page went away
     bool creeping = AnySoftStart();
     PowerScale = ((now - LastPacketMillis) > COMMS_TIMEOUT_MS && !creeping) ? 9 : 7;
     if (creeping)
@@ -4115,6 +4287,7 @@ void loop()
         for (uint8_t m = 0; m < NUM_MOTORS; m++)
         {
             if (SoftStart[m] && (now - SoftSince[m]) > SOFT_MAX_MS) { SoftStart[m] = 0; }   // never stuck creeping
+            if (OutBack[m] && !SoftStart[m] && (now - SoftSince[m]) > SOFT_MAX_MS) { OutBack[m] = 0; }  // nor outside
         }
     }
 

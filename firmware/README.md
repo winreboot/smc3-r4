@@ -38,6 +38,13 @@ What the R4 hardware adds:
   to it directly - no WiFi chip in between, so none of its USB stall and no lost bytes. It is a new COM port on the PC,
   once. The page's Settings, USB cable can give the connector back to the WiFi chip, for good or
   until the next reset.
+- **Park mode** (2.1.1): while the page parks the seat it may take the motors past their travel limits, Clip window
+  and end stops - anywhere inside the SMC3 cutoff - and switch them off there. It lasts only while the page keeps
+  refreshing it.
+- **Back from wherever a motor rests** (2.1.1): a motor that rests past its end stop with the motors off creeps back
+  when switched on (also with the soft start off), with up to PWMrev's drive while it lags - a heavy corner gets back
+  up. The board also keeps the motion sensor all the time while it is switched on, and reports its link to the page's
+  Motion sensor check.
 
 ### Flashing
 

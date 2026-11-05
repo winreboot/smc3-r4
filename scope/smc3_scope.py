@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-smc3_scope v2.9.2 - live scope, tuner and auto-tuner for the SMC3_R4 motion controller (Arduino UNO R4 WiFi).
+smc3_scope v2.9.3 - live scope, tuner and auto-tuner for the SMC3_R4 motion controller (Arduino UNO R4 WiFi).
 
 Connects to the board's TCP telemetry port, keeps a rolling buffer of samples and serves a web page with live
 charts, a parameter editor (sends ordinary SMC3 commands back to the board), test signals and a per-motor
@@ -17,6 +17,28 @@ or, on Windows with nothing installed, the PowerShell bridge from Settings, USB 
 Every option can also come from the environment (Docker): SMC3_HOST, SMC3_PORT, SMC3_WEB_PORT, SMC3_BIND,
 SMC3_DATA_DIR.  Settings changed in the page (board address, theme, auto-find) are saved to
 <data dir>/config.json and survive restarts and upgrades.  Standard-library Python 3.8+ only.
+
+v2.9.3 (with firmware 2.1.1): park, motion presets, centring the pots and the motion sensor check.
+        Park: the (P) in Quick Controls lowers the seat evenly to its park position - every motor arriving at the same
+        time - and switches the motors off there, so no corner sinks on its own; pressing it again (or Enable Motors)
+        raises the seat evenly back to level and gives it to SimHub. Park position (Seat Setup and Settings): set it
+        with the arrows (each motor, or the lifts together, Level side to side with the sensor), Save - with the
+        sensor's angles there - or type it; firmware 2.1.1 lets it go past the travel limits, Clip and end stops
+        (inside the SMC3 cutoff). Each park checks that every motor got there, that the seat sits at the saved angles,
+        and that nothing moves after the motors switch off. Motion presets in the 3D view: Wave, Twist, Heave and
+        Corner until Stop, a Landing (30 s) and a Drive (36 s), with Intensity and Speed; Stop holds the seat where it
+        is, Return to level glides it back. Seat setup: Start over (one button: the set-up off the board, the motors
+        on, back to the first step); Centre the pots (click the bubble in Seat now): the seat is levelled with the
+        sensor, a dial per motor shows how far its level reading is from 512, and the page says after each tooth of
+        the pot's belt whether that was the right way and how many teeth are left - the traction-loss motor's centre
+        from the sensor's yaw; end stops are put past where a motor rests with the motors off; Seat setup waits for
+        every motor to be back before it opens, Quick Controls says when it is open (with Open / Cancel), and it gives
+        the seat back after 15 minutes with nothing done. Diagnostics, Motion sensor check (also Check in the Motion
+        sensor card): 20 s of the link - whether angles arrive all the time, every gap and where the board found the
+        sensor again, packets and bad checksums a second, angles only or + gyro and acceleration, noise and drift at
+        rest; a strip of the link, a report and a CSV; with firmware 2.1.1 the board's own counts ([rdj]). The Motion
+        sensor card shows one steady status line, and Set up the sensor checks what took. Diagnostics also notes where
+        each motor rests with the motors off, and a Hall sensor at the end of its band.
 
 v2.9.2: honest labels and a fuller sensor comparison, from a review of 2.9.1 (page only, firmware 2.1 stays). The
         graphs' Drive line is called Drive (calc.): it is the PWM the board's output stage should send by its own
@@ -331,7 +353,7 @@ v1.4: settings dialog (board address, port, find-board scan, auto-find), day/nig
       fixed a thread race that made the page flash "not reachable".
 """
 
-VERSION = "2.9.2"
+VERSION = "2.9.3"
 
 import argparse
 import base64
@@ -433,18 +455,23 @@ class Config:
     DEFAULTS = {"host": "", "port": 4210, "theme": "dark", "auto_find": True, "scan_subnet": "",
                 "motors": 3, "disable_unused": True, "motor_names": ["", "", ""],
                 "layout": "tl", "tl_dir": 1, "lift_dir": {}, "lift_sink": {}, "rider_mode": "empty", "rider_kg": 0, "rider_unit": "lb",
-                "tune_speed": {}, "update_check": True, "update_repo": "", "usb_link": True, "sensor_type": "pot"}
+                "tune_speed": {}, "update_check": True, "update_repo": "", "usb_link": True, "sensor_type": "pot",
+                "motor_rest_off": [None, None, None], "park": None}
     # layout: "tl" = motors 1 and 2 lift the front corners, motor 3 slides the rear left / right (traction loss,
     #         the seat turning about a pivot at the front); "lifts" = all three motors lift the seat.
     # tl_dir: +1 = higher numbers move the rear to the right, -1 = to the left (Seat setup or the full check asks).
     # lift_dir: {"1": +1 | -1} which way a lift goes for higher numbers, from the full check's question (page 2.5).
     # lift_sink: {"1": +1 | -1} which way a lift's numbers go when its corner sinks under the seat's weight, seen by
     #          the full check (page 2.6) - auto-tune's "up" is the other way, until lift_dir is answered.
+    # motor_rest_off: page 2.9.3 - where each motor rests with the motors off ({"pot", "when"}; the watcher sees it), so
+    #          Seat setup never puts an end stop between level and there, and diagnostics can say so.
     # rider_*: auto-tune's "who's in the seat" and the rider's weight (kg; shown in rider_unit). tune_speed: per motor,
     #          the test-move speed and top speeds auto-tune measured, so Check runs the same moves.
     # update_check: ask GitHub twice a day whether there's a newer page or firmware (page 2.7). update_repo: where
     #          from ("owner/name", empty = winreboot/smc3-r4) - only in config.json, the page can't change it.
     # usb_link: a USB bridge on the PC with the cable may take over from WiFi (page 2.8; off = WiFi only).
+    # park: page 2.9.3 - the park position {"pos": [pot counts per motor], "angles": [roll, pitch] seen there,
+    #          "when", "beyond": set past the travel limits (firmware 2.1.1), "speed": counts/s}; None = the default.
     # sensor_type: what gives the position feedback (page 2.9.1) - "pot" (a potentiometer with a wiper) or "hall"
     #          (a contactless Hall-effect sensor, e.g. TT Electronics 6127): the advice for noise and jumps differs.
 
@@ -551,6 +578,8 @@ class Board:
         self.events = None                   # EventLog (diagnostics)
         self.diag = None                     # last firmware 1.7 diagnostics frame, decoded
         self.diag_seq = 0
+        self.imu_info = None                 # 2.9.3: last firmware 2.1.1 "SM3I" frame (the motion sensor link)
+        self.imu_info_seq = 0                # (its own count: imu_seq counts the "SM3X" frames - 2.9.3 shared it)
         self.last_dis_cmd = [0.0, 0.0, 0.0]  # when this page last switched each motor off
         self.seat = None                     # firmware 1.9 seat set-up running on the board (from [rdd])
         self.imu = None                      # firmware 1.9 "SM3X": the sensor's acceleration and gyro, latest
@@ -768,6 +797,24 @@ class Board:
         while time.time() < end:
             if self.diag_seq != seq0:
                 return dict(self.diag)
+            time.sleep(0.02)
+        return None
+
+    def imu_info_ok(self):
+        """2.9.3: does the board answer [rdj] with its sensor link ("SM3I", firmware 2.1.1 and newer)?"""
+        k = self.fw_known or self.fw_version
+        return bool(k) and self.fwnum() >= 21 and vkey(k) >= vkey("2.1.1b1")
+
+    def read_imu_info(self, timeout=1.0):
+        """2.9.3 / firmware 2.1.1: ask for the motion sensor link frame and wait for it (None if it doesn't come)."""
+        if not self.connected or not self.imu_info_ok():
+            return None
+        seq0 = self.imu_info_seq
+        self.send(b"[rdj]")
+        end = time.time() + timeout
+        while time.time() < end:
+            if self.imu_info_seq != seq0 and self.imu_info:
+                return dict(self.imu_info)
             time.sleep(0.02)
         return None
 
@@ -1290,6 +1337,17 @@ class Board:
                 if u and self.link == "usb":
                     self._usb_stream(u, count and struct.unpack_from("<I", buf, 6)[0])
                 buf = buf[need:]
+            elif buf[:4] == b"SM3I":                       # 2.9.3 / firmware 2.1.1: the motion sensor link
+                if len(buf) < 6:
+                    return buf
+                need = 6 + buf[5]
+                if len(buf) < need:
+                    return buf
+                d = decode_imu_info(buf[6:need], buf[4])
+                if d:
+                    self.imu_info = d
+                    self.imu_info_seq += 1
+                buf = buf[need:]
             elif buf[:4] == b"SM3X":                       # firmware 1.9: the sensor's acceleration and gyro
                 if len(buf) < 6:
                     return buf
@@ -1540,6 +1598,10 @@ class Generator:
         self.phase = 0.0               # cycles since the wave started
         self.amp_s = None              # amplitude and offset as sent (they slide to self.amp / self.centre)
         self.centre_s = None
+        self.show = None               # 2.9.3: a motion preset from the 3D view (see show_part.py)
+        self.show_msg = ""             # how the last one ended
+        self.show_msg_id = 0
+        self.on_show_end = None        # (kind "stop" | "level", positions, msg) -> the page holds the seat on (main)
         threading.Thread(target=self._run, daemon=True).start()
 
     def _start_pos(self, m):
@@ -1592,7 +1654,109 @@ class Generator:
         """Off at once, no easing back - for auto-tune, the full check, Seat setup and a restart, which move the
         motors themselves straight after."""
         with self.lock:
+            if self.mode == "show" and self.show:
+                self._show_note(f"{self.show['title']} stopped: something else moves the motors now.")
             self.mode, self.fade, self.sent, self.combo, self.plan = "off", None, {}, "", []
+            self.show = None
+
+    # ---- 2.9.3: motion presets (the 3D view) ----
+    def _show_note(self, msg):
+        self.show_msg, self.show_msg_id = msg, self.show_msg_id + 1
+
+    def start_show(self, name, plan, intensity, speed):
+        """Run preset name on the motors in plan (show_plan): from where they are, into the motion over SHOW_FADE."""
+        s = self.board.latest()
+        now = time.time()
+        frm = {}
+        for m, info in plan.items():
+            t = float(s["m"][m]["t"]) if s else info["c"]
+            frm[m] = (1023.0 - t) if info["rev"] else t          # telemetry targets are the board's (mirrored) ones
+        dur = SHOWS[name][0]
+        with self.lock:
+            self.mode, self.combo, self.fade, self.sent = "show", "show", None, {}
+            self.plan = [(m, 0, 0.0, info["c"]) for m, info in plan.items()]
+            self.show = {"name": name, "title": name.capitalize(), "plan": plan, "t": 0.0, "t0": now, "dur": dur,
+                         "intensity": float(intensity), "k": float(intensity), "speed": float(speed), "from": frm,
+                         "sent": dict(frm), "hold": 0.0, "label": "", "conn": self.board.conn_id}
+
+    def set_show(self, intensity=None, speed=None):
+        with self.lock:
+            if self.mode == "show" and self.show:
+                if intensity is not None:
+                    self.show["intensity"] = float(intensity)
+                if speed is not None:
+                    self.show["speed"] = float(speed)
+
+    def stop_show(self, kind, msg=None):
+        """Stop the preset: "stop" holds the seat where it is, "level" glides it back to level (the page keeps it)."""
+        with self.lock:
+            if self.mode != "show" or not self.show:
+                return False
+            pend = self._show_finish(kind, msg or (f"{self.show['title']} stopped" +
+                                                   (" - back to level." if kind == "level" else " - the seat holds "
+                                                    "where it is.")))
+        self._show_handover(pend)
+        return True
+
+    def _show_finish(self, kind, msg):
+        pos = dict(self.show["sent"])
+        self._show_note(msg)
+        self.mode, self.fade, self.sent, self.combo, self.plan = "off", None, {}, "", []
+        self.show = None
+        return kind, pos, msg
+
+    def _show_handover(self, pend):
+        if pend and pend[0] and self.on_show_end:
+            try:
+                self.on_show_end(*pend)
+            except Exception as e:                           # never let the generator die
+                log(f"[show] hand-over: {e!r}")
+
+    def show_status(self):
+        S = self.show
+        if self.mode != "show" or not S:
+            return {"active": False, "msg": self.show_msg, "msg_id": self.show_msg_id}
+        return {"active": True, "name": S["name"], "title": S["title"], "label": S["label"], "t": round(S["t"], 1),
+                "dur": S["dur"], "intensity": S["intensity"], "speed": S["speed"], "msg": self.show_msg,
+                "msg_id": self.show_msg_id}
+
+    def _show_tick(self, now, dt):
+        """One pass (50 a second): where every motor goes now. Returns a hand-over when it ends, else None."""
+        S, b = self.show, self.board
+        if not b.connected or b.conn_id != S["conn"]:
+            self._show_finish(None, f"{S['title']} stopped: the connection to the board dropped (SimHub has the seat "
+                                    f"again).")
+            return None
+        st = b.latest()
+        off = [m + 1 for m in S["plan"] if st and st["dis"][m]]
+        if off:
+            return self._show_finish("stop", f"{S['title']} stopped: motor {' and '.join(map(str, off))} switched off. "
+                                             f"The page holds the others where they are.")
+        if S["dur"] is None:
+            S["t"] += dt * max(0.25, min(3.0, S["speed"]))
+        else:
+            S["t"] += dt
+            if S["t"] >= S["dur"]:
+                return self._show_finish("level", f"{S['title']} done - the seat glides back to level; the page holds "
+                                                  f"it there until Resume SimHub.")
+        S["k"] += (max(0.0, min(1.0, S["intensity"])) - S["k"]) * min(1.0, dt / 0.5)    # Intensity slides
+        u, S["label"] = show_pose(S["name"], S["t"], {m: i["role"] for m, i in S["plan"].items()})
+        e = _ss((now - S["t0"]) / SHOW_FADE)
+        step = SHOW_SLEW * dt
+        for m, info in S["plan"].items():
+            v = info["c"] + info["sign"] * info["room"] * S["k"] * u.get(m, 0.0)
+            v = S["from"][m] + (v - S["from"][m]) * e
+            last = S["sent"][m]
+            v = max(last - step, min(last + step, v))
+            v = max(info["lo"], min(info["hi"], v))
+            S["sent"][m] = v
+            cmd = 1023.0 - v if info["rev"] else v
+            self.sent[m] = cmd
+            b.cmd_word("ABC"[m], int(round(cmd)))
+        if now - S["hold"] >= 1.0:                           # SimHub's positions wait while the page has the seat
+            b.seat_cmd(ord("H"), SHOW_HOLD)
+            S["hold"] = now
+        return None
 
     def drives(self, m):
         """True while the test signal sends positions to motor m (also while it eases back after Stop)."""
@@ -1622,6 +1786,17 @@ class Generator:
             time.sleep(0.02)
             now = time.time()
             dt, last = min(0.1, now - last), now
+            if self.mode == "show":                          # 2.9.3: a motion preset (the 3D view)
+                pend = None
+                with self.lock:
+                    if self.mode == "show" and self.show:
+                        try:
+                            pend = self._show_tick(now, dt)
+                        except Exception as e:               # a bug: stop it and hold the seat where it is
+                            log(f"[show] {e!r}")
+                            pend = self._show_finish("stop", f"Motion preset stopped: internal error {e!r}")
+                self._show_handover(pend)
+                continue
             with self.lock:
                 fd = self.fade
                 e = 1.0
@@ -4245,6 +4420,14 @@ DIAG_SOFT = struct.Struct("<HB")                    # firmware 1.9.1 (frame vers
 DIAG_WIFI = struct.Struct("<3BBBh")                 # firmware 1.9.2 (frame version 5): WiFi module, WiFi memory, update
 DIAG_MODULE = struct.Struct("<BHBB")                # firmware 1.9.8 (frame version 6): the last USB/WiFi chip restart
 MODULE_WIFI_LAST = {0: "not tried yet", 1: "joined", 2: "failed", 3: "no module", 4: "the chip doesn't answer"}
+# page 2.9.3 / firmware 2.1.1: the motion sensor link ([rdj] -> "SM3I")
+HALL_BAND = (41, 982)                             # 2.9.3: a TT 6127 (V1) puts out 0.2-4.8 V: about 41-982 counts
+HALL_EDGE = 8                                     # ... within this of either end it is at its limit (not measuring)
+IMU_INFO = struct.Struct("<BBIBBBBHHHIHIHHHHHHI")
+IMU_BAUDS = (9600, 115200, 230400, 57600, 38400, 19200, 4800)    # the board tries them in this order, 1.5 s each
+IMU_TYPES = {0: "time", 1: "acceleration", 2: "gyro", 3: "angles", 4: "magnetometer", 5: "port status",
+             6: "pressure / height", 7: "GPS position", 8: "GPS speed", 9: "quaternion", 10: "GPS accuracy"}
+IMU_SETUP = {0: "not since power-up", 1: "being sent", 2: "refused - the board wasn't receiving the sensor", 3: "sent"}
 TILT_DIRS = ("roll_right", "roll_left", "front_up", "front_down")   # roll +, roll -, pitch +, pitch - (firmware order)
 ACC_G = 32768.0 / 16.0                            # WitMotion raw -> g
 GYRO_DPS = 32768.0 / 2000.0                       # WitMotion raw -> degrees per second
@@ -4346,6 +4529,7 @@ def decode_diag(pl, ver=1):
                      "end_stop": [[mot[5 * m + 3], mot[5 * m + 4]] for m in range(3)],
                      "tilt_limit": {k: (t / 10.0 if t else None) for k, t in zip(TILT_DIRS, tilt)},
                      "saved": bool(fl & 1), "in_eeprom": bool(fl & 2), "page_holds": bool(fl & 8),
+                     "park_mode": bool(fl & 32),
                      "simhub_held": held}
         d["extras_on"] = bool(fl & 4)
         d["usb_page"] = bool(fl & 16)                    # firmware 1.9.5: the page is on the USB cable
@@ -4376,6 +4560,23 @@ def decode_diag(pl, ver=1):
                                "wifi_tries": tl & 15, "wifi_last": MODULE_WIFI_LAST.get(tl >> 4, str(tl >> 4)),
                                "wifi_last_code": tl >> 4}
     return d
+
+
+def decode_imu_info(pl, ver=1):
+    """Firmware 2.1.1 "SM3I" frame (the motion sensor link) -> dict, None if too short."""
+    if len(pl) < IMU_INFO.size:
+        return None
+    (st, idx, baud, lidx, nb, why, setup, ang, acc, gyro, pk, bad, rx, lost, steps, types, av, aa, ls,
+     ms) = IMU_INFO.unpack_from(pl, 0)
+    return {"rx": time.time(), "switched_on": bool(st & 1), "receiving": bool(st & 0x10), "found": bool(st & 0x20),
+            "setting_up": bool(st & 0x40), "accel_gyro": bool(st & 0x80), "baud_trying": baud, "baud_idx": idx,
+            "found_at": IMU_BAUDS[lidx] if lidx < len(IMU_BAUDS) else None, "rates_tried": nb,
+            "may_look": {"switched_on": bool(why & 1), "first_minute": bool(why & 2), "page_asked": bool(why & 4)},
+            "setup": IMU_SETUP.get(setup, str(setup)), "setup_code": setup, "angles_per_s": ang, "accel_per_s": acc,
+            "gyro_per_s": gyro, "good_packets": pk, "bad_checksums": bad, "bytes": rx, "lost": lost, "scan_steps": steps,
+            "types_mask": types, "types": [IMU_TYPES.get(i, f"0x{0x50 + i:02X}") for i in range(16) if types >> i & 1],
+            "ms_since_packet": None if av == 65535 else av, "ms_since_angles": None if aa == 65535 else aa,
+            "found_for_s": None if ls == 65535 else ls, "uptime_ms": ms}
 
 
 def seat_configured(seat):
@@ -4725,6 +4926,11 @@ def _wrap180(d):
     return (d + 540.0) % 360.0 - 180.0
 
 
+def sensor_coverage(samples, key="roll"):
+    """Share of the samples that carry motion sensor angles (0..1; 1 with no samples)."""
+    return sum(1 for x in samples if x.get(key) is not None) / len(samples) if samples else 1.0
+
+
 def seat_step(samples, m, t_old, yaw=False, whole=False):
     """What the SEAT did (motion sensor) when motor m stepped away from t_old: how far it tilted (or, yaw=True, for
     the traction-loss motor: how far it turned), which way, its own overshoot and ringing next to the motor's, how
@@ -4735,6 +4941,10 @@ def seat_step(samples, m, t_old, yaw=False, whole=False):
         return None
     t_new, t0 = samples[idx]["m"][m]["t"], samples[idx]["ms"]
     key = "yaw" if yaw else "roll"
+    # 2.9.3: only with the sensor there all the time - a sensor that drops out (firmware 2.1's lost lock) left a few
+    # stray readings, and a 0.00° "turn" that blamed the linkage
+    if sensor_coverage(samples[max(0, idx - 15):], key) < 0.9:
+        return None
     pre = [x for x in samples[max(0, idx - 15):idx] if x.get(key) is not None]
     # whole=True: a gradual move (auto-tune 2.5) - everything from its start, not only the readings at its first step
     post = [x for x in samples[idx:] if x.get(key) is not None and (whole or x["m"][m]["t"] == t_new)]
@@ -4873,6 +5083,7 @@ class Monitor:
         self.diag = None
         self.seat_setup = None               # SeatSetup (v2.0): its moves are the page's, not SimHub's
         self.manual = None                   # ManualControl (v2.4): knobs dragged / Return to center - the page's too
+        self.park = None                     # ParkControl (2.9.3): parking / setting the park position - the page's too
         self.inc_dir = os.path.join(data_dir, "diagnostics", "incidents")
         self.lock = threading.Lock()
         self.incidents = []
@@ -4904,6 +5115,14 @@ class Monitor:
         self.was_connected = False
         self.seat_on = None                       # motion sensor data arriving? (firmware 1.8)
         self.seat_prev = None
+        self.seat_drops = []                      # 2.9.3: when the sensor's data stopped (last 2 minutes)
+        # 2.9.3: where each motor rests with the motors off (the seat's weight may take a corner far): pot, when
+        rr = cfg.get("motor_rest_off") or [None, None, None]
+        self.rest_off = [dict(r) if isinstance(r, dict) else None for r in (list(rr) + [None] * 3)[:3]]
+        self.rest_track = [None, None, None]      # (off since, window start, low, high)
+        self.seat_since = None                    # ... when it last started or stopped
+        self.seat_last = None                     # ... the last sample with angles
+        self.seat_flap_noted = 0.0
         threading.Thread(target=self._loop, daemon=True).start()
 
     # ---- incidents on disk ----
@@ -5002,7 +5221,8 @@ class Monitor:
         g, t, d = self.gen, self.tuner, self.diag
         if g.drives(m) or (t.running() and t.motor == m) or (d is not None and d.moving()) or \
                 (self.seat_setup is not None and self.seat_setup.state != "idle") or \
-                (self.manual is not None and self.manual.active):
+                (self.manual is not None and self.manual.active) or \
+                (self.park is not None and self.park.state != "idle"):
             self.busy_until[m] = now + 8.0             # its last targets can arrive late after a WiFi stall (2.7.2)
         return now < self.busy_until[m]
 
@@ -5053,15 +5273,70 @@ class Monitor:
         heavy = self.tick % 10 == 0
         for m in range(nm):
             self._motor(m, s, now, drive[m], sim, bk, heavy)
+            self._rest(m, s, now)
         self.prev = s
+
+    def _rest(self, m, s, now):
+        """2.9.3: a motor that has been off for 3 s and holds still for a second rests there - remember it."""
+        f = s["m"][m]["f"]
+        if not s["dis"][m]:
+            self.rest_track[m] = None
+            return
+        tr = self.rest_track[m]
+        if tr is None:
+            self.rest_track[m] = [now, now, f, f]
+            return
+        tr[2], tr[3] = min(tr[2], f), max(tr[3], f)
+        if now - tr[1] < 1.0:
+            return
+        if now - tr[0] >= 3.0 and tr[3] - tr[2] <= 2.5:
+            pot = round((tr[2] + tr[3]) / 2.0, 1)
+            old = self.rest_off[m]
+            if not old or abs(old["pot"] - pot) > 5:
+                self.rest_off[m] = {"pot": pot, "when": time.strftime("%Y-%m-%d %H:%M")}
+                self.cfg.update(motor_rest_off=[dict(r) if r else None for r in self.rest_off])
+        tr[1], tr[2], tr[3] = now, f, f
+
+    def shift_rest(self, m, d):
+        """2.9.3: motor m's pot belt moved d counts (Centre the pots): its rest reads that much differently now."""
+        r = self.rest_off[m] if 0 <= m < 3 else None
+        if r:
+            self.rest_off[m] = {"pot": round(r["pot"] + d, 1), "when": time.strftime("%Y-%m-%d %H:%M")}
+            self.cfg.update(motor_rest_off=[dict(x) if x else None for x in self.rest_off])
+
+    def motor_rest(self, m):
+        """2.9.3: where motor m rests with the motors off (pot counts), or None if not seen yet."""
+        r = self.rest_off[m] if 0 <= m < 3 else None
+        return r["pot"] if r else None
+
+    def sensor_link(self):
+        """2.9.3: the motion sensor as the telemetry shows it - angles now, since when, drop-outs in 2 minutes."""
+        now = time.time()
+        drops = [t for t in self.seat_drops if now - t <= 120.0]
+        return {"angles": bool(self.seat_on), "for_s": None if self.seat_since is None else round(now - self.seat_since, 1),
+                "drop_outs_2min": len(drops), "last_angles_s_ago": None if self.seat_last is None else round(now - self.seat_last, 1)}
 
     def _seat(self, s, bk):
         """Seat angle statistics, and the sensor's data starting or stopping (firmware 1.8)."""
         on = s.get("roll") is not None
+        now = time.time()
+        if on:
+            self.seat_last = now
         if on != self.seat_on:
             was, self.seat_on = self.seat_on, on
+            self.seat_since = now
             sens = self.board.params.get("SENSOR") or [0, 0]
-            if on and was is not None:
+            if not on and was:
+                self.seat_drops.append(now)
+            self.seat_drops = [t for t in self.seat_drops if now - t <= 120.0]
+            flap = len(self.seat_drops) >= 3           # 2.9.3: one line for a sensor that keeps dropping out
+            if flap and now - self.seat_flap_noted > 600:
+                self.seat_flap_noted = now
+                self.events.add("sensor", f"The motion sensor keeps dropping out ({len(self.seat_drops)} times in "
+                                          f"the last 2 minutes) - Diagnostics, Motion sensor check tells why.")
+            if flap:
+                pass
+            elif on and was is not None:
                 self.events.add("sensor", "Motion sensor data is arriving.", quiet=True)
             elif not on and was:
                 if sens[0] & 1:
@@ -5114,8 +5389,11 @@ class Monitor:
         f = s["m"][m]["f"]
         lim = (self.board.params.get(f"LIM{n}") or [23, 100])[0]
         beyond = f < lim or f > 1023 - lim
+        es = ((self.board.seat or {}).get("end_stop") or [[0, 1023]] * 3)[m]   # 2.9.3: Seat setup's end stops too
+        past_es = (es[0] > lim and f < es[0]) or (es[1] < 1023 - lim and f > es[1])
         why = (f"its pot read {f:.0f}, past the safety cutoff ({lim} / {1023 - lim})" if beyond else
-               f"pot {f:.0f}; most likely its safety cutoff tripped for a moment")
+               f"its pot read {f:.0f}, past its end stop ({es[0]} / {es[1]}, Seat setup)" if past_es else
+               f"pot {f:.0f}; most likely its safety cutoff or an end stop tripped for a moment")
         self._note("motor_off", m, s, f"Motor {n} switched itself off - {why}.", pot=round(f, 1), cutoff=lim,
                    beyond=beyond)
         self.want_cause = True
@@ -5890,6 +6168,7 @@ class MotionCheck:
                 tl = tl_motor(self.d.cfg)
                 around = b.since(seq0 - 20)                     # needs a few samples from before the step
                 seat = seat_step(around, m, t_old, yaw=(m == tl))
+                cov = sensor_coverage(around, "yaw" if m == tl else "roll")    # 2.9.3: the sensor there all along?
                 # with a traction-loss rig, also the other kind of movement: a lift that turns the seat or a
                 # traction-loss motor that tilts it is set up (or wired) as something it isn't
                 other = seat_step(around, m, t_old, yaw=(m != tl)) if tl is not None else None
@@ -5903,6 +6182,8 @@ class MotionCheck:
                     res["speed_max"] = round(vmax)
                     if seat:
                         res["seat"] = seat
+                    elif 0 < cov < 0.9:
+                        res["seat_gaps"] = round(cov, 2)
                     if other and not other.get("small"):
                         res["seat_other"] = {"deg": other["deg"], "axis": other["axis"],
                                              "deg_per_count": other.get("deg_per_count")}
@@ -6176,6 +6457,11 @@ class Diagnostics:
             if self.gen.mode != "off":
                 return False, "A test signal is running - stop it first."
             self.cond = cond if cond in SENSOR_CONDS else "C"
+        if kind == "imu":                            # 2.9.3: Motion sensor check - nothing moves
+            if not self.board.connected:
+                return False, "The board is not connected."
+            if self.board.fwnum() and self.board.fwnum() < 18:
+                return False, "The motion sensor needs firmware 1.8 or newer on the board."
         if kind == "full":
             if not self.board.connected:
                 return False, "The board is not connected, so the full check can't move anything. Run the quick " \
@@ -6224,15 +6510,18 @@ class Diagnostics:
 
     # ---- running ----
     def _thread(self, kind, problem, ask):
-        what = {"full": "Full check", "sensor": "Sensor check"}.get(kind, "Quick check")
+        what = {"full": "Full check", "sensor": "Sensor check", "imu": "Motion sensor check"}.get(kind, "Quick check")
         self.events.add("diag", f"{what} started.")
         try:
             if kind == "sensor":
                 rep = self._collect_sensor(problem, self.cond)
+            elif kind == "imu":
+                rep = self._collect_imu(problem)
             else:
                 rep = self._collect(kind, problem, ask)
             self.stage, self.progress = "Working out what it means", 92
-            findings = analyze_sensor(rep, self.sensor_history()) if kind == "sensor" else analyze(rep)
+            findings = (analyze_sensor(rep, self.sensor_history()) if kind == "sensor" else
+                        analyze_imu(rep) if kind == "imu" else analyze(rep))
             names = list(self.cfg.get("motor_names") or ["", "", ""])
             for f in findings:
                 for k in ("title", "detail", "fix"):
@@ -6250,6 +6539,8 @@ class Diagnostics:
             nwarn = sum(1 for f in findings if f["level"] == "warn")
             self.result = {"name": name, "findings": findings, "summary": rep["summary"], "kind": kind,
                            "stopped": self.abort_flag}
+            if kind == "imu":                        # 2.9.3: the link over the check, for the strip in the result
+                self.result["imu_strip"] = (rep.get("imu_check") or {}).get("strip")
             self.state, self.progress, self.stage = "done", 100, ""
             self.events.add("diag", f"{what} finished: {nfail} problems, {nwarn} warnings. Saved as {name}.")
         except CheckStop as e:
@@ -6433,7 +6724,9 @@ class Diagnostics:
                       "layout": "front lifts + rear traction loss" if tl is not None else "lifts",
                       "traction_loss_motor": tl + 1 if tl is not None else None,
                       "traction_loss_higher_numbers_move_rear": ("right" if int(cfg.get("tl_dir") or 1) > 0 else "left")
-                      if tl is not None else None}
+                      if tl is not None else None,
+                      "rest_with_motors_off": {f"motor {n}": mon.rest_off[n - 1] for n in motors},   # 2.9.3
+                      "sensor_type": cfg.get("sensor_type") or "pot"}
         st = {"running": {f"motor {n}": motor_settings(params, n) for n in motors} if params.get("Kp1") is not None
               else None, "running_global": global_settings(params) if params.get("Kp1") is not None else None,
               "raw": canon(params) if params else None}
@@ -6526,6 +6819,83 @@ class Diagnostics:
         if tune_last.get("result") or tune_last.get("state") not in ("idle", None):
             rep["last_auto_tune"] = {"state": tune_last["state"], "motor": tune_last["motor"],
                                      "result": tune_last["result"], "log_tail": tune_last["log"][-25:]}
+        return rep
+
+    def _collect_imu(self, problem, secs=20.0):
+        """2.9.3: Motion sensor check - 20 s of the link between the board and the WT901C, nothing moves. Whether the
+        board receives the sensor all the time, and when it doesn't, what it does (the baud rates it tries, how soon
+        it lets go); what the sensor sends and how fast; its angles, acceleration and gyro at rest. The board's
+        diagnostics frame 4 times a second plus the 100 Hz telemetry; firmware 2.1.1 adds its own count of bytes,
+        lost locks, baud changes and the packet types ([rdj])."""
+        b, cfg = self.board, self.cfg
+        rep = {"made": time.strftime("%Y-%m-%d %H:%M:%S"), "made_ts": round(time.time()), "kind": "imu",
+               "problem": problem}
+        self.stage, self.progress = "Reading the board", 4
+        self.say("Motion sensor check.")
+        fw = b.fw_cache or [0, 0]
+        s0 = b.latest()
+        d0 = b.read_diag()
+        if not d0 or "sensor" not in d0:
+            raise CheckStop("no_data", "The board didn't answer the diagnostics request - is it connected?")
+        rich = b.imu_info_ok()
+        i0 = b.read_imu_info() if rich else None
+        rep["board"] = {"connected": b.connected, "address": f"{cfg.get('host')}:{cfg.get('port')}",
+                        "firmware": b.fw_label(), "fw_num": fw[1], "link": b.link_info(),
+                        "sensor_link_details": bool(rich and i0)}
+        if s0:
+            rep["board"].update({"uptime": _ago(s0["ms"] / 1000),
+                                 "power": "low (no position commands for 15 s)" if s0["low"] else "full"})
+        sen = d0["sensor"]
+        rep["rig"] = {"motors_in_use": int(cfg.get("motors")), "motion_sensor_in_page_settings": bool(sen.get("switched_on"))}
+        rep["sensor_settings"] = {k: sen.get(k) for k in ("switched_on", "swap_roll_pitch", "invert_roll", "invert_pitch",
+                                                          "tilt_limit_deg", "tilt_limits", "level_offset")}
+        rep["scope"] = {"version": VERSION, "settings": {k: v for k, v in cfg.public().items() if k != "path"}}
+        seq0, t0 = b.seq, time.time()
+        self.stage = f"Recording {secs:.0f} s of the sensor link"
+        self.say(f"Recording {secs:.0f} s - nothing moves." + ("" if rich else " (The board's firmware has no link "
+                 "counters - firmware 2.1.1 adds them; the check works from what it reports anyway.)"))
+        polls = []
+        while time.time() - t0 < secs and not self.abort_flag:
+            self.progress = 8 + int(80 * (time.time() - t0) / secs)
+            tp = time.time()
+            d = b.read_diag(0.8)
+            row = {"t": round(tp - t0, 2)}
+            if d and "sensor" in d:
+                sn = d["sensor"]
+                row["ms"] = d.get("uptime_ms")
+                row.update({k: sn.get(k) for k in ("receiving", "found", "setting_up", "switched_on", "baud_trying",
+                                                   "angles_per_s", "accel_per_s", "gyro_per_s", "accel_gyro",
+                                                   "good_packets", "bad_checksums", "ms_since_angles", "accel_g",
+                                                   "gyro_dps", "temp_c")})
+            if rich:
+                i = b.read_imu_info(0.8)
+                if i:
+                    row.update({"bytes": i["bytes"], "lost": i["lost"], "scan_steps": i["scan_steps"],
+                                "types_mask": i["types_mask"], "found_at": i["found_at"],
+                                "ms_since_packet": i["ms_since_packet"], "found_for_s": i["found_for_s"],
+                                "may_look": i["may_look"], "setup": i["setup_code"]})
+                    row.setdefault("ms", i["uptime_ms"])
+            polls.append(row)
+            rest = 0.25 - (time.time() - tp)
+            if rest > 0:
+                self._sleep(rest)
+        if self.abort_flag:
+            raise CheckStop("stopped", "Stopped by you.")
+        got = b.since(seq0)
+        if len(got) < 100:
+            raise CheckStop("no_data", f"Only {len(got)} telemetry samples arrived in {secs:.0f} s - is the board "
+                                       f"connected over WiFi or the USB cable?")
+        i1 = b.read_imu_info() if rich else None
+        link = imu_link_stats(got, polls)
+        rep["imu_check"] = {"seconds": round(time.time() - t0, 1), "samples": len(got), "polls": len(polls),
+                            "link_details": bool(rich), "info_start": i0, "info_end": i1, "sensor_start": sen,
+                            "link": link, "strip": link.pop("strip", None), "at_rest": imu_rest_stats(got, polls),
+                            "poll_rows": polls, "source": ("telemetry at 100 Hz (angles present or not), the board's "
+                                                           "diagnostics frame 4 times a second" +
+                                                           (" and its sensor link frame (firmware 2.1.1)" if rich else ""))}
+        rep["events"] = [e for e in self.events.recent(400) if e.get("kind") in ("sensor", "setting", "problem", "board",
+                                                                                   "link")][-80:]
+        rep["telemetry"] = {"capture": imu_capture_table(got, polls)}
         return rep
 
     def _collect_sensor(self, problem, cond, secs=10.0):
@@ -7269,6 +7639,12 @@ def analyze(rep):
                         "or PWMmax too low.", "Raise PWMmax / Kp, check the supply.", n, "slow")
                     break
             seats = [r["seat"] for r in (a, bk) if r and r.get("seat")]
+            gaps = [r["seat_gaps"] for r in (a, bk) if r and r.get("seat_gaps") is not None]
+            if gaps and not seats:                   # 2.9.3: no seat verdict from a sensor that came and went
+                add("info", f"Motor {n}: the seat check was skipped - the motion sensor dropped out during it",
+                    f"Angles came for only {100 * min(gaps):.0f}% of the time around the step - too little to say what "
+                    f"the seat did.", "Diagnostics, Motion sensor check shows why it drops out (firmware 2.1 and older "
+                    "lose the sensor while Use the sensor is ticked - fixed in firmware 2.1.1).", n, "seat_gaps")
             others = [r["seat_other"] for r in (a, bk) if r and r.get("seat_other")]
             slide = n == tln
             tilts, tilted = ("turns", "turned") if slide else ("tilts", "tilted")
@@ -7519,6 +7895,48 @@ def analyze(rep):
             "the full check - and send the file to whoever helps you.", code="none")
     order = {"fail": 0, "warn": 1, "info": 2, "ok": 3}
     F.sort(key=lambda f: (order[f["level"]], f["motor"] or 0))
+    # ---- 2.9.3: where each motor rests with the motors off, and a contactless sensor at its output limit ----
+    rest = (rep.get("rig") or {}).get("rest_with_motors_off") or {}
+    seat_b = board.get("seat_setup") or {}
+    fwv = str(board.get("firmware") or "")
+    creeps_back = vkey(fwv) >= vkey("2.1.1b2") if fwv else False
+    for n in motors:
+        r = (rest.get(f"motor {n}") or {}).get("pot")
+        cut = ((st.get("running") or {}).get(f"motor {n}") or {}).get("Max limit (cutoff)") or 23
+        es = (seat_b.get("end_stop") or [[0, 1023]] * 3)[n - 1]
+        if r is not None:
+            if r < cut or r > 1023 - cut:
+                add("warn", f"Motor {n} rests past its safety cutoff with the motors off ({r:.0f})",
+                    f"With the motors off the seat's weight takes it to {r:.0f}, past Max limit ({cut} / {1023 - cut}). "
+                    f"From there the board can't switch it on - it would read like a broken {sname}.",
+                    (f"Turn the {sname} on its shaft (or its belt a tooth or two) so that resting point reads well inside "
+                     f"{cut}-{1023 - cut} - Seat setup, Centre the pots shows the way - or lower this motor's Max limit."),
+                    n, "rest_past_cutoff")
+            elif (es[1] < 1023 - cut and r > es[1]) or (es[0] > cut and r < es[0]):
+                add("info" if creeps_back else "warn",
+                    f"Motor {n} rests past its end stop with the motors off ({r:.0f}, end stop {es[0]} / {es[1]})",
+                    "The seat's weight takes it there while the motors are off. " +
+                    ("Firmware 2.1.1 brings it back slowly when the motors are switched on." if creeps_back else
+                     f"Firmware {fwv or 'before 2.1.1'} may switch it off again at Enable Motors (E{n}) - a pot "
+                     f"glitch while it creeps back is enough."),
+                    ("" if creeps_back else "Install firmware 2.1.1, or ") + "run Seat setup again: it now puts "
+                    "the end stop past where the motor rests.", n, "rest_past_end")
+        if hall:
+            # (the telemetry's feedback and the resting point - not the board's raw extremes, which include glitches)
+            hs = [v for v in ((w60.get(n) or {}).get("pot_max"), r) if v is not None]
+            ls = [v for v in ((w60.get(n) or {}).get("pot_min"), r) if v is not None]
+            mx, mn = (max(hs) if hs else None), (min(ls) if ls else None)
+            hi_lim = mx is not None and mx >= HALL_BAND[1] - HALL_EDGE
+            lo_lim = mn is not None and mn <= HALL_BAND[0] + HALL_EDGE
+            if hi_lim or lo_lim:
+                at = f"{mx:.0f}" if hi_lim else f"{mn:.0f}"
+                add("warn", f"Motor {n}'s sensor reaches the end of its output ({at})",
+                    f"A TT 6127 puts out 0.2-4.8 V, about {HALL_BAND[0]}-{HALL_BAND[1]} counts, over its electrical "
+                    f"angle (180° for an ...A180); past that end it stops following the motor - the reading sits "
+                    f"there, or jumps. Motor {n} read {at}" + (f"; it rests at {r:.0f} with the motors off" if r else "")
+                    + ".", "Turn the sensor on its shaft (or move its belt a tooth or two) so the whole travel - "
+                    "including where the corner rests with the motors off - reads inside about 80-940. Seat setup, "
+                    "Centre the pots shows which way and how far; run Seat setup again afterwards.", n, "sensor_limit")
     return F
 
 
@@ -7654,6 +8072,280 @@ def _days_apart(whens):
     return (max(ds) - min(ds)) / 86400.0 if len(ds) >= 2 else None
 
 
+def imu_link_stats(samples, polls):
+    """2.9.3: the motion sensor link over a recording: the share of telemetry samples with angles, every gap (when,
+    how long, how soon the board switched baud rate after the last angles, where it found the sensor again), and the
+    board's counters over the time. A strip for the page: (from, to, state, baud) with state on / looking / off."""
+    ts = [s["ms"] for s in samples]
+    on = [s.get("roll") is not None for s in samples]
+    t0 = ts[0]
+    runs = []
+    for t, o in zip(ts, on):
+        if runs and runs[-1][0] == o:
+            runs[-1][2] = t
+        else:
+            runs.append([o, t, t])
+    pb = [p for p in polls if p.get("ms") is not None and p.get("baud_trying") is not None]
+    baud_at = lambda ms: next((p["baud_trying"] for p in reversed(pb) if p["ms"] <= ms), pb[0]["baud_trying"] if pb else None)
+
+    def baud_in(a, z):                                # the rate the board was on during a run of angles
+        return next((p["baud_trying"] for p in pb if a <= p["ms"] <= z and p.get("receiving")), baud_at(z))
+
+    gaps = []
+    for k, (o, a, z) in enumerate(runs):
+        if o or k == 0:
+            continue                                  # (a recording that starts without angles: not a drop-out)
+        pa, last = runs[k - 1][1], runs[k - 1][2]     # the run of angles before the gap
+        # the telemetry carries the angles for up to 0.5 s after the board's last angle packet (its freshness
+        # window): the packet came at last - 500 ms at the earliest, and the rate before is the one during the run
+        pkt = max(pa, last - 500)
+        was = baud_in(pa, pkt)
+        sw = next((p["ms"] for p in pb if p["ms"] > pa and p["baud_trying"] != was), None)
+        nxt = runs[k + 1] if k + 1 < len(runs) else None
+        gaps.append({"at_s": round((a - t0) / 1000.0, 2), "s": round((z - a) / 1000.0 + 0.01, 2),
+                     "ended": nxt is not None, "baud_before": was,
+                     "switched_after_s": None if sw is None else round(max(0, sw - pkt) / 1000.0, 2),
+                     "found_again_at": baud_in(nxt[1], nxt[2]) if nxt is not None else None})
+    lock_s = [round((z - a) / 1000.0 + 0.01, 2) for k, (o, a, z) in enumerate(runs) if o and 0 < k < len(runs) - 1]
+    dur = (ts[-1] - ts[0]) / 1000.0
+    out = {"seconds": round(dur, 1), "share_with_angles": round(sum(on) / len(on), 3), "drop_outs": len(gaps),
+           "gaps": gaps[:40], "longest_gap_s": max((g["s"] for g in gaps), default=0.0),
+           "found_for_s": lock_s[:40], "starts_without": not on[0], "ends_without": not on[-1],
+           "early_switches": sum(1 for g in gaps if g["switched_after_s"] is not None and g["switched_after_s"] < 2.5)}
+    gb = bb = 0                                       # bad checksums while found - the scan reads garbage at wrong rates
+    for p, q in zip(polls, polls[1:]):
+        if (p.get("receiving") and q.get("receiving") and p.get("baud_trying") == q.get("baud_trying")
+                and p.get("good_packets") is not None and q.get("good_packets") is not None):
+            gb += (q["good_packets"] - p["good_packets"]) % (1 << 32)
+            bb += (q["bad_checksums"] - p["bad_checksums"]) % 65536
+    out["bad_share_while_found"] = round(bb / (gb + bb), 4) if gb + bb else None
+    first = next((p for p in polls if p.get("good_packets") is not None), None)
+    last = next((p for p in reversed(polls) if p.get("good_packets") is not None), None)
+    if first and last and last["t"] > first["t"]:
+        dt = last["t"] - first["t"]
+        out["packets_per_s"] = round(((last["good_packets"] - first["good_packets"]) % (1 << 32)) / dt, 1)
+        out["bad_per_s"] = round(((last["bad_checksums"] - first["bad_checksums"]) % 65536) / dt, 2)
+        if first.get("bytes") is not None and last.get("bytes") is not None:
+            out["bytes_per_s"] = round(((last["bytes"] - first["bytes"]) % (1 << 32)) / dt)
+            out["lost"] = (last["lost"] - first["lost"]) % 65536
+            out["baud_changes"] = (last["scan_steps"] - first["scan_steps"]) % 65536
+    types = 0
+    for p in polls:
+        types |= p.get("types_mask") or 0
+    if any(p.get("types_mask") is not None for p in polls):
+        out["types"] = [IMU_TYPES.get(i, f"0x{0x50 + i:02X}") for i in range(16) if types >> i & 1]
+    out["bauds_while_looking"] = sorted({p["baud_trying"] for p in pb if not p.get("receiving")})
+    rec = [p for p in polls if p.get("receiving")]
+    out["receiving_at"] = sorted({p["baud_trying"] for p in rec})
+    out["angles_per_s"] = max((p.get("angles_per_s") or 0 for p in rec), default=0)
+    out["accel_gyro"] = any(p.get("accel_gyro") for p in rec)
+    out["switched_on"] = any(p.get("switched_on") for p in polls)
+    ml = [p["may_look"] for p in polls if p.get("may_look")]
+    if ml:
+        out["may_look"] = {k: any(m[k] for m in ml) for k in ml[0]}
+    # the strip: 100 Hz samples folded into runs, the baud rate tried while looking
+    strip = []
+    for o, a, z in runs:
+        if o:
+            strip.append([round((a - t0) / 1000.0, 2), round((z - t0) / 1000.0 + 0.01, 2), "on", baud_in(a, z)])
+        else:
+            cut = [a] + [p["ms"] for p in pb if a < p["ms"] <= z] + [z]
+            for u, v in zip(cut, cut[1:]):
+                if v <= u:
+                    continue
+                bu = baud_at(u)
+                if strip and strip[-1][2] == "looking" and strip[-1][3] == bu:     # the same rate: one run
+                    strip[-1][1] = round((v - t0) / 1000.0 + 0.01, 2)
+                else:
+                    strip.append([round((u - t0) / 1000.0, 2), round((v - t0) / 1000.0 + 0.01, 2), "looking", bu])
+    out["strip"] = {"seconds": round(dur, 2), "runs": strip[:400]}
+    return out
+
+
+def imu_rest_stats(samples, polls):
+    """2.9.3: the sensor's angles, acceleration and gyro over the recording - noise and drift at rest."""
+    seat = [s for s in samples if s.get("roll") is not None]
+    out = {"samples_with_angles": len(seat)}
+    if len(seat) >= 50:
+        moving = any(s["m"][k]["t"] != seat[0]["m"][k]["t"] for s in seat for k in range(3))
+        ts = [s["ms"] / 1000.0 for s in seat]
+        for key in ("roll", "pitch"):
+            xs = [s[key] for s in seat]
+            sl, _ = _trend(ts, xs)
+            out[key] = {"mean": round(_mean(xs), 2), "noise": round(robust_sigma([b - a for a, b in zip(xs, xs[1:])]) / 1.414, 3),
+                        "p2p": round(max(xs) - min(xs), 2), "drift_per_min": round(sl * 60, 2)}
+        ys = [s["yaw"] for s in seat if s.get("yaw") is not None]
+        if len(ys) >= 50:
+            un, off = [ys[0]], 0.0
+            for a, b in zip(ys, ys[1:]):
+                d = b - a
+                off += -360.0 if d > 180 else (360.0 if d < -180 else 0.0)
+                un.append(b + off)
+            sl, _ = _trend(ts[:len(un)], un)
+            out["yaw"] = {"drift_per_min": round(sl * 60, 2), "p2p": round(max(un) - min(un), 2)}
+        out["targets_moved"] = moving
+    ag = [p for p in polls if p.get("accel_gyro") and p.get("accel_g")]
+    if ag:
+        mags = [math.sqrt(sum(a * a for a in p["accel_g"])) for p in ag]
+        gy = [max(abs(g) for g in p["gyro_dps"]) for p in ag]
+        out["accel"] = {"g_mean": round(_mean(mags), 3), "g_min": round(min(mags), 3), "g_max": round(max(mags), 3)}
+        out["gyro"] = {"dps_mean_abs": round(_mean(gy), 2), "dps_max_abs": round(max(gy), 2)}
+        tc = [p["temp_c"] for p in ag if p.get("temp_c")]
+        if tc:
+            out["temp_c"] = round(_mean(tc), 1)
+    return out
+
+
+def imu_capture_table(samples, polls):
+    """2.9.3: the Motion sensor check's recording as CSV: every telemetry sample (100 Hz) with the seat angles (empty
+    when none came), and the board's sensor link figures from its last report before that sample."""
+    pb = [p for p in polls if p.get("ms") is not None]
+    cols = ["ms", "roll", "pitch", "yaw", "angles", "baud_trying", "board_receiving", "angles_per_s", "accel_per_s",
+            "good_packets", "bad_checksums", "bytes", "lost", "baud_changes", "accel_x_g", "accel_y_g", "accel_z_g",
+            "gyro_x_dps", "gyro_y_dps", "gyro_z_dps"]
+    rows, j, cur = [], 0, {}
+    f = lambda v: "" if v is None else (f"{v:.2f}" if isinstance(v, float) else str(v))
+    for s in samples:
+        while j < len(pb) and pb[j]["ms"] <= s["ms"]:
+            cur = pb[j]
+            j += 1
+        ag, gd = cur.get("accel_g") or [None] * 3, cur.get("gyro_dps") or [None] * 3
+        if not cur.get("accel_gyro"):
+            ag, gd = [None] * 3, [None] * 3
+        rows.append(",".join(f(v) for v in (
+            s["ms"], s.get("roll"), s.get("pitch"), s.get("yaw"), 1 if s.get("roll") is not None else 0,
+            cur.get("baud_trying"), None if not cur else (1 if cur.get("receiving") else 0), cur.get("angles_per_s"),
+            cur.get("accel_per_s"), cur.get("good_packets"), cur.get("bad_checksums"), cur.get("bytes"),
+            cur.get("lost"), cur.get("scan_steps"), *ag, *gd)))
+    return {"columns": ",".join(cols), "rows": "\n".join(rows)}
+
+
+def analyze_imu(rep):
+    """2.9.3: what the Motion sensor check found."""
+    F = []
+
+    def add(level, title, detail="", fix="", code=""):
+        F.append({"level": level, "motor": None, "title": title, "detail": detail, "fix": fix, "code": code})
+
+    ck = rep.get("imu_check") or {}
+    L, R = ck.get("link") or {}, ck.get("at_rest") or {}
+    fw = (rep.get("board") or {}).get("firmware") or "?"
+    fixed = bool(ck.get("link_details"))              # firmware 2.1.1: the lock is kept, and the board counts
+    secs = L.get("seconds") or 20
+    share = L.get("share_with_angles", 0.0)
+    rates = ", ".join(str(b) for b in IMU_BAUDS)
+    wiring_tx = ("the sensor's 5 V and GND, and its TX (yellow wire) -> MAX3232 RS-232 side (R1IN) -> TTL side "
+                 "(R1OUT) -> the board's D0")
+    on = L.get("switched_on")
+    ml = L.get("may_look") or {}
+    looking = (on or any(ml.values())) if ml else on
+    if share == 0:
+        bps = L.get("bytes_per_s")
+        if not looking and len(L.get("bauds_while_looking") or []) <= 1:
+            add("fail", "The board isn't looking for the motion sensor",
+                f"No angles in {secs:.0f} s, and the board stays at one baud rate: it looks for the sensor only "
+                f"while Use the sensor is ticked, for the first minute after power-up, or for 30 s after Search "
+                f"again.", "Settings, Motion sensor: tick Use the sensor and press Apply (or press Search again), "
+                "then run this check again.", "imu_not_looking")
+        elif fixed and bps:
+            add("fail", "Bytes arrive from the sensor, but never a valid packet at any baud rate",
+                f"About {bps} bytes a second reach D0 while the board tries {rates} baud - none of them makes a "
+                f"WitMotion packet. So the sensor is talking, at a rate the board doesn't try (460800 or 921600), "
+                f"or the signal is inverted (the RS-232 side wired straight to D0, without the MAX3232's TTL side "
+                f"- that also harms the board), or something else talks on D0.",
+                "Set the sensor to 115200 baud in WitMotion's software (on the PC, with its USB adapter), then "
+                "press Search again. Check that D0 comes from the MAX3232's TTL side (R1OUT).", "imu_garbage")
+        elif fixed:
+            add("fail", "Nothing arrives from the motion sensor - not a single byte",
+                f"The board tried {', '.join(str(b) for b in L.get('bauds_while_looking') or []) or rates} baud and "
+                f"received nothing on D0 at all: the sensor has no power, or its data doesn't reach D0.",
+                f"Check {wiring_tx}. The sensor's own LED blinks while it sends.", "imu_silent")
+        else:
+            add("fail", "No angles from the motion sensor at any baud rate",
+                f"Nothing that makes a WitMotion packet arrived in {secs:.0f} s while the board tried "
+                f"{', '.join(str(b) for b in L.get('bauds_while_looking') or []) or rates} baud. Either the sensor "
+                f"sends nothing (power, wiring), or it talks at a rate the board doesn't try (460800 or 921600). "
+                f"(Firmware 2.1.1 counts the bytes too, which tells these apart.)",
+                f"Check {wiring_tx}. If the sensor was set up in WitMotion's software, set it to 115200 baud there.",
+                "imu_silent")
+    elif L.get("drop_outs"):
+        n, early = L["drop_outs"], L.get("early_switches", 0)
+        g = L.get("gaps") or []
+        again = sorted({x["found_again_at"] for x in g if x.get("found_again_at")})
+        locks = L.get("found_for_s") or []
+        det = (f"Angles arrived {100 * share:.0f}% of the {secs:.0f} s. The board lost the sensor {n} time"
+               f"{'s' if n != 1 else ''}" + ((f", each time after holding it {min(locks):.1f} s" if f"{min(locks):.1f}" == f"{max(locks):.1f}" else
+                  f", each time after holding it {min(locks):.1f}-{max(locks):.1f} s") if locks else "")
+               + f"; it then tried the other baud rates, 1.5 s each" + (f", and found it again at {', '.join(map(str, again))}"
+                                                                       if again else "")
+               + f" (longest gap {L.get('longest_gap_s', 0):.1f} s).")
+        if early and not fixed:
+            det += (f" In {early} of the drop-outs the board switched to another baud rate less than 2.5 s after the "
+                    f"last angles - with a silent sensor it waits 3 s - so the sensor was still sending.")
+            add("fail", f"The board keeps losing the motion sensor ({n} drop-out{'s' if n != 1 else ''} in {secs:.0f} s)",
+                det, f"A timing bug in firmware {fw} (and older): while Use the sensor is ticked, the board now and "
+                "then takes a packet that has just arrived for a silent sensor and goes looking elsewhere. Firmware "
+                "2.1.1 fixes it - install it (Settings, Firmware update). Nothing is wrong with the sensor or its "
+                "wiring.", "imu_fw_race")
+        else:
+            add("fail", f"The motion sensor keeps dropping out ({n} drop-out{'s' if n != 1 else ''} in {secs:.0f} s)",
+                det + (" The board held on until the sensor had been silent for 3 s, so the sensor really stopped "
+                       "sending." if fixed or not early else ""),
+                f"Check {wiring_tx}: a loose joint, or a 5 V supply that dips when the motors pull. Power the sensor "
+                "from the Arduino's 5 V, not from the motor supply.", "imu_drops")
+    else:
+        add("ok", f"Motion sensor received all the time: {L.get('angles_per_s', 0)} angles/s at "
+                  f"{', '.join(map(str, L.get('receiving_at') or [])) or '?'} baud"
+                  + (" + gyro + acceleration" if L.get("accel_gyro") else ""), code="imu_ok")
+    if share > 0:
+        bs = L.get("bad_share_while_found")
+        if bs and bs > 0.01:
+            add("warn", f"{100 * bs:.1f}% of the sensor's packets arrive damaged (bad checksum)",
+                "Counted while the board had the sensor (not while it was trying other baud rates) - the signal is "
+                "marginal.", "Check the ground between the sensor, the MAX3232 and the board, and the cable to the "
+                "sensor (shielded, away from the motor cables).", "imu_badsums")
+        if not L.get("accel_gyro") and (rep.get("board") or {}).get("fw_num", 0) >= 19:
+            add("info", "The sensor sends angles only",
+                "The board also reads its acceleration and gyro, for the 3D view and the seat's bounce in the checks.",
+                "Settings, Motion sensor: Set up the sensor (100 Hz, 115200 baud, angles + gyro + acceleration) - "
+                "once it says Receiving.", "imu_angles_only")
+        aps = L.get("angles_per_s") or 0
+        if 0 < aps < 90 and not L.get("drop_outs"):
+            add("info", f"{aps} angles a second",
+                "Set up the sensor sets 100 a second; a lower figure means the sensor is set to a lower rate.",
+                "Settings, Motion sensor: Set up the sensor.", "imu_rate")
+        extra = [t for t in (L.get("types") or []) if t not in ("acceleration", "gyro", "angles", "time")]
+        if extra:
+            add("info", "The sensor also sends " + ", ".join(extra),
+                "The board doesn't use them; they only take time on the link.",
+                "Settings, Motion sensor: Set up the sensor limits it to angles, gyro and acceleration.", "imu_types")
+        for key in ("roll", "pitch"):
+            x = R.get(key) or {}
+            if x and x.get("noise", 0) > 0.15 and not R.get("targets_moved"):
+                add("info", f"Seat {key} jitters ±{x['noise']:.2f}° at rest",
+                    "More than a sensor at rest shows (about ±0.02°): the seat or the sensor's mount vibrates, or a "
+                    "motor holds with little drive pulses.", "Fix the sensor firmly to the seat frame.", "imu_noise")
+                break
+        acc = R.get("accel") or {}
+        if acc and abs(acc.get("g_mean", 1.0) - 1.0) > 0.05 and not R.get("targets_moved"):
+            add("info", f"Acceleration at rest reads {acc['g_mean']:.2f} g (should be 1.00 g)",
+                "The accelerometer is off by more than 5 %.", "Calibrate the accelerometer in WitMotion's software "
+                "(sensor lying still).", "imu_acc_cal")
+        gy = R.get("gyro") or {}
+        if gy and gy.get("dps_mean_abs", 0) > 1.0 and not R.get("targets_moved"):
+            add("info", f"The gyro reads {gy['dps_mean_abs']:.1f}°/s at rest",
+                "A gyro at rest should read close to 0.", "Calibrate the gyro in WitMotion's software.", "imu_gyro_cal")
+    i1 = ck.get("info_end") or {}
+    if i1.get("setup_code") == 2:
+        add("info", "The last Set up the sensor was refused",
+            "The board wasn't receiving the sensor at that moment, so the commands would have gone out at the "
+            "wrong baud rate.", "Press Set up the sensor once the status says Receiving.", "imu_setup_refused")
+    if L.get("bauds_while_looking") is not None and share and not L.get("drop_outs") and L.get("starts_without"):
+        add("info", "The board was still looking for the sensor when the check started",
+            "It found it during the check.", "", "imu_found_late")
+    return F
+
+
 def analyze_sensor(rep, history):
     """2.9.1: findings of a sensor check, and the comparison with the other conditions recorded before."""
     F = []
@@ -7750,8 +8442,8 @@ def analyze_sensor(rep, history):
 
 def summary_text(rep, findings):
     b = rep.get("board", {})
-    kn = {"full": "full check", "sensor": "sensor check " + str((rep.get("capture") or {}).get("label") or "")}.get(
-        rep.get("kind"), "quick check")
+    kn = {"full": "full check", "sensor": "sensor check " + str((rep.get("capture") or {}).get("label") or ""),
+          "imu": "motion sensor check"}.get(rep.get("kind"), "quick check")
     L = [f"SMC3 R4 diagnostics - {rep.get('made')} ({kn}, smc3_scope {VERSION})"]
     if rep.get("problem"):
         L.append(f"Problem described: {rep['problem']}")
@@ -7811,6 +8503,8 @@ SEAT_DEFAULT_TL = 10.0             # traction loss: degrees the seat may turn ea
 SEAT_TILT_MARGIN = 2.0             # tilt limit = the angle allowed + this
 SEAT_SOFT_MARGIN = 20              # travel limit this many counts inside the end found
 SEAT_END_MARGIN = 6                # end stop: this many counts inside an end it pushed against, outside other ends
+SEAT_REST_MARGIN = 25              # 2.9.3: end stop this far past where a motor rests with the motors off
+SEAT_IDLE_CANCEL = 900             # 2.9.3: s - Seat setup left open with nothing done this long gives the seat back
 WHY_TEXT = {"you": "you stopped it", "angle": "reached the tilt you allow", "stall": "pushed against something",
             "lag": "couldn't keep up (struggling)", "window": "end of its Clip window", "cutoff": "its safety cutoff tripped",
             "tilt": "the tilt limit tripped", "yaw": "reached the traction loss you allow"}
@@ -7942,10 +8636,14 @@ class SeatSetup:
         self.abort_flag = False
         self.last_cmd = 0.0
         self.last_poll = time.time()
+        self.last_act = time.time()          # 2.9.3: the owner's last Seat setup command
         self.samples = [[[], []] for _ in range(3)]      # exploration: (pot, roll, pitch) per motor and way
         self.error = None
         self.result = None
         self.has_sensor = False
+        self.pots = None                     # 2.9.3: centring the pots (their belts) - see pots_start()
+        if not hasattr(self, "restarting"):
+            self.restarting = None           # 2.9.3: Start over in progress (what it is doing)
 
     # ---- helpers ----
     def say(self, msg):
@@ -7962,6 +8660,11 @@ class SeatSetup:
 
     def lifts(self):
         return [m for m in self.motors() if m != self.tl()]
+
+    def rest(self, m):
+        """2.9.3: where motor m rests with the motors off, as the watcher saw it (None if not seen)."""
+        mon = getattr(self.diag, "monitor", None)
+        return mon.motor_rest(m) if mon else None
 
     def tl_dir(self):
         return 1 if int(self.cfg.get("tl_dir") or 1) > 0 else -1
@@ -8006,12 +8709,27 @@ class SeatSetup:
                 except Exception as e:                 # never let the keeper die
                     log(f"[seat] cancel failed: {e!r}")
                 continue
+            if now - self.last_act > SEAT_IDLE_CANCEL and self.state == "open":   # 2.9.3: never hold it unseen
+                self.say("Seat setup was left open with nothing done for 15 minutes - cancelled, SimHub has the seat "
+                         "again.")
+                self.events.add("seat", "Seat setup was left open for 15 minutes with nothing done - cancelled, SimHub "
+                                        "has the seat again.", quiet=False)
+                try:
+                    self.cancel(quiet=True)
+                except Exception as e:
+                    log(f"[seat] cancel failed: {e!r}")
+                continue
             if now - last_hold > 1.0 and self.b.connected:
                 self._hold(True)
                 last_hold = now
             if self.state == "open" and now - self.last_cmd > 1.0 and self.b.connected:
                 with self.lock:
                     self._send_all()
+            if self.step == "pots" and self.state == "open":
+                try:
+                    self._pots_tick()
+                except Exception as e:                 # never let the keeper die
+                    log(f"[seat] pots: {e!r}")
 
     def _check(self, moving_motor=None):
         if self.abort_flag:
@@ -8125,6 +8843,9 @@ class SeatSetup:
         off = [m + 1 for m in self.motors() if s and s["dis"][m]]
         if off:
             return False, "Motor " + " and ".join(map(str, off)) + " is switched off - press Enable Motors first."
+        away = self.not_back(d, s)
+        if away:                                        # 2.9.3: it would hold a motor where it is on its way back
+            return False, away
         self._reset()
         self.gen.stop_now()
         sen = d.get("sensor") or {}
@@ -8156,9 +8877,32 @@ class SeatSetup:
         self.events.add("seat", "Seat setup started.", quiet=True)
         return True, "open"
 
+    def not_back(self, d=None, s=None):
+        """2.9.3: why a motor isn't back at its position yet (still creeping after Enable Motors, or outside its Clip
+        window), or None. Seat setup starts from where the motors are, so it waits for that."""
+        b = self.b
+        d = d if d is not None else (b.read_diag(0.8) or {})
+        s = s or b.latest()
+        creeping = [m for m in self.motors() if m + 1 in ((d.get("soft_start") or {}).get("creeping") or [])]
+        if creeping:
+            m = creeping[0]
+            return (f"Motor {m + 1} is still creeping back to its position" +
+                    (f" (at {s['m'][m]['f']:.0f})" if s else "") + " - wait until it is back, then try again.")
+        clip = {m: (b.params.get(f"LIM{m + 1}") or [23, 100])[1] for m in self.motors()}
+        out = [m for m in self.motors() if s and not (clip[m] - 2 <= s["m"][m]["f"] <= 1023 - clip[m] + 2)]
+        if out:
+            m = out[0]
+            return (f"Motor {m + 1} is at {s['m'][m]['f']:.0f}, outside its Clip window ({clip[m]}-{1023 - clip[m]}): "
+                    f"it hasn't come back. Press Enable Motors and wait; if it stays out there, it can't lift the seat "
+                    f"from there (firmware 2.1.1 brings it back with PWMrev).")
+        return None
+
     def cancel(self, quiet=False):
         if self.state == "idle":
             return True
+        moved = self.step == "pots" and self._pots_moved()
+        if moved:                                        # 2.9.3: a pot moved - the old set-up no longer fits
+            self._pots_commit()
         self.abort_flag = True
         t0 = time.time()
         while self.state == "busy" and time.time() - t0 < 3:
@@ -8180,8 +8924,10 @@ class SeatSetup:
                 b.cmd_pair("i", o["sensor_flags"], 255)
         self._hold(False)
         if not quiet:
-            self.say("Cancelled - the previous set-up is back.")
-        self.events.add("seat", "Seat setup cancelled - nothing changed.", quiet=True)
+            self.say("Cancelled - a pot moved, so the old set-up stays off the board: run Seat setup." if moved else
+                     "Cancelled - the previous set-up is back.")
+        if not moved:
+            self.events.add("seat", "Seat setup cancelled - nothing changed.", quiet=True)
         self.state, self.step, self.action = "idle", "start", None
         threading.Thread(target=self.b.read_diag, daemon=True).start()
         return True
@@ -8251,10 +8997,14 @@ class SeatSetup:
         if not tilt_use:
             raise SeatAbort("None of the motors tilts the seat as far as the sensor can tell. Is the sensor on the "
                             "moving part of the seat?")
+        self._level_iter(J, tilt_use, use)
+
+    def _level_iter(self, J, tilt_use, use, first_progress=50):
+        """Move the lifts until the sensor reads level (2.9.3: also the pot centring's quick re-level)."""
         c = [512, 512, 512]                          # level, and as near the middle of every motor as that allows
         for it in range(10):
             self.msg = f"Levelling, step {it + 1}"
-            self.progress = 50 + it * 5
+            self.progress = first_progress + it * 5
             e = self._angles(0.6)
             x = list(self.targets)
             new = level_solution(J, x, c, e, tilt_use)
@@ -8542,8 +9292,36 @@ class SeatSetup:
                     hard = max(hard, soft + 8)
                 travel[m][side] = int(max(0, min(1023, round(soft))))
                 ends[m][side] = int(max(0, min(1023, round(hard))))
+        # 2.9.3: never an end stop between level and where a motor rests with the motors off (the seat's weight takes
+        # a back-drivable corner there): Enable Motors would find it past the end stop. Past it, inside the SMC3 cutoff.
+        notes, rest = [], {}
+        for m in use:
+            r = self.rest(m)
+            if r is None:
+                continue
+            rest[m] = r
+            cut = (self.b.params.get(f"LIM{m + 1}") or [23, 100])[0]
+            if r < cut or r > 1023 - cut:
+                notes.append({"motor": m + 1, "level": "warn", "text": (
+                    f"Motor {m + 1} rests at {r:.0f} with the motors off - past its safety cutoff (Max limit {cut}), so "
+                    f"the board can't switch it on from there. Centre the pots (or lower its Max limit) first.")})
+            elif r > ends[m][1] - 4 and r > self.level_pos[m]:
+                new = int(round(r + SEAT_REST_MARGIN))
+                ends[m][1] = 1023 if new > 1023 - cut else new
+                notes.append({"motor": m + 1, "level": "info", "text": (
+                    f"Motor {m + 1} rests at {r:.0f} with the motors off, so its end stop on that side goes past it "
+                    f"({'the safety cutoff, ' + str(1023 - cut) if ends[m][1] == 1023 else ends[m][1]}): Enable Motors "
+                    f"brings it back instead of switching it off.")})
+            elif r < ends[m][0] + 4 and r < self.level_pos[m]:
+                new = int(round(r - SEAT_REST_MARGIN))
+                ends[m][0] = 0 if new < cut else new
+                notes.append({"motor": m + 1, "level": "info", "text": (
+                    f"Motor {m + 1} rests at {r:.0f} with the motors off, so its end stop on that side goes past it "
+                    f"({'the safety cutoff, ' + str(cut) if ends[m][0] == 0 else ends[m][0]}): Enable Motors brings "
+                    f"it back instead of switching it off.")})
         out = {"trim": [self.level_pos[m] - 512 if m in use else 0 for m in range(3)], "travel": travel,
-               "end_stop": ends, "tilt": None, "reach": None, "polygon": None, "narrowed": False, "tl": None}
+               "end_stop": ends, "tilt": None, "reach": None, "polygon": None, "narrowed": False, "tl": None,
+               "rest": {str(m): r for m, r in rest.items()}, "notes": notes}
         tl = self.tl()
         if tl is not None and tl in use:
             k, c, d = self.yaw_per_count(), self.level_pos[tl], self.tl_dir()
@@ -8737,7 +9515,454 @@ class SeatSetup:
                 "board": b.seat, "saved": self.saved or None, "live": live,
                 "simhub_held": (b.seat or {}).get("simhub_held"),
                 "layout": self.cfg.get("layout"), "tl": self.tl(), "tl_dir": self.tl_dir(),
-                "yaw_k": self.yaw_k, "yaw_per_count": self.yaw_per_count()}
+                "yaw_k": self.yaw_k, "yaw_per_count": self.yaw_per_count(),
+                "pots": self._pots_status(), "rest": [self.rest(m) for m in range(3)],
+                "restarting": self.restarting}
+
+    # ---- 2.9.3: Start over ----
+    def restart(self):
+        """One button for a set-up you don't like: the saved set-up comes off the board, every motor in use is switched
+        on (each creeps back from where it rests - with firmware 2.1.1 also from past an old end stop), and Seat
+        setup opens at its first step. Runs in the background (status: "restarting")."""
+        b = self.b
+        if self.restarting:
+            return True, "already starting over"
+        if not b.connected:
+            return False, "The board is not connected."
+        if b.fwnum() < 19:
+            return False, "Seat setup needs firmware 1.9 on the board (flash SMC3_R4_v1.9.ino)."
+        if self.tuner.running() or self.diag.running():
+            return False, "Auto-tune or the diagnostics check is running - wait for it or stop it first."
+        self.restarting = "Starting over: taking the set-up off the board"
+        self.error = None
+        threading.Thread(target=self._restart_go, daemon=True).start()
+        return True, "starting over"
+
+    def _restart_go(self):
+        b = self.b
+        try:
+            if self.state != "idle":
+                self.pots = None                         # (starting over: nothing of the pot centring to keep)
+                self.cancel(quiet=True)
+            b.seat_cmd(ord("C"), ord("L"))
+            time.sleep(0.1)
+            b.seat_cmd(ord("S"), ord("V"))
+            time.sleep(0.2)
+            b.read_diag()
+            self.events.add("seat", "Seat setup started over: the saved set-up is off the board.", quiet=False)
+            use = self.motors()
+            s = b.latest()
+            if s and any(s["dis"][m] for m in use):
+                self.restarting = "Starting over: switching the motors on (each creeps back to its position)"
+                for m in use:
+                    if s["dis"][m]:
+                        b.cmd_text(f"en{m + 1}")
+            t0 = time.time()                             # 2.9.3: every motor on and back where it belongs first
+            why = None
+            while time.time() - t0 < 45:
+                time.sleep(0.5)
+                s = b.latest()
+                if s and any(s["dis"][m] for m in use):
+                    if time.time() - t0 > 3:
+                        break
+                    continue
+                why = self.not_back()
+                if not why:
+                    break
+            s = b.latest()
+            off = [m + 1 for m in use if s and s["dis"][m]]
+            if off:
+                self.error = ("The saved set-up is off the board, but motor " + " and ".join(map(str, off)) +
+                              " doesn't stay on (see Diagnostics) - Seat setup needs every motor on.")
+                return
+            if why:
+                self.error = "The saved set-up is off the board, but Seat setup didn't open. " + why
+                return
+            time.sleep(0.5)
+            ok, msg = self.start()
+            if ok:
+                self.say("Started over: the previous set-up is off the board.")
+            else:
+                self.error = msg
+        except Exception as e:
+            self.error = f"Internal error: {e!r}"
+            log(f"[seat] restart: {e!r}")
+        finally:
+            self.restarting = None
+
+    # ---- 2.9.3: centre the pots (the belts that turn them) ----
+    # The level seat should read 512 on every lift - the middle of the pot - so SimHub has the same travel each way
+    # (the Clip window is the same distance either side of 512). A level trim moves SimHub's centre but not the window,
+    # so a lift level at 587 has 75 counts less one way than the other. Moving the pot's belt a tooth moves the reading
+    # without moving the seat. The page levels the seat with the sensor once and learns how each lift tilts it; from
+    # then on each lift's level reading follows live from where the motors are and how far the seat is from level -
+    # also after a belt has moved and the motor has gone back to its old reading, now a little off level. The
+    # traction-loss motor has no level: its centre is where the seat points straight ahead (by eye, or from the
+    # sensor's yaw across the belt move when the seat setup measured the yaw per count).
+    POTS_STEP = 8                      # counts: a change this big across a motor's off and on is a belt moved
+    POTS_MAX_TILT = 8.0                # degrees: further from level than this the estimate isn't trusted
+
+    def pots_start(self):
+        if self.state != "idle":
+            return False, "Seat setup is open - finish or cancel it first."
+        if not self.sensor_ok():
+            return False, "Centring the pots needs the motion sensor sending angles - it says where level is."
+        ok, msg = self.start()
+        if not ok:
+            return ok, msg
+        self.step = "pots"
+        self.pots = {"stable": {}, "ref": {}, "steps": {m: [] for m in range(3)}, "small": {},
+                     "hist": {m: [] for m in range(3)}, "was_off": {}, "on_at": {}, "moved": False, "base": {},
+                     "tl": None, "yaw_hist": [], "tl_wait": False,
+                     "rest_at_off": {}}
+        self.say("Centring the pots: levelling the seat with the sensor first.")
+        self.events.add("seat", "Centring the pots started.", quiet=True)
+        return self._run("level", self._pots_level, True)
+
+    def pots_level(self):
+        if self.step != "pots":
+            return False, "Not centring the pots."
+        s = self.b.latest()
+        if s and any(s["dis"][m] for m in self.motors()):
+            return False, "Switch every motor on first."
+        return self._run("level", self._pots_level, False)
+
+    def _pots_level(self, learn):
+        if learn:
+            try:
+                self._auto_level()
+            except SeatAbort as e:                       # 2.9.3: never left open, holding the seat, unseen
+                self.state = "open"
+                self.pots = None
+                self.step = "start"
+                self.cancel(quiet=True)
+                raise SeatAbort(f"{e} Centring the pots closed - the previous set-up is back.")
+        elif not self.J:
+            self._auto_level()
+        else:
+            use = self.lifts()
+            tilt_use = [m for m in use if math.hypot(self.J[0][m], self.J[1][m]) >= SEAT_MIN_EFFECT]
+            self.say("Levelling again with the sensor.")
+            self._settle(3.0, 0.3)
+            self._level_iter(self.J, tilt_use, use, 10)
+        self.level_pos = list(self.targets)
+        P = self.pots
+        if P is None:
+            return
+        for m in self.lifts():
+            P["stable"][m] = float(self.targets[m])
+            P["base"].setdefault(m, float(self.targets[m]))
+            P["hist"][m] = []
+        tl = self.tl()
+        if tl is not None and P["tl"] is None:           # the rear as it is now: where SimHub's centre had it
+            pts = self.b.since(max(0, self.b.seq - 20))
+            c = round(sum(p["m"][tl]["f"] for p in pts) / len(pts), 1) if pts else float(self.targets[tl])
+            P["tl"] = {"centre": c, "by": "start"}
+            P["base"][tl] = c
+        self.say("Level reads " + ", ".join(f"motor {m + 1} {self.targets[m]}" for m in self.lifts()) +
+                 " - the middle of each pot is 512." +
+                 (f" Motor {tl + 1} (the rear) is at {self.targets[tl]}: centre it by eye with the arrows and press "
+                  f"Centre is here if the seat doesn't point straight ahead." if tl is not None else ""))
+
+    def pots_motor(self, m, on):
+        """Switch one motor off (to move its pot belt) or on again (it creeps back to where it was)."""
+        if self.step != "pots" or self.state != "open":
+            return False, "Not now." if self.state == "busy" else "Not centring the pots."
+        if m not in self.motors():
+            return False, "That motor isn't in use."
+        self.b.cmd_text(f"{'en' if on else 'di'}{m + 1}")
+        self.say(f"Motor {m + 1} switched " + ("on - it creeps back to its reading." if on else
+                                               "off - move its pot belt now, then switch it on."))
+        return True, "ok"
+
+    def pots_mark(self):
+        """Traction loss: the rear is centred now (by eye) - its reading here is the centre."""
+        tl, P = self.tl(), self.pots
+        if self.step != "pots" or tl is None or not P or self.state != "open":
+            return False, "Not now."
+        s = self.b.latest()
+        if not s or s["dis"][tl]:
+            return False, f"Switch motor {tl + 1} on first."
+        pts = self.b.since(max(0, self.b.seq - 20))
+        v = round(sum(p["m"][tl]["f"] for p in pts) / len(pts), 1) if pts else float(self.targets[tl])
+        old = (P["tl"] or {}).get("centre")
+        if P["tl_wait"] and old is not None and abs(v - old) >= self.POTS_STEP:
+            self._pots_step(tl, v - old)
+        P["tl_wait"] = False
+        P["tl"] = {"centre": v, "by": "you"}
+        P["yaw_hist"] = []
+        self.say(f"Rear centre marked at {v:.0f}" + (f" ({v - old:+.0f})" if old is not None and v != old else "") + ".")
+        return True, "ok"
+
+    def _pots_moved(self):
+        P = self.pots
+        if not P:
+            return False
+        return bool(P["moved"])                      # a step across a motor's off and on (a belt only moves then)
+
+    def _pots_commit(self):
+        """A pot moved: every reading of that motor moved with it, so the old set-up no longer fits. Take it off the
+        board (saved that way) - also what Cancel puts back from now on."""
+        b = self.b
+        b.seat_cmd(ord("C"), ord("L"))
+        time.sleep(0.1)
+        b.seat_cmd(ord("S"), ord("V"))
+        time.sleep(0.2)
+        d = b.read_diag()
+        if self.orig and d and d.get("seat"):
+            self.orig["seat"] = json.loads(json.dumps(d["seat"]))
+        elif self.orig:
+            st = self.orig["seat"]
+            st["trim"] = [0, 0, 0]
+            st["travel"] = [[0, 1023] for _ in range(3)]
+            st["end_stop"] = [[0, 1023] for _ in range(3)]
+        self.events.add("seat", "Pots centred - the old seat set-up no longer fitted and is off the board.", quiet=False)
+
+    def pots_finish(self):
+        """Done centring. If nothing moved, the previous set-up comes back (as Cancel). If a pot moved, the old set-up
+        comes off the board and Seat setup carries on from levelling (Cancel there leaves the board without one)."""
+        if self.step != "pots":
+            return False, "Not centring the pots."
+        if self.state == "busy":
+            return False, "Wait for the seat to stop moving."
+        s = self.b.latest()
+        if s and any(s["dis"][m] for m in self.motors()):
+            return False, "Switch every motor on first."
+        if not self._pots_moved():
+            self.pots = None
+            self.step = "start"
+            self.cancel(quiet=True)
+            self.say("Pot centring closed - no pot moved, the previous set-up is back.")
+            return True, "unchanged"
+        self._pots_commit()
+        P, tl = self.pots, self.tl()
+        goal = list(self.targets)                        # where level (and the rear's centre) reads now
+        for m in self.lifts():
+            if m in P["stable"]:
+                goal[m] = int(round(P["stable"][m]))
+        if tl is not None and P["tl"]:
+            goal[tl] = int(round(P["tl"]["centre"]))
+        self.pots = None
+        self.step = "level"
+        self.level_pos, self.level_ang, self.level_yaw = None, None, None
+        self.ends = [[None, None] for _ in range(3)]
+        self.say("Pots centred. Their readings moved, so the old set-up no longer fitted - it is off the board. Seat "
+                 "setup carries on: the seat goes to where level reads now; level it, then find the travel and save.")
+        self._run("move", self._pots_goto, goal)
+        return True, "moved"
+
+    def _pots_goto(self, goal):
+        self.msg = "To the new level"
+        self._move_to(goal)
+        self._settle(4.0, 0.4)
+        self.say("At the new level: " + ", ".join(f"motor {m + 1} {goal[m]}" for m in self.motors()) + ".")
+
+    def _pots_est(self):
+        """Each lift's level reading now: where the motors are, and how far the seat is from level by the sensor, through
+        the tilt per count learned when levelling (the level nearest the middle, with three lifts)."""
+        b = self.b
+        if not self.J:
+            return None
+        pts = [x for x in b.since(max(0, b.seq - 40)) if x.get("roll") is not None]
+        if len(pts) < 10:
+            return None
+        use = [m for m in self.lifts() if math.hypot(self.J[0][m], self.J[1][m]) >= SEAT_MIN_EFFECT]
+        x = [sum(p["m"][m]["f"] for p in pts) / len(pts) for m in range(3)]
+        e = [sum(p["roll"] for p in pts) / len(pts), sum(p["pitch"] for p in pts) / len(pts)]
+        if not use or any(p["dis"][m] for p in pts[-10:] for m in self.motors()) or \
+                max(abs(e[0]), abs(e[1])) > self.POTS_MAX_TILT:
+            return None
+        new = level_solution(self.J, x, [512, 512, 512], e, use)
+        return {m: new[m] for m in use} if new else None
+
+    def _pots_tick(self):
+        """Follow each motor (the keeper, 4 times a second): stable readings, a motor switched off and on (a belt may have
+        moved), and the change across it."""
+        P, b = self.pots, self.b
+        s = b.latest()
+        if not P or not s or self.state == "busy":
+            return
+        now = time.time()
+        est = self._pots_est() or {}
+        tl = self.tl()
+        for m in self.motors():
+            dz = (b.params.get(f"DZ{m + 1}") or [2, 0])[0]
+            if s["dis"][m]:
+                if m not in P["was_off"]:
+                    P["was_off"][m] = now
+                    P["rest_at_off"][m] = self.rest(m)
+                    if m == tl:
+                        old = [(y, f) for t, y, f in P["yaw_hist"] if now - t > 0.15]
+                        P["tl_before"] = ((old[0][0] + sum(_wrap180(y - old[0][0]) for y, _ in old) / len(old),
+                                           sum(f for _, f in old) / len(old)) if len(old) >= 3 else None)
+                        P["tl_wait"] = True
+                    elif m in P["stable"]:
+                        P["ref"][m] = P["stable"][m]
+                        P["small"].pop(m, None)
+                P["hist"][m] = []
+                if m == tl:
+                    P["yaw_hist"] = []
+                continue
+            if m in P["was_off"]:
+                del P["was_off"][m]
+                P["on_at"][m] = now
+            # back and still (the level estimate uses where it is: a lift under load may hold some counts off target)
+            settled = abs(s["m"][m]["f"] - self.targets[m]) <= max(dz + 4, 30) and now - P["on_at"].get(m, 0) >= 1.5
+            if m == tl:
+                self._pots_tl_tick(P, s, now, settled)
+                continue
+            v = est.get(m)
+            if v is None or not settled:
+                P["hist"][m] = []
+                continue
+            h = P["hist"][m]
+            h.append((now, v))
+            while h and now - h[0][0] > 1.5:
+                h.pop(0)
+            vs = [y for _, y in h]
+            if len(vs) >= 3 and h[-1][0] - h[0][0] >= 1.0 and max(vs) - min(vs) <= 3.0:
+                val = sum(vs) / len(vs)
+                P["stable"][m] = val
+                if m in P["ref"]:
+                    d = val - P["ref"].pop(m)
+                    if abs(d) >= self.POTS_STEP:
+                        self._pots_step(m, d)
+                        self.say(f"Motor {m + 1}: its level reading moved {d:+.0f} (now {val:.0f}).")
+                    else:
+                        P["small"][m] = round(d, 1)
+
+    def _pots_tl_tick(self, P, s, now, settled):
+        """The traction-loss motor: with the yaw per count known (Seat setup measured it), the sensor's yaw before and
+        after a belt move says how far its centre moved; otherwise it waits to be centred by eye (Centre is here)."""
+        yaw = s.get("yaw")
+        tl = self.tl()
+        if yaw is None or not settled or not self.yaw_k:
+            P["yaw_hist"] = []
+            return
+        h = P["yaw_hist"]
+        h.append((now, yaw, s["m"][tl]["f"]))
+        while h and now - h[0][0] > 1.5:
+            h.pop(0)
+        if not P["tl_wait"] or P.get("tl_before") is None or not P["tl"]:
+            return
+        yb, fb = P["tl_before"]
+        ys = [yb + _wrap180(y - yb) for _, y, _ in h]
+        fs = [f for _, _, f in h]
+        if len(ys) >= 3 and h[-1][0] - h[0][0] >= 1.0 and max(ys) - min(ys) <= 0.15 and max(fs) - min(fs) <= 3.0:
+            # the centre reading C' = C + (where it is now - where it was) - (the turn since then) / (turn per count)
+            d = (sum(fs) / len(fs) - fb) - (sum(ys) / len(ys) - yb) / self.yaw_k
+            P["tl_wait"] = False
+            if abs(d) >= self.POTS_STEP:
+                c = P["tl"]["centre"] + d
+                P["tl"] = {"centre": c, "by": "sensor"}
+                self._pots_step(tl, d)
+                self.say(f"Motor {self.tl() + 1}: by the sensor's yaw its centre moved {d:+.0f} (now about {c:.0f}) - "
+                         f"check by eye, and if the seat doesn't point straight ahead there, centre it with the arrows "
+                         f"and press Centre is here.")
+            else:
+                P["small"][self.tl()] = round(d, 1)
+
+    def _pots_step(self, m, d):
+        """A belt moved: note the change; the motors-off rest moved with the reading too (unless the watcher saw the new
+        one while the motor was off)."""
+        P = self.pots
+        P["steps"][m].append(round(d, 1))
+        P["moved"] = True
+        mon = getattr(self.diag, "monitor", None)
+        was = P["rest_at_off"].get(m)
+        if mon and was is not None and self.rest(m) == was and hasattr(mon, "shift_rest"):
+            mon.shift_rest(m, d)
+
+    def _pots_tooth(self, m):
+        """Counts per belt tooth: this motor's moves, else the others' (the same belts, most likely)."""
+        def size(ds):                                   # a move of two teeth counts as two
+            ds = [abs(d) for d in ds if abs(d) >= self.POTS_STEP]
+            if not ds:
+                return None
+            one = min(ds)
+            return round(sum(d / max(1, round(d / one)) for d in ds) / len(ds), 1)
+        return size(self.pots["steps"][m]) or size([d for k in range(3) for d in self.pots["steps"][k]])
+
+    def _pots_advice(self, m, row):
+        P = self.pots
+        name = "centre" if row["role"] == "tl" else "level"
+        if not row["off"]:
+            row["todo"] = None
+        if row["off"]:
+            return "Off: move its pot belt" + (f" {row['todo']}" if row.get("todo") else " one tooth") + \
+                   ", then switch it on."
+        if row["state"] == "wait":
+            if row["role"] == "tl" and (not self.yaw_k or P.get("tl_before") is None):
+                return "Centre the rear by eye with the arrows, then press Centre is here."
+            return "Switched on - waiting for it to settle."
+        if row["state"] == "level":
+            return "Waiting for a steady reading (the seat needs the motors on and still)."
+        v, o, t = row["level"], row["offset"], row["tooth"]
+        small = P["small"].get(m)
+        note = (f"The last move changed it only {small:+.0f} - did the belt skip a tooth? " if small is not None else "")
+        eye = (" Check by eye that the seat points straight ahead (this is where SimHub's centre had it); if not, "
+               "centre it with the arrows and press Centre is here." if row["role"] == "tl" and row.get("by") == "start"
+               else "")
+        if row["state"] == "done":
+            return note + f"Centred: the {name} reads {v} ({o:+d} from 512)" + \
+                   (", as close as whole teeth get." if abs(o) > 3 and t else ".") + eye
+        side = "above" if o > 0 else "below"
+        steps = P["steps"][m]
+        note = eye.strip() + " " + note if eye else note
+        if not steps:
+            return (note + f"The {name} reads {v}, {abs(o)} {side} the middle. Switch it off, move its pot belt one tooth "
+                    f"either way and switch it on: the page then says if that was the right way" +
+                    (f" (about {row['teeth']} teeth in all, at {t:.0f} counts a tooth)." if t and row["teeth"] else "."))
+        last = steps[-1]
+        n = max(1, row["teeth"] or 1)
+        teeth = f"{n} tooth" if n == 1 else f"{n} teeth"
+        if row["right_way"]:
+            row["todo"] = f"{teeth} the same way"
+            return note + f"Right way (that moved it {last:+.0f}): now {v}, {abs(o)} {side} 512. {teeth.capitalize()} " \
+                          f"more the same way."
+        row["todo"] = f"{teeth} the other way"
+        return note + f"Wrong way (that moved it {last:+.0f}): now {v}, {abs(o)} {side} 512. Go {teeth} the other way."
+
+    def _pots_status(self):
+        P = self.pots
+        if not P or self.step != "pots":
+            return None
+        s = self.b.latest()
+        tl, out = self.tl(), []
+        hall = hall_sensor(self.cfg)
+        for m in self.motors():
+            off = bool(s and s["dis"][m])
+            clip = (self.b.params.get(f"LIM{m + 1}") or [23, 100])[1]
+            row = {"motor": m + 1, "role": "tl" if m == tl else "lift", "off": off, "steps": P["steps"][m],
+                   "tooth": self._pots_tooth(m), "rest": self.rest(m), "clip": clip, "todo": P.get("todo", {}).get(m)}
+            if m == tl:
+                v = (P["tl"] or {}).get("centre")
+                waiting = P["tl_wait"]
+                row["by"] = (P["tl"] or {}).get("by")
+            else:
+                v = P["stable"].get(m)
+                waiting = m in P["ref"]
+            row["level"] = None if v is None else int(round(v))
+            if v is not None and not off and not waiting:
+                o = v - 512
+                t = row["tooth"]
+                row["offset"] = int(round(o))
+                row["room"] = [int(round(v - clip)), int(round(1023 - clip - v))]   # from level each way (Clip window)
+                row["teeth"] = int(round(abs(o) / t)) if t else None
+                last = P["steps"][m][-1] if P["steps"][m] else None
+                row["right_way"] = None if last is None else abs(o) < abs(o - last)
+                row["state"] = "done" if abs(o) <= max(10.0, (t / 2.0) if t else 10.0) else "go"
+            else:
+                row["state"] = "off" if off else ("wait" if waiting else "level")
+            row["live"] = bool(P["hist"][m]) if m != tl else bool(P["yaw_hist"])
+            if hall and row["rest"] is not None and (row["rest"] >= 982 - 8 or row["rest"] <= 41 + 8):
+                row["rest_at_limit"] = True
+            row["advice"] = self._pots_advice(m, row)
+            if not off:
+                P.setdefault("todo", {})[m] = row.get("todo")
+            out.append(row)
+        return {"motors": out, "moved": self._pots_moved(), "yaw_k": self.yaw_k,
+                "all_done": all(r["state"] == "done" for r in out)}
 
     def _window_raw(self, m):
         clip = (self.b.params.get(f"LIM{m + 1}") or [23, 100])[1]
@@ -9375,8 +10600,9 @@ class ManualControl:
         self.last_hold = time.time()
         if self.b.seat is not None:
             self.b.seat["page_holds"] = True
-        self.events.add("manual", "The page took the seat (" + ("Return to center" if what == "centre" else
-                        "a motor's knob dragged") + "): SimHub's motion is ignored until Resume SimHub.", quiet=True)
+        self.events.add("manual", "The page took the seat (" + {"centre": "Return to center", "show": "after a motion "
+                        "preset"}.get(what, "a motor's knob dragged") + "): SimHub's motion is ignored until Resume "
+                        "SimHub.", quiet=True)
 
     def _end(self, msg, give_back=True):
         self.active = False
@@ -9417,6 +10643,24 @@ class ManualControl:
                 if self.pos[m] is None:
                     self.pos[m] = self.goal[m]
         return {"ok": True}
+
+    def take_over(self, pos, to_level, msg=""):
+        """2.9.3: a motion preset ended - keep the seat: from where it sent each motor (pot counts), hold it there,
+        or glide back to level (as Return to center)."""
+        if not self.b.connected or self.busy():
+            return False
+        with self.lock:
+            if not self.active:
+                self._begin("show")
+            for m in self.motors():
+                if m in pos:
+                    self.pos[m] = float(pos[m])
+                    self.vel[m] = 0.0
+                if self.pos[m] is None:
+                    continue
+                self.goal[m] = float(self.b.centre(m)) if to_level else self.pos[m]
+                self.speed[m] = MANUAL_SPEED_CENTRE
+        return True                                  # (msg: the 3D view shows how the preset ended)
 
     def release(self):
         with self.lock:
@@ -11043,6 +12287,766 @@ def usb_browser_link(handler):
                 s.close()
             except OSError:
                 pass
+
+
+# --------------------------------------------------------------------------------------------------------------
+# Motion presets in the 3D view (page 2.9.3): the seat moves by itself while you watch it in 3D - Wave, Twist, Heave
+# and Corner over and over, or a whole Landing or Drive played once. They run on the test-signal generator (so
+# auto-tune, the full check, Seat setup, an update stop them like a test signal) but, unlike a test signal, they
+# take the seat from SimHub ([kH], refreshed every second, as Return to center does). Each motor moves around its
+# level (SimHub's centre with a seat set-up) inside its Clip window and travel limits, by at most Intensity of the
+# room it has to the nearer end, no faster than SHOW_SLEW. Stop holds the seat where it is; Return to level glides it
+# back to level; either way the page keeps the seat until Resume SimHub (as after Return to center).
+# --------------------------------------------------------------------------------------------------------------
+
+SHOW_SLEW = 1500.0                 # counts/s: the fastest a preset moves a motor
+SHOW_FADE = 1.2                    # s: from where the seat is into the preset
+SHOW_PERIOD = 2.0                  # s: one cycle of Wave / Twist / Heave / Corner at speed 1
+SHOW_HOLD = 30                     # x 100 ms: the board ignores SimHub this long after each refresh
+SHOWS = {                          # name: (seconds, None = until Stop; what it is)
+    "wave": (None, "every motor in turn, a third of a cycle apart"),
+    "twist": (None, "the front lifts opposite each other: the seat rolls left and right"),
+    "heave": (None, "the lifts together: up and down"),
+    "corner": (None, "the seat rolls and the rear slides out with it, as in a corner"),
+    "landing": (30.0, "an airliner's approach in light turbulence, a crosswind, the flare, touchdown, rollout and "
+                      "braking"),
+    "driving": (36.0, "a lap: launch and gear shifts, braking, a hairpin over a kerb, esses, a bumpy straight and a "
+                      "sweeper where the rear steps out"),
+}
+
+
+def _ss(x):
+    """0 -> 1 smoothly (raised cosine) as x goes 0 -> 1."""
+    x = max(0.0, min(1.0, x))
+    return 0.5 - 0.5 * math.cos(math.pi * x)
+
+
+def _win(t, a, b, ramp=0.6):
+    """1 between a and b, easing in and out over ramp seconds at each end."""
+    return _ss((t - a) / ramp) * (1.0 - _ss((t - (b - ramp)) / ramp))
+
+
+def _pulse(t, t0, w):
+    """One smooth bump (half a sine) from t0, w seconds long."""
+    return math.sin(math.pi * (t - t0) / w) if t0 <= t <= t0 + w else 0.0
+
+
+def _rumble(t, f, seed=0.0):
+    """Smooth, bounded (+-1) noise around f Hz - the same every time."""
+    return (math.sin(2 * math.pi * f * t + seed) + 0.6 * math.sin(2 * math.pi * f * 1.73 * t + 1.3 + seed) +
+            0.4 * math.sin(2 * math.pi * f * 2.41 * t + 2.1 + 2 * seed)) / 2.0
+
+
+def _landing(t):
+    h = p = r = y = 0.0
+    if t < 9.0:
+        lab = "Approach - light turbulence"
+    elif t < 15.0:
+        lab = "Crosswind - banking, crabbing"
+    elif t < 18.0:
+        lab = "Flare"
+    elif t < 19.6:
+        lab = "Touchdown"
+    elif t < 21.5:
+        lab = "Nose wheel down - rollout"
+    elif t < 26.0:
+        lab = "Braking"
+    else:
+        lab = "Taxi"
+    air = 1.0 - _ss((t - 17.5) / 1.0)                        # in the air until the flare is done
+    r += air * 0.13 * _rumble(t, 0.35, 0.4)
+    p += air * (-0.08 + 0.07 * _rumble(t, 0.27, 1.7))
+    h += air * 0.10 * _rumble(t, 0.55, 2.9)
+    bank = _win(t, 9.0, 15.0, 1.6) * math.sin(math.pi * max(0.0, min(1.0, (t - 9.0) / 6.0)))
+    r += 0.35 * bank
+    y += 0.25 * bank                                          # crabbing into the wind
+    flare = _ss((t - 15.0) / 2.5) * (1.0 - _ss((t - 19.4) / 0.6))
+    p += 0.45 * flare
+    h += 0.10 * _win(t, 15.0, 18.0, 1.0)
+    h += -0.70 * _pulse(t, 18.0, 0.25) + 0.25 * _pulse(t, 18.25, 0.35)      # the mains touch down, a rebound
+    h += -0.35 * _pulse(t, 19.9, 0.22)                                       # the nose wheel
+    p += -0.20 * _pulse(t, 19.9, 0.3)
+    roll_out = _win(t, 18.2, 26.0, 0.8)
+    h += roll_out * 0.07 * _rumble(t, 6.0, 0.9)
+    r += roll_out * 0.04 * _rumble(t, 4.3, 3.1)
+    p += -0.35 * _win(t, 21.5, 26.0, 1.0)                    # brakes and reversers
+    return {"heave": h, "pitch": p, "roll": r, "slide": y}, lab
+
+
+def _driving(t):
+    h = p = r = y = 0.0
+    marks = [(1.0, "On the grid"), (4.0, "Launch - gear shifts"), (6.0, "Flat out"), (7.8, "Braking"),
+             (10.5, "Left hairpin"), (11.2, "Over the kerb"), (13.0, "Exit, on the throttle"), (19.0, "Esses"),
+             (23.0, "Bumpy straight"), (24.5, "Braking"), (26.0, "Right sweeper"), (28.5, "The rear steps out"),
+             (30.0, "Catching it"), (33.0, "Finish straight"), (36.1, "Slowing down")]
+    lab = next((name for until, name in marks if t < until), marks[-1][1])
+    h += 0.03 * _rumble(t, 5.0, 0.2) * (1.0 - _ss((t - 1.0) / 0.5))       # idling
+    p += 0.45 * _win(t, 1.0, 4.2, 0.4)                                     # launch: pushed back
+    p += -0.28 * _pulse(t, 2.4, 0.14) - 0.25 * _pulse(t, 3.5, 0.14)       # gear shifts
+    p += 0.20 * _win(t, 4.0, 6.0, 0.6)
+    h += 0.05 * _rumble(t, 4.0, 1.1) * _win(t, 1.0, 36.0, 0.5)            # the road
+    p += -0.55 * _win(t, 6.0, 7.9, 0.35)                                   # braking: thrown forward
+    h += -0.10 * _win(t, 6.0, 7.9, 0.35)
+    turn = _win(t, 7.6, 11.4, 0.7)
+    r += 0.55 * turn                                                       # left hairpin: rolls to the right
+    y += 0.15 * turn
+    kerb = _win(t, 10.5, 11.2, 0.12)
+    h += 0.18 * kerb * math.sin(2 * math.pi * 6.0 * t)
+    r += 0.10 * kerb * math.sin(2 * math.pi * 6.0 * t + 1.0)
+    p += 0.35 * _win(t, 11.0, 13.2, 0.5)
+    es = _win(t, 13.0, 19.0, 0.8)
+    r += 0.45 * es * math.sin(2 * math.pi * 0.45 * (t - 13.0))
+    y += 0.25 * es * math.sin(2 * math.pi * 0.45 * (t - 13.0) - 0.6)
+    bump = _win(t, 19.0, 23.0, 0.5)
+    h += 0.22 * bump * _rumble(t, 2.5, 0.7)
+    p += 0.20 * bump + 0.06 * bump * _rumble(t, 1.9, 2.2)
+    p += -0.50 * _win(t, 23.0, 24.7, 0.35)
+    sw = _win(t, 24.5, 30.5, 0.8)
+    r += -0.50 * sw                                                        # right sweeper: rolls to the left
+    y += -0.60 * _win(t, 26.0, 28.6, 0.6) + 0.22 * _win(t, 28.3, 30.2, 0.5)   # oversteer, then the catch
+    p += 0.30 * _win(t, 30.0, 33.2, 0.5)
+    p += -0.22 * _win(t, 33.0, 35.6, 0.6)
+    return {"heave": h, "pitch": p, "roll": r, "slide": y}, lab
+
+
+def show_pose(name, t, roles):
+    """Where each motor should be, -1..1 of its room ("up" for a lift, right for the rear slide), at t seconds into
+    preset name; roles: {motor: "left" | "right" | "rear" | "slide"}. Returns ({motor: value}, what happens now)."""
+    ph = t / SHOW_PERIOD
+    if name == "wave":
+        ms = sorted(roles)
+        return {m: math.sin(2 * math.pi * (ph + i / len(ms))) for i, m in enumerate(ms)}, "Wave"
+    if name == "twist":
+        d, lab = {"roll": math.sin(2 * math.pi * ph)}, "Twist"
+    elif name == "heave":
+        d, lab = {"heave": math.sin(2 * math.pi * ph)}, "Heave"
+    elif name == "corner":
+        s = math.sin(2 * math.pi * ph)
+        d, lab = {"roll": s, "slide": s}, ("Left-hander" if s >= 0 else "Right-hander")
+    elif name == "landing":
+        d, lab = _landing(t)
+    elif name == "driving":
+        d, lab = _driving(t)
+    else:
+        return {}, ""
+    h, p, r, y = (d.get(k, 0.0) for k in ("heave", "pitch", "roll", "slide"))
+    out = {}
+    for m, role in roles.items():
+        v = {"left": h + p + r, "right": h + p - r, "rear": h - p, "slide": y}.get(role, 0.0)
+        out[m] = max(-1.0, min(1.0, v))
+    return out, lab
+
+
+def show_plan(cfg, board):
+    """{motor: {"c": level, "room": counts each way, "sign": +1 when higher numbers lift it (or move the rear right),
+    "role", "rev", "lo", "hi"}} for the motors in use, or (None, why)."""
+    n = int(cfg.get("motors") or 3)
+    lifts, tl = lift_motors(cfg), tl_motor(cfg)
+    fwfl = (board.fw_cache or [0, 0])[0]
+    names = ["left", "right", "rear"]
+    out = {}
+    for m in range(n):
+        lo, hi = board.window(m)
+        c = float(board.centre(m))
+        rev = m == 0 and bool(fwfl & 1)
+        if m == tl:
+            role, sign = "slide", (1 if int(cfg.get("tl_dir") or 1) > 0 else -1)
+        else:
+            i = lifts.index(m)
+            role = names[i] if i < 3 else "rear"
+            if tl is None and len(lifts) == 2:
+                role = names[i]
+            sign = up_sign(cfg, m, fwfl) * (-1 if rev else 1)        # in pot counts (motor 1 mirrored on the board)
+        room = max(0.0, min(c - lo, hi - c))
+        if room < 20:
+            return None, (f"Motor {m + 1} has no room to move around its level ({c:.0f}, window {lo}-{hi}) - check "
+                          f"its Clip and travel limits.")
+        out[m] = {"c": c, "room": room, "sign": sign, "role": role, "rev": rev, "lo": lo, "hi": hi}
+    return out, None
+
+
+# --------------------------------------------------------------------------------------------------------------
+# Park (page 2.9.3, firmware 2.1.1): lower the seat evenly to its park position and switch the motors off there,
+# so no corner sinks on its own when the rig is switched off (a back-drivable corner sank while friction held the
+# other). The park position may be past the travel limits, Clip and end stops - near where the seat rests on its own -
+# with firmware 2.1.1 ([kP mask]: those motors may go anywhere inside the SMC3 cutoff while the page refreshes it);
+# older firmware parks at the edge of the travel window. Every motor arrives at the same time. With the motion sensor
+# the page compares the seat's angles with the ones saved with the park position, and checks that nothing moves when
+# the motors switch off (if a corner still sinks, its park position isn't low enough). Enable Motors unparks: each motor
+# creeps back (firmware 2.1.1: also from past an end stop).
+# --------------------------------------------------------------------------------------------------------------
+
+PARK_SPEED = 60.0                  # counts/s for the motor with the furthest to go (the others arrive with it)
+PARK_HOLD = 30                     # x 100 ms: SimHub waits this long after each refresh
+PARK_TOL = 6                       # counts: there
+PARK_STALL_S = 0.8                 # still this long short of its park position = against its stop (that's fine)
+PARK_SETTLE_S = 2.5                # after switching the motors off: does anything move?
+PARK_SAG = 6                       # counts a motor moves after switching off = it isn't resting there
+PARK_ANGLE_TOL = 0.8               # degrees: sits as when the park position was set
+PARK_JOG_SPEED = 120.0             # counts/s while setting the park position
+
+
+class ParkControl:
+    def __init__(self, board, cfg, events, manual):
+        self.b, self.cfg, self.events, self.manual = board, cfg, events, manual
+        self.busy = lambda: None             # -> why something else moves the motors (set by main), or None
+        self.rest = lambda m: None           # -> where motor m rests with the motors off (the watcher), or None
+        self.lock = threading.Lock()
+        self.state = "idle"                  # idle | parking | setting | moving (setting: going somewhere)
+        self.msg, self.msg_id = "", 0
+        self.result = None                   # the last park: where each motor stopped, angles, what moved after off
+        self.parked = False                  # parked and the motors still off
+        self.targets = [None, None, None]    # pot counts being sent now (setting)
+        self.goal = [None, None, None]       # where they ramp to (setting)
+        self.set_from = None                 # where the motors were when setting started
+        self.abort_flag = False
+        self.conn = None
+        threading.Thread(target=self._keeper, daemon=True).start()
+
+    # ---- helpers ----
+    def motors(self):
+        return list(range(int(self.cfg.get("motors") or 3)))
+
+    def fw_park(self):
+        """Firmware 2.1.1: park positions past the travel limits, Clip and end stops."""
+        k = self.b.fw_known or self.b.fw_version
+        return bool(k) and self.b.fwnum() >= 21 and vkey(k) >= vkey("2.1.1b4")
+
+    def _rev(self, m):
+        return m == 0 and bool((self.b.fw_cache or [0, 0])[0] & 1)
+
+    def limits(self, m):
+        """Where a park position may be: inside the SMC3 cutoff (firmware 2.1.1), else the travel window."""
+        if self.fw_park():
+            cut = (self.b.params.get(f"LIM{m + 1}") or [23, 100])[0]
+            return cut + 8, 1023 - cut - 8
+        return self.b.window(m)
+
+    def down(self, m):
+        """+1 when higher numbers lower lift m (pot counts), -1 when lower numbers do; None for the rear slide."""
+        if m == tl_motor(self.cfg):
+            return None
+        k = str(m + 1)
+        if k not in (self.cfg.get("lift_dir") or {}) and k not in (self.cfg.get("lift_sink") or {}):
+            r = self.rest(m)                         # not asked yet: down is where it rests with the motors off
+            if r is not None and abs(r - self.b.centre(m)) > 50:
+                return 1 if r > self.b.centre(m) else -1
+        fl = (self.b.fw_cache or [0, 0])[0]
+        return -up_sign(self.cfg, m, fl) * (-1 if self._rev(m) else 1)
+
+    def saved(self):
+        p = self.cfg.get("park")
+        return p if isinstance(p, dict) else {}
+
+    def default_pos(self, m):
+        """No park position set: lifts at the low end of their travel window, the rear slide centred."""
+        d = self.down(m)
+        if d is None:
+            return float(self.b.centre(m))
+        lo, hi = self.b.window(m)
+        return float(hi if d > 0 else lo)
+
+    def positions(self):
+        sp = self.saved().get("pos") or [None, None, None]
+        out = {}
+        for m in self.motors():
+            v = sp[m] if m < len(sp) and sp[m] is not None else self.default_pos(m)
+            lo, hi = self.limits(m)
+            out[m] = float(max(lo, min(hi, v)))
+        return out
+
+    def _send(self, m, v):
+        self.b.cmd_word("ABC"[m], int(round(1023 - v if self._rev(m) else v)))
+
+    def _now_pos(self, key="t"):
+        """Where each motor is (f) or is being sent (t), pot counts, from the latest sample."""
+        s = self.b.latest()
+        out = {}
+        for m in self.motors():
+            v = float(s["m"][m][key]) if s else 512.0
+            out[m] = (1023.0 - v) if (key == "t" and self._rev(m)) else v
+        return out
+
+    def _mean_pos(self, dur=0.3):
+        seq = self.b.seq
+        time.sleep(dur)
+        pts = self.b.since(seq) or [self.b.latest()]
+        return {m: sum(p["m"][m]["f"] for p in pts) / len(pts) for m in self.motors()}
+
+    def _angles(self, dur=0.6):
+        seq = self.b.seq
+        time.sleep(dur)
+        pts = [p for p in self.b.since(seq) if p.get("roll") is not None]
+        if len(pts) < 3:
+            return None
+        return [round(sum(p["roll"] for p in pts) / len(pts), 2), round(sum(p["pitch"] for p in pts) / len(pts), 2)]
+
+    def _note(self, msg, event=False):
+        self.msg, self.msg_id = msg, self.msg_id + 1
+        if event:
+            self.events.add("park", msg, quiet=False)
+
+    def can(self):
+        """Why the seat can't be parked (or its park position set) now, or None."""
+        b = self.b
+        if not b.connected:
+            return "The board is not connected."
+        if b.fwnum() < 19:
+            return "Park needs firmware 1.9 or newer (it holds SimHub back while it lowers the seat)."
+        if self.state != "idle":
+            return {"parking": "Parking already.", "unparking": "Unparking."}.get(self.state,
+                                                                                 "The park position is being set.")
+        why = self.busy()
+        if why:
+            return why
+        s = b.latest()
+        off = [m + 1 for m in self.motors() if s and s["dis"][m]]
+        if off:
+            return ("The motors are off" + (" - the seat is parked" if self.parked else "") + ". Enable Motors first."
+                    if len(off) == len(self.motors()) else
+                    "Motor " + " and ".join(map(str, off)) + " is off - press Enable Motors first.")
+        return None
+
+    def _take(self):
+        """Take the seat from SimHub (and from Return to center / a dragged knob)."""
+        with self.manual.lock:
+            if self.manual.active:
+                self.manual._end("Park took the seat.", give_back=False)
+        self.conn = self.b.conn_id
+        self.abort_flag = False
+        self._refresh(force=True)
+
+    def _refresh(self, force=False):
+        now = time.time()
+        if force or now - getattr(self, "_last_hold", 0.0) >= 1.0:
+            self.b.seat_cmd(ord("H"), PARK_HOLD)
+            if self.fw_park():
+                self.b.seat_cmd(ord("P"), sum(1 << m for m in self.motors()))
+            self._last_hold = now
+
+    def _let_go(self, give_back=True):
+        if self.fw_park():
+            self.b.seat_cmd(ord("P"), 0)
+        if give_back:
+            self.b.seat_cmd(ord("H"), 0)
+            if self.b.seat is not None:
+                self.b.seat["page_holds"] = False
+
+    def _check(self):
+        if self.abort_flag:
+            raise SeatAbort("Stopped.")
+        if not self.b.connected or self.b.conn_id != self.conn:
+            raise SeatAbort("The connection to the board dropped.")
+        s = self.b.latest()
+        off = [m + 1 for m in self.motors() if s and s["dis"][m]]
+        if off:
+            raise SeatAbort("Motor " + " and ".join(map(str, off)) + " switched off.")
+
+    def _move(self, goal, speed):
+        """Every motor from where it is being sent to goal, arriving together, easing in and out."""
+        start = {m: (self.targets[m] if self.targets[m] is not None else v) for m, v in self._now_pos("t").items()}
+        dist = max([abs(goal[m] - start[m]) for m in goal] + [0.0])
+        dur = max(1.0, dist / max(5.0, speed) * 1.25)          # (eased: a little longer than at constant speed)
+        t0 = time.time()
+        while True:
+            self._check()
+            x = min(1.0, (time.time() - t0) / dur)
+            e = _ss(x)
+            for m in goal:
+                v = start[m] + (goal[m] - start[m]) * e
+                self.targets[m] = v
+                self._send(m, v)
+            self._refresh()
+            if x >= 1.0:
+                return
+            time.sleep(0.02)
+
+    def _wait_there(self, goal, timeout=6.0):
+        """Until every motor is at its park position, or still against its stop short of it."""
+        t0, hist = time.time(), {m: [] for m in goal}
+        stalled = set()
+        while time.time() - t0 < timeout:
+            self._check()
+            self._refresh()
+            for m in goal:
+                self._send(m, goal[m])
+            time.sleep(0.05)
+            s = self.b.latest()
+            now = time.time()
+            done = True
+            for m in goal:
+                f = s["m"][m]["f"]
+                h = hist[m]
+                h.append((now, f))
+                while h and now - h[0][0] > PARK_STALL_S:
+                    h.pop(0)
+                if abs(f - goal[m]) <= PARK_TOL:
+                    continue
+                if now - t0 > 1.0 and len(h) > 5 and max(x for _, x in h) - min(x for _, x in h) <= 2.0:
+                    stalled.add(m)
+                    continue
+                done = False
+            if done:
+                break
+        return self._mean_pos(0.3), sorted(stalled)
+
+    # ---- park ----
+    def start(self):
+        why = self.can()
+        if why:
+            return False, why
+        goal = self.positions()
+        self._take()
+        self.state = "parking"
+        self.targets = [None, None, None]
+        self._note("Lowering the seat to its park position.")
+        threading.Thread(target=self._park, args=(goal,), daemon=True).start()
+        return True, "parking"
+
+    def _park(self, goal):
+        b, sv = self.b, self.saved()
+        res = {"when": time.strftime("%Y-%m-%d %H:%M"), "goal": {str(m + 1): round(v) for m, v in goal.items()}}
+        try:
+            self._move(goal, float(sv.get("speed") or PARK_SPEED))
+            at, stalled = self._wait_there(goal)
+            res["at"] = {str(m + 1): round(at[m], 1) for m in at}
+            res["stalled"] = [m + 1 for m in stalled]
+            a_on = self._angles(0.6)
+            res["angles"] = a_on
+            notes = []
+            ref = sv.get("angles")
+            if a_on and ref:
+                dr, dp = a_on[0] - ref[0], a_on[1] - ref[1]
+                res["vs_saved"] = [round(dr, 2), round(dp, 2)]
+                if max(abs(dr), abs(dp)) > PARK_ANGLE_TOL:
+                    notes.append(f"The seat sits {dr:+.1f}° roll, {dp:+.1f}° pitch from when the park position was set - a "
+                                 f"pot or its belt may have moved, or the rig did.")
+                else:
+                    notes.append("It sits as when the park position was set (the sensor agrees within "
+                                 f"{max(abs(dr), abs(dp)):.1f}°).")
+            far = [m for m in at if abs(at[m] - goal[m]) > 15]
+            for m in far:
+                notes.append(f"Motor {m + 1} stopped at {at[m]:.0f}, short of its park position {goal[m]:.0f} - against its "
+                             f"stop, or too weak to get there.")
+            if True:                                     # parked = the motors off (the point: nothing sinks on its own)
+                b.cmd_text("dis")
+                self._let_go()
+                time.sleep(PARK_SETTLE_S)
+                f_off = self._mean_pos(0.4)
+                a_off = self._angles(0.6)
+                moved = {m: f_off[m] - at[m] for m in at}
+                res["moved_off"] = {str(m + 1): round(v, 1) for m, v in moved.items()}
+                res["angles_off"] = a_off
+                sank = [m for m in moved if abs(moved[m]) > PARK_SAG]
+                tilt = (max(abs(a_off[0] - a_on[0]), abs(a_off[1] - a_on[1])) if (a_off and a_on) else None)
+                if sank or (tilt is not None and tilt > 0.3):
+                    who = ", ".join(f"motor {m + 1} {moved[m]:+.0f}" for m in sank) if sank else "the seat"
+                    notes.append(f"After the motors switched off it still moved ({who}" +
+                                 (f", {tilt:.1f}°" if tilt is not None else "") + ") - set the park position lower "
+                                 "there, so it rests.")
+                else:
+                    notes.append("Nothing moved when the motors switched off" +
+                                 (" (the sensor agrees)" if tilt is not None else "") + ".")
+                self.parked, self.parked_at = True, time.time()
+                head = "Parked: the motors are off. Enable Motors brings the seat back up."
+            res["ok"] = True
+            self.result = res
+            self._note(head + (" " + " ".join(notes) if notes else ""), event=True)
+        except SeatAbort as e:
+            b.cmd_text("dis")                            # partway down: switch off where it is (safe, as parked)
+            self._let_go()
+            self.parked, self.parked_at = True, time.time()
+            res["ok"] = False
+            self.result = res
+            self._note(f"Park stopped ({e}) - the motors are off where the seat is. Enable Motors brings it back.", event=True)
+        except Exception as e:
+            log(f"[park] {e!r}")
+            b.cmd_text("dis")
+            self._let_go()
+            self._note(f"Park stopped: internal error {e!r} - the motors are off.", event=True)
+        finally:
+            self.state = "idle"
+            self.targets = [None, None, None]
+
+    def targets_dict(self):
+        return {m: v for m, v in enumerate(self.targets) if v is not None}
+
+    def stop(self):
+        if self.state == "idle":
+            return False, "Nothing to stop."
+        if self.state == "setting":
+            return self.set_end("back")
+        self.abort_flag = True
+        return True, "stopping"
+
+    def unpark(self):
+        """2.9.3: with firmware 2.1.1+ the page raises the seat evenly back to level in park mode (no end stop in
+        the way, every motor arriving together - firmware 2.1.1 gives a lagging motor up to PWMrev's drive), then
+        gives it back to SimHub; with older firmware Enable Motors and each motor creeps back by itself. Either way the
+        page checks that every motor got back up."""
+        b = self.b
+        if not b.connected:
+            return False, "The board is not connected."
+        if self.state != "idle":
+            return False, "Wait - " + ("parking." if self.state == "parking" else "busy.")
+        why = self.busy()
+        if why:
+            return False, why
+        self.state = "unparking"
+        self.abort_flag = False
+        threading.Thread(target=self._unpark, daemon=True).start()
+        return True, "unparking"
+
+    def _unpark(self):
+        b = self.b
+        use = self.motors()
+        goal = {m: float(b.centre(m)) for m in use}
+        try:
+            if self.fw_park():
+                self._take()                             # hold SimHub, park mode: nothing trips on the way up
+                start = self._mean_pos(0.2)
+                for m in use:                            # the board's targets: where each motor is now
+                    self.targets[m] = start[m]
+                    self._send(m, start[m])
+                time.sleep(0.15)
+                b.cmd_text("ena")
+                sync_unused(b, self.cfg)
+                t0 = time.time()
+                while time.time() - t0 < 2.0:
+                    s = b.latest()
+                    if s and not any(s["dis"][m] for m in use):
+                        break
+                    time.sleep(0.1)
+                self.parked = False
+                self._note("Unparking: the seat rises evenly back to level.")
+                self._move(goal, float(self.saved().get("speed") or PARK_SPEED))
+                at, stalled = self._wait_there(goal, 8.0)
+            else:
+                b.cmd_text("ena")
+                sync_unused(b, self.cfg)
+                self.parked = False
+                self._note("Unparking: every motor creeps back up to its position.")
+                t0, at = time.time(), {}
+                while time.time() - t0 < 30:             # the board creeps back by itself (soft start)
+                    time.sleep(0.5)
+                    s = b.latest()
+                    if s and any(s["dis"][m] for m in use):
+                        break
+                    at = self._now_pos("f")
+                    if all(abs(at[m] - goal[m]) <= 20 for m in use):
+                        break
+                at = self._now_pos("f")
+            far = [m for m in use if abs(at[m] - goal[m]) > 20]
+            if far:
+                if self.fw_park():                       # it can't come back: down again, off (rather than trip)
+                    self.b.cmd_text("dis")
+                    self._let_go()
+                    self.parked, self.parked_at = True, time.time()
+                self._note("Motor " + " and ".join(f"{m + 1}" for m in far) + " couldn't get back up (" +
+                           ", ".join(f"at {at[m]:.0f}, level is {goal[m]:.0f}" for m in far) + ")" +
+                           (" - the motors are off again." if self.fw_park() else ".") +
+                           " Set its park position higher (Park position)" +
+                           ("." if self.b.fwnum() >= 21 and vkey(self.b.fw_known or self.b.fw_version or "0") >=
+                            vkey("2.1.1b5") else ", or flash firmware 2.1.1 (it gives a motor coming back up up to "
+                                                 "PWMrev's drive)."), event=True)
+                return
+            if self.fw_park():
+                self._let_go()
+            self._note("Unparked: the seat is back at level - SimHub has it.", event=True)
+        except SeatAbort as e:
+            b.cmd_text("dis")
+            self._let_go()
+            self.parked, self.parked_at = True, time.time()
+            self._note(f"Unparking stopped ({e}) - the motors are off where the seat is.", event=True)
+        except Exception as e:
+            log(f"[park] unpark: {e!r}")
+            b.cmd_text("dis")
+            self._let_go()
+            self._note(f"Unparking stopped: internal error {e!r} - the motors are off.", event=True)
+        finally:
+            self.state = "idle"
+            self.targets = [None, None, None]
+
+    # ---- setting the park position ----
+    def set_start(self):
+        why = self.can()
+        if why:
+            return False, why
+        self._take()
+        cur = self._now_pos("t")
+        self.set_from = dict(cur)
+        for m in self.motors():
+            self.targets[m] = self.goal[m] = cur[m]
+        self.state = "setting"
+        self._note("Setting the park position: the page has the seat" +
+                   (" and may take it past the travel limits and Clip (inside the SMC3 cutoff)." if self.fw_park() else
+                    " - inside the travel window (firmware 2.1.1 lets it go further).") +
+                   " Lower it with the arrows until it rests where it sits when switched off, then Save.")
+        return True, "setting"
+
+    def jog(self, m, d):
+        if self.state != "setting" or m not in self.motors():
+            return False, "Not now."
+        lo, hi = self.limits(m)
+        with self.lock:
+            self.goal[m] = float(max(lo, min(hi, (self.goal[m] if self.goal[m] is not None else self.targets[m]) + d)))
+        return True, round(self.goal[m])
+
+    def lower(self, d):
+        """Every lift down (d > 0) or up (d < 0) together by d counts."""
+        if self.state != "setting":
+            return False, "Not now."
+        for m in self.motors():
+            s = self.down(m)
+            if s is not None:
+                self.jog(m, s * d)
+        return True, "ok"
+
+    def level(self):
+        """Level side to side with the sensor (the tilt per count Seat setup learned), one gentle step at a time."""
+        if self.state != "setting":
+            return False, "Not now."
+        J = None
+        try:
+            J = (json.load(open(os.path.join(self.cfg_dir(), "seat.json"))) or {}).get("J")
+        except (OSError, ValueError, TypeError):
+            pass
+        s = self.b.latest()
+        if not J or not s or s.get("roll") is None:
+            return False, "Needs the motion sensor and a Seat setup that measured how each lift tilts the seat."
+        lifts = [m for m in self.motors() if self.down(m) is not None and abs(J[0][m]) > 0.002]
+        if not lifts:
+            return False, "No lift tilts the seat sideways."
+        r = s["roll"]
+        k = sum(J[0][m] ** 2 for m in lifts)
+        for m in lifts:
+            self.jog(m, max(-25.0, min(25.0, -r * J[0][m] / k)))
+        return True, f"roll {r:+.1f}°"
+
+    def cfg_dir(self):
+        return os.path.dirname(self.cfg.path)
+
+    def save(self):
+        if self.state != "setting":
+            return False, "Not now."
+        pos = self._mean_pos(0.4)
+        ang = self._angles(0.6)
+        sv = dict(self.saved())
+        sv.update(pos=[round(pos[m]) if m in pos else None for m in range(3)], angles=ang,
+                  when=time.strftime("%Y-%m-%d %H:%M"), beyond=self.fw_park())
+        self.cfg.update(park=sv)
+        txt = ("Park position saved: " + ", ".join(f"motor {m + 1} {pos[m]:.0f}" for m in pos) +
+               (f" (seat {ang[0]:+.1f}° roll, {ang[1]:+.1f}° pitch)" if ang else "") + ".")
+        self._note(txt + " Park here now, or go back up.", event=False)
+        self.events.add("park", txt, quiet=True)
+        return True, "saved"
+
+    def set_end(self, how):
+        """After setting: "park" switches the motors off here; "back" glides back to where it was and gives the seat
+        back to SimHub."""
+        if self.state != "setting":
+            return False, "Not now."
+        if how == "park":
+            self.state = "moving"
+            threading.Thread(target=self._park, args=(self.positions(),), daemon=True).start()
+            return True, "parking"
+        self.state = "moving"
+        threading.Thread(target=self._back, daemon=True).start()
+        return True, "back"
+
+    def _back(self):
+        try:
+            self._move(self.set_from, PARK_JOG_SPEED)
+            self._wait_there(self.set_from, 3.0)
+            self._let_go()
+            self._note("Back where it was - SimHub has the seat again.")
+        except SeatAbort as e:
+            self.b.cmd_text("dis")
+            self._let_go()
+            self._note(f"Stopped ({e}) - the motors are off where the seat is.")
+        except Exception as e:
+            log(f"[park] {e!r}")
+        finally:
+            self.state = "idle"
+            self.targets = [None, None, None]
+
+    def clear(self):
+        self.cfg.update(park=None)
+        self._note("Park position cleared: the default is the low end of each lift's travel, the rear centred.")
+        return True, "ok"
+
+    def options(self, req):
+        sv = dict(self.saved())
+        if "speed" in req:
+            try:
+                sv["speed"] = max(10.0, min(300.0, float(req["speed"])))
+            except (TypeError, ValueError):
+                return False, "Speed?"
+        if isinstance(req.get("pos"), list):
+            try:
+                cur = list(sv.get("pos") or [None, None, None])
+                for m, v in enumerate(req["pos"][:3]):
+                    if v not in (None, ""):
+                        lo, hi = self.limits(m)
+                        cur[m] = int(max(lo, min(hi, int(v))))
+                sv["pos"] = cur
+                sv["angles"] = None                     # typed in: no angles to compare with
+            except (TypeError, ValueError):
+                return False, "Check the numbers."
+        self.cfg.update(park=sv)
+        return True, "ok"
+
+    # ---- the keeper: while setting, ramp to the goals and keep the seat ----
+    def _keeper(self):
+        prev = time.time()
+        while True:
+            time.sleep(0.02)
+            now = time.time()
+            dt, prev = min(0.1, now - prev), now
+            if self.state != "setting":
+                continue
+            try:
+                if not self.b.connected or self.b.conn_id != self.conn:
+                    self.state = "idle"
+                    self._note("The connection to the board dropped - setting the park position stopped.")
+                    continue
+                why = self.busy()
+                s = self.b.latest()
+                off = [m + 1 for m in self.motors() if s and s["dis"][m]]
+                if why or off:
+                    self.state = "idle"
+                    self._let_go()
+                    self._note("Setting the park position stopped: " + (why or f"motor {off[0]} switched off."))
+                    continue
+                with self.lock:
+                    for m in self.motors():
+                        g, t = self.goal[m], self.targets[m]
+                        if g is None or t is None:
+                            continue
+                        step = PARK_JOG_SPEED * dt
+                        t = g if abs(g - t) <= step else t + math.copysign(step, g - t)
+                        self.targets[m] = t
+                        self._send(m, t)
+                self._refresh()
+            except Exception as e:
+                log(f"[park] keeper: {e!r}")
+
+    def status(self):
+        s = self.b.latest()
+        if self.parked and s and not any(s["dis"][m] for m in self.motors()) and \
+                time.time() - getattr(self, "parked_at", 0.0) > 2.0:
+            self.parked = False                      # Enable Motors (anywhere) unparks (not the switch-off's own lag)
+        pos = self.positions() if self.b.connected else {}
+        sv = self.saved()
+        return {"state": self.state, "parked": self.parked, "msg": self.msg, "msg_id": self.msg_id,
+                "can": None if self.state != "idle" else self.can(), "fw_park": self.fw_park(),
+                "pos": [round(pos[m]) if m in pos else None for m in range(3)],
+                "saved": bool(sv.get("pos")), "saved_when": sv.get("when"), "angles": sv.get("angles"),
+                "speed": float(sv.get("speed") or PARK_SPEED),
+                "limits": [list(self.limits(m)) for m in range(3)] if self.b.connected else None,
+                "window": [list(self.b.window(m)) for m in range(3)] if self.b.connected else None,
+                "down": [self.down(m) for m in range(3)],
+                "targets": [None if t is None else round(t) for t in self.targets], "result": self.result}
 
 
 # --------------------------------------------------------------------------------------------------------------
@@ -13186,9 +15190,9 @@ main[data-view=tools]{grid-template-columns:minmax(0,1.75fr) minmax(0,1fr);grid-
 main[data-view=profiles]{grid-template-columns:minmax(0,1fr) minmax(360px,430px);grid-template-areas:"genres pid" "profiles pid"}
 main[data-view=autotune]{grid-template-columns:minmax(360px,430px) minmax(0,1fr);grid-template-areas:"tune tunelive" "tuneres tunelive" "tunelog tunelog" "graphs graphs"}
 main[data-view=eeprom]{grid-template-columns:minmax(0,1fr) minmax(360px,430px);grid-template-areas:"eeprom pid" "backups pid"}
-main[data-view=settings]{grid-template-columns:repeat(2,minmax(0,1fr));grid-template-areas:"settings global" "settings mnames" "usb usb" "led sensor" "upd upd" "fwupd fwupd" "diag diag"}
+main[data-view=settings]{grid-template-columns:repeat(2,minmax(0,1fr));grid-template-areas:"settings global" "settings mnames" "usb usb" "led sensor" "park park" "upd upd" "fwupd fwupd" "diag diag"}
 main[data-view=help]{grid-template-columns:1fr;grid-template-areas:"help"}
-main[data-view=seat]{grid-template-columns:minmax(0,1fr) minmax(300px,380px);grid-template-areas:"seat seatlive" "graphs graphs"}
+main[data-view=seat]{grid-template-columns:minmax(0,1fr) minmax(300px,380px);grid-template-areas:"seat seatlive" "park seatlive" "graphs graphs"}
 main[data-view=view3d]{grid-template-columns:1fr;grid-template-areas:"v3d"}
 main[data-view] > [data-views]{align-self:stretch}
 .mrow{display:grid;grid-template-columns:repeat(var(--n,3),minmax(0,1fr));gap:14px;min-width:0}
@@ -13260,6 +15264,20 @@ html[data-theme=light] .mimg{background:#111a24}
 .tile{height:72px;border-radius:7px;flex-direction:column;gap:6px;font-size:14px;white-space:normal;text-align:center;line-height:1.2;padding:0 8px}
 .tile svg{width:22px;height:22px}
 .qsub{font-size:15px;font-weight:600;margin:16px 0 9px}
+/* 2.9.3: park */
+.pkbtn{margin-left:auto;height:30px;width:44px;padding:0;display:grid;place-items:center;border-radius:8px;border:1px solid var(--line-2);background:var(--card-2);color:var(--dim);cursor:pointer}
+.pkbtn:hover{color:var(--text);border-color:var(--blue)}
+.pkbtn .pki,.ct .pki{width:34px;height:22px;fill:none;stroke:currentColor;stroke-width:2.2;stroke-linecap:round;stroke-linejoin:round}
+.ct .pki{width:30px;height:20px}
+.pkbtn.parked{color:#fff;background:var(--blue);border-color:var(--blue);box-shadow:0 0 10px color-mix(in srgb,var(--blue) 55%,transparent)}
+.pkbtn.busy{color:var(--amber);border-color:var(--amber);animation:pkpulse 1.2s ease-in-out infinite}
+@keyframes pkpulse{0%,100%{box-shadow:0 0 0 0 rgba(255,170,60,0)}50%{box-shadow:0 0 0 4px rgba(255,170,60,.35)}}
+.pk td,.pk th{white-space:normal}.pk td .jb{display:flex;gap:4px;flex-wrap:wrap}
+.pk tr.pkr td{border-bottom:0;padding-bottom:0}.pk tr.pks td{padding-top:3px}.pk td .jb .btn{height:28px;padding:0 8px;font-size:12.5px}
+.pk .now{font-family:var(--mono);color:var(--dim)}
+.pkmsg{margin-top:10px;font-size:13.5px}
+.qseat{border:1px solid var(--amber);border-radius:10px;padding:10px 12px;margin:0 0 12px;font-size:13.5px;background:color-mix(in srgb,var(--amber) 10%,var(--card))}
+.qseat .ssacts{margin:8px 0 0;gap:8px}.qseat .btn{height:30px}
 #resBtn.glow{animation:heldglow 1.6s ease-in-out infinite}
 @keyframes heldglow{0%,100%{box-shadow:0 0 0 0 rgba(75,201,91,.0)}50%{box-shadow:0 0 0 4px rgba(75,201,91,.35)}}
 
@@ -13442,6 +15460,15 @@ ul.tips{margin:6px 0 10px;padding-left:18px}ul.tips li{color:var(--dim);margin:4
 .help p,.help li{color:var(--dim);max-width:72ch}
 .help ol,.help ul{padding-left:20px;margin:6px 0}
 .msg{margin-top:10px;font-size:13.5px}
+.imustrip{position:relative;height:26px;border-radius:6px;background:var(--line);overflow:hidden;margin-top:6px}
+.imustrip i{position:absolute;top:0;bottom:0;font-style:normal;font-size:10.5px;line-height:26px;text-align:center;color:#1a1a1a;overflow:hidden;white-space:nowrap}
+.imustrip i.on{background:var(--st-good)}
+.imustrip i.lk{background:var(--st-warn);box-shadow:inset 1px 0 0 rgba(0,0,0,.28)}
+.imuaxis{display:flex;justify-content:space-between;font-size:11px;color:var(--muted);margin-top:2px}
+.snhint{font-size:13px;margin:-4px 0 10px;color:var(--muted)}
+#sn_stat>span:not(.ang){flex:1 1 220px;min-width:0}
+#sn_stat>.ang{flex:1 0 100%;padding-left:21px}
+.warnc{color:var(--st-warn)}
 .okc{color:var(--c-f)}.badc{color:var(--red)}.warnc{color:var(--orange);margin-top:6px}
 .fwpick{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:2px 0 8px}
 .fwpick input[type=file]{position:absolute;width:1px;height:1px;opacity:0;pointer-events:none}
@@ -13590,6 +15617,20 @@ details.oks .flist{margin-top:6px}
 .mtrack .lv{position:absolute;top:-3px;bottom:-3px;width:2px;background:var(--text);opacity:.6}
 .mtrack .pt{position:absolute;top:50%;width:10px;height:10px;margin:-5px 0 0 -5px;border-radius:50%;background:var(--mc);box-shadow:0 0 6px var(--mc)}
 .mini .num{font-family:var(--mono);font-size:12.5px;color:var(--dim);min-width:58px;text-align:right}
+/* 2.9.3: Start over, centring the pots */
+.ct .ssover{margin-left:auto;height:28px;font-size:12.5px;padding:0 10px}
+.sslive.canpots #ss_bub,.sslive.canpots #ss_minis{cursor:pointer}
+.sslive.canpots #ss_bub:hover{filter:brightness(1.1)}
+.potshint{font-size:12.5px;color:var(--blue);text-align:center;margin:4px 0 0;cursor:pointer}
+.mtrack .c5{position:absolute;left:50%;top:-4px;bottom:-4px;border-left:2px dashed var(--c-f);opacity:.8}
+.potrow{display:grid;grid-template-columns:150px minmax(0,1fr);gap:14px;align-items:center;border:1px solid var(--line-2);border-radius:10px;padding:10px 12px;margin:10px 0;background:var(--card-2)}
+.potrow.done{border-color:var(--c-f)}.potrow.off{border-color:var(--amber)}
+.potrow .pg{width:150px;height:100px;display:block}
+.potrow .pt1{display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:14.5px}
+.potrow .adv{margin:6px 0 6px;font-size:13.5px;max-width:70ch}
+.potrow .facts{font-size:12.5px;color:var(--dim)}
+.potrow .ssacts{margin:8px 0 0;gap:6px}.potrow .ssacts .btn{height:30px}
+@media (max-width:560px){.potrow{grid-template-columns:1fr}.potrow .pg{margin:0 auto}}
 
 /* 3D view (v2.0) */
 .v3card{padding:0;overflow:hidden;background:#03070d;border-color:#16324f}
@@ -13618,6 +15659,26 @@ details.oks .flist{margin-top:6px}
 .v3ctl button:hover{border-color:#2fd0ff;color:#fff}
 .v3ctl button.on{background:rgba(20,110,200,.55);border-color:#2fd0ff;color:#fff}
 .att{position:absolute;right:16px;top:50%;transform:translateY(-50%);width:150px;height:150px;pointer-events:none}
+/* 2.9.3: motion presets */
+.v3mo{position:absolute;left:50%;top:14px;transform:translateX(-50%);width:min(560px,calc(100% - 470px));min-width:330px;font:12px/1.35 var(--sans);color:#bfe9ff;z-index:2}
+.v3mo .pn{background:linear-gradient(135deg,rgba(6,22,40,.82),rgba(3,10,20,.62));border:1px solid rgba(64,170,255,.35);border-radius:4px;padding:9px 12px 10px;backdrop-filter:blur(3px)}
+.v3mo h5{margin:0 0 7px;font:600 10.5px var(--sans);letter-spacing:2.2px;color:#6fd5ff;text-transform:uppercase;display:flex;gap:8px;align-items:center}
+.v3mo h5 span{margin-left:auto;letter-spacing:.5px;text-transform:none;font:600 11px var(--mono);color:#ffcf8a}
+.v3mo .mrow{display:flex;gap:6px;flex-wrap:wrap}
+.v3mo button{font:600 11.5px var(--sans);letter-spacing:.8px;text-transform:uppercase;color:#bfe9ff;background:rgba(6,22,40,.75);border:1px solid rgba(64,170,255,.4);border-radius:4px;padding:7px 10px;cursor:pointer;flex:1 1 auto}
+.v3mo button:hover:not(:disabled){border-color:#2fd0ff;color:#fff}
+.v3mo button.on{background:rgba(20,110,200,.6);border-color:#2fd0ff;color:#fff;box-shadow:0 0 10px rgba(47,208,255,.45)}
+.v3mo button:disabled{opacity:.4;cursor:default}
+.v3mo button.mstop{border-color:rgba(255,90,74,.7);color:#ffd2cc}.v3mo button.mstop:not(:disabled){background:rgba(120,20,14,.55)}
+.v3mo button.mlev{border-color:rgba(47,208,255,.6)}.v3mo button.mres{border-color:rgba(70,220,120,.6);color:#c9f7d7}
+.v3mo .msl{display:grid;grid-template-columns:1fr 1fr;gap:4px 14px;margin:8px 0 6px}
+.v3mo .msl label{display:grid;grid-template-columns:auto 1fr auto;gap:8px;align-items:center;font-size:11px;letter-spacing:1px;text-transform:uppercase;color:#7fa6c4}
+.v3mo .msl b{font:600 11.5px var(--mono);color:#e9f7ff;min-width:36px;text-align:right}
+.v3mo input[type=range]{width:100%;accent-color:#2fd0ff}
+.v3mo .mbar{height:4px;background:rgba(80,160,255,.14);border-radius:2px;overflow:hidden;margin:2px 0 6px}
+.v3mo .mbar i{display:block;height:100%;width:0;background:#2fd0ff;box-shadow:0 0 8px #2fd0ff}
+.v3mo .mtxt{min-height:16px;color:#9fc6e2;font-size:12px;margin:0 0 7px}
+.v3mo .mtxt.warn{color:#ffcf8a}
 .v3msg{position:absolute;inset:0;display:grid;place-items:center;color:#bfe9ff;font:14px var(--sans);text-align:center;padding:30px}
 .v3msg div{max-width:520px;background:rgba(6,22,40,.85);border:1px solid rgba(64,170,255,.4);border-radius:8px;padding:18px 22px}
 
@@ -13657,6 +15718,8 @@ details.oks .flist{margin-top:6px}
  .want{grid-template-columns:1fr 1fr}
  .v3wrap{height:72vh;min-height:420px}
  .hud .pn{min-width:0;padding:7px 9px}.hud.tr,.att{display:none}
+ .v3mo{left:8px;right:8px;width:auto;min-width:0;transform:none;top:auto;bottom:58px}.v3mo .msl{grid-template-columns:1fr}
+ .v3mo button{padding:6px 7px;font-size:10.5px}
  .jog td:nth-child(3){display:none}
  .nrow{grid-template-columns:31px minmax(0,1fr)}.nrow input{grid-column:2}
  section[style*="grid-area:global"] .frow{grid-template-columns:1fr 1fr!important}
@@ -13716,7 +15779,9 @@ details.oks .flist{margin-top:6px}
  </div>
 
  <section class="card" style="grid-area:quick" data-views="dashboard motors tuning">
-  <div class="ct">Quick Controls</div>
+  <div class="ct">Quick Controls<button class="pkbtn" id="pkBtn" data-k="park" onclick="parkClick()" aria-label="Park"><svg class="pki" viewBox="0 0 40 26" aria-hidden="true"><circle cx="20" cy="13" r="8.6"/><path d="M8.2 4.6a12 12 0 0 0 0 16.8M31.8 4.6a12 12 0 0 1 0 16.8"/><path d="M17.2 17.6V8.4h3.6a2.7 2.7 0 0 1 0 5.4h-3.6"/></svg></button></div>
+  <div class="qseat" id="qseat" hidden><b>Seat setup is open</b> - <span id="qseat_txt">the page holds the seat</span>: SimHub's positions are ignored, Return to center, the USB cable and the full check wait until it is finished or cancelled.
+   <div class="ssacts"><a class="btn b-blue" href="#seat">Open Seat setup</a><button class="btn b-grey" onclick="ssCancel()">Cancel Seat setup</button></div></div>
   <div class="qgrid">
    <button class="btn b-blue tile" data-k="ena" onclick="txt('ena')"><svg class="i" viewBox="0 0 24 24"><path d="M7 4l13 8-13 8z" fill="currentColor"/></svg>Enable Motors</button>
    <button class="btn b-red tile" id="disBtn" data-k="dis" onclick="disableAll()"><svg class="i" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor"/></svg>Disable Motors</button>
@@ -13863,8 +15928,8 @@ details.oks .flist{margin-top:6px}
 
  <!-- seat setup (v2.0, firmware 1.9) -->
  <section class="card" id="sscard" style="grid-area:seat" data-views="seat">
-  <div class="ct"><svg class="i" viewBox="0 0 24 24"><rect x="2.5" y="9" width="19" height="6" rx="3"/><circle cx="12" cy="12" r="1.6"/><path d="M8.5 9v6M15.5 9v6M12 3v3M12 18v3"/></svg>Seat setup <small>level first, then the limits</small></div>
-  <div class="steps" id="ss_steps"><span data-s="start">Start</span><span data-s="level">Level</span><span data-s="travel">Travel</span><span data-s="limits">Limits</span><span data-s="done">Saved</span></div>
+  <div class="ct"><svg class="i" viewBox="0 0 24 24"><rect x="2.5" y="9" width="19" height="6" rx="3"/><circle cx="12" cy="12" r="1.6"/><path d="M8.5 9v6M15.5 9v6M12 3v3M12 18v3"/></svg>Seat setup <small>level first, then the limits</small><button class="btn b-grey ssover" id="ss_overbtn" data-k="ss_over" onclick="ssRestart()" hidden>Start over</button></div>
+  <div class="steps" id="ss_steps"><span data-s="start">Start</span><span data-s="level">Level</span><span data-s="travel">Travel</span><span data-s="limits">Limits</span><span data-s="done">Saved</span><span data-s="pots" hidden>Centre the pots</span></div>
   <div id="ss_busy" class="ssbusy" hidden></div>
   <div id="ss_err" class="msg badc" hidden></div>
 
@@ -13881,6 +15946,7 @@ details.oks .flist{margin-top:6px}
    <div class="ssacts">
     <button class="btn b-green" id="ss_startbtn" data-k="ss_start" onclick="ssStart()">Start seat setup</button>
     <button class="btn b-grey" id="ss_removebtn" data-k="ss_remove" onclick="ssRemove()" hidden>Remove the seat set-up</button>
+    <button class="btn b-blue" id="ss_potsbtn" data-k="ss_pots" onclick="ssPotsOpen()" hidden>Centre the pots</button>
    </div>
   </div>
 
@@ -13909,6 +15975,7 @@ details.oks .flist{margin-top:6px}
    <div class="limgrid">
     <div>
      <table class="lim" id="ss_limtab"></table>
+     <div id="ss_restnote"></div>
      <div class="note" id="ss_tltxt" hidden></div>
      <div id="ss_tiltbox"><span class="lbl" style="margin-top:12px">Tilt limits - every motor stops if the seat tilts further (°)</span>
       <div class="want"><div><span class="lbl">Roll right</span><input type="number" id="t_rr" min="0" max="45" step="0.5"></div><div><span class="lbl">Roll left</span><input type="number" id="t_rl" min="0" max="45" step="0.5"></div><div><span class="lbl">Front up</span><input type="number" id="t_fu" min="0" max="45" step="0.5"></div><div><span class="lbl">Front down</span><input type="number" id="t_fd" min="0" max="45" step="0.5"></div></div></div>
@@ -13929,7 +15996,16 @@ details.oks .flist{margin-top:6px}
   <div class="sspanel" data-p="done" hidden>
    <h3>Saved on the board</h3>
    <p class="note" id="ss_donetxt"></p>
-   <div class="ssacts"><a class="btn b-blue" href="#view3d">See it in the 3D view</a><button class="btn b-grey" onclick="ssAgain()">Run Seat setup again</button></div>
+   <div class="ssacts"><a class="btn b-blue" href="#view3d">See it in the 3D view</a><button class="btn b-grey" onclick="ssAgain()">Run Seat setup again</button><button class="btn b-grey" id="ss_potsbtn2" data-k="ss_pots" onclick="ssPotsOpen()">Centre the pots</button></div>
+   <p class="note" id="ss_donepots"></p>
+  </div>
+
+  <div class="sspanel" data-p="pots" hidden>
+   <h3>Centre the pots</h3>
+   <p class="note">With the seat level every motor should read <b>512</b>, the middle of its pot: then SimHub has the same travel up and down. A level trim moves SimHub's centre but not the travel window, so a motor that is level at 587 has 75 counts less travel one way. To move the reading, move the <b>pot's belt one tooth</b>: switch that motor <b>off</b>, skip one tooth on the pot's pulley, keep your hands clear and switch it <b>on</b>. It creeps back to its reading, the seat now sits a little off level, and the page works out the new level reading from the sensor. It then says if that was the right way and how many teeth are left. One tooth at a time; nothing is saved until you finish.</p>
+   <div id="ss_pots"></div>
+   <p class="note" id="ss_potsnote"></p>
+   <div class="ssacts"><button class="btn b-blue" data-k="ss_potslevel" onclick="ssPost('pots_level')">Level again</button><button class="btn b-green" data-k="ss_potsdone" onclick="ssPotsFinish()">Finish</button><button class="btn b-grey" data-k="ss_cancel" onclick="ssCancel()">Cancel</button></div>
   </div>
   <details class="evd" style="margin-top:10px"><summary>What happened</summary><div class="sslog" id="ss_log"></div></details>
  </section>
@@ -13940,7 +16016,8 @@ details.oks .flist{margin-top:6px}
   <div class="big" id="ss_big"><span><small>roll</small><b id="ss_r">-</b></span><span><small>pitch</small><b id="ss_p">-</b></span><span id="ss_tlbig" hidden><small>rear (traction loss)</small><b id="ss_tl">-</b></span></div>
   <svg class="bubble" id="ss_bub" viewBox="0 0 220 220"></svg>
   <div id="ss_minis"></div>
-  <p class="note" style="font-size:12.5px">Green band: the travel limits. Red ticks: the end stops. White tick: level.</p>
+  <p class="note" style="font-size:12.5px" id="ss_minikey">Green band: the travel limits. Red ticks: the end stops. White tick: level.</p>
+  <p class="potshint" id="ss_potshint" hidden onclick="ssPotsOpen()">Click the bubble to centre the pots: the same travel up and down</p>
  </section>
 
  <!-- 3D view (v2.0) -->
@@ -13964,6 +16041,14 @@ details.oks .flist{margin-top:6px}
      <div class="row"><span class="dim">TOTAL</span><b id="h_ag">--</b><span class="dim" id="h_vib" style="font-size:11px"></span></div></div></div>
    <div class="hud bl"><div class="pn"><h5>Actuators</h5><div id="h_mot"></div></div></div>
    <div class="hud br"><div class="pn"><h5>Sensor</h5><div id="h_sen" class="dim">--</div></div></div>
+   <div class="v3mo" id="v3mo"><div class="pn">
+    <h5>Motion presets <span id="mo_now"></span></h5>
+    <div class="mrow" id="mo_presets"><button data-show="wave" data-k="mo_wave">Wave</button><button data-show="twist" data-k="mo_twist">Twist</button><button data-show="heave" data-k="mo_heave">Heave</button><button data-show="corner" data-k="mo_corner">Corner</button><button data-show="landing" data-k="mo_landing">Landing</button><button data-show="driving" data-k="mo_driving">Driving</button></div>
+    <div class="msl"><label>Intensity<input type="range" id="mo_int" min="10" max="100" step="5" value="40"><b id="mo_intv">40%</b></label><label id="mo_spdl">Speed<input type="range" id="mo_spd" min="0.5" max="2" step="0.1" value="1"><b id="mo_spdv">1.0×</b></label></div>
+    <div class="mbar"><i id="mo_bar"></i></div>
+    <div class="mtxt" id="mo_txt">Pick a preset: the seat moves and you watch it here.</div>
+    <div class="mrow"><button class="mstop" id="mo_stop" data-k="mo_stop" onclick="moStop('stop')">Stop</button><button class="mlev" id="mo_level" data-k="mo_level" onclick="moStop('level')">Return to level</button><button class="mres" id="mo_res" data-k="mresume" onclick="manRelease()">Resume SimHub</button></div>
+   </div></div>
    <svg class="att" id="h_att" viewBox="-80 -80 160 160"></svg>
    <div class="v3ctl" id="v3ctl">
     <button data-cam="hero" class="on">3/4</button><button data-cam="chase">Chase</button><button data-cam="side">Side</button><button data-cam="front">Front</button><button data-cam="top">Top</button><button data-cam="rig" data-k="v3rig">Rig</button>
@@ -14114,6 +16199,7 @@ details.oks .flist{margin-top:6px}
  <section class="card" style="grid-area:sensor" data-views="settings" id="sencard">
   <div class="ct"><svg class="i" viewBox="0 0 24 24"><path d="M3 15l9-4 9 4"/><path d="M12 11V4M9 7l3-3 3 3"/><path d="M5 19h14"/></svg>Motion sensor <small>WT901C on the board</small></div>
   <div class="sstat" id="sn_stat"><i class="dot off"></i><span>Not read yet</span></div>
+  <div class="snhint" id="sn_hint" hidden></div>
   <div class="field" data-k="sn_on"><span>Use the sensor</span><label class="chk"><input type="checkbox" id="sn_on"><span>A WT901C is fitted to the seat</span></label></div>
   <div class="field" data-k="sn_tilt"><span>Tilt limits (°)</span><div class="want" style="margin:0;max-width:none"><div><span class="lbl">Roll right</span><input type="number" id="sn_t_rr" min="0" max="45" step="0.5"></div><div><span class="lbl">Roll left</span><input type="number" id="sn_t_rl" min="0" max="45" step="0.5"></div><div><span class="lbl">Front up</span><input type="number" id="sn_t_fu" min="0" max="45" step="0.5"></div><div><span class="lbl">Front down</span><input type="number" id="sn_t_fd" min="0" max="45" step="0.5"></div></div></div>
   <div class="field" data-k="sn_mount"><span>Mounting</span><div><label class="chk"><input type="checkbox" id="sn_swap"><span>Swap roll / pitch</span></label><label class="chk"><input type="checkbox" id="sn_ir"><span>Invert roll</span></label><label class="chk"><input type="checkbox" id="sn_ip"><span>Invert pitch</span></label></div></div>
@@ -14122,9 +16208,34 @@ details.oks .flist{margin-top:6px}
    <button class="btn b-grey sn" data-k="sn_level" onclick="sensorAct('level')">Level now</button>
    <button class="btn b-grey sn" data-k="sn_setup" onclick="sensorAct('setup')">Set up the sensor</button>
    <button class="btn b-grey sn" data-k="sn_search" onclick="sensorAct('search')">Search again</button>
+   <button class="btn b-grey sn" data-k="sn_check" onclick="sensorCheck()">Check (20 s)</button>
   </div>
   <p class="note" id="sn_note" style="margin-top:10px">Check the mounting: lift the seat's front - pitch should go <b>+</b>; lower its right side - roll should go <b>+</b>. Tick a box if one goes the other way. Tilt limits: 0 = off; <a href="#seat">Seat setup</a> levels the seat and suggests them for you.</p>
   <div class="msg" id="sn_msg"></div>
+ </section>
+
+ <!-- 2.9.3: park position (Seat Setup and Settings) -->
+ <section class="card" id="parkcard" style="grid-area:park" data-views="seat settings">
+  <div class="ct"><svg class="pki" viewBox="0 0 40 26" aria-hidden="true"><circle cx="20" cy="13" r="8.6"/><path d="M8.2 4.6a12 12 0 0 0 0 16.8M31.8 4.6a12 12 0 0 1 0 16.8"/><path d="M17.2 17.6V8.4h3.6a2.7 2.7 0 0 1 0 5.4h-3.6"/></svg>Park position <small id="pk_sub"></small></div>
+  <p class="note" id="pk_note">Park (the <b>(P)</b> in Quick Controls) lowers the seat evenly to here - every motor arriving at the same time - and switches the motors off, so no corner sinks on its own. Set it where the seat rests by itself. Enable Motors brings it back up.</p>
+  <table class="lim pk" id="pk_tab"></table>
+  <div class="ssacts" id="pk_idle">
+   <button class="btn b-blue" data-k="pk_park" onclick="parkClick()">Park now</button>
+   <button class="btn b-grey" data-k="pk_set" onclick="pkPost('set/start')">Set the park position</button>
+   <button class="btn b-grey" data-k="pk_typed" onclick="pkTyped()">Save typed values</button>
+   <button class="btn b-grey" data-k="pk_clear" onclick="pkClear()">Default</button>
+   <label class="muted" style="display:flex;gap:6px;align-items:center;font-size:13px">Speed <input type="number" id="pk_speed" min="10" max="300" step="10" style="width:70px;height:30px" onchange="pkPost('options',{speed:+this.value})"> counts/s</label>
+  </div>
+  <div class="ssacts" id="pk_setting" hidden>
+   <button class="btn b-blue" data-k="pk_lower" onclick="pkPost('set/lower',{delta:10})">Lower the lifts 10</button>
+   <button class="btn b-grey" onclick="pkPost('set/lower',{delta:2})">Lower 2</button>
+   <button class="btn b-grey" onclick="pkPost('set/lower',{delta:-10})">Raise 10</button>
+   <button class="btn b-grey" data-k="pk_level" id="pk_levelbtn" onclick="pkPost('set/level')">Level side to side</button>
+   <button class="btn b-green" data-k="pk_save" onclick="pkPost('set/save')">Save this as the park position</button>
+   <button class="btn b-blue" data-k="pk_here" onclick="pkPost('set/end',{how:'park'})">Park here now</button>
+   <button class="btn b-grey" data-k="pk_back" onclick="pkPost('set/end',{how:'back'})">Back up (cancel)</button>
+  </div>
+  <div class="pkmsg" id="pk_msg"></div>
  </section>
 
  <!-- updates from GitHub (page 2.7) -->
@@ -14188,6 +16299,7 @@ details.oks .flist{margin-top:6px}
      <button class="btn b-orange" id="dg_full" data-k="dg_full" onclick="openModal('mDiag')"><svg class="i" viewBox="0 0 24 24"><path d="M12 3v18M5 10l7-7 7 7"/></svg>Full check (moves motors)</button>
      <button class="btn b-grey" id="dg_sensor" data-k="dg_sensor" onclick="diagStart('sensor')"><svg class="i" viewBox="0 0 24 24"><path d="M2 12h3l2-6 3 12 3-9 2 5 2-2h5"/></svg>Sensor check</button>
      <select id="dg_cond" data-k="dg_cond" aria-label="Condition for the sensor check"><option value="A">A - motor power off</option><option value="B">B - power on, motors off</option><option value="C" selected>C - motors holding</option></select>
+     <button class="btn b-grey" id="dg_imu" data-k="dg_imu" onclick="diagStart('imu')"><svg class="i" viewBox="0 0 24 24"><path d="M3 15l9-4 9 4"/><path d="M12 11V4M9 7l3-3 3 3"/><path d="M5 19h14"/></svg>Motion sensor check</button>
      <button class="btn b-grey" id="dg_stop" data-k="dg_stop" onclick="post('/diag/abort')" hidden>Stop</button>
      <label class="chk" data-k="dg_ask"><input type="checkbox" id="dg_ask" checked><span>Ask me which way each motor moved</span></label>
     </div>
@@ -14384,7 +16496,7 @@ const TIPS={
  sn_mount:"How the sensor sits on the seat. Lift the seat's front: pitch should rise; lower its right side: roll should rise. Swap if roll and pitch are the wrong way round, invert one that goes the wrong way.",
  sn_save:"Sends sensor on/off, tilt limit and mounting to the board; saved there at once.",
  sn_level:"Put the seat at its normal centre position first. The board then takes the current angles as 0° / 0° (the sensor is never mounted perfectly level).",
- sn_setup:"The WT901C leaves the factory at 10 readings per second. This sets it to 100 per second at 115200 baud - with firmware 1.9 angles, gyro and acceleration (for the 3D view), with 1.8 angles only - and saves that in the sensor. Needs the board's D1 wired through the MAX3232 to the sensor's RX (green). If SimHub also reads the sensor, set it in WitMotion's PC software instead.",
+ sn_setup:"The WT901C leaves the factory at 10 readings per second. This sets it to 100 per second at 115200 baud - with firmware 1.9 angles, gyro and acceleration (for the 3D view), with 1.8 angles only - and saves that in the sensor. Needs the board's D1 wired through the MAX3232 to the sensor's RX (green). Page 2.9.3: sent only while the board receives the sensor (the commands go out at the board's baud rate - while it is still looking, that is the wrong one), then checked - the message says what took. If another program also reads the sensor, set it in WitMotion's PC software instead.",
  sn_search:"The board tries the usual baud rates until the sensor answers - normally by itself while the sensor is switched on. This makes it look again for 30 s.",
  smooth:"<b>Target smoothing</b> - how softly the motor eases into each new position SimHub sends (a low-pass filter on the target).<br><br><b>Off / 4 ms:</b> raw, every bump and kerb comes through - rally.<br><b>8-16 ms:</b> crisp but not jagged - circuit racing.<br><b>32-64 ms:</b> soft and floaty - flight, space, trucks.<br><br>Times are at Fpid/1 (double them at Fpid/2). Needs firmware 1.6.",
  fw_file:"<b>Firmware file</b> (firmware 1.9.2 or newer on the board). In the Arduino IDE: open the new SMC3_R4 .ino, choose Arduino UNO R4 WiFi, then <b>Sketch, Export Compiled Binary</b>. Pick the <b>.bin</b> it writes into the sketch's build folder (not the .hex or .elf). The page checks it before anything is sent to the board.",
@@ -14421,6 +16533,24 @@ const TIPS={
  lg_p:"<b>PID output</b> before PWMmin is added (the orange numbers on the left: PWM, middle line = 0, top/bottom = full ±255). Pinned at the edge means the motor is giving everything it is allowed. It reacts to every bit of pot noise (Kp × error, and Kd) - whether that reaches the motor shows in the Drive line. Click to hide or show.",
  lg_d:"<b>Drive (calculated)</b> (dashed): the PWM the board's output stage should send to the motor by its own rule - PWMmin added, PWMmax as the limit, and <b>0 while it is braked</b> inside the dead zone (the bridge shorts the motor). The PID out line can jitter with pot noise while this stays at 0: then that jitter doesn't reach the motor. <b>Calculated</b> from the telemetry and the settings the page last read or sent, not read back from the board or measured on the bridge: the page can't tell whether the motor supply is on, and doesn't see soft start. Click to hide or show.",
  mpos:"<b>Position</b> - where the motor is being sent (the smoothed goal, 0-1023). The green tick on the bar is where it really is.",
+ park:"<b>Park</b>: lowers the seat evenly to its park position (Seat Setup or Settings, Park position) and switches the motors off there, so no corner sinks on its own. Lit: parked - press again (or Enable Motors) to bring it back up. While it parks: press to stop (the motors switch off where the seat is).",
+ pk_park:"Lower the seat evenly to the park position and switch the motors off there. SimHub waits meanwhile.",
+ pk_set:"The page takes the seat and you move it to where it should park: each motor with its arrows, or the lifts together. With firmware 2.1.1 it may go past the travel limits, Clip and end stops (inside the SMC3 cutoff). Then Save - the positions and, with the sensor, the seat's angles there.",
+ pk_typed:"Save the numbers typed in the table as the park position (no angles to compare with then).",
+ pk_clear:"Forget the park position: the default is the low end of each lift's travel window, the rear centred.",
+ pk_lower:"Every lift down together by 10 counts (towards where its corner sinks).",
+ pk_level:"Level side to side with the sensor: one step, using how each lift tilts the seat (measured by Seat setup).",
+ pk_save:"Keep where the seat is now as the park position - and, with the sensor, its angles, so each park can check it sits the same.",
+ pk_here:"Park now, here: the motors switch off (with the check that nothing moves after).",
+ pk_back:"Glide back to where the seat was and give it back to SimHub.",
+ mo_wave:"<b>Wave</b>: every motor in turn, a third of a cycle apart - until you press Stop. Speed sets how fast.",
+ mo_twist:"<b>Twist</b>: the front lifts opposite each other - the seat rolls left and right, until you press Stop.",
+ mo_heave:"<b>Heave</b>: the lifts together, up and down, until you press Stop.",
+ mo_corner:"<b>Corner</b>: the seat rolls and the rear slides out with it, left-hander then right-hander, until you press Stop.",
+ mo_landing:"<b>Landing</b> (30 s): an airliner's approach in light turbulence, a crosswind (banking and crabbing), the flare, touchdown with a rebound, the nose wheel, rollout rumble and braking. Then the seat glides back to level.",
+ mo_driving:"<b>Driving</b> (36 s): a lap - launch and gear shifts, braking, a left hairpin over a kerb, esses, a bumpy straight and a right sweeper where the rear steps out and is caught. Then back to level.",
+ mo_stop:"<b>Stop</b>: the preset stops and the seat holds where it is. The page keeps the seat (SimHub waits) until Return to level or Resume SimHub.",
+ mo_level:"<b>Return to level</b>: the seat glides back to level (SimHub's centre - your Seat setup's level) at up to 120 counts/s and holds there until Resume SimHub. Also when no preset runs, as Quick Controls' Return to center.",
  knob:"<b>Drag to move this motor</b> (firmware 1.9). The page takes the seat from SimHub while you do: every motor holds where it is and SimHub's motion is ignored until you press <b>Resume SimHub</b> (Quick Controls). The motor follows at up to 200 counts/s, easing in and out, and stops at its Clip window and travel limits (hatched). The thin line marks where it is going.<br><br>Arrow keys move it 5 counts, with Shift 25. Keep clear of the seat while you move it.",
  mcenter:"<b>Return to center</b> (firmware 1.9): every motor goes back to its neutral position - SimHub's 0, the level seat with the rear centred (your Seat setup's level, if you made one) - gently, at up to 120 counts/s. The page keeps the seat there: SimHub's motion is ignored until you press <b>Resume SimHub</b>.",
  mresume:"<b>Give the seat back to SimHub.</b> Lit up while the page has the seat (after you dragged a knob or pressed Return to center; the status bar says so too) - SimHub keeps sending meanwhile, but the board ignores it. From the next position SimHub sends after this, the seat goes wherever the game puts it - straight away, so pause the game (or stop its motion output) first if you sit in the seat.",
@@ -14467,6 +16597,8 @@ const TIPS={
  sy_err:"Safety cutoffs, a slow control loop or a lost connection show up here - and problems the page noticed while you drove (click to see them).",
  dg_problem:"Describe what goes wrong, in your own words: which motor, when (starting SimHub, over kerbs, after a while...), what it does. It goes at the top of the file, so whoever reads it knows what to look for.",
  s_sensor:"<b>What tells the board where each motor is.</b> A potentiometer's wiper can wear and lose contact; a contactless Hall-effect sensor (like the TT Electronics 6127) can't - its jumps come from the wiring, its 5 V and GND, or the motor supply. Diagnostics and auto-tune give the advice that fits.",
+ dg_imu:"<b>Motion sensor check</b> - nothing moves. 20 s of the link between the board and the WT901C: whether angles arrive all the time, and if not, what the board does (the baud rates it tries, how soon it lets go of the sensor), how fast the sensor sends and what, bad packets, and its angles, acceleration and gyro at rest. Shows the link as a strip, saves a report and a CSV of the recording. Firmware 2.1.1 adds the board's own counts (bytes at any rate, times lost, packet types).",
+ sn_check:"Runs the <b>Motion sensor check</b> (20 s, nothing moves) - the result shows in Diagnostics.",
  dg_sensor:"<b>Sensor check</b> - nothing moves. Records 10 s of every motor's feedback, PID output and calculated drive from the telemetry (100 Hz), plus a summary of the board's own raw readings (every control cycle: lowest, highest, biggest step, jumps - not a waveform), under one condition you set up: <b>A</b> motor power switched off, <b>B</b> motor power on but the motors switched off (Disable Motors), <b>C</b> motors on, holding. Each check is saved; with two or three of them the result says how much of the noise is the sensor side (A), the motor supply (what B adds) and the drive (what C adds). Pause SimHub first.",
  dg_cond:"Set the rig up like this before you press Sensor check: <b>A</b> switch the motor power supply off (the Arduino stays on), <b>B</b> motor power on, press Disable Motors, <b>C</b> motor power on, motors enabled and holding.",
  dg_quick:"<b>Quick check</b> - nothing moves. Reads every setting, the board's own counters (firmware 1.7), listens to the motors for 3 seconds, and adds what the page noticed while you drove. About 5 seconds; safe while SimHub runs.",
@@ -14950,15 +17082,31 @@ function showBoard(r,fillInputs){const ok=r.ok;showSoft(r,fillInputs);
   const tl=s.tilt_limits||{roll_right:s.tilt_limit_deg,roll_left:s.tilt_limit_deg,front_up:s.tilt_limit_deg,front_down:s.tilt_limit_deg};
   TD.forEach((k,i)=>$('sn_t_'+TDID[i]).value=tl[k]||0);
   $('sn_swap').checked=s.swap_roll_pitch;$('sn_ir').checked=s.invert_roll;$('sn_ip').checked=s.invert_pitch;}
- let h,cls;
+ // 2.9.3: one steady line - the telemetry says whether angles arrive (the board's "receiving" bit lingers 0.5 s after it
+ // switches baud), drop-outs over 2 minutes, and with firmware 2.1.1 the rate the board found the sensor at
+ const L=r.link||{},bd=L.board||null,drops=L.drop_outs_2min||0,sw=s.switched_on;
+ const looking=sw||Date.now()<snSearchUntil||!!(bd&&bd.may_look&&Object.values(bd.may_look).some(x=>x));
+ const rec=s.receiving&&L.angles!==false,ago=L.last_angles_s_ago,nr=(bd&&bd.rates_tried)||7;
+ let h,cls,hint='';
  if(s.setting_up){cls='warn';h='Setting the sensor up…';}
- else if(s.receiving){cls=s.angles_per_s>=40?'on':'warn';h=`Receiving ${s.angles_per_s} angles/s at ${s.baud} baud`+(s.accel_gyro?' + gyro + acceleration':'')+(s.angles_per_s<40?' - press Set up the sensor':(r.fwnum>=19&&!s.accel_gyro?' - angles only: Set up the sensor adds gyro + acceleration (3D view)':''));}
- else if(s.found){cls='warn';h='Found, but no angles right now';}
- else{cls=s.switched_on?'off':'idle';h=s.switched_on?`Switched on, but nothing arrives - checking ${s.baud_trying} baud (ERROR E5 on the matrix)`:'No sensor found - fit one and tick Use the sensor';}
+ else if(rec){const aps=s.angles_per_s||0;   // (0 in the first second after the board found it: its count is per full second)
+  cls=drops>=2||(aps&&aps<40)?'warn':'on';h=(aps?`Receiving ${aps} angles/s at ${s.baud} baud`:`Receiving at ${s.baud} baud (just found)`)+(s.accel_gyro?' + gyro + acceleration':'');
+  if(drops>=2){h+=` - but it dropped out ${drops} times in the last 2 minutes`;
+   hint=(!L.fw_keeps_lock&&sw)?`Firmware ${esc(L.fw||'2.1')} lets go of the sensor every few seconds while Use the sensor is ticked - a timing bug, fixed in firmware 2.1.1 (Settings, Firmware update). The Motion sensor check shows it.`:'Run the Motion sensor check (Check, 20 s) to see why.';}
+  else if(aps&&aps<40)h+=' - press Set up the sensor';
+  else if(r.fwnum>=19&&!s.accel_gyro)h+=' - angles only: Set up the sensor adds gyro + acceleration (3D view)';}
+ else if(looking){const long=(ago==null&&L.for_s!=null&&L.for_s>25)||(ago!=null&&ago>25);
+  cls=long?'off':'warn';
+  h=long?`Nothing from the sensor for ${ago!=null?Math.round(ago)+' s':'a while'} - the board keeps trying every baud rate (ERROR E5 on the matrix)`:
+   `Looking for the sensor: trying ${s.baud_trying} baud (${nr} rates, 1.5 s each)`+(ago!=null?` - last angles ${Math.round(ago)} s ago`+(bd&&bd.found_at?` at ${bd.found_at} baud`:''):'');
+  if(long)hint='Run the Motion sensor check (Check, 20 s): it tells a silent sensor from one at a baud rate the board doesn\'t try.';
+  else if(drops>=2&&!L.fw_keeps_lock&&sw)hint=`It keeps dropping out (${drops} times in 2 minutes): firmware ${esc(L.fw||'2.1')} lets go of the sensor while Use the sensor is ticked - a timing bug, fixed in firmware 2.1.1.`;}
+ else{cls='idle';h=s.found?'Found, but the board isn\'t looking for it now - press Search again':'No sensor found - fit one, tick Use the sensor and Apply (or press Search again)';}
  const lv=s.level_offset&&(s.level_offset[0]||s.level_offset[1])?'levelled':'not levelled';
  const ls=data.length?data[data.length-1]:null;
  const ang=ls&&ls.roll!=null?`<span class="ang">roll ${ls.roll>=0?'+':''}${ls.roll.toFixed(1)}° · pitch ${ls.pitch>=0?'+':''}${ls.pitch.toFixed(1)}° · ${lv}${s.tilt_trips?` · tilt limit tripped ${s.tilt_trips}x`:''}</span>`:'';
- st.innerHTML=`<i class="dot ${cls==='on'?'on':(cls==='idle'?'':'off')}"></i><span>${esc(h)}</span>${ang}`;
+ st.innerHTML=`<i class="dot ${cls==='on'?'on':(cls==='idle'?'':(cls==='warn'?'warn':'off'))}"></i><span>${esc(h)}</span>${rec?ang:''}`;
+ $('sn_hint').hidden=!hint;$('sn_hint').innerHTML=hint;
  if(m.showing)$('l_msg').innerHTML=`<span class="badc">The matrix is scrolling ERROR ${esc(m.showing)}</span> - see Help for what it means.`;}
 async function saveLed(){const a=+$('l_anim').value;const r=await post('/board/led',{view:+$('l_view').value,idle:a>=0,anim:Math.max(0,a),repeat:$('l_rep').checked});
  if(!r.ok){$('l_msg').innerHTML='<span class="badc">'+esc(r.error)+'</span>';return;}showBoard(r,true);if(!r.matrix.showing)$('l_msg').innerHTML='<span class="okc">Sent - saved on the board.</span>'+(a>=0?' The matrix shows it now for 15 s (unless SimHub is driving).':'');}
@@ -15135,11 +17283,18 @@ function ledPv(){const a=+$('l_anim').value,old=ledPvFw&&ledPvFw<21;
 async function saveSensor(){const t4={};TD.forEach((k,i)=>t4[k]=Math.max(0,+$('sn_t_'+TDID[i]).value||0));const nz=Object.values(t4).filter(v=>v>0);
  const r=await post('/board/sensor',{on:$('sn_on').checked,tilt4:t4,tilt:fwnum>=19?(nz.length?Math.min(...nz):0):t4.roll_right,swap:$('sn_swap').checked,inv_roll:$('sn_ir').checked,inv_pitch:$('sn_ip').checked});
  if(!r.ok){$('sn_msg').innerHTML='<span class="badc">'+esc(r.error)+'</span>';return;}showBoard(r,true);$('sn_msg').innerHTML='<span class="okc">Sent - saved on the board.</span>';}
-async function sensorAct(a){if(a==='setup'&&!confirm('Set the sensor up: 100 readings per second at 115200 baud'+(fwnum>=19?', with gyro and acceleration (for the 3D view)':'')+'? Needs the board\'s D1 wired to the sensor\'s RX through the MAX3232. If SimHub also reads this sensor, change it in WitMotion\'s software instead.'))return;
- $('sn_msg').textContent={level:'Levelling…',setup:'Setting the sensor up…',search:'Looking for the sensor…'}[a];
+let snSearchUntil=0;
+async function sensorAct(a){if(a==='setup'&&!confirm('Set the sensor up: 100 readings per second at 115200 baud'+(fwnum>=19?', with gyro and acceleration (for the 3D view)':'')+', saved in the sensor? It is sent only while the board receives the sensor, then checked (about 10 s). Needs the board\'s D1 wired to the sensor\'s RX through the MAX3232. (If another program also reads this sensor, set it in WitMotion\'s software instead.)'))return;
+ $('sn_msg').textContent={level:'Levelling…',setup:'Setting the sensor up and checking it… (about 10 s)',search:'Looking for the sensor…'}[a];
+ if(a==='search')snSearchUntil=Date.now()+30000;
  const r=await post('/board/sensor/action',{action:a});if(!r.ok){$('sn_msg').innerHTML='<span class="badc">'+esc(r.error)+'</span>';return;}showBoard(r,false);
- $('sn_msg').innerHTML='<span class="okc">'+{level:'Levelled: this seat position now reads 0° / 0°.',setup:'Sent. If the rate doesn\'t change within a few seconds, the board\'s TX (D1) isn\'t reaching the sensor - set it in WitMotion\'s software instead (100 Hz, 115200 baud, angles + acceleration + gyro).',search:'Looking for the sensor for 30 s.'}[a]+'</span>';
- if(a==='setup')setTimeout(()=>loadBoard(false),4000);}
+ if(a==='setup'&&r.setup){$('sn_msg').innerHTML=`<span class="${r.setup.ok?'okc':(r.setup.level==='fail'?'badc':'warnc')}">${esc(r.setup.text)}</span>`;return;}
+ $('sn_msg').innerHTML='<span class="okc">'+{level:'Levelled: this seat position now reads 0° / 0°.',search:'Looking for the sensor for 30 s.'}[a]+'</span>';}
+// 2.9.3: the Motion sensor check from the Motion sensor card - runs in Diagnostics, where the result shows
+async function sensorCheck(){const r=await post('/diag/start',{kind:'imu',problem:$('dg_problem').value,ask:false});
+ if(!r.ok){$('sn_msg').innerHTML='<span class="badc">'+esc(r.error)+'</span>';return;}
+ $('sn_msg').innerHTML='<span class="okc">Motion sensor check running (20 s) - the result shows in Diagnostics, below.</span>';
+ diagRes=null;$('dg_result').innerHTML='';diagState='running';diagPoll(true);setTimeout(()=>$('diagcard').scrollIntoView({behavior:'smooth',block:'start'}),300);}
 setInterval(()=>{if(curView==='settings'&&document.visibilityState==='visible'){loadBoard(false);usbLoad();}},3000);
 function fillNames(){let h='';
  for(let m=0;m<3;m++){const v=MNAMES[m]||'',preset=!v||NAMEOPTS.includes(v);
@@ -15167,6 +17322,10 @@ async function poll(){
    if((j.diag.state==='running'||j.diag.state==='waiting')&&diagState!==j.diag.state&&curView!=='settings')diagPoll(true);}
   if(j.watch){watch=j.watch;showBadge();}
   if(j.manual){man=j.manual;}
+  if(j.show){show=j.show;moUI();}
+  if(j.park){park=j.park;parkUI();}
+  {const so=!!(j.seat&&j.seat.open),qs=$('qseat');if(qs.hidden===so)qs.hidden=!so;     // 2.9.3: never open unseen
+   if(so){const t=j.seat.action?'it is moving the seat now':(ss&&ss.step==='pots'?'centring the pots, the page holds the seat':'the page holds the seat');if($('qseat_txt').textContent!==t)$('qseat_txt').textContent=t;}}
   if(typeof V3!=='undefined'&&V3)V3.imu=j.imu||null;
   updateStatus(j); updateCards(); manUI(); if(!paused)draw(); misses=0;
   const ls=data[data.length-1];$('dg_live').innerHTML=diagMotor!=null&&ls?`<span class="mtag m${diagMotor+1}">${esc(mshort(diagMotor))}</span>pot ${ls.m[diagMotor].f.toFixed(1)}  target ${ls.m[diagMotor].t}  drive ${ls.m[diagMotor].p.toFixed(0)}`:'';
@@ -15335,6 +17494,82 @@ function manUI(){const held=man.active,why=manBlock(null);
   if(man.goal[m]!=null)$('mg'+m).style.left=(man.goal[m]/1023*100)+'%';}
  if(man.msg_id!=null&&manMsgSeen!==null&&man.msg_id!==manMsgSeen&&man.msg)toast(esc(man.msg),!/Resume SimHub pressed/.test(man.msg));
  if(man.msg_id!=null)manMsgSeen=man.msg_id;}
+
+// ---------- park (2.9.3) ----------
+let park={state:'idle',parked:false,can:'The board is not connected.'},pkMsgSeen=null,pkTabH='';
+async function pkPost(k,o){const r=await post('/park/'+k,o||{});if(r.park){park=r.park;parkUI();}if(r.ok===false&&r.error)toast(esc(r.error),true);return r;}
+async function parkClick(){const p=park;
+ if(p.state==='parking'||p.state==='moving'||p.state==='unparking'){if(confirm('Stop '+(p.state==='unparking'?'unparking':'parking')+'? The motors switch off where the seat is now.'))pkPost('stop');return;}
+ if(p.state==='setting'){location.hash='#seat';setTimeout(()=>$('parkcard').scrollIntoView({block:'start'}),300);return;}
+ if(p.parked){if(confirm(p.fw_park?'Unpark? The motors switch on and the seat rises evenly back to level, then SimHub has it.':'Unpark? The motors switch on and each creeps back up to its position.'))pkPost('unpark');return;}
+ if(p.can){toast(esc(p.can),true);return;}
+ const pos=(p.pos||[]).map((v,m)=>v==null||m>=NM?null:esc(mshort(m))+' '+v).filter(x=>x).join(', ');
+ if(!confirm('Park the seat?\n\nIt goes down evenly to its park position ('+pos.replace(/<[^>]*>/g,'')+') and the motors switch off there. SimHub waits meanwhile. Enable Motors brings it back up.'))return;
+ pkPost('start');}
+function pkTyped(){const v=[0,1,2].map(m=>{const e=$('pkv'+m);return e?(e.value===''?null:+e.value):null;});pkPost('options',{pos:v});}
+function pkClear(){if(confirm('Forget the park position? The default is the low end of each lift\'s travel window, the rear centred.'))pkPost('clear');}
+function pkJog(m,d){pkPost('set/jog',{motor:m,delta:d});}
+function parkUI(){const p=park,b=$('pkBtn');if(!b)return;const busy=p.state==='parking'||p.state==='moving'||p.state==='unparking';
+ b.classList.toggle('parked',!!p.parked&&!busy);b.classList.toggle('busy',busy||p.state==='setting');
+ b.setAttribute('aria-label',p.parked?'Parked - unpark':(busy?'Parking - stop':'Park'));
+ if(p.msg_id!=null&&pkMsgSeen!==null&&p.msg_id!==pkMsgSeen&&p.msg)toast(esc(p.msg),/stopped|error|short of|still moved|from when|couldn't/i.test(p.msg));
+ if(p.msg_id!=null)pkMsgSeen=p.msg_id;
+ const card=$('parkcard');if(!card||card.hidden)return;
+ const set=p.state==='setting';$('pk_idle').hidden=set;$('pk_setting').hidden=!set;
+ card.querySelectorAll('#pk_idle button').forEach(x=>x.disabled=busy);
+ $('pk_sub').textContent=busy?(p.state==='unparking'?'unparking…':'parking…'):(p.parked?'parked':(set?'setting it':(p.saved?'set '+(p.saved_when||''):'default')));
+ const lv=data[data.length-1];const use=[0,1,2].filter(m=>m<NM);
+ let h='<tr><th></th><th>Park at</th><th>Now</th></tr>';
+ for(const m of use){const dn=p.down?p.down[m]:null,sl=dn==null;
+  const now=lv?Math.round(lv.m[m].f):'-',w=p.window?p.window[m]:null,lim=p.limits?p.limits[m]:null;
+  const sub=set?(sl?`<div class="jb">${[-10,-1,1,10].map(d=>`<button class="btn b-grey" onclick="pkJog(${m},${d})">${d>0?'+':''}${d}</button>`).join('')}<span class="muted" style="font-size:12px;align-self:center">rear: centred</span></div>`:
+   `<div class="jb">${[[10,'▼ 10'],[1,'▼ 1'],[-1,'▲ 1'],[-10,'▲ 10']].map(([d,t])=>`<button class="btn b-grey" onclick="pkJog(${m},${d*dn})">${t}</button>`).join('')}</div>`)
+   :`<span class="muted" style="font-size:12px">${sl?'the rear: centred · ':''}${w?'travel '+w[0]+'-'+w[1]:''}${lim&&w&&(lim[0]!==w[0]||lim[1]!==w[1])?' · may park '+lim[0]+'-'+lim[1]:''}</span>`;
+  const pv=set?(p.targets&&p.targets[m]!=null?p.targets[m]:'-'):`<input type="number" id="pkv${m}" min="0" max="1023" value="${p.pos?p.pos[m]:''}">`;
+  h+=`<tr class="pkr"><td><span class="mtag m${m+1}">${esc(mshort(m))}</span></td><td class="mono">${pv}</td><td class="now" data-m="${m}">${now}</td></tr><tr class="pks"><td colspan="3">${sub}</td></tr>`;}
+ const key=h.replace(/<td class="now"[^>]*>[^<]*<\/td>/g,'');
+ if(key!==pkTabH&&!(document.activeElement&&document.activeElement.id&&document.activeElement.id.startsWith('pkv'))){$('pk_tab').innerHTML=h;pkTabH=key;}
+ else $('pk_tab').querySelectorAll('td.now').forEach(td=>{const m=+td.dataset.m;if(lv)td.textContent=Math.round(lv.m[m].f);});
+ const sp=$('pk_speed');if(document.activeElement!==sp)sp.value=p.speed||60;
+ $('pk_note').innerHTML='Park (the <b>(P)</b> in Quick Controls) lowers the seat evenly to here - every motor arriving at the same time - and switches the motors off, so no corner sinks on its own. Set it where the seat rests by itself. Enable Motors brings it back up.'+
+  (p.fw_park?' The park position may be past the travel limits, Clip and end stops (firmware 2.1.1), inside the SMC3 cutoff.':' <span class="warnc">With this firmware it stays inside the travel window; firmware 2.1.1 lets it go further down.</span>');
+ let m=p.msg||'';const r=p.result;
+ if(!m&&r&&r.when)m='Last park '+r.when+'.';
+ if(p.angles)m+=(m?' ':'')+`Saved with the seat at ${p.angles[0]>=0?'+':''}${p.angles[0].toFixed(1)}° roll, ${p.angles[1]>=0?'+':''}${p.angles[1].toFixed(1)}° pitch.`;
+ if(p.can&&!set&&!busy&&!p.parked)m+=(m?' ':'')+'<span class="muted">('+esc(p.can)+')</span>';
+ const pm=$('pk_msg');if(pm.innerHTML!==m)pm.innerHTML=m;}
+
+// ---------- motion presets in the 3D view (2.9.3) ----------
+let show={active:false,can:'The board is not connected.'},moOk=false,moMsgSeen=null,moSetT=null;
+async function moStart(name){if(show.can&&!show.active){toast(esc(show.can),true);return;}
+ if(!moOk&&!confirm('The seat moves now ('+name+' at '+$('mo_int').value+'%).\n\nThe page takes the seat: SimHub\'s positions are ignored until Resume SimHub. Keep hands, feet and cables clear; Stop holds the seat where it is, Return to level glides it back.'))return;
+ moOk=true;const r=await post('/show/start',{name:name,intensity:+$('mo_int').value/100,speed:+$('mo_spd').value});
+ if(!r.ok)toast(esc(r.error||'No answer.'),true);else{show=Object.assign({},show,r.show);moUI();}}
+async function moStop(how){const was=!!show.active,r=await post('/show/stop',{how:how});
+ if(r&&r.ok===false&&r.error){toast(esc(r.error),true);return;}
+ if(how==='level'&&!was){$('v3mo').dataset.last='Back to level - the page holds the seat there until Resume SimHub.';moUI();}}
+function moSet(){clearTimeout(moSetT);moSetT=setTimeout(()=>{if(show.active)post('/show/set',{intensity:+$('mo_int').value/100,speed:+$('mo_spd').value});},120);}
+function moUI(){const box=$('v3mo');if(!box)return;const a=!!show.active,held=!!(man&&man.active);
+ box.querySelectorAll('[data-show]').forEach(b=>{b.classList.toggle('on',a&&show.name===b.dataset.show);b.disabled=!a&&!!show.can;});
+ $('mo_stop').disabled=!a;$('mo_level').disabled=!a&&!held&&!!(show.can);$('mo_res').disabled=!held;$('mo_res').classList.toggle('on',held&&!a);
+ const per=a&&show.dur==null;$('mo_spdl').style.opacity=a&&!per?.45:1;
+ $('mo_now').textContent=a?(show.dur?Math.floor(show.t)+' / '+show.dur+' s':show.title):'';
+ $('mo_bar').style.width=a&&show.dur?Math.min(100,show.t/show.dur*100)+'%':(a?'100%':'0');
+ let t='',w=false;if(a)t=show.title+(show.label&&show.label!==show.title?' - '+show.label:'')+(show.dur?'':' - until Stop');
+ else if(show.msg_id!=null&&show.msg_id!==moMsgSeen&&show.msg&&moMsgSeen!==null){t=show.msg;moMsgSeen=show.msg_id;box.dataset.last=t;}
+ else if(held)t=box.dataset.last||'The page holds the seat - Resume SimHub gives it back.';
+ else if(show.can){t=show.can;w=true;}else t='Pick a preset: the seat moves and you watch it here.';
+ if(show.msg_id!=null&&moMsgSeen===null)moMsgSeen=show.msg_id;
+ if(!a&&!held)delete box.dataset.last;
+ const e=$('mo_txt');if(e.textContent!==t)e.textContent=t;e.classList.toggle('warn',w);}
+(function(){const b=$('v3mo');if(!b)return;b.querySelectorAll('[data-show]').forEach(x=>x.onclick=()=>moStart(x.dataset.show));
+ $('mo_int').oninput=()=>{$('mo_intv').textContent=$('mo_int').value+'%';moSet();};
+ $('mo_spd').oninput=()=>{$('mo_spdv').textContent=(+$('mo_spd').value).toFixed(1)+'×';moSet();};
+ try{const o=JSON.parse(localStorage.getItem('smc3_motion')||'{}');if(o.i){$('mo_int').value=o.i;$('mo_intv').textContent=o.i+'%';}if(o.s){$('mo_spd').value=o.s;$('mo_spdv').textContent=(+o.s).toFixed(1)+'×';}}catch(e){}
+ const keep=()=>{try{localStorage.setItem('smc3_motion',JSON.stringify({i:$('mo_int').value,s:$('mo_spd').value}));}catch(e){}};
+ $('mo_int').addEventListener('change',keep);$('mo_spd').addEventListener('change',keep);
+ ['pointerdown','wheel','keydown'].forEach(ev=>b.addEventListener(ev,e=>e.stopPropagation()));
+ tipAttach(b);})();
 
 // ---------- test signal ----------
 async function gen(mode){const combo=$('gcombo').value,body={motor:+$('gm').value,mode:mode||$('gmode').value,amp:+$('gamp').value,period:+$('gper').value,centre:+$('goff').value,value:+$('goff').value,combo};
@@ -15644,8 +17879,9 @@ function fItem(f){return `<div class="fitem ${f.level}"><i class="fic">${FIC[f.l
 function renderResult(res,title){const F=res.findings||[];const c=k=>F.filter(f=>f.level===k).length;
  const nf=c('fail'),nw=c('warn');
  let head=nf||nw?`${nf} problem${nf!==1?'s':''}, ${nw} warning${nw!==1?'s':''}`:'No problems found';
- let h=`<div class="fsum"><b class="${nf?'badc':(nw?'':'okc')}">${head}</b><span class="muted">${esc(title||(({full:'Full check',sensor:'Sensor check '+((res.name.match(/_sensor_([ABC])/)||[])[1]||'')}[res.kind]||'Quick check')+(res.stopped?' (stopped early)':'')))} - ${esc(res.name)}</span></div>`;
- h+=`<div class="facts"><a class="btn b-blue" data-k="dg_dl" href="/diag/file?name=${encodeURIComponent(res.name)}&dl=1"><svg class="i" viewBox="0 0 24 24"><path d="M12 3v12M7 10l5 5 5-5M4 20h16"/></svg>Download file</a><button class="btn b-grey" data-k="dg_copy" onclick="copySummary()">Copy summary</button>${res.kind==='sensor'?`<a class="btn b-grey" href="/diag/csv?name=${encodeURIComponent(res.name)}">Download recording (CSV)</a>`:''}</div>`;
+ let h=`<div class="fsum"><b class="${nf?'badc':(nw?'':'okc')}">${head}</b><span class="muted">${esc(title||(({full:'Full check',sensor:'Sensor check '+((res.name.match(/_sensor_([ABC])/)||[])[1]||''),imu:'Motion sensor check'}[res.kind]||'Quick check')+(res.stopped?' (stopped early)':'')))} - ${esc(res.name)}</span></div>`;
+ h+=`<div class="facts"><a class="btn b-blue" data-k="dg_dl" href="/diag/file?name=${encodeURIComponent(res.name)}&dl=1"><svg class="i" viewBox="0 0 24 24"><path d="M12 3v12M7 10l5 5 5-5M4 20h16"/></svg>Download file</a><button class="btn b-grey" data-k="dg_copy" onclick="copySummary()">Copy summary</button>${res.kind==='sensor'||res.kind==='imu'?`<a class="btn b-grey" href="/diag/csv?name=${encodeURIComponent(res.name)}">Download recording (CSV)</a>`:''}</div>`;
+ if(res.kind==='imu')h+=imuStrip(res.imu_strip);
  const main=F.filter(f=>f.level!=='ok'),oks=F.filter(f=>f.level==='ok');
  h+='<div class="flist">'+main.map(fItem).join('')+'</div>';
  if(oks.length)h+=`<details class="oks"${main.length?'':' open'}><summary>${oks.length} thing${oks.length>1?'s':''} checked and fine</summary><div class="flist">${oks.map(fItem).join('')}</div></details>`;
@@ -15664,6 +17900,13 @@ async function sensorTable(){let c;try{c=await (await fetch('/diag/sensor')).jso
  h+='</tbody></table></div>';if(c.missing&&c.missing.length)h+=`<p class="muted" style="margin:6px 0 0">Not recorded yet: ${c.missing.join(', ')}. Set the rig up that way, pick it next to Sensor check and run it.</p>`;
  h+='<p class="muted" style="margin:6px 0 0">A is the sensor side on its own; what B adds over A is the motor supply, what C adds over B is the drive - they add up, so a rig can have some of each. "Added" is &radic;(new&sup2; &minus; previous&sup2;). The board raw row is a summary of every reading the board took (extremes and counts), not a recording; P share is estimated from the telemetry; Braked is calculated from the settings, not measured on the bridge.</p>';
  box.innerHTML=h;}
+// 2.9.3: the Motion sensor check's link over its 20 s - green while angles arrive, amber while the board looks for the
+// sensor (at the baud rate written in it)
+function imuStrip(st){if(!st||!st.runs||!st.runs.length)return '';const T=st.seconds||20,k=b=>b>=1000?(Math.round(b/100)/10)+'k':String(b);
+ let h='<div class="qsub" style="margin-top:12px">The sensor link over the check <span class="muted">green: angles arriving · amber: the board looking for the sensor, at the baud rate shown</span></div><div class="imustrip" role="img" aria-label="Sensor link over '+T.toFixed(0)+' s">';
+ for(const [a,z,st2,b] of st.runs){const w=Math.max(0.25,100*(z-a)/T);
+  h+=`<i class="${st2==='on'?'on':'lk'}" style="left:${(100*a/T).toFixed(2)}%;width:${w.toFixed(2)}%" title="${a.toFixed(1)}-${z.toFixed(1)} s: ${st2==='on'?'angles arriving':'looking'}${b?' at '+b+' baud':''}">${st2!=='on'&&w>5&&b?k(b):''}</i>`;}
+ return h+`</div><div class="imuaxis"><span>0 s</span><span>${(T/2).toFixed(0)} s</span><span>${T.toFixed(0)} s</span></div>`;}
 function copySummary(){const t=diagRes&&diagRes.summary;if(!t)return;
  const done=()=>toast('Summary copied - paste it into a chat or message.');
  if(navigator.clipboard&&window.isSecureContext){navigator.clipboard.writeText(t).then(done,()=>fallbackCopy(t,done));}else fallbackCopy(t,done);}
@@ -15672,7 +17915,7 @@ function fallbackCopy(t,done){const ta=document.createElement('textarea');ta.val
 async function diagPoll(once){
  try{const s=await (await fetch('/diag/status')).json();const was=diagState;diagState=s.state;
   const running=s.state==='running'||s.state==='waiting';
-  $('dg_run').hidden=!running;$('dg_stop').hidden=!running;$('dg_quick').disabled=$('dg_full').disabled=$('dg_sensor').disabled=running;
+  $('dg_run').hidden=!running;$('dg_stop').hidden=!running;$('dg_quick').disabled=$('dg_full').disabled=$('dg_sensor').disabled=$('dg_imu').disabled=running;
   if(running){$('dg_bar').style.width=(s.progress||0)+'%';const last=s.log.length?s.log[s.log.length-1].slice(9):'';
    $('dg_stage').textContent=nameify(({full:'Full check',sensor:'Sensor check'}[s.kind]||'Quick check')+' - '+(s.stage||'starting')+(last?': '+last:''));}
   const p=s.prompt,box=$('dg_prompt');
@@ -15686,13 +17929,13 @@ async function diagLists(){
   $('dg_inc_n').textContent=inc.length?`(${inc.length})`:'';
   $('dg_inc').innerHTML=inc.length?inc.map(x=>`<div class="drow"><div><span class="t">${esc(x.when.slice(5,16))}</span> ${x.motor?`<span class="mtag m${x.motor}">${esc(mshort(x.motor-1))}</span>`:''}<b>${esc(x.title)}</b><div class="m">${escn(x.msg)}</div></div></div>`).join('')
    :'<p class="muted" style="margin:0">Nothing noticed. The page keeps watching while you drive.</p>';
-  $('dg_reports').innerHTML=rep.length?rep.map(x=>`<div class="drow"><div><span class="t">${esc(x.when)}</span> ${x.kind==='full'?'Full check':(x.kind==='sensor'?'Sensor check '+esc(x.cond||''):'Quick check')} <span class="muted">${x.kb} kB</span></div><div class="acts"><button class="btn b-grey" onclick="viewReport('${esc(x.name)}')">View</button><a class="btn b-blue" href="/diag/file?name=${encodeURIComponent(x.name)}&dl=1">Download</a><button class="btn b-grey" onclick="delReport('${esc(x.name)}')">Delete</button></div></div>`).join('')
+  $('dg_reports').innerHTML=rep.length?rep.map(x=>`<div class="drow"><div><span class="t">${esc(x.when)}</span> ${x.kind==='full'?'Full check':(x.kind==='sensor'?'Sensor check '+esc(x.cond||''):(x.kind==='imu'?'Motion sensor check':'Quick check'))} <span class="muted">${x.kb} kB</span></div><div class="acts"><button class="btn b-grey" onclick="viewReport('${esc(x.name)}')">View</button><a class="btn b-blue" href="/diag/file?name=${encodeURIComponent(x.name)}&dl=1">Download</a><button class="btn b-grey" onclick="delReport('${esc(x.name)}')">Delete</button></div></div>`).join('')
    :'<p class="muted" style="margin:0">No reports yet.</p>';
   if(curView==='settings')markSeen();
   if($('dg_evd').open)loadEvents();
  }catch(e){}}
 async function viewReport(name){const r=await (await fetch('/diag/file?name='+encodeURIComponent(name))).json();
- diagRes={name:name,findings:r.findings||[],summary:r.summary||'',kind:r.kind};renderResult(diagRes,({full:'Full check',sensor:'Sensor check '+((r.capture||{}).condition||'')}[r.kind]||'Quick check')+' from '+r.made);
+ diagRes={name:name,findings:r.findings||[],summary:r.summary||'',kind:r.kind,imu_strip:(r.imu_check||{}).strip};renderResult(diagRes,({full:'Full check',sensor:'Sensor check '+((r.capture||{}).condition||''),imu:'Motion sensor check'}[r.kind]||'Quick check')+' from '+r.made);
  if(r.problem)$('dg_result').insertAdjacentHTML('afterbegin',`<p class="note" style="margin:12px 0 0"><b>Problem described:</b> ${esc(r.problem)}</p>`);}
 async function delReport(name){if(!confirm('Delete this report from the NAS?'))return;await post('/diag/delete',{name:name});diagLists();}
 async function clearIncidents(){if(!confirm('Forget the problems the page has recorded?'))return;await post('/diag/incidents/clear');diagLists();}
@@ -15712,10 +17955,49 @@ async function ssPost(what,obj){const r=await post('/seat/'+what,obj||{});if(r.s
  if(!r.ok&&r.error)ssErr(r.error);else ssErr('');return r;}
 function ssErr(t){const e=$('ss_err');e.hidden=!t;e.textContent=t||'';}
 async function ssStart(){ssFilled=null;const r=await ssPost('start');if(r.ok){ssView='level';ssRender();}}
-async function ssCancel(){if(!confirm('Cancel Seat setup? The previous level trim and limits come back, and SimHub gets the seat again.'))return;await ssPost('cancel');ssView='start';ssRender();}
+async function ssCancel(){const pm=ss&&ss.step==='pots'&&ss.pots&&ss.pots.moved;
+ if(!confirm(pm?'Cancel? A pot moved, so the previous set-up no longer fits: it comes off the board and SimHub gets the seat with its centre at 512. Run Seat setup to make a new one.':(ss&&ss.step==='pots'?'Close the pot centring? Nothing moved - the previous set-up comes back, and SimHub gets the seat again.':'Cancel Seat setup? The previous level trim and limits come back, and SimHub gets the seat again.')))return;await ssPost('cancel');ssView='start';ssRender();}
 async function ssRemove(){if(!confirm('Remove the seat set-up from the board? No level trim (SimHub\'s centre is 512 again), no travel limits or end stops; the tilt limits stay.'))return;
  const r=await ssPost('remove');if(r.ok)toast('Seat set-up removed from the board.');}
 function ssAgain(){ssView='start';ssRender();}
+// 2.9.3: Start over, centring the pots
+async function ssRestart(){if(!confirm('Start Seat setup over?\n\nThe set-up on the board now comes off (level trim, travel limits, end stops - saved that way; the tilt limits stay), every motor is switched on (each creeps back to its position) and Seat setup opens at its first step.'))return;
+ ssFilled=null;ssView='start';await ssPost('restart');ssRender();}
+function ssCanPots(st){return !!(st&&st.state==='idle'&&!st.restarting&&st.connected&&st.fw_ok&&st.has_sensor);}
+async function ssPotsOpen(){if(!ssCanPots(ss)){if(ss&&ss.state!=='idle')toast('Seat setup is open - finish or cancel it first.',1);else if(ss&&!ss.has_sensor)toast('Centring the pots needs the motion sensor sending angles.',1);return;}
+ if(!confirm('Centre the pots?\n\nSeat setup opens (SimHub\'s positions are held back), levels the seat with the sensor (about 15 s, the motors move a little) and shows where each motor reads level.\n\nIf you move a pot belt, the set-up on the board no longer fits: it comes off at the end and Seat setup carries on from levelling. If you move none, it stays as it is.'))return;
+ ssFilled=null;ssView='pots';const r=await ssPost('pots_start');if(!r.ok)ssView='start';ssRender();}
+async function ssPotsFinish(){const p=ss&&ss.pots;
+ if(p&&p.moved&&!confirm('Finish centring the pots?\n\nA pot moved, so the old set-up (level trim, travel limits, end stops) no longer fits: it comes off the board, and Seat setup carries on from levelling - level, find the travel and save.'))return;
+ const r=await ssPost('pots_finish');if(r.ok)toast(p&&p.moved?'Pots centred - now level the seat and find the travel.':'Nothing moved - the previous set-up is back.');}
+function ssPotMotor(m,on){ssPost('pots_motor',{motor:m,on:on});}
+function ssGauge(o,tol){// a dial: the level reading's distance from 512, green = close enough
+ const R=Math.max(150,Math.ceil((Math.abs(o||0)+25)/50)*50),cx=75,cy=82,rr=62,ang=v=>Math.max(-1,Math.min(1,v/R))*Math.PI/2,pt=(v,r)=>[cx+r*Math.sin(ang(v)),cy-r*Math.cos(ang(v))];
+ const [a1,b1]=pt(-tol,rr),[a2,b2]=pt(tol,rr);let h=`<path d="M${cx-rr} ${cy} A${rr} ${rr} 0 0 1 ${cx+rr} ${cy}" fill="none" stroke="var(--line-2)" stroke-width="10" stroke-linecap="round"/>`+
+  `<path d="M${a1.toFixed(1)} ${b1.toFixed(1)} A${rr} ${rr} 0 0 1 ${a2.toFixed(1)} ${b2.toFixed(1)}" fill="none" stroke="var(--c-f)" stroke-width="10"/>`;
+ for(const v of [-R,-R/2,0,R/2,R]){const [x1,y1]=pt(v,rr-9),[x2,y2]=pt(v,rr-15);h+=`<line x1="${x1.toFixed(1)}" y1="${y1.toFixed(1)}" x2="${x2.toFixed(1)}" y2="${y2.toFixed(1)}" stroke="var(--axis)" stroke-width="1.5"/>`;}
+ if(o!=null){const [x,y]=pt(o,rr-4),ok=Math.abs(o)<=tol;h+=`<line x1="${cx}" y1="${cy}" x2="${x.toFixed(1)}" y2="${y.toFixed(1)}" stroke="${ok?'var(--c-f)':'var(--text)'}" stroke-width="3" stroke-linecap="round"/><circle cx="${cx}" cy="${cy}" r="5" fill="var(--text)"/>`+
+  `<text x="${cx}" y="${cy+16}" text-anchor="middle" font-size="14" font-weight="700" font-family="var(--mono)" fill="${ok?'var(--c-f)':'var(--text)'}">${o>0?'+':''}${o}</text>`;}
+ else h+=`<text x="${cx}" y="${cy+16}" text-anchor="middle" font-size="12" fill="var(--dim)">-</text>`;
+ h+=`<g font-size="9.5" fill="var(--dim)" font-family="var(--mono)"><text x="${cx-rr-2}" y="${cy+14}" text-anchor="middle">-${R}</text><text x="${cx+rr+2}" y="${cy+14}" text-anchor="middle">+${R}</text><text x="${cx}" y="${cy-rr-6}" text-anchor="middle">512</text></g>`;
+ return `<svg class="pg" viewBox="0 0 150 100">${h}</svg>`;}
+function ssPotsRender(st){const P=st.pots,box=$('ss_pots');if(!P){box.innerHTML='';return;}
+ let h='';for(const r of P.motors){const m=r.motor-1,tl=r.role==='tl',t=r.tooth,tol=Math.max(10,t?t/2:10);
+  const lab=tl?'centre':'level';
+  const read=r.level!=null?`${lab} reads <b class="mono">${r.level}</b>`:`${lab}: <span class="muted">${r.off?'motor off':'waiting'}</span>`;
+  const facts=[];if(r.room)facts.push(`travel from ${lab}: ${r.room[0]} to lower numbers, ${r.room[1]} to higher (Clip ${r.clip})`);
+  if(t)facts.push(`a tooth ≈ ${Math.round(t)} counts`+(r.steps.length?'':' (from the other motor)'));
+  if(r.steps.length)facts.push('moves so far: '+r.steps.map(d=>(d>0?'+':'')+Math.round(d)).join(', '));
+  if(tl&&r.by)facts.push(r.by==='sensor'?'centre from the sensor\'s yaw - check by eye':(r.by==='you'?'centre marked by you':'centre as SimHub had it'));
+  if(r.rest_at_limit)facts.push(`<span class="warnc">rests at ${Math.round(r.rest)} with the motors off - at the end of the sensor's band</span>`);
+  const btn=r.off?`<button class="btn b-green" onclick="ssPotMotor(${m},1)">Switch motor ${r.motor} on</button>`:`<button class="btn b-grey" onclick="ssPotMotor(${m},0)">Switch motor ${r.motor} off</button>`;
+  const jog=tl&&!r.off?[-10,-1,1,10].map(d=>`<button class="btn b-grey" onclick="ssJog(${m},${d})">${d>0?'+':''}${d}</button>`).join('')+`<button class="btn b-blue" onclick="ssPost('pots_mark')">Centre is here</button>`:'';
+  h+=`<div class="potrow ${r.state==='done'?'done':(r.off?'off':'')}" data-m="${m}">${ssGauge(r.state==='done'||r.state==='go'?r.offset:null,tol)}<div>`+
+   `<div class="pt1"><span class="mtag m${r.motor}">${esc(mshort(m))}</span>${tl?'<span class="muted" style="font-size:12.5px">rear slide</span>':''}<span>${read}</span>${r.state==='done'?'<span class="okc">✓ centred</span>':''}</div>`+
+   `<div class="adv ${r.state==='go'?'':'muted'}">${esc(r.advice||'')}</div><div class="facts">${facts.join(' · ')}</div><div class="ssacts">${btn}${jog}</div></div></div>`;}
+ if(box.dataset.h!==h){box.innerHTML=h;box.dataset.h=h;}
+ $('ss_potsnote').innerHTML=P.all_done?'<b class="okc">Every motor is centred.</b> Press <b>Finish</b>'+(P.moved?': the old set-up comes off the board and Seat setup carries on from levelling.':'.'):
+  (P.moved?'A pot moved: when you finish, the old set-up comes off the board (it no longer fits) and Seat setup carries on from levelling.':'');}
 function ssStep(v){if(v==='limits'){ssFilled=null;ssOptions(true);}ssView=v;ssRender();}
 function ssExplore(m,way){ssOptions(true).then(()=>ssPost('explore',{motor:m,way:way}));}
 async function ssOptions(wantOnly){const want={};TD.forEach((k,i)=>{const v=parseFloat($('w_'+TDID[i]).value);if(v>0)want[k]=v;});
@@ -15736,11 +18018,12 @@ document.addEventListener('keydown',e=>{if(curView!=='seat'||!ss||ss.action!=='e
 function ssRender(){if(!ss)return;const st=ss;
  // which panel: follow the server when it moves on, otherwise stay where the owner went
  if(st.state==='idle'){if(st.step==='done'&&ssLastStep!=='done')ssView='done';else if(ssView!=='done')ssView='start';}
- else if(st.step!==ssLastStep){if(st.step==='travel'||st.step==='limits'||st.step==='level')ssView=st.step;}
+ else if(st.step!==ssLastStep){if(st.step==='travel'||st.step==='limits'||st.step==='level'||st.step==='pots')ssView=st.step;}
  if(st.state!=='idle'&&ssView==='start')ssView=st.step==='start'?'level':st.step;
+ if(st.state!=='idle'&&st.step==='pots')ssView='pots';else if(ssView==='pots')ssView=st.state==='idle'?'start':st.step;
  ssLastStep=st.step;
- const order=['start','level','travel','limits','done'];const cur=order.indexOf(ssView);
- document.querySelectorAll('#ss_steps span').forEach(sp=>{const i=order.indexOf(sp.dataset.s);sp.classList.toggle('on',i===cur);sp.classList.toggle('done',i<cur||(st.step==='done'&&sp.dataset.s==='done'));});
+ const pv=ssView==='pots',order=['start','level','travel','limits','done'];const cur=order.indexOf(ssView);
+ document.querySelectorAll('#ss_steps span').forEach(sp=>{const i=order.indexOf(sp.dataset.s);sp.hidden=pv?sp.dataset.s!=='pots':sp.dataset.s==='pots';sp.classList.toggle('on',pv?sp.dataset.s==='pots':i===cur);sp.classList.toggle('done',!pv&&(i<cur||(st.step==='done'&&sp.dataset.s==='done')));});
  document.querySelectorAll('#sscard .sspanel').forEach(p=>p.hidden=p.dataset.p!==ssView);
  if(st.error&&st.action==null)ssErr(st.error);
  // busy box
@@ -15749,7 +18032,14 @@ function ssRender(){if(!ss)return;const st=ss;
   const h=`<span class="watching"><i></i>${ex?'Moving - watch the rig':(st.action==='save'?'Saving':'Moving')}</span><span style="flex:1;min-width:200px">${escn(st.msg||'…')}</span>`+
    (ex?`<button class="btn b-red bigstop" onclick="ssPost('stop')"><svg class="i" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor"/></svg>Stop - this is the end</button><button class="btn b-grey" onclick="ssPost('abort')">Abort</button>`
      :`<button class="btn b-grey" onclick="ssPost('abort')">Stop</button>`)+`<div class="bar"><div style="width:${st.progress||0}%"></div></div>`;
-  if(bz.dataset.h!==h){bz.innerHTML=h;bz.dataset.h=h;}}else{bz.hidden=true;bz.dataset.h='';}
+  if(bz.dataset.h!==h){bz.innerHTML=h;bz.dataset.h=h;}}
+ else if(st.restarting){bz.hidden=false;const h=`<span class="watching"><i></i>Starting over</span><span style="flex:1;min-width:200px">${escn(st.restarting)}…</span>`;if(bz.dataset.h!==h){bz.innerHTML=h;bz.dataset.h=h;}}
+ else{bz.hidden=true;bz.dataset.h='';}
+ // 2.9.3: Start over (always there), centring the pots
+ const ob=$('ss_overbtn');ob.hidden=!st.connected||!st.fw_ok;ob.disabled=st.action==='save'||!!st.restarting;
+ $('ss_potsbtn').hidden=!ssCanPots(st);$('ss_potsbtn2').hidden=!ssCanPots(st);
+ $('ss_donepots').innerHTML=ssCanPots(st)?'Does a motor have more travel one way than the other from level? <b>Centre the pots</b> (or click the bubble): move a pot belt a tooth at a time until every motor reads 512 at level, then run Seat setup again.':'';
+ if(pv)ssPotsRender(st);
  const busy=!!st.action;document.querySelectorAll('#sscard .sspanel button').forEach(b=>{if(!b.closest('[data-p=start]'))b.disabled=busy;});
  // start panel
  const b=st.board,senOk=st.has_sensor;
@@ -15788,6 +18078,7 @@ function ssRender(){if(!ss)return;const st=ss;
   let lh='<tr><th></th><th>Level at</th><th data-k="ss_travel">Travel limits</th><th data-k="ss_ends">End stops</th></tr>';
   for(const m of use){lh+=`<tr><td><span class="mtag m${m+1}">${esc(mshort(m))}</span></td><td class="mono">${st.level_pos[m]}${m===tlm?' <span class="muted" style="font:12px var(--sans)">centre</span>':''}</td><td><input type="number" id="tl${m}" value="${sg.travel[m][0]}"> – <input type="number" id="th${m}" value="${sg.travel[m][1]}"></td><td><input type="number" id="el${m}" value="${sg.end_stop[m][0]}"> / <input type="number" id="eh${m}" value="${sg.end_stop[m][1]}"></td></tr>`;}
   $('ss_limtab').innerHTML=lh;tipAttach($('ss_limtab'));
+  $('ss_restnote').innerHTML=(sg.notes||[]).map(n=>`<p class="note ${n.level==='warn'?'warnc':''}" style="margin:8px 0 0">${n.level==='warn'?'<b>Careful:</b> ':''}${esc(n.text)}</p>`).join('');
   const t3=sg.tl,tt=$('ss_tltxt');tt.hidden=!t3;
   if(t3)tt.innerHTML=`<b>Rear slide (motor ${t3.motor+1})</b>: inside these travel limits the seat turns up to <b>${t3.left}° with the rear left</b> and <b>${t3.right}° with it right</b>`+
    (t3.measured?' (measured with the sensor).':` (estimated at ${t3.deg_per_count}°/count - the sensor measures it).`)+
@@ -15817,6 +18108,9 @@ function ssReachSvg(poly,want,tilt){const sv=$('ss_reach');if(!poly||!poly.lengt
  h+=`<g font-size="11" fill="var(--axis)" font-family="var(--sans)"><text x="282" y="144" text-anchor="end">roll right</text><text x="18" y="144">roll left</text><text x="156" y="26">front up</text><text x="156" y="280">front down</text><text x="${X(mx>12?5:2)}" y="${Y(0)+14}" text-anchor="middle">${mx>12?5:2}°</text></g>`;
  sv.innerHTML=h;}
 function ssLive(st){const lv=st.live||{},b=st.board;
+ const cp=ssCanPots(st);document.querySelector('.sslive').classList.toggle('canpots',cp);$('ss_potshint').hidden=!cp;
+ const pots=st.step==='pots'&&st.pots?st.pots:null;
+ $('ss_minikey').innerHTML=pots?'Dashed: 512, the middle of the pot. White tick: where the motor reads level now.':'Green band: the travel limits. Red ticks: the end stops. White tick: level.';
  const held=st.state!=='idle'||(b&&b.page_holds);const he=$('ss_held');he.classList.toggle('on',held);
  he.innerHTML=held?`<i class="dot" style="background:var(--amber)"></i><span>This page has the seat - SimHub's positions are held back by the board${st.simhub_held?` (${st.simhub_held} so far)`:''}.</span>`:'<i class="dot on"></i><span>SimHub is in charge of the seat.</span>';
  $('ss_r').textContent=lv.roll!=null?sgn(lv.roll):'-';$('ss_p').textContent=lv.pitch!=null?sgn(lv.pitch):'-';
@@ -15838,10 +18132,12 @@ function ssLive(st){const lv=st.live||{},b=st.board;
   const sg=st.suggest,src=st.state!=='idle'&&sg?{travel:sg.travel[m],end:sg.end_stop[m],level:st.level_pos?st.level_pos[m]:null}:(b?{travel:wins[m],end:b.end_stop[m],level:512+b.trim[m]}:null);
   if(src){tz=`<div class="tz" style="left:${pc(src.travel[0])}%;width:${pc(src.travel[1])-pc(src.travel[0])}%"></div>`;
    if(src.end[0]>0)ez+=`<div class="ez" style="left:${pc(src.end[0])}%"></div>`;if(src.end[1]<1023)ez+=`<div class="ez" style="left:${pc(src.end[1])}%"></div>`;
-   if(src.level!=null)lvl=`<div class="lv" style="left:${pc(src.level)}%"></div>`;}
+   if(pots){const pr=pots.motors.find(x=>x.motor===m+1);src.level=pr&&pr.level!=null?pr.level:null;lvl='<div class="c5"></div>';}
+   if(src.level!=null)lvl+=`<div class="lv" style="left:${pc(src.level)}%"></div>`;}
   mh+=`<div class="mini" data-m="${m}"><span class="badge">${m+1}</span><div class="mtrack">${tz}${ez}${lvl}${pot!=null?`<div class="pt" style="left:${pc(pot)}%"></div>`:''}</div><span class="num">${pot!=null?pot.toFixed(0):'-'}</span></div>`;}
  $('ss_minis').innerHTML=mh;}
 
+$('ss_bub').addEventListener('click',()=>{if(ssCanPots(ss))ssPotsOpen();});$('ss_minis').addEventListener('click',()=>{if(ssCanPots(ss))ssPotsOpen();});
 // ---------- 3D view (v2.1): a sci-fi cockpit seat moving with the motion sensor and the motors ----------
 // Two rigs: traction loss (default: motors 1 and 2 lift the front corners through a yoke, motor 3 slides the rear
 // left / right on a rail, the seat turning about a pivot at the front) and three lifts (actuators placed from how
@@ -16283,6 +18579,8 @@ class Handler(BaseHTTPRequestHandler):
     fwup: "FirmwareUpdate" = None
     upd: "Updater" = None
     usb_busy = None                     # 2.8: callable -> why a USB bridge has to wait, or None
+    show_can = None                     # 2.9.3: callable -> why a motion preset can't start, or None
+    park = None                         # 2.9.3: ParkControl
 
     def log_message(self, *a):          # quiet
         pass
@@ -16342,6 +18640,8 @@ class Handler(BaseHTTPRequestHandler):
                         "seat": {"open": self.seat.state != "idle", "action": self.seat.action,
                                  "trim": [self.board.trim(m) for m in range(3)]},
                         "manual": self.manual.status(), "upd": self.upd.summary(),
+                        "show": dict(self.gen.show_status(), can=Handler.show_can() if Handler.show_can else None),
+                        "park": self.park.status(),
                         "link": self.board.link_info()})
         elif u.path == "/config":
             self._json(self.cfg.public())
@@ -16401,7 +18701,7 @@ class Handler(BaseHTTPRequestHandler):
             fwn = (self.board.fw_cache or [0, 0])[1]
             st = self.board.board_settings() if self.board.connected else None
             self._json({"connected": self.board.connected, "fwnum": fwn, "ok": st is not None,
-                        **(st or {})})
+                        **(st or {}), "link": self._sensor_link() if st else None})
         elif (u.path.startswith("/img/") and u.path[5:] in ASSETS) or u.path[1:] in ("favicon.svg", "favicon-32.png",
                                                                                      "apple-touch-icon.png", "favicon.ico"):
             name = u.path[5:] if u.path.startswith("/img/") else ("favicon-32.png" if u.path == "/favicon.ico" else u.path[1:])
@@ -16476,6 +18776,77 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._json({"error": "not found"}, 404)
 
+    def _sensor_link(self):
+        """2.9.3: the motion sensor link for the Settings card's status line - the telemetry's drop-outs, and with
+        firmware 2.1.1 the board's own view (the rate it found the sensor at, times lost, what it sends)."""
+        out = dict(self.monitor.sensor_link())
+        b = self.board
+        out["fw_keeps_lock"] = b.imu_info_ok()
+        out["fw"] = b.fw_label()
+        i = b.read_imu_info(0.6) if out["fw_keeps_lock"] else None
+        if i:
+            out["board"] = {k: i[k] for k in ("found_at", "lost", "scan_steps", "bytes", "types", "ms_since_packet",
+                                              "ms_since_angles", "found_for_s", "may_look", "setup", "setup_code",
+                                              "rates_tried", "baud_trying")}
+        return out
+
+    def _sensor_setup(self, req):
+        """2.9.3: Set up the sensor - only while the board receives it (the commands go out at the board's baud
+        rate, and while it is still looking that is the wrong one), then checks what took. Returns (ok, text, level)."""
+        b = self.board
+        d = b.read_diag()
+        sn = (d or {}).get("sensor") or {}
+        if not sn.get("receiving"):
+            return False, ("The board isn't receiving the sensor right now" + (f" (it is trying {sn.get('baud_trying')} "
+                           f"baud)" if sn.get("baud_trying") else "") + ", so the set-up would go out at the wrong "
+                           "baud rate and the sensor would ignore it - or take only part of it. Wait until the status "
+                           "says Receiving (Search again helps), then press Set up the sensor again."), "warn"
+        full = b.fwnum() >= 19
+        old = sn.get("baud")
+        b.cmd_pair("i", ord("S"), 0x49 if full else 0x09)
+        self.events.add("setting", "Motion sensor set-up sent: 100 Hz at 115200 baud" +
+                        (", angles + gyro + acceleration." if full else ", angles."), quiet=True)
+        t_end = time.time() + 12.0                   # 11 commands 120 ms apart, then found at 115200, then a second
+        last, since = None, None
+        time.sleep(0.4)
+        while time.time() < t_end:
+            d = b.read_diag(0.8)
+            x = (d or {}).get("sensor") or {}
+            last = x or last
+            if x.get("setting_up"):
+                since = None
+            elif x.get("receiving") and x.get("baud") == 115200:
+                since = since or time.time()
+                if time.time() - since >= 1.6 and (x.get("angles_per_s") or 0) >= 80 and (x.get("accel_gyro") or not full):
+                    break
+            time.sleep(0.3)
+        x = last or {}
+        i = b.read_imu_info(0.6)
+        if i and i.get("setup_code") == 2:
+            return False, ("The board refused: it had just lost the sensor, so the set-up would have gone out at the "
+                           "wrong baud rate. Wait until the status says Receiving, then try again."), "warn"
+        if x.get("receiving") and x.get("baud") == 115200:
+            aps = x.get("angles_per_s") or 0
+            if full and not x.get("accel_gyro"):
+                return False, (f"The sensor now talks at 115200 baud ({aps} angles/s) but still sends angles only - "
+                               f"it didn't take the output setting. Press Set up the sensor once more (the board "
+                               f"reaches it at the right rate now)."), "warn"
+            if aps < 80:
+                return False, (f"The sensor talks at 115200 baud but sends {aps} angles/s, not 100 - press Set up the "
+                               f"sensor once more."), "warn"
+            return True, (f"Done: {aps} angles/s at 115200 baud" + (", with gyro and acceleration" if full else "")
+                          + " - saved in the sensor."), "ok"
+        if x.get("receiving") and x.get("baud") == old:
+            return False, (f"The sensor didn't take the new settings: it still talks at {old} baud. The board's "
+                           f"commands don't reach it - check D1 -> MAX3232 TTL side (T1IN) -> RS-232 side (T1OUT) -> "
+                           f"the sensor's RX (green wire). Or set it in WitMotion's software (100 Hz, 115200 baud, "
+                           f"angles + acceleration + gyro)."), "fail"
+        if x.get("receiving"):
+            return False, (f"The sensor answers at {x.get('baud')} baud now, not 115200 - press Set up the sensor "
+                           f"once more."), "warn"
+        return False, ("No answer from the sensor at 115200 baud yet; the board keeps looking at every rate for 30 s. "
+                       "Watch the status line, or run Diagnostics, Motion sensor check."), "warn"
+
     def _board_setting(self, p, req):
         """Firmware 1.8 settings that live on the board: LED matrix view and the motion sensor."""
         b = self.board
@@ -16545,18 +18916,23 @@ class Handler(BaseHTTPRequestHandler):
                     self._json({"ok": False, "error": "Seat setup is open - it levels the sensor itself."})
                     return
                 full = b.fwnum() >= 19                       # 1.9 reads gyro and acceleration too (3D view)
-                b.cmd_pair("i", code, (0x49 if full else 0x09) if act == "setup" else 0)
+                if act == "setup":                           # 2.9.3: only to a found sensor, and checked after
+                    ok, text, level = self._sensor_setup(req)
+                    self.events.add("setting", "Motion sensor set-up: " + text, quiet=not ok)
+                    st = b.board_settings()
+                    self._json({"ok": True, **(st or {}), "link": self._sensor_link() if st else None,
+                                "setup": {"ok": ok, "text": text, "level": level}})
+                    return
+                b.cmd_pair("i", code, 0)
                 self.events.add("setting", {"level": "Motion sensor levelled: this seat position now reads 0° / 0°.",
                                             "clear": "Motion sensor level cleared (raw sensor angles).",
-                                            "setup": "Motion sensor set to 100 Hz at 115200 baud" +
-                                                     (", angles + gyro + acceleration." if full else ", angles."),
                                             "search": "Looking for the motion sensor again."}[act], quiet=True)
         except (TypeError, ValueError):
             self._json({"ok": False, "error": "Check the values."})
             return
-        time.sleep(0.25 if p != "/board/sensor/action" or req.get("action") != "setup" else 1.6)
+        time.sleep(0.25)
         st = b.board_settings()
-        self._json({"ok": True, **(st or {})})
+        self._json({"ok": True, **(st or {}), "link": self._sensor_link() if (st and p.startswith("/board/sensor")) else None})
 
     def _seat_post(self, what, req):
         _seat_post_impl(self, what, req)
@@ -16775,6 +19151,10 @@ class Handler(BaseHTTPRequestHandler):
             elif "pair" in req:
                 ok = self.board.cmd_pair(req["pair"], req.get("a", 0), req.get("b", 0))
             elif "text" in req:
+                if str(req["text"]) == "ena" and self.park.parked and self.park.fw_park() and self.park.state == "idle":
+                    ok, why = self.park.unpark()                 # 2.9.3: parked - rise evenly back to level
+                    self._json({"ok": ok, "error": None if ok else why})
+                    return
                 ok = self.board.cmd_text(req["text"])
                 if str(req["text"]) == "ena":
                     sync_unused(self.board, self.cfg)
@@ -16784,8 +19164,18 @@ class Handler(BaseHTTPRequestHandler):
         elif p == "/read":
             self._json(self.board.read_params())
         elif p == "/gen":
+            if self.gen.mode == "show":
+                if req.get("mode", "off") != "off":
+                    self._json({"ok": False, "error": "A motion preset is running in the 3D view - stop it first."})
+                    return
+                self.gen.stop_show("level")              # the test card's Stop: back to level, the page keeps the seat
+                self._json({"ok": True, "motors": []})
+                return
             if self.seat.state != "idle" and req.get("mode", "off") != "off":
                 self._json({"ok": False, "error": "Seat setup is open - finish or cancel it first."})
+                return
+            if self.park.state != "idle" and req.get("mode", "off") != "off":     # 2.9.3
+                self._json({"ok": False, "error": "The seat is being parked - wait for it."})
                 return
             if self.tuner.running():
                 self._json({"ok": False, "error": "Auto-tune is running - stop it first."})
@@ -16820,6 +19210,84 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"ok": False, "error": "Check the test-signal numbers."})
                 return
             self._json({"ok": True, "motors": [m + 1 for m, *_ in plan] if plan else [self.gen.motor + 1]})
+        elif p.startswith("/park/"):                     # 2.9.3: park
+            k, pk = p[6:], self.park
+            if k == "start":
+                ok, msg = pk.start()
+            elif k == "stop":
+                ok, msg = pk.stop()
+            elif k == "unpark":
+                ok, msg = pk.unpark()
+            elif k == "set/start":
+                ok, msg = pk.set_start()
+            elif k == "set/jog":
+                try:
+                    ok, msg = pk.jog(int(req.get("motor", -1)), max(-50.0, min(50.0, float(req.get("delta", 0)))))
+                except (TypeError, ValueError):
+                    ok, msg = False, "Which motor?"
+            elif k == "set/lower":
+                try:
+                    ok, msg = pk.lower(max(-50.0, min(50.0, float(req.get("delta", 0)))))
+                except (TypeError, ValueError):
+                    ok, msg = False, "How far?"
+            elif k == "set/level":
+                ok, msg = pk.level()
+            elif k == "set/save":
+                ok, msg = pk.save()
+            elif k == "set/end":
+                ok, msg = pk.set_end("park" if req.get("how") == "park" else "back")
+            elif k == "clear":
+                ok, msg = pk.clear()
+            elif k == "options":
+                ok, msg = pk.options(req)
+            else:
+                self._json({"ok": False, "error": "unknown"}, 404)
+                return
+            self._json({"ok": bool(ok), "error": None if ok else msg, "park": pk.status()})
+        elif p == "/show/start":                         # 2.9.3: a motion preset (the 3D view)
+            name = str(req.get("name") or "")
+            if name not in SHOWS:
+                self._json({"ok": False, "error": "No such preset."})
+                return
+            why = Handler.show_can() if Handler.show_can else "Not now."
+            if why:
+                self._json({"ok": False, "error": why})
+                return
+            plan, why = show_plan(self.cfg, self.board)
+            if not plan:
+                self._json({"ok": False, "error": why})
+                return
+            try:
+                inten = max(0.1, min(1.0, float(req.get("intensity", 0.4))))
+                speed = max(0.25, min(3.0, float(req.get("speed", 1.0))))
+            except (TypeError, ValueError):
+                self._json({"ok": False, "error": "Check Intensity and Speed."})
+                return
+            with self.manual.lock:                       # it takes over from Return to center / a dragged knob
+                if self.manual.active:
+                    self.manual._end("A motion preset took the seat.", give_back=False)
+            was = self.gen.show["name"] if (self.gen.mode == "show" and self.gen.show) else None
+            self.gen.start_show(name, plan, inten, speed)
+            if was != name:
+                self.events.add("test", f"Motion preset {name} started (3D view, intensity {inten * 100:.0f}%): the "
+                                        f"page has the seat.", quiet=True)
+            self._json({"ok": True, "show": self.gen.show_status()})
+        elif p == "/show/set":
+            try:
+                self.gen.set_show(intensity=max(0.1, min(1.0, float(req["intensity"]))) if "intensity" in req else None,
+                                  speed=max(0.25, min(3.0, float(req["speed"]))) if "speed" in req else None)
+            except (TypeError, ValueError):
+                self._json({"ok": False, "error": "Check Intensity and Speed."})
+                return
+            self._json({"ok": True, "show": self.gen.show_status()})
+        elif p == "/show/stop":                          # Stop (hold where it is) / Return to level
+            kind = "level" if req.get("how") == "level" else "stop"
+            if self.gen.stop_show(kind):
+                self._json({"ok": True})
+            elif kind == "level":
+                self._json(self.manual.centre())         # nothing running: as Return to center
+            else:
+                self._json({"ok": True})
         elif p == "/manual/move":                        # 2.4: a motor card's knob dragged
             try:
                 m, pos = int(req.get("motor", -1)), float(req.get("pos"))
@@ -16839,7 +19307,10 @@ class Handler(BaseHTTPRequestHandler):
         elif p.startswith("/seat/"):
             self._seat_post(p[6:], req)
         elif p == "/diag/start":
-            kind = req.get("kind") if req.get("kind") in ("full", "sensor") else "quick"
+            kind = req.get("kind") if req.get("kind") in ("full", "sensor", "imu") else "quick"
+            if kind in ("full", "sensor") and self.park.state != "idle":     # 2.9.3
+                self._json({"ok": False, "error": "The seat is being parked - wait for it."})
+                return
             if kind in ("full", "sensor") and self.seat.state != "idle":
                 self._json({"ok": False, "error": "Seat setup is open - finish or cancel it first."})
                 return
@@ -16942,6 +19413,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if self.seat.state != "idle":
                 self._json({"ok": False, "error": "Seat setup is open - finish or cancel it first."})
+                return
+            if self.park.state != "idle":                # 2.9.3
+                self._json({"ok": False, "error": "The seat is being parked - wait for it."})
                 return
             self.cfg.update(rider_mode=rider, rider_kg=round(kg, 1), rider_unit=unit)
             if mode == "tune" and not self.tuner.running() and self.board.connected:
@@ -17069,6 +19543,11 @@ class Handler(BaseHTTPRequestHandler):
 
 def _seat_post_impl(h, what, req):
     st = h.seat
+    st.last_act = time.time()                      # 2.9.3: the owner is at it (Seat setup left open is given back)
+    if what in ("start", "restart", "pots_start") and h.park.state != "idle":      # 2.9.3
+        h._json({"ok": False, "error": "The seat is being parked (or its park position set) - wait for it.",
+                 "status": st.status()})
+        return
     if what == "start":
         ok, msg = st.start()
     elif what == "cancel":
@@ -17103,6 +19582,21 @@ def _seat_post_impl(h, what, req):
         ok, msg = st.remove()
     elif what == "centre_tl":
         ok, msg = st.centre_tl()
+    elif what == "restart":                        # 2.9.3: Start over
+        ok, msg = st.restart()
+    elif what == "pots_start":                     # 2.9.3: centre the pots
+        ok, msg = st.pots_start()
+    elif what == "pots_level":
+        ok, msg = st.pots_level()
+    elif what == "pots_motor":
+        try:
+            ok, msg = st.pots_motor(int(req.get("motor", -1)), bool(req.get("on")))
+        except (TypeError, ValueError):
+            ok, msg = False, "Which motor?"
+    elif what == "pots_mark":
+        ok, msg = st.pots_mark()
+    elif what == "pots_finish":
+        ok, msg = st.pots_finish()
     elif what == "tl_dir":                         # which way higher numbers move the rear (traction loss)
         if req.get("dir") in (1, -1, "1", "-1"):
             h.cfg.update(tl_dir=int(req["dir"]))
@@ -17166,13 +19660,20 @@ def main():
     Handler.monitor.seat_setup = Handler.seat
     Handler.fwup = FirmwareUpdate(board, cfg, events, args.bind)
 
-    def busy():
+    def busy(park=True):
+        if park and Handler.park.state != "idle":       # 2.9.3
+            return {"setting": "The park position is being set - save or cancel it first.",
+                    "unparking": "The seat is being unparked - wait for it."}.get(Handler.park.state,
+                                                                                   "The seat is being parked - wait for it "
+                                                                                   "or stop it.")
         if Handler.seat.state != "idle":
             return "Seat setup is open - finish or cancel it first."
         if Handler.diag.moving():
             return "The diagnostics check is moving the motors - wait for it or stop it."
         if Handler.tuner.running():
             return "Auto-tune is running - wait for it or stop it."
+        if gen.mode == "show":
+            return "A motion preset is running (3D view) - stop it first."
         if gen.mode != "off":
             return "A test signal is running - stop it first."
         return None
@@ -17180,6 +19681,8 @@ def main():
 
     def usb_busy():
         """2.8: what a USB bridge waits for before it takes over from WiFi (switching mid-way would spoil it)."""
+        if Handler.park.state != "idle":
+            return "The seat is being parked (or its park position set) in the page - wait for it."
         if Handler.seat.state != "idle":
             return "Seat setup is open in the page - finish or cancel it first."
         if Handler.diag.moving():
@@ -17188,12 +19691,43 @@ def main():
             return "Auto-tune is running in the page - wait for it or stop it."
         if Handler.fwup.state == "running":
             return "A firmware update is running - wait for it to finish."
+        if gen.mode == "show":
+            return "A motion preset is running in the 3D view - stop it first."
         return None
     Handler.usb_busy = usb_busy
     Handler.manual = ManualControl(board, cfg, events)
+    Handler.park = ParkControl(board, cfg, events, Handler.manual)          # 2.9.3
+    Handler.park.busy = lambda: busy(park=False) or ("A firmware update is running." if Handler.fwup.state == "running"
+                                                     else None)
+    Handler.monitor.park = Handler.park
+    Handler.park.rest = lambda m: Handler.monitor.motor_rest(m)
     Handler.manual.busy = lambda: busy() or ("A firmware update is running." if Handler.fwup.state == "running"
                                              else None)
     Handler.manual.seat_open = lambda: Handler.seat.state != "idle"
+
+    def show_end(kind, pos, msg):                        # 2.9.3: after a motion preset the page keeps the seat
+        Handler.manual.take_over(pos, kind == "level", msg)
+    gen.on_show_end = show_end
+
+    def show_can():
+        """Why a motion preset can't start now, or None."""
+        if not board.connected:
+            return "The board is not connected."
+        if board.fwnum() < 19:
+            return "Motion presets need firmware 1.9 or newer (it holds SimHub back meanwhile)."
+        if gen.mode not in ("off", "show"):
+            return "A test signal is running - stop it first (Test & Tools)."
+        why = busy() if gen.mode != "show" else None
+        if why:
+            return why
+        if Handler.fwup.state == "running":
+            return "A firmware update is running."
+        s = board.latest()
+        off = [m + 1 for m in range(int(cfg.get("motors") or 3)) if s and s["dis"][m]]
+        if off:
+            return "Motor " + " and ".join(map(str, off)) + " is off - press Enable Motors first."
+        return None
+    Handler.show_can = show_can
     Handler.monitor.manual = Handler.manual
     Handler.diag.fwup = Handler.fwup
 
@@ -17201,6 +19735,8 @@ def main():
         """What a page update waits for (2.7.3): the things that change the board's settings for a while and put
         them back at the end. Move motors / Return to center and a test signal don't count - prepare_update ends
         them just before the restart."""
+        if Handler.park.state != "idle":
+            return "The seat is being parked - wait for it."
         if Handler.seat.state != "idle":
             return "Seat setup is open - finish or cancel it first."
         if Handler.diag.moving():
@@ -17221,6 +19757,8 @@ def main():
         if gen.mode != "off":
             gen.stop_now()
             events.add("test", "Test signal stopped: the page restarts for an update.", quiet=True)
+        if Handler.park.state != "idle":                 # 2.9.3 (busy_update waits for it - just in case)
+            Handler.park.stop()
     def board_fw():
         fw = board.fw_cache
         if not fw or not board.connected:

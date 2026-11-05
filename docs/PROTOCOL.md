@@ -51,6 +51,8 @@ are two separate bytes. The same commands work over USB (SimHub, SMC3Utils) and 
 | `[kE1]` | 1.9.7 | The page only (WiFi, or USB in page mode): restart the board's WiFi/USB chip (the ESP32-S3), which clears its USB stall - see [The board's own USB port](#the-boards-own-usb-port-firmware-20). At most once per 15 s. 2.0: refused while SimHub is sending positions (the last one less than 10 s ago) and on the main chip's own USB port. Any of 1 or '1'. |
 | `[kOn]` | 2.0 | The page only: who has the USB connector. n = 0 the WiFi chip (saved), 1 the main chip (saved), 2 the WiFi chip until the next reset (for an Arduino IDE upload). Bytes 0-2 or '0'-'2'. USB page mode ends at once; the PC sees the port go away and another one come. |
 | `[kZR]` | 2.0 | The page only: restart the board, as its RESET button does - the motors are switched off first and the page's connection closed. Refused while SimHub is sending positions (the last one less than 10 s ago) and during a firmware update. |
+| `[kPm]` | 2.1.1 | Park mode for the motors in m (bits 0-2; 0 = off) for the next 3 s - the page repeats it every second while it parks the seat or sets the park position, and it lapses 3 s after the last one. Those motors' limits become the SMC3 cutoff, 8 counts in from it: they may go past their Clip window, travel limits and end stops. SMC3's PWMrev push back into the Clip window is left out for them and the tilt limits wait (1.5 s after it ends). The diagnostics frame's seat flags say when it is on (bit 5). |
+| `[rdj]` | 2.1.1 | The page only (WiFi, or USB in page mode): one "SM3I" frame (below) - the motion sensor link as the board sees it. |
 
 ### Seat set-up (firmware 1.9)
 
@@ -212,6 +214,21 @@ Firmware 1.9.2 sends, after `[rdu]`, whenever the update's state changes and fou
   uint8 WiFi module firmware major, minor, patch   char[8] this firmware's version ("1.9.2", zero-padded)
 ```
 
+Firmware 2.1.1 answers `[rdj]` with the motion sensor link, for the page's Motion sensor check:
+
+```
+'S' 'M' '3' 'I'  uint8 version (1)  uint8 length (42)
+  uint8 sensor state (as [rdi])   uint8 index of the baud rate being tried   uint32 that baud rate
+  uint8 index it last found the sensor at (255 none)   uint8 number of baud rates it tries
+  uint8 why it may look (bit0 the sensor is switched on, bit1 the first minute after power-up, bit2 the page asked)
+  uint8 set-up (0 never, 1 sending, 2 refused - the sensor isn't received, 3 sent)
+  uint16 angles/s   uint16 acceleration/s   uint16 gyro/s   uint32 good packets   uint16 bad checksums
+  uint32 bytes received at any rate   uint16 times it lost the sensor   uint16 baud changes while looking
+  uint16 packet types since the last [rdj] (bit n = type 0x50 + n)
+  uint16 ms since the last good packet   uint16 ms since the last angles (65535 none)
+  uint16 s since it found the sensor (65535 not found now)   uint32 uptime ms
+```
+
 ## Diagnostics frame (`[rdd]`, firmware 1.7; over USB in page mode since 1.9.5)
 
 ```
@@ -240,7 +257,7 @@ Firmware 1.9.2 sends, after `[rdu]`, whenever the update's state changes and fou
   3 × { int16 level trim, travel low, travel high, end stop low, end stop high }
   int16 tilt limits ×10 (roll +, roll −, pitch +, pitch −)
   uint8 flags: bit0 the seat set-up running is the saved one, bit1 one is saved, bit2 "SM3X" frames on, bit3 the page holds the seat,
-        bit4 USB page mode on (1.9.5)
+        bit4 USB page mode on (1.9.5), bit5 park mode on (2.1.1)
   uint32 SimHub position commands ignored while held   uint16 acceleration packets, gyro packets in the last second
   int16 raw acceleration x, y, z   int16 raw gyro x, y, z   int16 temperature ×100
   version 4 (1.9.1) continues:
@@ -346,6 +363,16 @@ PWMrev (the original's full-duty drive back from past the Clip window) is not us
 its 1.9 end stops may come back (it is switched off only if it goes 16 counts further out than it has been, or past
 the SMC3 cutoff, until it is 16 counts inside); the tilt limit waits until no motor creeps any more, plus 1.5 s; the
 board keeps full power without position commands.
+
+Firmware 2.1.1 brings a motor back from wherever it rests:
+
+- A motor switched on from past one of its end stops creeps back also with the soft start off (at 60 counts/s). The
+  end-stop exemption is kept apart from the creep: it lasts until the motor is 16 counts back inside, or 40 s. Until
+  then the motor is switched off only if it gets 24 counts further out than where it started, or past the SMC3
+  cutoff, for 25 ms - a pot glitch is shorter, a broken pot or a motor running the wrong way is not.
+- While a motor comes back - creeping, not back from past an end stop yet, or in park mode - and lags its goal by more
+  than 16 counts, its drive may go up to PWMrev instead of PWMmax (when PWMrev is the larger). PWMrev also pushes it in
+  from outside the Clip window once its goal is 16 counts inside. A motor that keeps up never gets more than PWMmax.
 
 RSTSR2 bit0 (CWSF) reads 0 after a real power-on, or after a supply dip deep enough to restart the chip. The
 firmware sets it to 1 at boot, so a later reset by the button, an upload or the WiFi/USB chip reads 1. The first

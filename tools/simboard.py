@@ -113,6 +113,18 @@ ap.add_argument("--fw", type=int, default=19)
 ap.add_argument("--imu", type=float, default=0)
 ap.add_argument("--imu-no-tx", action="store_true")
 ap.add_argument("--imu-lost-at", type=float, default=0)
+ap.add_argument("--imu-baud", type=int, default=0, help="the sensor's baud rate at start (default 9600 at <= 20 Hz, else 115200; 460800 = one the board doesn't try)")
+ap.add_argument("--imu-angles-only", action="store_true", help="the sensor sends angles only (no acceleration / gyro)")
+ap.add_argument("--imu-race", action="store_true", help="firmware <= 2.1's timing bug: with the sensor switched on the board loses it every few seconds")
+ap.add_argument("--fw211b1", action="store_true", help="firmware 2.1.1b1: 2.1 + the sensor lock fixed, [rdj] SM3I, set-up only to a found sensor")
+ap.add_argument("--fw2112", action="store_true", help="firmware 2.1.1b2: 2.1.1b1 + a motor creeps back from outside its end stops (robust to glitches, also with soft start off)")
+ap.add_argument("--fw211", action="store_true", help="firmware 2.1.1: park, coming back up from wherever a motor rests, the sensor lock fix")
+ap.add_argument("--fw2115", action="store_true", help="firmware 2.1.1b5: 2.1.1b4 + up to PWMrev's drive for a motor coming back that lags")
+ap.add_argument("--fw2114", action="store_true", help="firmware 2.1.1b4: 2.1.1b3 + park mode ([kP mask])")
+ap.add_argument("--fw2113", action="store_true", help="firmware 2.1.1b3: 2.1.1b2 with the end-stop exemption apart from the creep (PWMrev back, full power until back)")
+ap.add_argument("--lift-hard", default="", help="M:FROM:EXTRA - lifting motor M needs EXTRA more drive past physical position FROM (the sunk end of a --sag / --sag-high lift: a corner PWMmax can't lift from there)")
+ap.add_argument("--pot-offset", action="append", default=[], help="M:N - motor M's pot reads N counts more than where the motor is (its belt sits that far round)")
+ap.add_argument("--tooth", type=float, default=37.0, help="counts one tooth of the pot belt moves the reading ([zt]: simulator only)")
 ap.add_argument("--flex", action="store_true")
 ap.add_argument("--slop", default="")
 ap.add_argument("--supply-sag", type=float, default=0.0,
@@ -225,12 +237,20 @@ TL_DIR = -1 if args.tl_left else 1            # +1: higher numbers move the rear
 SENSOR_OFFSET = (1.3, -0.8)                   # the sensor isn't mounted perfectly level
 SEAT_TILT = tuple(float(x) for x in args.seat_tilt.split(":")) if args.seat_tilt else (0.0, 0.0)
 STOPS = [[30.0, 993.0] for _ in range(3)]     # mechanical ends of each motor's travel (pot counts)
+LIFT_HARD = None                              # 2.9.3b3 --lift-hard M:FROM:EXTRA
+if args.lift_hard:
+    _m, _f, _e = args.lift_hard.split(":")
+    LIFT_HARD = (int(_m) - 1, float(_f), float(_e))
+POT_OFF = [0.0, 0.0, 0.0]                     # 2.9.3: where each pot's belt sits (counts added to the reading)
+for po_ in args.pot_offset:
+    m_, n_ = po_.split(":")
+    POT_OFF[int(m_) - 1] = float(n_)
 START = {}                                    # --start: where the pots are at power-up
 for st_ in args.start:
     m_, pot_ = st_.split(":")
     START[int(m_) - 1] = float(pot_)
 FW = {"ver": ("1.9" if args.old19 else ("1.9.1" if args.fw191 else ("1.9.3" if args.no_potfilter else
-       ("1.9.4" if args.fw194 else ("1.9.5" if args.fw195 else ("1.9.6" if args.fw196 else ("1.9.7" if (args.fw197 or args.fw197_stuck) else ("2.0b1" if args.fw20b1 else ("2.1" if args.fw21 else ("2.0" if (args.fw20 or args.fw20_esp) else "1.9.8")))))))))) if args.fw >= 19
+       ("1.9.4" if args.fw194 else ("1.9.5" if args.fw195 else ("1.9.6" if args.fw196 else ("1.9.7" if (args.fw197 or args.fw197_stuck) else ("2.0b1" if args.fw20b1 else ("2.1.1" if args.fw211 else ("2.1.1b5" if args.fw2115 else ("2.1.1b4" if args.fw2114 else ("2.1.1b3" if args.fw2113 else ("2.1.1b2" if args.fw2112 else ("2.1.1b1" if args.fw211b1 else ("2.1" if args.fw21 else ("2.0" if (args.fw20 or args.fw20_esp) else "1.9.8")))))))))))))))) if args.fw >= 19
       else f"{args.fw // 10}.{args.fw % 10}"}
 
 
@@ -314,10 +334,12 @@ class Seat:                                   # the seat on the three linkages, 
     def __init__(self):
         self.roll = self.pitch = 0.0; self.vr = self.vp = 0.0
         self.yaw = 0.0; self.vy = 0.0; self.vy_prev = 0.0  # tl: the seat's turn, + = rear to the right (nose left)
-        self.rate = args.imu; self.baud = 9600 if args.imu <= 20 else 115200
-        self.last_out = 0.0; self.out = None      # last sensor reading (raw roll, raw pitch, yaw)
-        self.packets = 0; self.bad = 0; self.found_at = None
-        self.all = True                           # factory: acceleration, gyro and angles; [iS 0] = angles only
+        self.rate = args.imu; self.baud = args.imu_baud or (9600 if args.imu <= 20 else 115200)
+        self.last_out = 0.0; self.out = None      # last reading the board received (raw roll, raw pitch, yaw)
+        self.last_send = 0.0                      # 2.9.3: when the sensor last sent (whether the board could read it)
+        self.packets = 0; self.bad = 0
+        self.all = not args.imu_angles_only       # factory: acceleration, gyro and angles; [iS 0] = angles only
+        self.unlocked = False; self.baud_pending = None   # 2.9.3: the sensor's own register writes
         self.acc = (0, 0, 2048); self.gyro = (0, 0, 0); self.acc_t = 0.0; self.acc_n = 0; self.peak = 0
         self.vr_prev = 0.0; self.vp_prev = 0.0
 
@@ -338,13 +360,19 @@ class Chan:                                   # the firmware's per-motor state
         self.trips = 0; self.trip_at = -1; self.jumps = 0; self.jmax = 0; self.fmin = 16383; self.fmax = 0
         self.trim, self.tlo, self.thi, self.elo, self.ehi = 0, 0, 1023, 0, 1023     # 1.9 seat set-up
         self.soft, self.soft_ticks, self.soft_out, self.soft_since = False, 0, 0, 0.0   # 1.9.1 soft start
+        self.soft_bad = 0                                                              # 2.1.1b2
+        self.out_back = False                                                          # 2.1.1b3
         self.update_ilim()
 
     def window(self):                         # target limits in force: SMC3 clip and the travel limits (1.9)
+        if PARK["mask"] & (1 << self.i):      # 2.1.1b4 park mode: anywhere inside the cutoff
+            return self.cut + 8, 1023 - self.cut - 8
         lo, hi = max(self.clip, self.tlo), min(1023 - self.clip, self.thi)
         return (self.clip, 1023 - self.clip) if hi < lo + 8 else (lo, hi)
 
     def cut_window(self):                     # cutoff in force: SMC3 Max limit and the end stops (1.9)
+        if PARK["mask"] & (1 << self.i):
+            return self.cut, 1023 - self.cut
         lo, hi = max(self.cut, self.elo), min(1023 - self.cut, self.ehi)
         return (self.cut, 1023 - self.cut) if hi < lo + 8 else (lo, hi)
 
@@ -362,6 +390,23 @@ lock = threading.Lock()
 TICKS = [0]
 SIMHUB = [False]                          # switched with [zs1] / [zs0] from any client (simulator only)
 HOLD = [0.0]                              # 1.9 [kH n]: SimHub's positions are ignored until then
+PARK = {"mask": 0, "until": 0.0}          # 2.1.1b4 [kP mask]: park mode, 3 s from the last one
+
+
+def park_fw():
+    return args.fw >= 19 and _vt(FW["ver"]) >= (2, 1, 1) and FW["ver"] not in ("2.1.1b1", "2.1.1b2", "2.1.1b3")
+
+
+def recover_fw():                             # firmware 2.1.1b5: a lagging motor coming back gets up to PWMrev's drive
+    return park_fw() and FW["ver"] != "2.1.1b4"
+
+
+def park_set(mask):
+    PARK["until"] = time.time() + 3.0
+    if mask != PARK["mask"]:
+        PARK["mask"] = mask
+        for c in C:
+            lo, hi = c.window(); c.target = max(lo, min(hi, c.target))
 EXTRAS_ANY = [False]
 VREG = [0]                                # 1.9 [w hi lo]
 def soft_start_from(c):
@@ -369,19 +414,36 @@ def soft_start_from(c):
     lo, hi = c.cut_window()
     fb = c.fb_q
     c.soft_out = (lo * 16 - fb) if fb < lo * 16 else ((fb - hi * 16) if fb > hi * 16 else 0)
-    c.soft_ticks, c.soft = 0, True
+    c.soft_ticks, c.soft, c.soft_bad = 0, True, 0
+    c.out_back = c.soft_out > 0                   # 2.1.1b3: the end-stop exemption, apart from the creep
     c.goal_acc = fb << 8; c.goal_q = fb
     c.cum = 0; c.lastpos = fb; c.dterm = 0
     c.soft_since = time.time()
 
 
+def creeping(c):                               # 2.1.1b3: creeping, or not back from past an end stop yet
+    return (c.soft or (creep_b3() and c.out_back)) and not c.disabled
+
+
 def any_soft():
-    return any(c.soft and not c.disabled for c in C)
+    return any(creeping(c) for c in C)
+
+
+def creep_b3():                               # firmware 2.1.1b3: the end-stop exemption apart from the creep
+    return args.fw >= 19 and _vt(FW["ver"]) >= (2, 1, 1) and FW["ver"] not in ("2.1.1b1", "2.1.1b2")
+
+
+def creep_fix():                              # firmware 2.1.1b2: back from outside its end stops, robustly
+    return args.fw >= 19 and FW["ver"] not in ("2.1.1b1",) and _vt(FW["ver"]) >= (2, 1, 1)
 
 
 def enable(c):
-    if c.disabled and soft_fw() and SOFT["rate"] > 0:
+    lo, hi = c.cut_window()
+    outside = c.fb_q > hi * 16 or c.fb_q < lo * 16
+    if c.disabled and soft_fw() and (SOFT["rate"] > 0 or (creep_fix() and outside)):
         soft_start_from(c)
+    elif c.disabled and creep_b3():
+        c.out_back, c.soft_out = False, 0
     c.disabled, c.reason = False, 0
 
 
@@ -430,7 +492,7 @@ def boot(cold=True):
         load_seat()
     if soft_fw() and eeprom[105] == 0xB5:
         SOFT["rate"] = struct.unpack(">h", bytes(eeprom[106:108]))[0]
-    SEAT.found_at = None; SEAT.packets = 0
+    link_reset(time.time()); SEAT.packets = 0; SEAT.bad = 0
     for c in C:
         p = P[potmap[c.i]]
         c.fb_q = int(p.pot_x * 16); c.lastpos = c.fb_q; c.raw_q = c.fb_q; c.held = 0
@@ -538,22 +600,124 @@ def matrix_error(now):
     return 255
 
 
+def imu_fix():                                 # firmware 2.1.1: the lock kept, [rdj] SM3I, set-up only to a found sensor
+    return args.fw >= 19 and _vt(FW["ver"]) >= (2, 1, 1)
+
+
+LINK = {}                                     # 2.9.3: the board's side of the sensor link (PollImu / ServiceImu)
+
+
+def link_reset(now):
+    LINK.clear()
+    LINK.update(since=now, last_valid=0.0, locked_since=0.0, locked_idx=255, losses=0, steps=0, rx=0, types=0, q=[],
+                pos=0, switch_at=-1, cmd_last=0.0, setup_state=0, rate_n=0, rate_hz=0, acc_n=0, acc_hz=0, rate_since=now)
+
+
+def imu_hear(reg, val):
+    """The sensor gets one register write (WitMotion: FF AA reg lo hi) - only at its own baud rate."""
+    if reg == 0x69:
+        SEAT.unlocked = True
+    elif not SEAT.unlocked:
+        return
+    elif reg == 0x02:
+        SEAT.all = bool(val & 0x06) and args.fw >= 19
+    elif reg == 0x03:
+        SEAT.rate = {6: 10, 7: 20, 8: 50, 9: 100, 11: 200}.get(val, 100)
+    elif reg == 0x04:
+        SEAT.baud_pending = {1: 4800, 2: 9600, 3: 19200, 4: 38400, 5: 57600, 6: 115200, 7: 230400}.get(val)
+    elif reg == 0x00 and SEAT.baud_pending:   # this sensor takes a new baud rate when it saves
+        SEAT.baud, SEAT.baud_pending = SEAT.baud_pending, None
+
+
+def sensor_link(now, powered):
+    """2.9.3: the board's baud scan, the set-up queue, and whether a packet from the sensor can be read at all.
+    Returns True when the board reads the packet the sensor sends now."""
+    L = LINK
+    if not L:
+        link_reset(now)
+    if now - L["rate_since"] >= 1.0:          # per second, like ImuRateHz
+        L["rate_since"] = now
+        L["rate_hz"], L["rate_n"], L["acc_hz"], L["acc_n"] = L["rate_n"], 0, L["acc_n"], 0
+    if L["q"]:                                # set-up commands, 120 ms apart, at the board's rate
+        if now - L["cmd_last"] >= 0.12:
+            if L["pos"] == L["switch_at"]:
+                board["baud_idx"] = 1; L["since"] = now
+            reg, val = L["q"][L["pos"]]
+            if powered and not args.imu_no_tx and BAUDS[board["baud_idx"]] == SEAT.baud:
+                imu_hear(reg, val)
+            L["pos"] += 1; L["cmd_last"] = now
+            if L["pos"] >= len(L["q"]):
+                L["q"], L["pos"], L["switch_at"], L["setup_state"] = [], 0, -1, 3
+                if imu_fix():
+                    L["locked_since"] = 0.0
+                board["scan_until"] = now + 30.0; L["since"] = now
+    sends = powered and SEAT.rate and now - SEAT.last_send >= 1.0 / SEAT.rate - 0.002
+    readable = False
+    if sends:
+        SEAT.last_send = now
+        L["rx"] += 11 * (3 if SEAT.all else 1)
+        if BAUDS[board["baud_idx"]] == SEAT.baud:
+            readable = True
+            L["last_valid"] = now; L["types"] |= 0x0E if SEAT.all else 0x08
+            L["rate_n"] += 1; L["acc_n"] += 1 if SEAT.all else 0
+        elif random.random() < 0.05:          # bytes at the wrong rate look like a packet now and then
+            SEAT.bad += 1
+    if not L["q"]:                            # ServiceImu
+        locked = bool(L["last_valid"]) and now - L["last_valid"] < 3.0 and L["last_valid"] > L["since"]
+        scan = bool(board["sflags"] & 1) or now - t0 < 60.0 or board["scan_until"] > now
+        if (locked and args.imu_race and not imu_fix() and scan and now - L["since"] >= 1.5
+                and random.random() < 0.03):  # firmware <= 2.1: a packet "from the future" - the sensor looks silent
+            locked = False
+        if locked:
+            if not L["locked_since"]:
+                L["locked_since"] = now; L["locked_idx"] = board["baud_idx"]
+                if eeprom[56] == 0xA6 and eeprom[65] != board["baud_idx"]:
+                    eeprom[65] = board["baud_idx"]
+        else:
+            if L["locked_since"]:
+                L["locked_since"] = 0.0; L["losses"] += 1
+            if scan and now - L["since"] >= 1.5:
+                board["baud_idx"] = (board["baud_idx"] + 1) % 7; L["since"] = now; L["steps"] += 1
+    return readable
+
+
+def imu_rate():
+    """Angles per second the board reports: the sensor's own rate once found for a second, else what it counted."""
+    L = LINK
+    if L and L["locked_since"] and time.time() - L["locked_since"] >= 1.0 and sensor_fresh(time.time()):
+        return int(SEAT.rate)
+    return int(L.get("rate_hz", 0)) if sensor_fresh(time.time()) else 0
+
+
+def imu_info_frame():
+    """2.1.1 "SM3I" ([rdj]): the sensor link, for the page's Motion sensor check."""
+    now = time.time(); L = LINK
+    why = (1 if board["sflags"] & 1 else 0) | (2 if now - t0 < 60 else 0) | (4 if board["scan_until"] > now else 0)
+    av = min(65535, int((now - L["last_valid"]) * 1000)) if L["last_valid"] else 65535
+    aa = min(65535, int((now - SEAT.last_out) * 1000)) if SEAT.out is not None else 65535
+    ls = min(65535, int(now - L["locked_since"])) if L["locked_since"] else 65535
+    acc = int(SEAT.rate) if (SEAT.all and imu_rate()) else 0
+    pl = struct.pack("<BBIBBBBHHHIHIHHHHHHI", sensor_state(now), board["baud_idx"], BAUDS[board["baud_idx"]],
+                     L["locked_idx"], 7, why, L["setup_state"], imu_rate(), acc, acc, SEAT.packets & 0xFFFFFFFF,
+                     SEAT.bad & 0xFFFF, L["rx"] & 0xFFFFFFFF, min(65535, L["losses"]), min(65535, L["steps"]),
+                     L["types"], av, aa, ls, int((now - t0) * 1000) & 0xFFFFFFFF)
+    L["types"] = 0
+    return b"SM3I" + bytes([1, len(pl)]) + pl
+
+
 def sensor_tick(now):
-    """Called every 10 ms: the sensor sends at its rate; the board levels, turns and checks the tilt limit."""
-    if not args.imu or (args.imu_lost_at and now - started > args.imu_lost_at):
+    """Called every 10 ms: the sensor sends at its rate; the board reads it if it is at the sensor's baud rate (2.9.3),
+    levels, turns and checks the tilt limit."""
+    powered = bool(args.imu) and not (args.imu_lost_at and now - started > args.imu_lost_at)
+    if not args.imu:
         return
-    if SEAT.found_at is None:                 # the board tries baud rates until it finds the sensor
-        SEAT.found_at = now + (0.4 if BAUDS[board["baud_idx"]] == SEAT.baud else 1.6)
-        board["baud_idx"] = BAUDS.index(SEAT.baud)
-    if now < SEAT.found_at or now < board["setup_until"]:
-        return
-    if now - SEAT.last_out < 1.0 / SEAT.rate - 0.002:
+    if not sensor_link(now, powered):
         return
     q = lambda d: round(d * 32768 / 180) * 180 / 32768
     SEAT.out = (q(SEAT.roll + SENSOR_OFFSET[0] + random.gauss(0, 0.015)),
                 q(SEAT.pitch + SENSOR_OFFSET[1] + random.gauss(0, 0.015)), q(((37.5 + SEAT.yaw + random.gauss(0, 0.05)) + 180) % 360 - 180))
     dt = max(1e-3, now - SEAT.last_out)
-    SEAT.last_out = now; SEAT.packets += 3
+    SEAT.last_out = now; SEAT.packets += 3 if SEAT.all else 1
     if SEAT.all:                              # acceleration (g) and gyro (deg/s) as the sensor sends them, raw
         rr, pp = math.radians(SEAT.out[0]), math.radians(SEAT.out[1])
         ar = (SEAT.vr - SEAT.vr_prev) / dt; ap_ = (SEAT.vp - SEAT.vp_prev) / dt      # deg/s^2
@@ -575,7 +739,7 @@ def sensor_tick(now):
         past = ((TILT4[0] and r > TILT4[0] / 10.0) or (TILT4[1] and r < -TILT4[1] / 10.0)
                 or (TILT4[2] and p > TILT4[2] / 10.0) or (TILT4[3] and p < -TILT4[3] / 10.0))
         lim = 1 if any(TILT4) else 0
-    if any_soft():                            # 1.9.1: the tilt limit waits while the seat creeps back
+    if any_soft() or PARK["mask"]:            # 1.9.1: the tilt limit waits while the seat creeps back (2.1.1b4: parks)
         board["grace"] = now + 1.5
     if (board["sflags"] & 1) and lim and now >= board["grace"]:
         r, p = seat_angles()
@@ -618,9 +782,11 @@ def chan_tick(c):
         lim = int(frate * 4096 / 4000); step = max(-lim, min(lim, step))
     if c.soft:                                # 1.9.1: creeping after power-up / Enable Motors
         ad = abs(diff)
-        sstep = int(SOFT["rate"] * 4096 / 4000)
-        if ad <= (2 << 12) or sstep <= 0:
+        sstep = int(SOFT["rate"] * 4096 / 4000) or (int(60 * 4096 / 4000) if creep_fix() else 0)
+        if (ad <= (2 << 12) and (c.soft_out <= 1 or not creep_fix() or creep_b3())) or sstep <= 0:
             c.soft = False
+        elif ad <= (2 << 12):
+            pass                              # 2.1.1b2: there, but the motor is still outside its end stops
         else:
             lim = sstep
             if c.soft_ticks < 2400:
@@ -667,14 +833,20 @@ def chan_tick(c):
     c.fb_q = fb
     clo, chi = c.cut_window() if args.fw >= 19 else (c.cut, 1023 - c.cut)
     past = fb > (chi << 4) or fb < (clo << 4)
-    if past and c.soft and c.soft_out > 0:   # 1.9.1: coming back from past an end stop after power-up
+    if past and (c.soft or (creep_b3() and c.out_back)) and c.soft_out > 0:   # 1.9.1: back from past an end stop
         out_q = (clo << 4) - fb if fb < (clo << 4) else fb - (chi << 4)
         hard = fb > ((1023 - c.cut) << 4) or fb < (c.cut << 4)
-        if not hard and out_q <= c.soft_out + (16 << 4):
+        if creep_fix():                       # 2.1.1b2: against where it started + 24, only when it lasts 25 ms
+            if not hard and out_q <= c.soft_out + (24 << 4):
+                past = False; c.soft_bad = 0
+            elif c.soft_bad < 100:
+                past = False; c.soft_bad += 1
+        elif not hard and out_q <= c.soft_out + (16 << 4):
             past = False; c.soft_out = min(c.soft_out, out_q)
     elif not past and c.soft_out:             # well inside (16 counts): the end stops count as usual again
         inside = min(fb - (clo << 4), (chi << 4) - fb)
-        c.soft_out = 0 if (inside > (16 << 4) or not c.soft) else 1
+        c.soft_out = 0 if (inside > (16 << 4) or not (c.soft or (creep_b3() and c.out_back))) else 1
+        if c.soft_out == 0: c.out_back = False
     if past:
         if not c.disabled:
             c.trips += 1; c.trip_at = fb >> 4; c.reason = 1
@@ -696,7 +868,18 @@ def chan_tick(c):
         return 0.0, True
     cmax, cmin = (1023 - c.clip) << 4, c.clip << 4
     offq, maxq, revq = c.pwmmin << 4, c.pwmmax << 4, c.pwmrev << 4
+    if (recover_fw() and c.pwmrev > c.pwmmax and (c.soft or c.out_back or PARK["mask"] & (1 << c.i)) and
+            abs(c.goal_q - fb) > 256):
+        maxq = revq                           # 2.1.1b5: coming back and lagging - up to PWMrev
     rev = c.pwmrev and not c.soft             # 1.9.1: no PWMrev drive while creeping
+    if PARK["mask"] & (1 << c.i):             # 2.1.1b4: not while parking
+        c_park = True
+    else:
+        c_park = False
+    if c.pwmrev and c.soft and creep_b3():    # 2.1.1b3: unless the goal is 16 counts inside and the motor lags outside
+        rev = (fb > cmax and c.goal_q < cmax - 256) or (fb < cmin and c.goal_q > cmin + 256)
+    if c_park:
+        rev = False
     if fb > cmax and rev: return -revq / FULL, False
     if fb < cmin and rev: return revq / FULL, False
     if c.goal_q > fb + dzq or c.goal_q < fb - dzq:
@@ -720,6 +903,8 @@ def phys_tick(p, d, brake):
         sgn = 1.0 if args.sag_high == p.i + 1 else -1.0      # --sag-high: "down" is towards higher numbers
         net = (0.0 if brake else p.dl) + sgn * (SAG_PULL + (0.0012 * kg if _lifts(p.i) else 0.0))
         fr = FRIC_UP if net * -sgn > 0 else FRIC_DN       # lifting is the harder way
+        if LIFT_HARD and LIFT_HARD[0] == p.i and net * -sgn > 0 and (p.x - LIFT_HARD[1]) * sgn > 0:
+            fr += LIFT_HARD[2]                    # --lift-hard: the sunk end needs more than PWMmax to lift
         deff = math.copysign(max(0.0, abs(net) - fr), net) if net != 0 else 0.0
         if brake:                             # the bridge brakes: it sinks slowly
             p.v += (deff * VMAX * 0.15 - p.v) * DT / 0.012
@@ -748,7 +933,7 @@ def phys_tick(p, d, brake):
     if p.x < lo_: p.x, p.v = lo_, 0.0
     if p.x > hi_: p.x, p.v = hi_, 0.0
     if args.slip != p.i + 1:
-        p.pot_x = p.x
+        p.pot_x = p.x + POT_OFF[p.i]
     h = SLOP[p.i] / 2.0                       # --slop: the linkage only follows once the play is taken up
     p.link = min(max(p.link, p.x - h), p.x + h)
 
@@ -812,6 +997,9 @@ def sim_loop():
             if soft_now:
                 for c in C:
                     if c.soft and time.time() - c.soft_since > 40: c.soft = False
+                    if c.out_back and not c.soft and time.time() - c.soft_since > 40: c.out_back = False
+            if PARK["mask"] and time.time() > PARK["until"]:   # 2.1.1b4: the page went away
+                park_set(0)
             for _ in range(SUB):
                 out = [chan_tick(c) for c in C]
                 if args.supply_sag:                   # --supply-sag: one supply for every motor
@@ -905,7 +1093,7 @@ def diag_frame():
     raw = SEAT.out or (0.0, 0.0, 0.0)
     cl = lambda v: max(-32767, min(32767, int(v * 100)))
     age = 65535 if SEAT.out is None else min(65535, int((now - SEAT.last_out) * 1000))
-    rate = int(SEAT.rate) if fresh else 0
+    rate = imu_rate()
     pl += struct.pack("<BBBIHIHHhhhhhHBBB", sensor_state(now), tilt_deg(), board["baud_idx"], BAUDS[board["baud_idx"]],
                       rate, SEAT.packets, SEAT.bad, age, cl(raw[0]), cl(raw[1]), cl(raw[2]), board["lv_r"], board["lv_p"],
                       board["tilt_trips"], board["view"], board["lflags"], matrix_error(now))
@@ -915,12 +1103,12 @@ def diag_frame():
         pl += struct.pack("<5h", c.trim, c.tlo, c.thi, c.elo, c.ehi)
     pl += struct.pack("<4h", *TILT4)
     fl = (1 if seat_saved() else 0) | (2 if eeprom[66] == 0xB9 else 0) | (4 if EXTRAS_ANY[0] else 0) | \
-        (8 if time.time() < HOLD[0] else 0) | (16 if USBP["on"] else 0)
-    hz = int(SEAT.rate) if (fresh and SEAT.all) else 0
+        (8 if time.time() < HOLD[0] else 0) | (16 if USBP["on"] else 0) | (32 if PARK["mask"] else 0)
+    hz = int(SEAT.rate) if (fresh and SEAT.all and imu_rate()) else 0
     pl += struct.pack("<BIHH3h3hh", fl, usb.get("held", 0), hz, hz, *SEAT.acc, *SEAT.gyro, 2950)
     if not soft_fw():
         return b"SM3D" + bytes([3, len(pl)]) + pl
-    pl += struct.pack("<HB", SOFT["rate"], sum(1 << i for i, c in enumerate(C) if c.soft and not c.disabled))
+    pl += struct.pack("<HB", SOFT["rate"], sum(1 << i for i, c in enumerate(C) if creeping(c)))
     if not ota_fw():
         return b"SM3D" + bytes([4, len(pl)]) + pl
     wf = 1 | (6 if OTA["placeholder"] else 0)     # remembered; joined with it + a build with the placeholders
@@ -1050,8 +1238,8 @@ def extras_frame():
 def sensor_state(now):
     v = board["sflags"] & 15
     if sensor_fresh(now): v |= 0x10
-    if SEAT.out is not None and now - SEAT.last_out < 3: v |= 0x20
-    if now < board["setup_until"]: v |= 0x40
+    if LINK.get("last_valid") and now - LINK["last_valid"] < 3: v |= 0x20
+    if LINK.get("q"): v |= 0x40
     if args.fw >= 19 and SEAT.all and sensor_fresh(now): v |= 0x80
     return v
 
@@ -1109,6 +1297,7 @@ def handle_cmd(c, a, b, out, cl=None):
             elif (a, b) == (ord("R"), ord("L")): load_seat()
             elif (a, b) == (ord("C"), ord("L")): clear_seat()
             elif a == ord("H"): HOLD[0] = time.time() + b * 0.1
+            elif a == ord("P") and park_fw(): park_set(b & 7)
         elif c == "x" and a == ord("e") and args.fw >= 19 and cl is not None:
             cl["extras"] = b in (1, ord("1"))
             EXTRAS_ANY[0] = cl["extras"]
@@ -1129,12 +1318,20 @@ def handle_cmd(c, a, b, out, cl=None):
             elif a == ord("C"):
                 board["lv_r"] = board["lv_p"] = 0; save_board()
             elif a == ord("S") and args.imu:
-                board["setup_until"] = now + 1.2       # nine commands, 120 ms apart
-                if not args.imu_no_tx:
-                    code = (b & 0x0F) or 9
-                    SEAT.rate, SEAT.baud = {6: 10, 7: 20, 8: 50, 9: 100, 11: 200}.get(code, 100), 115200
-                    SEAT.all = bool(b & 0x40) and args.fw >= 19          # [iS 0] (1.8): angles only
-                    board["baud_idx"] = 1; save_board()
+                L = LINK
+                if L.get("q"):
+                    pass
+                elif imu_fix() and not L.get("locked_since"):
+                    L["setup_state"] = 2               # 2.1.1: only to a sensor the board is receiving
+                else:                                  # sent at the board's rate now; heard only at the sensor's
+                    code = ((b & 0x0F) or 9) if b else 9
+                    rsw = 0x0E if (b & 0x40) else 0x08 # [iS 0] (1.8): angles only
+                    q = [(0x69, 0xB588), (0x02, rsw), (0x03, code), (0x00, 0), (0x69, 0xB588), (0x04, 6), (0x00, 0)]
+                    sw = len(q)
+                    q += ([(0x69, 0xB588), (0x02, rsw), (0x03, code), (0x00, 0)] if imu_fix() else [(0x69, 0xB588), (0x00, 0)])
+                    L.update(q=q, pos=0, switch_at=sw, cmd_last=now, setup_state=1)
+            elif a == ord("R"):
+                board["scan_until"] = now + 30.0
         elif c in "DEF": C["DEF".index(c)].kp = w
         elif c in "GHI": ch = C["GHI".index(c)]; ch.ki = w; ch.update_ilim()
         elif c in "JKL": C["JKL".index(c)].kd = w
@@ -1176,6 +1373,11 @@ def handle_cmd(c, a, b, out, cl=None):
                     threading.Thread(target=ota_run, daemon=True).start()
         elif c == "z" and a == ord("s"):          # simulator only: fake SimHub on/off
             SIMHUB[0] = (b == ord("1"))
+        elif c == "z" and a == ord("t"):          # simulator only: [zt b] motor b>>4 (1-3), (b & 15) - 8 teeth of its pot belt
+            mi, n = (b >> 4) - 1, (b & 15) - 8
+            if 0 <= mi < 3:
+                POT_OFF[mi] += n * args.tooth
+                print(f"simboard [zt]: motor {mi + 1} pot belt {n:+d} tooth/teeth -> offset {POT_OFF[mi]:+.0f}", flush=True)
         elif c == "s" and a == ord("a") and b == ord("v"):
             save_eeprom()
             if args.fw >= 19: save_seat()
@@ -1204,6 +1406,7 @@ def handle_cmd(c, a, b, out, cl=None):
             elif k == "i" and args.fw >= 18: out.append(reply2("i", sensor_state(time.time()), tilt_deg()))
             elif k == "f" and args.fw >= 16: out.append(reply2("f", fshift, frate // 100))
             elif k == "d" and args.fw >= 17: out.append(diag_frame())
+            elif k == "j" and imu_fix() and cl is not None: out.append(imu_info_frame())   # 2.1.1 (the page only)
             elif k == "u" and ota_fw(): out.append(ota_frame())
 
 

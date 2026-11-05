@@ -89,6 +89,28 @@ part that counts, biggest first, and says *compare with care* when the checks we
 counts apart or more than 7 days apart. The file holds it under `compare`: `table[].parts`, `table[].cautions`,
 `method`.
 
+## Motion sensor check
+
+Page 2.9.3; also the **Check (20 s)** button in Settings, Motion sensor. Nothing moves, so it's safe while SimHub runs.
+It records 20 s of the link between the board and the WT901C: the 100 Hz telemetry (whether each sample carries
+angles) and the board's diagnostics frame four times a second - with firmware 2.1.1 also its sensor link frame
+(`[rdj]`, see [PROTOCOL.md](PROTOCOL.md)).
+
+- **The link:** the share of the time angles arrived, and every gap - when it started, how soon the board switched
+  baud rate after the last angles (within a second while it holds the sensor too loosely; after 3 s for a sensor that
+  went quiet), which rates it tried and where it found the sensor again.
+- **What the sensor sends:** angles, acceleration and gyro per second, packets and bad checksums per second, and with
+  firmware 2.1.1 the bytes received at any rate, the times it lost the sensor, baud changes, the packet types and the
+  result of the last **Set up the sensor**.
+- **At rest:** the noise and drift of the angles, the acceleration and the gyro.
+
+The verdicts tell apart: a board that isn't looking for the sensor (Use the sensor not ticked), nothing arriving at
+all (power or wiring - with 2.1.1's byte count), bytes that never make a packet (a baud rate the board doesn't try, or
+the RS-232 side wired straight to D0), a link that keeps dropping out, a sensor sending only angles or at the factory
+10 per second, and a healthy link. The result shows the 20 s as a strip - green while angles arrive, amber while the
+board looks, labelled with the rate it tries - and the recording downloads as CSV (every telemetry sample with the
+angles, and the board's link readings). The report is saved as `..._imu.json`; its data is under `imu_check`.
+
 ## What the page notices while you drive
 
 A background watcher checks every sample, all the time:
@@ -152,6 +174,9 @@ cover:
   updated from the page yet;
 - the seat set-up (firmware 1.9): none yet, running but not saved (Seat setup left open), a motor switched off by
   its end stop, the page holding SimHub's positions back;
+- where each motor rests with the motors off (page 2.9.3): past its safety cutoff (the board can't switch it on from
+  there) or past its end stop (firmware 2.1.1 brings it back when the motors are switched on; Seat setup now puts the
+  end stop past it); a contactless sensor that reaches the end of its output (a TT 6127 puts out about 41-982 counts);
 - motors that don't agree on which way is up;
 - a motor whose name doesn't match where you saw it move.
 
@@ -163,12 +188,13 @@ The newest 20 are kept in `diagnostics/reports/` and can be downloaded from the 
 | Section | Contents |
 |---|---|
 | `about` | What the file is, units, how to read the traces |
-| `made`, `kind`, `problem` | When, quick, full or sensor, and what the owner typed |
+| `made`, `kind`, `problem` | When, quick, full, sensor or imu (Motion sensor check, page 2.9.3), and what the owner typed |
 | `summary` | The findings as plain text |
 | `findings` | The findings, structured |
 | `board` | Connection, firmware, build options (2.0: who has the USB port), uptime, last start cause, WiFi, USB counters, per-motor counters, motion sensor and LED matrix (1.8), seat set-up: level trim, travel limits, end stops, tilt limits (1.9), soft start (1.9.1), the WiFi module's firmware, WiFi memory and the last update (1.9.2), the last WiFi/USB chip restart (`module_restart`, 1.9.8) |
 | `firmware_update` | The page's own record of the last firmware update: from and to which version, every step, the result |
-| `rig` | Motors in use, motor names, layout (front lifts + rear traction loss, or lifts), which motor is the rear slide and which way it goes for higher numbers |
+| `rig` | Motors in use, motor names, layout (front lifts + rear traction loss, or lifts), which motor is the rear slide and which way it goes for higher numbers; where each motor rests with the motors off (`rest_with_motors_off`, page 2.9.3) |
+| `imu_check` | Motion sensor check: the link (share with angles, gaps, rates tried and found), what the sensor sends, the strip, at-rest noise and drift, and the board's sensor link frames at the start and end (firmware 2.1.1) |
 | `settings` | Running settings, saved settings (EEPROM), the differences, the last save made from the page |
 | `live` | The 3-second listen (2.9.1: per motor also `still`, the Sensor check's numbers, and `raw`, the board's raw readings) |
 | `capture` | Sensor check: the condition, and per motor `feedback` (noise, events, PID split, drive) and `raw` |
