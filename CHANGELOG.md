@@ -3,6 +3,40 @@
 `smc3_scope` (the page) and `SMC3_R4` (the firmware) are versioned separately. The page works with older
 firmware too; the notes say which firmware a feature needs.
 
+## Page 2.9.4 (firmware 2.1.1 unchanged)
+
+Tested as eight page betas; all of them are in this release. Nothing in it changes how the page talks to the board.
+
+- **Frame Design**, a new page in the menu: a wizard that plans a motion rig before any metal is cut. It keeps the
+  design in `frame.json` in the data folder. `GET /frame/load`, `POST /frame/calc`, `POST /frame/pdf`.
+- **Motors**: 2 (seat mover), 3 (2 lifts + traction loss, or 3 vertical actuators), 4 (one under each corner), 5 (4
+  corners + traction loss), 6 (+ surge, or a Stewart platform).
+- **Drive**: a gear motor with a lever and push rod - presets for wheelchair, worm-gear and wiper motors - or a
+  ball-screw actuator - SFX-100 style presets; or your own rpm, torque, gearing, lever length and swing, travel, screw
+  lead and servo.
+- **Size**: driver, seat and slider, wheel and wheelbase, pedals and the rest of the moving weight, each at its own
+  place; the distances; metric or inches and pounds. The page works out travel, range and speed of every movement, the
+  force a quick move asks for against what the actuators can make, all day and at most, and says where the seat goes
+  so the rig balances.
+- **Frame**: square, rectangular and round tube, C channel, T-slot; aluminium 6061 and 6063, steel; bolted or welded.
+  Each member gets the lightest section that is strong and stiff enough (stress, bending, use of its allowance), or
+  one size for all, or its own section and material. Channels are mirrored left and right, inwards or outwards.
+- **Joints**: every place two members meet is sized for the largest force an actuator can make - L and T plates with
+  through-bolts and spacer sleeves on tube, angle cleats on channel, corner brackets or joining plates with T-nuts on
+  T-slot, set-screw fittings on round tube, welds - with a picture of the joint, the sizes to cut and drill, and a
+  close-up of the fastener. Mounting plates for motors, actuators, the pivot, the seat slider, the wheel deck and the
+  pedal plate are counted too.
+- **What would make it better**: a stronger section, a brace (at the foot of a post or of a wheel upright, at the yaw
+  pivot's corners, a foot under a base rail), a shorter lever, a torque limit in the drive, a better seat position -
+  each with Apply, and **Fix it for me**.
+- **Build**: the cut list, drawn to scale; the mounting hardware with sizes, counts and tightening torques; the parts;
+  a ball-park cost; what to assemble first, as pictures; the steps.
+- **3D test**: the rig with its real sections, plates and bolts, lever motors or actuators with their brackets, the
+  seat on its slider, the wheelbase on a deck frame, the pedals. Orbit and zoom; a weight on the seat with its amount;
+  slide the seat; move each axis or all of them, up to 150% of its range; adjust the design with sliders. **Rig**
+  and **Heat map** views - the heat map shows the joints first and lets the parts bend.
+- **Export PDF**: the whole design as a document - standard library only, like the rest of the page.
+
 ## Page 2.9.3, firmware 2.1.1
 
 Tested on a rig as six page betas and five firmware betas; all of them are in this release. Page 2.9.3 works with

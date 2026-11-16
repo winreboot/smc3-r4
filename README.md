@@ -34,7 +34,11 @@ The page lets you:
   while the real seat moves ([Motion presets](#motion-presets));
 - **centre the pots**: with the seat level, the page tells you which way to move each pot's belt, and how many
   teeth, so every motor has the same travel up and down ([Centre the pots](#centre-the-pots));
-- **check the motion sensor's link** second by second, and **start Seat setup over** in one click.
+- **check the motion sensor's link** second by second, and **start Seat setup over** in one click;
+- **plan a rig before you build it** with **Frame Design**: a wizard for 2 to 6 motors that works out travel, speed
+  and force, sizes every frame member and joint, lets you test the rig in **3D** with a weight on the seat, and
+  exports the cut list, the hardware, a ball-park cost and the build steps as a **PDF**
+  ([Frame design](#frame-design)).
 
 It knows two kinds of rig: **two front lifts plus a traction-loss motor** (motors 1 and 2 lift the front corners,
 motor 3 is mounted horizontally and swings the rear left and right about a pivot at the front - the default), and
@@ -318,6 +322,105 @@ position, those motors may go past their travel limits, Clip window and end stop
 (Max limit). SMC3's PWMrev push back into the Clip window is left out and the tilt limits wait. Park mode lasts only
 while the page refreshes it every second, and lapses 3 s after the last refresh. With older firmware the park position
 stays inside the travel window, and unpark is Enable Motors: each motor creeps back up by itself.
+
+### Frame design
+
+Page 2.9.4. A new page in the menu for planning a rig before any metal is cut. It is a calculator and a drawing
+board - nothing in it talks to the board, so it is safe to open any time, and it works without a rig. It keeps your
+design between visits.
+
+![Frame Design: the wizard on the left, the drawings, movements and checks on the right](docs/img/frame-design_v2.9.4.png)
+
+The wizard has six steps; the right-hand side follows every change with a top, side and front drawing (motors and
+actuators drawn, arrows for what moves, the main distances), the range and speed of each movement, what each
+actuator must push against what it can, and a list of checks in plain words.
+
+1. **Motors** - how many, and the layout:
+
+   | Motors | Layout | Moves |
+   |---|---|---|
+   | 2 | seat mover on a universal joint | pitch, roll |
+   | 3 | 2 lifts + traction loss | pitch, roll, yaw |
+   | 3 | 3 vertical actuators | pitch, roll, heave |
+   | 4 | one actuator under each corner | pitch, roll, heave |
+   | 5 | 4 corners + traction loss | pitch, roll, heave, yaw |
+   | 6 | 4 corners + traction loss + surge | pitch, roll, heave, yaw, surge |
+   | 6 | Stewart platform | all six |
+
+2. **Drive** - a gear motor with a lever and a push rod (presets for wheelchair, worm-gear and wiper motors) or a
+   ball-screw actuator (SFX-100 style presets), or your own numbers: rpm, torque, gearing, lever length and swing, or
+   travel, screw lead and servo.
+3. **Size** - the weights (driver, seat and slider, wheel and wheelbase, pedals, everything else that moves) and the
+   distances. Millimetres and kilograms, or inches and pounds.
+
+   <img src="docs/img/frame-design-size_v2.9.4.png" width="560" alt="The Size step: weights and distances">
+
+4. **Frame** - square, rectangular or round tube, C channel or T-slot extrusion; aluminium 6061 or 6063, or steel;
+   bolted or welded. Every member gets the lightest section that is strong and stiff enough, with its stress, its
+   bending and how much of its allowance is used - or pick **one size** for everything, or give any member **its own
+   section and material**. Left and right channels are a mirrored pair, opening inwards or outwards.
+
+   ![The Frame step: each member with its section, stress, bending and use](docs/img/frame-design-frame_v2.9.4.png)
+
+   **Joints** are sized too, each kind of section its own way, for the largest force an actuator can make:
+
+   | Section | Joined with |
+   |---|---|
+   | square and rectangular tube | L and T plates on both faces, as wide as the tube, with through-bolts, wide washers, nyloc nuts and a spacer sleeve |
+   | round tube | set-screw pipe fittings (tees, elbows, flanges) |
+   | C channel | angle cleats bolted through the webs |
+   | T-slot | corner brackets or joining plates with M8 screws and T-nuts |
+   | welded | fillet welds, with gussets where a joint works hard |
+
+   A picture shows the joint with the sizes to cut and drill, and a close-up of one fastener.
+
+   <img src="docs/img/frame-design-joint_v2.9.4.png" width="640" alt="A joint: the plate's size, the holes, the bolt and its spacer sleeve">
+
+   **What would make it better** lists suggestions - a stronger section, a brace at the foot of a post or of a wheel
+   upright, a shorter lever, a torque limit in the drive, a better place for the seat - each with **Apply**, and
+   **Fix it for me** applies the ones that are needed.
+
+   <img src="docs/img/frame-design-fix_v2.9.4.png" width="640" alt="Suggestions, with Fix it for me">
+
+5. **Build** - the cut list (also drawn to scale), the mounting hardware to buy (bolt sizes, lengths and counts,
+   plates, brackets, fittings, tightening torques), the parts, a **ball-park cost**, **what to assemble first** as a
+   row of pictures, and the steps.
+
+   ![The Build step: cut list, hardware, cost, assembly order and steps](docs/img/frame-design-build_v2.9.4.png)
+
+6. **3D test** - the rig as designed: real sections, plates and bolts, motors or actuators with their brackets, the
+   seat on its slider, the wheelbase on its deck, the pedals. Drag to turn it, scroll to zoom.
+
+   ![The 3D test](docs/img/frame-design-3dtest_v2.9.4.png)
+
+   - **Weight on the seat**: a slider and 150 / 220 / 300 / 400 lb buttons; the weight is drawn on the seat with its
+     amount.
+   - **Slide the seat** forwards or back, the way a driver adjusts it: the balance and the forces follow.
+   - **Move it**: each movement by itself or everything together, up to 150% of its range to see what would hit
+     first. An actuator turns red when it runs out of travel or of force.
+   - **Adjust the design** with sliders and watch it change.
+   - **Rig** shows every part as built. **Heat map** colours the frame by how much of its allowance the load uses -
+     the joints first, fading along each beam - and lets the parts bend, drawn 20 times larger than life.
+
+   ![Rig view, close up: plates, bolts, the wheel deck, the seat slider](docs/img/frame-design-3d-close_v2.9.4.png)
+
+   ![Heat map with 136 kg (300 lb) on the seat](docs/img/frame-design-heatmap_v2.9.4.png)
+
+Every layout carries a seat on a slider, a steering wheel on a deck frame and pedals; on a seat mover that moves the
+seat only, the wheel and pedals stand on the base.
+
+![A seat mover, four corners, four corners with traction loss and surge, and a Stewart platform](docs/img/frame-design-layouts_v2.9.4.jpg)
+
+**Export PDF** saves the whole design: the numbers, the checks, the drawings, the frame and joint tables, the joint
+pictures, the hardware, the cut list, the assembly pictures, the parts with the cost, and the steps
+([an example](docs/examples/frame-design-example_v2.9.4.pdf)).
+
+![Pages of the exported PDF](docs/img/frame-design-pdf_v2.9.4.png)
+
+The numbers come from lever and beam formulas with a safety factor of 2 against the largest force the actuators can
+make. That makes it a first design to check, not a finite-element analysis: fatigue, weld quality and torsion are
+not modelled, the joint figures are estimates, and the cost is a rough guide. A motion rig can hurt you - have a
+design you will sit in checked, fit mechanical end stops, and keep an emergency stop within reach.
 
 ### Tuning
 
@@ -780,7 +883,7 @@ board on network**).
 [latest release](https://github.com/winreboot/smc3-r4/releases/latest) and run
 
 ```sh
-python3 smc3_scope_v2.9.3.py --host 192.168.1.50 --bind 0.0.0.0 --web 8198
+python3 smc3_scope_v2.9.4.py --host 192.168.1.50 --bind 0.0.0.0 --web 8198
 ```
 
 (`py` instead of `python3` on Windows). `--bind 0.0.0.0` makes the page reachable from other devices; without it,

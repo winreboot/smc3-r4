@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-smc3_scope v2.9.3 - live scope, tuner and auto-tuner for the SMC3_R4 motion controller (Arduino UNO R4 WiFi).
+smc3_scope v2.9.4 - live scope, tuner and auto-tuner for the SMC3_R4 motion controller (Arduino UNO R4 WiFi).
 
 Connects to the board's TCP telemetry port, keeps a rolling buffer of samples and serves a web page with live
 charts, a parameter editor (sends ordinary SMC3 commands back to the board), test signals and a per-motor
@@ -17,6 +17,25 @@ or, on Windows with nothing installed, the PowerShell bridge from Settings, USB 
 Every option can also come from the environment (Docker): SMC3_HOST, SMC3_PORT, SMC3_WEB_PORT, SMC3_BIND,
 SMC3_DATA_DIR.  Settings changed in the page (board address, theme, auto-find) are saved to
 <data dir>/config.json and survive restarts and upgrades.  Standard-library Python 3.8+ only.
+
+v2.9.4 (firmware 2.1.1 unchanged): Frame Design, a new page in the menu - a wizard that plans a motion rig before any
+        metal is cut. Nothing in it talks to the board.
+        Motors: 2 to 6 - a seat mover, 2 lifts + traction loss, 3 or 4 corner actuators, 4 corners + traction loss
+        (+ surge), or a Stewart platform. Drive: a gear motor with a lever and push rod (wheelchair, worm and wiper
+        presets) or a ball-screw actuator (SFX-100 style). Size: the weights - driver, seat and slider, wheel and
+        wheelbase, pedals - and the distances. The page works out travel, speed and force for every axis and checks
+        them.
+        Frame: square, rectangular or round tube, C channel or T-slot, aluminium or steel, bolted or welded; each
+        member gets the lightest section that is strong and stiff enough, or its own section and material (mix and
+        match). Every joint is sized too - L and T plates with through-bolts, angle cleats, corner brackets with
+        T-nuts, set-screw pipe fittings or welds - with pictures of the joint and a close-up of the fastener.
+        Suggestions say what would make it better (a stronger section, a brace, a shorter lever, a torque limit, the
+        seat's place) and Fix it for me applies them.
+        Build: the cut list, drawn to scale; the mounting hardware; the parts with a ball-park cost; what to assemble
+        first, as pictures; and the steps. Export PDF saves all of it.
+        3D test: the rig as designed - real sections, plates and bolts, motors or actuators, the seat on its slider,
+        the wheel on its deck, the pedals - to orbit, load (a weight on the seat, the seat slid forwards or back) and
+        move; a Heat map view shows where the load goes, joints first, and lets the parts bend.
 
 v2.9.3 (with firmware 2.1.1): park, motion presets, centring the pots and the motion sensor check.
         Park: the (P) in Quick Controls lowers the seat evenly to its park position - every motor arriving at the same
@@ -353,7 +372,7 @@ v1.4: settings dialog (board address, port, find-board scan, auto-find), day/nig
       fixed a thread race that made the page flash "not reachable".
 """
 
-VERSION = "2.9.3"
+VERSION = "2.9.4"
 
 import argparse
 import base64
@@ -13050,6 +13069,2584 @@ class ParkControl:
 
 
 # --------------------------------------------------------------------------------------------------------------
+# Frame design (2.9.4): a wizard that sizes a motion rig - layout, drive, travel, speed, force, the frame's members
+# and the section to buy - from first-order mechanics.  Nothing here talks to the board.
+#
+# Sources for the rules of thumb: the xsimulator.net FAQ "Design considerations & resources" (150-700 mm/s for good
+# motion; force = torque / lever length (CTC); speed = rpm x 2 pi x CTC; 25 mm CTC as the practical minimum; balance
+# the rig over a universal joint placed close under the seat; 6-14 degrees of total swing is typical).
+# Aluminium strengths are the Aluminum Design Manual minimums (6061-T6 35 ksi, 15 ksi next to a weld; 6063-T5
+# 16 ksi, 8 ksi next to a weld).  Everything is a beam-formula estimate, not a finite-element analysis.
+# --------------------------------------------------------------------------------------------------------------
+FRAME_G = 9.81
+FRAME_IN = 25.4
+
+FRAME_LAYOUTS = {     # id: (motors, family, name, axes, what it is)
+    "seat2": (2, "pivot", "2 motors: seat mover (pitch + roll)", ["pitch", "roll"],
+              "The seat (or the whole cockpit) balances on a universal joint; two actuators behind it tilt it."),
+    "lift2tl": (3, "pivot", "3 motors: 2 lifts + traction loss", ["pitch", "roll", "yaw"],
+                "Two lifts tilt the platform about a rear support; a third motor slides the rear sideways."),
+    "heave3": (3, "corner", "3 motors: 3 vertical actuators (pitch, roll, heave)", ["pitch", "roll", "heave"],
+               "Two actuators at one end and one at the other carry the whole rig and lift it too."),
+    "corner4": (4, "corner", "4 motors: one actuator under each corner (pitch, roll, heave)", ["pitch", "roll", "heave"],
+                "The whole cockpit stands on four actuators (the SFX-100 arrangement)."),
+    "corner4tl": (5, "corner", "5 motors: 4 corners + traction loss", ["pitch", "roll", "heave", "yaw"],
+                  "Four corner actuators on a sub-frame that a fifth motor swings sideways at the rear."),
+    "corner4tlsurge": (6, "corner", "6 motors: 4 corners + traction loss + surge", ["pitch", "roll", "heave", "yaw", "surge"],
+                       "As 5 motors, on a slide that a sixth motor moves forwards and backwards."),
+    "hexapod": (6, "hexapod", "6 motors: Stewart platform (all six movements)", ["pitch", "roll", "yaw", "heave", "surge", "sway"],
+                "Six inclined legs between a base and a platform. The most demanding to build and to tune."),
+}
+
+FRAME_DEFAULTS = {
+    "motors": 3, "layout": "lift2tl", "moves": "cockpit", "driver_kg": 85.0, "moving_kg": 70.0,
+    # parts of the moving weight that sit in known places (2.9.4): a direct-drive wheelbase with its rim (a Simagic
+    # Alpha Evo is 6.3 kg, the Evo Pro 8.6 kg, a rim about 1.5 kg), a load-cell pedal set (a Simagic P1000 is 7-9 kg),
+    # the seat with its slider; and how far the driver has slid the seat (+ forwards)
+    "wheel_kg": 10.0, "pedal_kg": 8.5, "seat_kg": 12.0, "seat_slide": 0.0,
+    "drive": "rotary", "preset": "wheelchair",
+    # rotary: a gear motor with a lever and a push rod
+    "rpm": 120.0, "torque": 25.0, "torque_peak": 80.0, "motor_w": 250.0, "volts": 24.0, "ratio": 1.0,
+    "ctc": 50.0, "swing": 45.0,
+    # linear: a ball-screw actuator
+    "travel": 100.0, "lead": 5.0, "servo_torque": 2.4, "servo_peak": 7.2, "servo_rpm": 3000.0,
+    # geometry (mm)
+    "arm": 800.0, "spacing": 600.0, "cg_h": 300.0, "cg_off": 150.0, "pivot_h": 250.0,
+    "wheelbase": 1300.0, "track": 600.0, "tl_radius": 800.0,
+    "base_r": 700.0, "plat_r": 500.0, "hex_h": 550.0,
+    "accel": 3.0,
+    # frame
+    "material": "al6061", "family": "sq", "join": "bolted", "size": "auto",
+}
+
+FRAME_LAYOUT_DEFAULTS = {   # what a layout starts from (the page fills these in when the layout is chosen)
+    "seat2": {"moves": "seat", "moving_kg": 25.0, "arm": 500.0, "spacing": 450.0, "cg_h": 250.0, "cg_off": 0.0, "pivot_h": 300.0},
+    "lift2tl": {"moves": "cockpit", "moving_kg": 70.0, "arm": 800.0, "spacing": 600.0, "cg_h": 300.0, "cg_off": 150.0,
+                "pivot_h": 250.0, "tl_radius": 800.0, "ctc": 60.0},
+    "hexapod": {"moves": "cockpit", "moving_kg": 90.0, "drive": "linear", "preset": "custom", "travel": 300.0, "lead": 10.0,
+                "servo_torque": 2.4, "servo_peak": 7.2, "servo_rpm": 3000.0},
+}
+for _k in ("heave3", "corner4", "corner4tl", "corner4tlsurge"):      # rigs that stand on their actuators start from SFX-100s
+    FRAME_LAYOUT_DEFAULTS[_k] = {"moves": "cockpit", "moving_kg": 80.0, "drive": "linear", "preset": "sfx100", "travel": 100.0,
+                                 "lead": 5.0, "servo_torque": 2.4, "servo_peak": 7.2, "servo_rpm": 3000.0}
+for _k in ("seat2", "lift2tl"):                                      # tilting rigs start from wheelchair motors
+    FRAME_LAYOUT_DEFAULTS[_k].update(drive="rotary", preset="wheelchair")
+
+FRAME_PRESETS = {     # drive presets: fills the drive fields
+    "wheelchair": ("rotary", "Wheelchair motor, 24 V 250 W, 120 rpm",
+                   {"rpm": 120, "torque": 25, "torque_peak": 80, "motor_w": 250, "volts": 24, "ratio": 1}),
+    "wheelchair75": ("rotary", "Wheelchair motor, 24 V 250 W, 75 rpm",
+                     {"rpm": 75, "torque": 40, "torque_peak": 120, "motor_w": 250, "volts": 24, "ratio": 1}),
+    "worm180": ("rotary", "Worm gear motor, 24 V 200 W, 180 rpm, 20 Nm",
+                {"rpm": 180, "torque": 20, "torque_peak": 40, "motor_w": 200, "volts": 24, "ratio": 1}),
+    "wiper": ("rotary", "Wiper motor, 12 V, 45 rpm (light seat movers only)",
+              {"rpm": 45, "torque": 8, "torque_peak": 25, "motor_w": 60, "volts": 12, "ratio": 1}),
+    "sfx100": ("linear", "SFX-100 style: 1605 ball screw, 750 W servo, 100 mm",
+               {"travel": 100, "lead": 5, "servo_torque": 2.4, "servo_peak": 7.2, "servo_rpm": 3000}),
+    "sfx150": ("linear", "As SFX-100 with 150 mm travel",
+               {"travel": 150, "lead": 5, "servo_torque": 2.4, "servo_peak": 7.2, "servo_rpm": 3000}),
+    "screw1610": ("linear", "1610 ball screw (10 mm lead), 750 W servo, 150 mm: twice the speed, half the force",
+                  {"travel": 150, "lead": 10, "servo_torque": 2.4, "servo_peak": 7.2, "servo_rpm": 3000}),
+    "servo400": ("linear", "1605 ball screw, 400 W servo (1.27 Nm), 100 mm",
+                 {"travel": 100, "lead": 5, "servo_torque": 1.27, "servo_peak": 3.8, "servo_rpm": 3000}),
+}
+
+FRAME_MATERIALS = {   # id: (name, yield MPa, yield next to a weld MPa, E MPa, density g/cm3)
+    "al6061": ("Aluminium 6061-T6", 241.0, 103.0, 69000.0, 2.70),
+    "al6063": ("Aluminium 6063-T5 (architectural)", 110.0, 55.0, 69000.0, 2.70),
+    "steel": ("Mild steel (A36 / A500)", 250.0, 250.0, 200000.0, 7.85),
+}
+FRAME_TSLOT_YIELD = 241.0      # 6105-T5 extrusion, bolted
+FRAME_SF = 2.0                 # on yield, against the largest force the actuators can make
+FRAME_FAMILIES = {"sq": "Square tube", "rect": "Rectangular tube (on edge)", "round": "Round tube",
+                  "chan": "C channel (web upright)", "tslot": "T-slot extrusion"}
+
+
+def _frame_sections():
+    """Every section on offer: id -> dict(family, name, h mm (depth in the load direction), area mm2, I mm4, S mm3)."""
+    out = {}
+
+    def add(fam, name, h, area, i, shape):
+        sid = fam + ":" + name
+        out[sid] = {"id": sid, "family": fam, "name": name, "h": h, "area": area, "I": i, "S": i / (h / 2.0),
+                    "shape": {k: (round(v, 2) if isinstance(v, float) else v) for k, v in shape.items()}}
+
+    def tube(b, h, t):        # inches -> mm
+        b, h, t = b * FRAME_IN, h * FRAME_IN, t * FRAME_IN
+        return h, b * h - (b - 2 * t) * (h - 2 * t), (b * h ** 3 - (b - 2 * t) * (h - 2 * t) ** 3) / 12.0
+
+    for b, t, lab in ((1, .125, '1 x 1 x 1/8"'), (1.5, .125, '1.5 x 1.5 x 1/8"'), (2, .125, '2 x 2 x 1/8"'),
+                      (2, .1875, '2 x 2 x 3/16"'), (2, .25, '2 x 2 x 1/4"'), (2.5, .125, '2.5 x 2.5 x 1/8"'),
+                      (3, .125, '3 x 3 x 1/8"'), (3, .1875, '3 x 3 x 3/16"'), (3, .25, '3 x 3 x 1/4"'),
+                      (4, .25, '4 x 4 x 1/4"')):
+        add("sq", lab, *tube(b, b, t), {"k": "tube", "b": b * FRAME_IN, "h": b * FRAME_IN, "t": t * FRAME_IN})
+    for b, h, t, lab in ((1, 2, .125, '1 x 2 x 1/8"'), (1.5, 3, .125, '1.5 x 3 x 1/8"'), (2, 3, .125, '2 x 3 x 1/8"'),
+                         (2, 4, .125, '2 x 4 x 1/8"'), (2, 4, .1875, '2 x 4 x 3/16"'), (2, 4, .25, '2 x 4 x 1/4"'),
+                         (2, 6, .25, '2 x 6 x 1/4"')):
+        add("rect", lab, *tube(b, h, t), {"k": "tube", "b": b * FRAME_IN, "h": h * FRAME_IN, "t": t * FRAME_IN})
+    for d, t, lab in ((1.5, .125, '1.5" OD x 1/8"'), (2, .125, '2" OD x 1/8"'), (2, .25, '2" OD x 1/4"'),
+                      (2.5, .125, '2.5" OD x 1/8"'), (3, .125, '3" OD x 1/8"'), (3, .25, '3" OD x 1/4"'),
+                      (4, .25, '4" OD x 1/4"')):
+        do, di = d * FRAME_IN, (d - 2 * t) * FRAME_IN
+        add("round", lab, do, math.pi / 4 * (do ** 2 - di ** 2), math.pi / 64 * (do ** 4 - di ** 4),
+            {"k": "round", "b": do, "h": do, "t": t * FRAME_IN})
+    for h, b, t, lab in ((2, 1, .125, '2 x 1 x 1/8"'), (3, 1.5, .1875, '3 x 1.5 x 3/16"'), (4, 2, .1875, '4 x 2 x 3/16"'),
+                         (4, 2, .25, '4 x 2 x 1/4"'), (5, 2.25, .25, '5 x 2.25 x 1/4"'), (6, 2.5, .25, '6 x 2.5 x 1/4"')):
+        hm, bm, tm = h * FRAME_IN, b * FRAME_IN, t * FRAME_IN
+        add("chan", lab, hm, bm * hm - (bm - tm) * (hm - 2 * tm), (bm * hm ** 3 - (bm - tm) * (hm - 2 * tm) ** 3) / 12.0,
+            {"k": "chan", "b": bm, "h": hm, "t": tm})
+    # T-slot: catalogue values, rounded down (they differ a little between makers - check your supplier's sheet)
+    for lab, bw, h, area_cm2, i_cm4 in (('1515 (1.5 x 1.5")', 38.1, 38.1, 7.4, 10.5), ('4040 (40 x 40 mm)', 40.0, 40.0, 7.9, 11.0),
+                                        ('1530 (1.5 x 3") on edge', 38.1, 76.2, 13.9, 74.0),
+                                        ('4080 (40 x 80 mm) on edge', 40.0, 80.0, 15.0, 78.0), ('3030 (3 x 3")', 76.2, 76.2, 21.0, 140.0)):
+        add("tslot", lab, h, area_cm2 * 100.0, i_cm4 * 1e4, {"k": "tslot", "b": bw, "h": h, "t": 0.0})
+    return out
+
+
+FRAME_SECTIONS = _frame_sections()
+FRAME_MEMBER_IDS = ("spine", "cross", "post", "rails", "tl", "pivx", "side", "seatx", "wheelp", "deck", "mount", "rear", "plat", "legm")
+FRAME_BRACEABLE = ("post", "rails", "tl", "pivx", "wheelp")   # where a diagonal (or a foot) really shortens what bends      # members a brace or an extra support can help
+FRAME_SHORT = {"spine": "moving-frame rail", "cross": "actuator cross-member", "post": "support post", "rails": "base rail",
+               "tl": "traction-loss rail", "pivx": "yaw-pivot cross-member", "side": "side rail", "seatx": "seat cross-member",
+               "rear": "rear cross-member", "wheelp": "steering-wheel upright", "deck": "wheel deck arm", "plat": "platform side", "mount": "actuator bracket", "legm": "leg mount"}
+FRAME_BOLTS = {"M8": (8.0, 36.6, 25), "M10": (10.0, 58.0, 49), "M12": (12.0, 84.3, 85), "M16": (16.0, 157.0, 210)}  # dia, stress area mm2, torque Nm (8.8)
+FRAME_BOLT_FUB = 800.0         # grade 8.8
+FRAME_JOIN = {   # how each kind of section is joined: (name, how)
+    "gusset": ("Gusset plates and through-bolts",
+               "A 6 mm (1/4 in) plate on both faces of every joint - an L at a corner, a T where one tube meets the side of "
+               "another, cut no wider than the tubes so nothing sticks out past the frame - bolted through both tubes with grade 8.8 bolts, a wide "
+               "washer under the head and under the nut, and nyloc nuts. A hollow tube crushes when a bolt is pulled hard: "
+               "put a spacer sleeve (a piece of small tube, as long as the tube is wide inside) over the bolt inside the "
+               "tube, or tighten only until snug."),
+    "clamp": ("Structural pipe fittings (set-screw clamps)",
+              "Round tube is not drilled and bolted: it slides into cast tee, elbow and flange fittings (the Kee Klamp kind) "
+              "and a hardened set screw locks each socket with a hex key - about 39 Nm (29 lb ft) on steel fittings, less on "
+              "aluminium ones; use the maker's figure. Check the set screws again after the first hour: a motion rig "
+              "shakes them. The other way is to cope (fish-mouth) the tube ends and weld."),
+    "cleat": ("Angle cleats bolted through the web",
+              "Channels meet web to web. A 50 x 50 x 6 mm (2 x 2 x 1/4 in) angle cleat sits in each inside corner, bolted "
+              "through both webs with grade 8.8 bolts, flat washers and nyloc nuts. Where an actuator or a pivot pushes, "
+              "add a backing plate across the flanges so the channel cannot twist."),
+    "tslot": ("Corner brackets, T-nuts and M8 screws",
+              "T-slot is joined with a corner bracket (gusset) on both sides of every joint: M8 screws into T-nuts, about "
+              "20 Nm (15 lb ft) - use your supplier's figure. Anchor fasteners hidden inside the profile make the strongest "
+              "joint but need a counterbore machined in the profile. The joints hold by friction: re-tighten them after "
+              "the first hour."),
+    "weld": ("Welded joints",
+             "A fillet weld all round every joint (MIG for steel, TIG for aluminium), with a gusset welded in where a joint "
+             "is marked amber or red. Aluminium keeps under half its strength next to a weld; the sizes here allow for it."),
+}
+
+
+def _frame_num(raw, k, lo, hi, dflt):
+    try:
+        v = float(raw.get(k, dflt))
+    except (TypeError, ValueError):
+        v = float(dflt)
+    if v != v:
+        v = float(dflt)
+    return max(lo, min(hi, v))
+
+
+def frame_inputs(raw):
+    """The design's inputs, cleaned: every value present, in range, the layout matching the motor count."""
+    raw = raw if isinstance(raw, dict) else {}
+    d = dict(FRAME_DEFAULTS)
+    lay = raw.get("layout")
+    try:
+        n = int(raw.get("motors", FRAME_LAYOUTS[lay][0] if lay in FRAME_LAYOUTS else d["motors"]))
+    except (TypeError, ValueError):
+        n = d["motors"]
+    n = max(2, min(6, n))
+    fits = [k for k, v in FRAME_LAYOUTS.items() if v[0] == n]
+    d["motors"], d["layout"] = n, (lay if lay in fits else fits[0])
+    d.update(FRAME_LAYOUT_DEFAULTS[d["layout"]])
+    if raw.get("moves") in ("seat", "cockpit"):
+        d["moves"] = raw["moves"]
+    if FRAME_LAYOUTS[d["layout"]][1] != "pivot" or d["layout"] == "lift2tl":
+        d["moves"] = "cockpit"
+    if raw.get("drive") in ("linear", "rotary"):
+        d["drive"] = raw["drive"]
+    d["preset"] = raw.get("preset") if raw.get("preset") in FRAME_PRESETS else "custom"
+    for k, lo, hi in (("driver_kg", 30, 200), ("moving_kg", 5, 600), ("rpm", 5, 20000), ("torque", 0.05, 500),
+                      ("torque_peak", 0.05, 1500), ("motor_w", 10, 5000), ("volts", 6, 400), ("ratio", 0.2, 200),
+                      ("ctc", 15, 300), ("swing", 10, 75), ("travel", 20, 600), ("lead", 1, 50),
+                      ("servo_torque", 0.1, 50), ("servo_peak", 0.1, 150), ("servo_rpm", 100, 6000),
+                      ("arm", 150, 2000), ("spacing", 150, 1500), ("cg_h", 0, 1200), ("cg_off", -500, 500),
+                      ("pivot_h", 80, 1200), ("wheelbase", 500, 2500), ("track", 300, 1500), ("tl_radius", 300, 2500),
+                      ("base_r", 300, 1500), ("plat_r", 200, 1200), ("hex_h", 200, 1500), ("accel", 0.5, 20),
+                      ("wheel_kg", 0, 40), ("pedal_kg", 0, 40), ("seat_kg", 3, 40), ("seat_slide", -120, 120)):
+        d[k] = _frame_num(raw, k, lo, hi, d[k])
+    # the moving weight is at least its named parts plus a little frame
+    d["moving_kg"] = max(d["moving_kg"], d["seat_kg"] + (d["wheel_kg"] + d["pedal_kg"] if d["moves"] == "cockpit" else 0.0) + 5.0)
+    d["torque_peak"] = max(d["torque_peak"], d["torque"])
+    d["servo_peak"] = max(d["servo_peak"], d["servo_torque"])
+    d["material"] = raw.get("material") if raw.get("material") in FRAME_MATERIALS else d["material"]
+    d["family"] = raw.get("family") if raw.get("family") in FRAME_FAMILIES else d["family"]
+    d["join"] = "welded" if raw.get("join") == "welded" else "bolted"
+    if d["family"] == "tslot":
+        d["material"], d["join"] = "al6061", "bolted"
+    if d["material"] == "steel" and d["family"] == "chan":
+        d["family"] = "sq"
+    d["size"] = raw.get("size") if raw.get("size") in FRAME_SECTIONS and FRAME_SECTIONS[raw.get("size")]["family"] == d["family"] else "auto"
+    mix = {}                         # a member may have its own section and material
+    for mid, v in (raw.get("mix") or {}).items() if isinstance(raw.get("mix"), dict) else ():
+        if mid in FRAME_MEMBER_IDS and isinstance(v, dict):
+            sec, mat = v.get("sec"), v.get("mat")
+            e = {}
+            if sec in FRAME_SECTIONS:
+                e["sec"] = sec
+            if mat in FRAME_MATERIALS:
+                e["mat"] = mat
+            if e:
+                mix[mid] = e
+    d["mix"] = mix
+    d["chan_out"] = bool(raw.get("chan_out"))
+    br = raw.get("braces")
+    d["braces"] = sorted({b for b in br if b in FRAME_BRACEABLE}) if isinstance(br, (list, tuple)) else []
+    return d
+
+
+def _frame_mm(v):
+    """A length for people: mm with inches."""
+    return f"{v:.0f} mm ({v / FRAME_IN:.1f} in)"
+
+
+def _frame_n(v):
+    return f"{v:.0f} N ({v / 4.448:.0f} lbf)"
+
+
+def _frame_cockpit(d, fam):
+    """Who weighs what and where, measured forwards from the seat back's lower edge: the driver and the seat slide
+    together; wheel, pedals and the rest of the moving frame stay put.  From that: where the seat back goes so the
+    centre of gravity is where the design wants it, how far sliding the seat moves it, and how long the frame must be
+    to carry the whole seat, the wheel and the pedals."""
+    cock = d["moves"] == "cockpit"
+    mw, mp = (d["wheel_kg"], d["pedal_kg"]) if cock else (0.0, 0.0)
+    ms = d["seat_kg"]
+    rest = d["moving_kg"] - ms - mw - mp
+    mass = d["driver_kg"] + d["moving_kg"]
+    k = (d["driver_kg"] * 280.0 + ms * 250.0 + mw * 760.0 + mp * 1050.0 + rest * (450.0 if cock else 250.0)) / mass
+    shift = d["seat_slide"] * (d["driver_kg"] + ms) / mass
+    cg0 = d["cg_off"] if fam == "pivot" else 0.0
+    back0 = cg0 - k
+    return {"cock": cock, "wheel_kg": mw, "pedal_kg": mp, "seat_kg": ms, "rest_kg": rest, "k": k, "shift": shift,
+            "cg0": cg0, "cg": cg0 + shift, "back0": back0, "back": back0 + d["seat_slide"], "slide": d["seat_slide"],
+            "seat_xs": [back0 + 60.0, back0 + 440.0], "rear": back0 - 130.0,
+            "front": back0 + (1200.0 if cock else 640.0), "x_up": back0 + 700.0, "x_wheel": back0 + 760.0,
+            "x_ped": back0 + 1050.0, "ped_xs": [back0 + 950.0, back0 + 1150.0], "wheel_h": 480.0}
+
+
+def _frame_pivot_x(d, ck):
+    """Tilting rigs: where the base starts and ends, and where the moving frame starts and ends (mm from the pivot):
+    under the whole seat with room to slide it back, and out to the pedals when they move too."""
+    a = d["arm"]
+    if d["layout"] == "seat2":
+        xr, xf = min(-a, ck["rear"]), max(ck["front"], 150.0)
+        # a seat mover that moves the seat only: wheel and pedals stand on the base, so the base runs out to them
+        return min(-a - 175, xr - 20), max(175.0, xf + 40, 0.0 if ck["cock"] else ck["back0"] + 1220.0), xr, xf
+    xr, xf = min(0.0, ck["rear"]), max(a, ck["front"])
+    return min(-175.0, xr - 20), max(a + 175, xf + 20), xr, xf
+
+
+def frame_design(raw):
+    """The whole design from the inputs: actuator, axes, forces, checks, frame members, drawings, lists and steps."""
+    d = frame_inputs(raw)
+    n, fam, lname, axes, lwhat = FRAME_LAYOUTS[d["layout"]]
+    mass = d["driver_kg"] + d["moving_kg"]
+    ck = _frame_cockpit(d, fam)
+    cg = ck["cg"]                    # where the weight really is, with the seat slid where the driver has it
+    W = mass * FRAME_G
+    acc = d["accel"]
+    checks = []
+
+    def chk(level, title, text):
+        checks.append({"level": level, "title": title, "text": text})
+
+    # ---------------- the actuator ----------------
+    if d["drive"] == "rotary":
+        geared = abs(d["ratio"] - 1.0) > 1e-6
+        eff = 0.9 if geared else 1.0
+        w0 = d["rpm"] / d["ratio"] * 2 * math.pi / 60.0                    # rad/s at the lever, no load
+        t_rated, t_peak = d["torque"] * d["ratio"] * eff, d["torque_peak"] * d["ratio"] * eff
+        ctc = d["ctc"] / 1000.0
+        travel = 2 * d["ctc"] * math.sin(math.radians(d["swing"]))        # mm, end to end at the rod
+        v0 = w0 * ctc * 1000.0                                             # mm/s with the lever square to the rod
+        f_rated, f_peak = t_rated / ctc, t_peak / ctc
+        f_stall = max(t_peak, 2.5 * t_rated) / ctc
+        i_rated = d["motor_w"] / (d["volts"] * 0.75)
+        i_stall = i_rated * d["torque_peak"] / d["torque"]
+        act = {"kind": "rotary", "lever_rpm": d["rpm"] / d["ratio"], "torque_rated": t_rated, "torque_peak": t_peak}
+    else:
+        lead = d["lead"] / 1000.0
+        travel = d["travel"]
+        v0 = d["servo_rpm"] * d["lead"] / 60.0
+        f_rated = 2 * math.pi * 0.9 * d["servo_torque"] / lead
+        f_peak = 2 * math.pi * 0.9 * d["servo_peak"] / lead
+        f_stall = f_peak
+        p_servo = d["servo_torque"] * d["servo_rpm"] * 2 * math.pi / 60.0
+        i_rated = i_stall = 0.0
+        act = {"kind": "linear", "servo_w": p_servo}
+    half = travel / 2.0
+
+    # ---------------- what each actuator has to do ----------------
+    f_static = f_need = 0.0          # the lifts: to hold the rig still, and the most a move asks for
+    extra = []                       # other axes' actuators: (name, need N)
+    rng = []                         # axes: name, total range, unit, speed, unit
+    geo = {}
+    if fam == "pivot":
+        a, b, h = d["arm"] / 1000.0, d["spacing"] / 1000.0, d["cg_h"] / 1000.0
+        th_p, th_r = math.atan(half / d["arm"]), math.atan(half / (d["spacing"] / 2.0))
+        i_p, i_r = mass * (h * h + 0.30 ** 2), mass * (h * h + 0.25 ** 2)
+        m_hold = W * abs(cg) / 1000.0
+        m_pitch = m_hold + W * h * math.sin(th_p) + i_p * acc / a
+        m_roll = W * h * math.sin(th_r) + i_r * acc / (b / 2.0)
+        f_static = m_hold / a / 2.0
+        f_need = m_pitch / a / 2.0 + m_roll / b
+        rng.append(("Pitch", 2 * math.degrees(th_p), "deg", math.degrees(v0 / d["arm"]), "deg/s"))
+        rng.append(("Roll", 2 * math.degrees(th_r), "deg", math.degrees(v0 / (d["spacing"] / 2.0)), "deg/s"))
+        geo.update(th_p=th_p, th_r=th_r)
+        if d["layout"] == "lift2tl":
+            chk("info", "The lifts carry part of the weight",
+                f"With the centre of gravity {cg:.0f} mm ahead of the rear support, each lift holds "
+                f"{_frame_n(f_static)} all the time. The closer the weight sits to the rear support, the less the lifts "
+                f"carry - but keep some load on them so the platform never lifts off.")
+        elif abs(cg) > 60:
+            chk("warn", "The rig is not balanced over its pivot",
+                f"The centre of gravity sits {abs(cg):.0f} mm from the pivot, so each actuator holds "
+                f"{_frame_n(f_static)} all the time just to keep the seat level. Move the pivot (or the seat) until the "
+                f"rig balances with you in it: the motors then only work when something moves.")
+        if d["cg_h"] > 450:
+            chk("warn", "High centre of gravity",
+                f"With the centre of gravity {d['cg_h']:.0f} mm above the pivot the rig wants to fall over as it tilts, "
+                f"and the actuators fight that. Put the universal joint as close under the seat as you can.")
+    elif fam == "corner":
+        nl = 3 if d["layout"] == "heave3" else 4
+        share = 0.42 if nl == 3 else 0.325        # the worst-loaded actuator's share (the weight is never dead centre)
+        share *= 1 + 2 * abs(cg) / d["wheelbase"]  # ... and less so with the seat slid off centre
+        f_static = share * W
+        f_need = share * W * (1 + acc / FRAME_G) * 1.05
+        rng.append(("Pitch", 2 * math.degrees(math.atan(travel / d["wheelbase"])), "deg",
+                    math.degrees(2 * v0 / d["wheelbase"]), "deg/s"))
+        rng.append(("Roll", 2 * math.degrees(math.atan(travel / d["track"])), "deg",
+                    math.degrees(2 * v0 / d["track"]), "deg/s"))
+        rng.append(("Heave", travel, "mm", v0, "mm/s"))
+        geo["nl"] = nl
+    else:                            # hexapod
+        dh = math.hypot(d["base_r"] - d["plat_r"] * math.cos(math.radians(40)), d["plat_r"] * math.sin(math.radians(40)))
+        beta = math.atan(dh / d["hex_h"])
+        f_static = W / 6.0 / math.cos(beta) * 1.4
+        f_need = f_static * (1 + acc / FRAME_G)
+        tilt = math.degrees(math.atan(half / math.cos(beta) / d["plat_r"]))
+        rng.append(("Pitch", 2 * tilt, "deg", math.degrees(v0 / math.cos(beta) / d["plat_r"]), "deg/s"))
+        rng.append(("Roll", 2 * tilt, "deg", math.degrees(v0 / math.cos(beta) / d["plat_r"]), "deg/s"))
+        rng.append(("Heave", travel / math.cos(beta), "mm", v0 / math.cos(beta), "mm/s"))
+        sw = travel / max(math.sin(beta), 0.2)
+        rng.append(("Surge / sway", sw, "mm", v0 / max(math.sin(beta), 0.2), "mm/s"))
+        rng.append(("Yaw", 2 * math.degrees(math.atan(sw / 2.0 / d["plat_r"])), "deg",
+                    math.degrees(v0 / max(math.sin(beta), 0.2) / d["plat_r"]), "deg/s"))
+        geo["beta"] = beta
+        chk("info", "Stewart platform: these are estimates",
+            f"The legs lean {math.degrees(beta):.0f} deg from upright at mid height. The ranges are for one movement at a "
+            f"time and shrink when several happen together. Model the platform (the FAQ lists MotionVisualizer and a "
+            f"SketchUp model) before cutting metal.")
+    if "yaw" in axes and fam != "hexapod":
+        R = d["tl_radius"] if fam == "pivot" else d["wheelbase"]
+        f_tl = 0.08 * W / 2.0 + mass * acc / 3.0 + (60 * acc / 3.0 if fam == "corner" else 0)
+        extra.append(("Traction loss", f_tl))
+        rng.append(("Yaw (traction loss)", 2 * math.degrees(math.atan(half / R)), "deg", math.degrees(v0 / R), "deg/s"))
+        geo["R"] = R
+    if "surge" in axes and fam != "hexapod":
+        f_su = (mass + 90) * acc + 0.03 * (W + 90 * FRAME_G)
+        extra.append(("Surge", f_su))
+        rng.append(("Surge", travel, "mm", v0, "mm/s"))
+
+    f_cont = f_static + 0.35 * (f_need - f_static)       # what the motor works against on average while driving
+    v_load = v0 * max(0.0, 1 - f_cont / f_stall) if d["drive"] == "rotary" else v0
+    m_cont, m_peak = f_rated / max(f_cont, 1e-6), f_peak / max(f_need, 1e-6)
+
+    # ---------------- verdicts ----------------
+    lifts = "lift actuator" if extra else "actuator"
+    if m_peak < 1.0:
+        chk("bad", "Not enough force",
+            f"A quick move asks each {lifts} for {_frame_n(f_need)}, and it can make {_frame_n(f_peak)} at most. "
+            + ("Shorten the lever (more force, less travel and speed), add gearing, or use stronger motors."
+               if d["drive"] == "rotary" else "Use a finer screw lead or a bigger servo, or lighten the rig."))
+    elif m_peak < 1.5:
+        chk("warn", "Force is marginal",
+            f"A quick move asks each {lifts} for {_frame_n(f_need)}; it can make {_frame_n(f_peak)} at most "
+            f"({m_peak:.1f} times). Aim for 1.5 times or more, so it still feels crisp with a heavier driver.")
+    else:
+        chk("ok", "Enough force",
+            f"A quick move asks each {lifts} for {_frame_n(f_need)}; it can make {_frame_n(f_peak)} at most ({m_peak:.1f} times).")
+    if m_cont < 1.0:
+        chk("bad" if fam != "pivot" else "warn", "The motors would run hot",
+            f"While driving each {lifts} works against about {_frame_n(f_cont)} on average, more than its continuous "
+            f"{_frame_n(f_rated)}." + (" With the rig standing on its actuators they carry its weight all the time: "
+                                         "this needs more force, not just a bigger driver." if fam != "pivot" else ""))
+    else:
+        chk("ok", "Within the motors' continuous rating",
+            f"About {_frame_n(f_cont)} on average while driving, against {_frame_n(f_rated)} continuous.")
+    for name, need in extra:
+        lv = "bad" if f_peak < need else "warn" if f_peak < 1.5 * need else "ok"
+        chk(lv, f"{name}: " + ("not enough force" if lv == "bad" else "force is marginal" if lv == "warn" else "enough force"),
+            f"The {name.lower()} motor needs about {_frame_n(need)} (friction of the slide plus the acceleration); it can "
+            f"make {_frame_n(f_peak)} at most.")
+    if v_load < 100:
+        chk("bad", "Too slow", f"{v_load:.0f} mm/s under load. The FAQ's range for good motion is 150-700 mm/s: "
+            + ("use a longer lever, a faster motor, or less gearing." if d["drive"] == "rotary" else
+               "use a coarser screw lead (a 1610 screw doubles the speed) or a faster motor."))
+    elif v_load < 150:
+        chk("warn", "A little slow", f"{v_load:.0f} mm/s under load; 150-700 mm/s is the FAQ's range for good motion.")
+    else:
+        chk("ok", "Fast enough", f"{v_load:.0f} mm/s under load ({v0:.0f} mm/s with no load); 150-700 mm/s is the FAQ's range for good motion.")
+    if d["drive"] == "rotary":
+        if d["ctc"] < 25:
+            chk("warn", "Very short lever", "Below 25 mm between centres there is little room for the bearings and the "
+                "pot's resolution is wasted; the FAQ calls 25 mm the practical minimum.")
+        if d["swing"] > 60:
+            chk("warn", "Lever swings too far", f"At +/-{d['swing']:.0f} deg the lever is nearly in line with the rod at "
+                "the ends: the speed collapses there and a little overshoot goes over centre. Keep it within +/-60 deg "
+                "(+/-45 is a good target) and set the limits in Seat Setup to match.")
+    tot = [r for r in rng if r[0] in ("Pitch", "Roll")]
+    for name, val, unit, _s, _u in tot:
+        if val < 5:
+            chk("warn", f"{name} range is small", f"{val:.1f} deg in total. Seat movers in the FAQ run 6.5-12.5 deg; "
+                + ("bring the actuators closer to the pivot or lengthen the lever." if fam == "pivot" else "use more travel or a shorter frame."))
+        elif val > 25 and fam == "pivot":
+            chk("info", f"{name} range is generous", f"{val:.1f} deg in total is more than racing needs (6-14 deg is "
+                "typical). Moving the actuators further from the pivot trades the spare range for force and finer control.")
+
+    # ---------------- the frame ----------------
+    f_des = max(f_need, f_peak)      # the frame takes whatever the actuators can make (an end stop, a jam)
+    px0, px1, pxr, pxf = _frame_pivot_x(d, ck) if fam == "pivot" else (0.0, 0.0, 0.0, 0.0)
+    def build(f_des):
+        mem = []                         # id, name, model, L mm, P N, qty, piece length mm, note, marker (view, x, y)
+
+        def member(mid, name, model, length, load, qty, piece, note, mark):
+            braced = mid in d["braces"] and mid in FRAME_BRACEABLE      # a brace or support halves the free length
+            full = length
+            if braced:
+                length = length / 2.0
+                note += "; braced, so half the length works"
+            mem.append({"id": mid, "name": name, "model": model, "L": length, "L_full": full, "braced": braced, "P": load,
+                        "qty": qty, "piece": piece, "note": note, "mark": mark,
+                        "M": load * length / 1000.0 * (1.0 if model == "cantilever" else 0.25)})
+
+        dyn = 1 + acc / FRAME_G
+        seat_load = (d["driver_kg"] + d["seat_kg"]) * FRAME_G * dyn
+
+        def wheel_frame(z0, on_base=False):
+            """The uprights and the deck that carry the wheelbase along its whole length (z0: where the uprights stand)."""
+            hw_ = ck["wheel_h"] + (d["pivot_h"] if on_base else 0.0)
+            member("wheelp", "Steering wheel uprights" + (" (on the base: wheel and pedals stay still)" if on_base else ""), "cantilever",
+                   hw_, (350.0 + d["wheel_kg"] * FRAME_G * dyn * 0.3) / 2, 2, hw_,
+                   "the driver hauling on the wheel (350 N) and the wheelbase shaking, at the top, taken at the foot",
+                   ("side", ck["x_up"], z0 + hw_ * 0.5))
+            member("deck", "Wheel deck arms (the wheelbase bolts along these, on a plate)", "cantilever", 210.0,
+                   (d["wheel_kg"] * FRAME_G * dyn + 250.0) / 2, 2, 320,
+                   "half the wheelbase's weight and the driver leaning on the wheel, at the arm's end, taken at the upright",
+                   ("side", ck["x_up"] + 150, z0 + hw_))
+        if fam == "pivot":
+            sx = -1 if d["layout"] == "seat2" else 1          # the actuators behind the pivot (seat mover) or ahead of it
+            ax_ = sx * d["arm"]
+            if d["layout"] == "seat2":
+                member("spine", "Moving frame: spine, from the actuator cross-member to the front of the " + ("pedals" if ck["cock"] else "seat"),
+                       "cantilever", d["arm"], 2 * f_des, 1, pxf - pxr, "both actuators pushing together, taken at the pivot plate",
+                       ("top", sx * 40.0, 0.0))
+            else:
+                reach = max(d["arm"] - max(cg, 0), 200.0)
+                member("spine", "Moving frame: side rails, under the whole seat and out to the " + ("pedals" if ck["cock"] else "lifts"),
+                       "cantilever", reach, f_des, 2, pxf - pxr, "one lift's full force, taken where the weight sits (the seat mounts)",
+                       ("top", max(cg, 0) + 30.0, d["spacing"] / 2.0 - 60))
+            member("cross", "Moving frame: actuator cross-member", "cantilever", d["spacing"] / 2.0, f_des, 1,
+                   d["spacing"] + 60, "one actuator's force at its end, taken where it meets the spine or rail",
+                   ("top", ax_, d["spacing"] / 4.0 if d["layout"] != "seat2" else 0.0))
+            lat = W * math.sin(max(geo["th_p"], geo["th_r"])) + mass * acc + f_des * 0.26
+            member("post", "Base: pivot post" if d["layout"] == "seat2" else "Rear support post", "cantilever", d["pivot_h"], lat, 1, d["pivot_h"],
+                   "sideways load at the joint (tilted weight, acceleration, leaning push rods), taken at its foot",
+                   ("side", 0.0, 20.0))
+            base_l = px1 - px0
+            if d["layout"] == "seat2":
+                member("seatx", "Moving frame: seat cross-members (the slider bolts to these)", "cantilever", 220.0, seat_load / 4.0, 2, 440,
+                       "a quarter of the driver and seat at each end, 220 mm out from the spine", ("top", ck["seat_xs"][1], 110.0))
+            else:
+                member("seatx", "Moving frame: seat cross-members (the slider bolts to these)", "simple", d["spacing"] - 120,
+                       seat_load / 2.0, 2, d["spacing"] - 120, "half the driver and seat in the middle of each", ("top", ck["seat_xs"][1], 0.0))
+            wheel_frame(d["pivot_h"] if ck["cock"] else 0.0, not ck["cock"])
+            member("rails", "Base: long rails", "simple", base_l, (W * dyn + 2 * f_des) / 2.0, 2, base_l,
+                   "the pivot's load between the feet, shared by two rails", ("side", sx * base_l * 0.25, 0.0))
+            if "yaw" in axes:
+                member("tl", "Traction-loss frame: rails bent sideways", "simple", d["tl_radius"], max(extra[0][1], f_peak) / 2.0,
+                       2, base_l, "the traction-loss motor's push between the yaw pivot and the slide",
+                       ("top", sx * d["arm"] * 0.5 if sx > 0 else -d["arm"] * 0.5, d["spacing"] / 2.0 + 90))
+                member("pivx", "Yaw pivot cross-members (base and traction-loss frame)", "simple", d["spacing"] + 200,
+                       max(extra[0][1], f_peak), 2, d["spacing"] + 200,
+                       "the yaw pivot pulled sideways by the traction-loss motor, in the middle of the cross-member",
+                       ("top", sx * d["arm"], -d["spacing"] / 4.0))
+        elif fam == "corner":
+            L, B = d["wheelbase"], d["track"]
+            member("side", "Moving frame: side rails, under the whole seat and out to the pedals", "simple", L, W * dyn / 2.0, 2,
+                   max(L / 2.0 + 50, ck["front"]) - min(-L / 2.0 - 50, ck["rear"]),
+                   "half the rig's weight (with the acceleration) in the middle of each rail", ("side", 0.0, 0.0))
+            member("seatx", "Moving frame: cross-members under the seat (the slider bolts to these)", "simple", B,
+                   (d["driver_kg"] + d["seat_kg"]) * FRAME_G * dyn / 2.0, 4, B,
+                   "the driver and seat on two cross-members (cut four: two more at the actuators)", ("top", ck["seat_xs"][1], 0.0))
+            wheel_frame(300 + travel)
+            member("mount", "Actuator brackets", "cantilever", 80.0, f_des, geo["nl"], 160,
+                   "the actuator's full force 80 mm out from the rail", ("top", L / 2.0, B / 2.0))
+            if geo["nl"] == 3:
+                member("rear", "Moving frame: cross-member over the single actuator", "simple", B, f_des, 1, B,
+                       "the single actuator pushing in the middle", ("top", -L / 2.0, 0.0))
+            if "yaw" in axes:
+                member("tl", "Traction-loss sub-frame: rails bent sideways", "simple", L, max(extra[0][1], f_peak) / 2.0, 2, L + 200,
+                       "the traction-loss motor's push between the yaw pivot and the slide", ("top", 0.0, -B / 2.0 - 70))
+                member("pivx", "Yaw pivot cross-members (base and sub-frame)", "simple", B + 140, max(extra[0][1], f_peak), 2, B + 300,
+                       "the yaw pivot pulled sideways by the traction-loss motor, in the middle of the cross-member",
+                       ("top", L / 2.0 + 90, B / 4.0))
+        else:
+            chord = d["plat_r"] * math.sqrt(3.0)
+            member("plat", "Platform: the three sides", "simple", chord, W * dyn / 3.0, 3, chord,
+                   "a third of the rig's weight in the middle of each side", ("top", 0.0, d["plat_r"] * 0.5))
+            member("legm", "Leg mounts", "cantilever", 80.0, f_des, 6, 160, "a leg's full force 80 mm from the frame",
+                   ("top", d["base_r"] * 0.87, 0.0))
+            member("side", "Platform rails: under the whole seat and out to the pedals", "simple", 1.6 * d["plat_r"], W * dyn / 2.0, 2,
+                   ck["front"] - ck["rear"], "half the rig's weight in the middle of each, between the platform's sides",
+                   ("side", 0.0, d["hex_h"] + 40))
+            member("seatx", "Seat cross-members (the slider bolts to these)", "simple", 400.0, seat_load / 2.0, 2, 400,
+                   "half the driver and seat in the middle of each", ("top", ck["seat_xs"][1], 0.0))
+            wheel_frame(d["hex_h"] + 40)
+
+        return mem
+
+    mem = build(f_des)
+    for m, wk in zip(mem, build(min(f_need, f_des))):        # what the frame sees with this load, in normal use
+        m["P_work"] = wk["P"]
+
+    mat_name, fy, fy_weld, E, rho = FRAME_MATERIALS[d["material"]]
+    if d["family"] == "tslot":
+        fy_use, mat_name = FRAME_TSLOT_YIELD, "T-slot extrusion (6105-T5)"
+    else:
+        fy_use = fy_weld if d["join"] == "welded" else fy
+    allow = fy_use / FRAME_SF
+    cand = sorted((s for s in FRAME_SECTIONS.values() if s["family"] == d["family"]), key=lambda s: s["area"])
+
+    def props(sec, mat_id):
+        """Allowed stress, stiffness, density and name for a section in a material (T-slot is its own alloy)."""
+        if sec["family"] == "tslot":
+            return FRAME_TSLOT_YIELD / FRAME_SF, 69000.0, 2.70, "T-slot 6105-T5"
+        nm, y, yw, e_, rh = FRAME_MATERIALS[mat_id if not (mat_id == "steel" and sec["family"] == "chan") else "al6061"]
+        return (yw if d["join"] == "welded" else y) / FRAME_SF, e_, rh, nm
+
+    def rate(m, s, mat_id=None):
+        al, e_, _rh, _nm = props(s, mat_id or d["material"])
+        stress = m["M"] * 1000.0 / s["S"]                                   # MPa
+        if m["model"] == "cantilever":
+            defl, lim = m["P"] * m["L"] ** 3 / (3 * e_ * s["I"]), m["L"] / 150.0
+        else:
+            defl, lim = m["P"] * m["L"] ** 3 / (48 * e_ * s["I"]), m["L"] / 250.0
+        return stress, defl, lim, max(stress / al, defl / lim), al
+
+    for m in mem:
+        best = next((s for s in cand if rate(m, s)[3] <= 1.0), None)
+        m["fits"] = best is not None
+        m["rec"] = (best or cand[-1])["id"]
+        own = d["mix"].get(m["id"], {})
+        use = FRAME_SECTIONS[own["sec"]] if "sec" in own else FRAME_SECTIONS[d["size"]] if d["size"] != "auto" else (best or cand[-1])
+        if m["id"] == "deck" and "sec" not in own and d["size"] == "auto":       # never a thinner bar than the uprights it sits on
+            up_ = next((FRAME_SECTIONS[q["section"]] for q in mem if q["id"] == "wheelp" and "section" in q), None)
+            if up_ and up_["family"] == use["family"] and up_["area"] > use["area"]:
+                use = up_
+        mat_id = own.get("mat", d["material"])
+        st, de, lim, u, al = rate(m, use, mat_id)
+        _al, _e, rho_m, mat_nm = props(use, mat_id)
+        kw = m["P_work"] / m["P"] if m["P"] else 1.0
+        m.update(util_work=max(st * kw / al, de * kw / lim), defl_work=de * kw, own=bool(own), own_sec=own.get("sec", ""),
+                 own_mat=own.get("mat", ""), material=mat_nm, material_id=mat_id if use["family"] != "tslot" else "tslot", allow=al,
+                 section=use["id"], section_name=use["name"], stress=st, defl=de, defl_limit=lim, util=u,
+                 governs="stiffness" if de / lim > st / al else "strength",
+                 rec_name=FRAME_SECTIONS[m["rec"]]["name"],
+                 kg=use["area"] * rho_m / 1000.0 * m["piece"] / 1000.0 * m["qty"])
+    one = next((s for s in cand if all(rate(m, s)[3] <= 1.0 for m in mem)), None)
+    worst = max(mem, key=lambda m: m["util"])
+    if worst["util"] > 1.0:
+        chk("bad", "The frame is too light" if d["size"] != "auto" else "No section in this family is strong enough",
+            f"{worst['name']} is at {worst['util'] * 100:.0f}% of what {worst['section_name']} should carry "
+            f"({worst['governs']} governs). " + (f"The smallest {FRAME_FAMILIES[d['family']].lower()} that passes "
+                                                 f"everywhere is {one['name']}." if one else
+                                                 "Choose a deeper family (rectangular tube on edge), steel, or shorten that member."))
+    elif d["size"] == "auto" and not d["mix"]:
+        chk("ok", "The frame is sized",
+            "Each member gets the lightest section in this family that is strong and stiff enough"
+            + (f"; {one['name']} passes everywhere if you would rather buy one size." if one else "."))
+    elif worst["util"] > 0.8:
+        chk("warn", "The frame is close to its limit", f"{worst['name']} is at {worst['util'] * 100:.0f}% with "
+            f"{worst['section_name']} ({worst['governs']} governs).")
+    else:
+        chk("ok", "The frame has margin", f"The hardest-working member, {worst['name'].lower()}, is at "
+            f"{worst['util'] * 100:.0f}% with {worst['section_name']}.")
+    if d["join"] == "welded" and d["material"] != "steel":
+        chk("info", "Welded aluminium", f"Next to a weld {mat_name} keeps only {fy_weld:.0f} MPa of its {fy:.0f} MPa, "
+            "and that is what the sizes here are based on. Bolting with gussets, or putting the welds away from the "
+            "marked points, keeps the full strength.")
+    if d["family"] == "chan":
+        chk("info", "C channel twists", "A channel loaded off its web twists easily. Use it web upright, box it with a "
+            "second channel or a plate where an actuator pushes, and prefer tube for the spine and the pivot post.")
+    if d["material"] == "al6063":
+        chk("info", "6063 is the soft alloy", "Architectural 6063-T5 has less than half the strength of 6061-T6. It is "
+            "fine where stiffness governs; where strength governs, buy 6061-T6.")
+
+    # ---------------- the rig in 3D, its joints and what holds them together ----------------
+    ranges = [{"name": r[0], "range": r[1], "unit": r[2], "speed": r[3], "speed_unit": r[4]} for r in rng]
+    seat = _frame_seat(d, fam, mass, f_rated, W, ck)
+    model = _frame_model3d(d, fam, geo, mem, travel, ranges, f_des, seat, ck)
+    joints, hardware, jmethods = _frame_joints(d, model, mem)
+    live = [j for j in joints if j["u"] > 0]
+    if live:
+        wj = max(live, key=lambda j: j["u"])
+        if wj["u"] > 1.0:
+            chk("bad", "A joint is overloaded", f"{wj['name']}: {wj['u'] * 100:.0f}% of what {wj['hw']} should carry. "
+                "Use a thicker wall there (the bolts bear on it), steel backing plates, or a brace so the joint sees less.")
+        elif wj["u"] > 0.8:
+            chk("warn", "A joint is close to its limit", f"{wj['name']}: {wj['u'] * 100:.0f}% with {wj['hw']}.")
+        else:
+            chk("ok", "The joints have margin", f"The hardest-working joint, {wj['name'].lower()}, is at {wj['u'] * 100:.0f}% "
+                f"with {wj['hw']}. Joints fail before beams do: they are sized for the largest force an actuator can make.")
+    if "yaw" in axes and fam != "hexapod":
+        chk("info", "The yaw pivot is carried, not floating",
+            "The traction-loss frame is as long as the frame under it, and the pivot bolt goes through a cross-member in "
+            "each. Those two cross-members are sized as members (see the frame table) and the pivot bolt as a joint.")
+
+    # ---------------- lists ----------------
+    frame_kg = sum(m["kg"] for m in mem)
+    mixed = len({m["material"] for m in mem}) > 1
+    cut = [{"what": m["name"], "section": m["section_name"] + (f" ({m['material']})" if mixed else ""), "qty": m["qty"],
+            "len": m["piece"], "group": "moving" if m["id"] in ("spine", "cross", "side", "seatx", "wheelp", "deck", "rear", "plat") else
+            "sub" if m["id"] in ("tl",) else "base"} for m in mem if m["id"] not in ("mount", "legm")]
+    cut += [{"what": m["name"], "section": "6 mm (1/4 in) plate or angle", "qty": m["qty"], "len": m["piece"], "group": "base"}
+            for m in mem if m["id"] in ("mount", "legm")]
+    others = {}
+    for mb in model["members"]:
+        if mb["id"] is None and not mb.get("brace"):
+            ln = math.dist(mb["a"], mb["b"])
+            key = (mb["nm"], mb["sec"], round(ln / 5.0) * 5)
+            others[key] = others.get(key, 0) + 1
+    for (nm, sec, ln), q in others.items():
+        cut.append({"what": nm[0].upper() + nm[1:], "section": FRAME_SECTIONS[sec]["name"], "qty": q, "len": ln,
+                    "group": "sub" if "traction" in nm else "moving" if any(w_ in nm for w_ in ("moving", "seat", "pedal", "wheel")) else "base"})
+    if len({m["material_id"] for m in mem if m["material_id"] != "tslot"}) > 1:
+        chk("info", "Steel and aluminium together",
+            "Where steel meets aluminium, bolt them (they cannot be welded to each other) and keep the joint dry or "
+            "painted: the two metals corrode each other when wet.")
+    if any(FRAME_SECTIONS[m["section"]]["family"] == "chan" for m in mem):
+        chk("info", "Channels are mirrored", "Left and right channels are a mirrored pair, all opening "
+            + ("outwards" if d["chan_out"] else "inwards") + ", so the frame is the same on both sides.")
+    if fam == "corner":
+        cut.append({"what": "Feet / floor plates under the actuators", "section": "6 mm (1/4\") plate, 150 x 150 mm",
+                    "qty": geo["nl"], "len": 150, "group": "base"})
+
+    # ---------------- what would make it better ----------------
+    fixes = []
+
+    def fix(level, title, text, patch):
+        fixes.append({"level": level, "title": title, "text": text, "patch": patch})
+
+    any_sec = sorted((q for q in FRAME_SECTIONS.values() if not (q["family"] == "chan" and d["material"] == "steel")),
+                     key=lambda q: q["area"])
+    for m in mem:
+        mid, own = m["id"], d["mix"].get(m["id"], {})
+        mat_id = own.get("mat", d["material"])
+        can_brace = mid in FRAME_BRACEABLE and not m["braced"]
+        half_m = dict(m, L=m["L"] / 2.0, M=m["M"] / 2.0)
+        what = ("a diagonal brace at its foot" if m["model"] == "cantilever" else
+                "a foot under the middle of each rail" if mid == "rails" else "corner braces at the yaw-pivot cross-member")
+        if m["util"] > 1.0:
+            in_fam = next((q for q in cand if rate(m, q, mat_id)[3] <= 1.0), None)
+            braced_fam = next((q for q in cand if rate(half_m, q, mat_id)[3] <= 1.0), None) if can_brace else None
+            anyq = next((q for q in any_sec if rate(m, q, mat_id)[3] <= 1.0), None)
+            if in_fam:
+                fix("bad", f"Use {in_fam['name']} for: {m['name'].lower()}",
+                    f"{m['section_name']} is at {m['util'] * 100:.0f}% ({m['governs']} governs). {in_fam['name']} is the lightest "
+                    f"{FRAME_FAMILIES[d['family']].lower()} that passes.", {"mix": {mid: dict(own, sec=in_fam["id"])}})
+            elif braced_fam:
+                fix("bad", f"Add {what} and use {braced_fam['name']} for: {m['name'].lower()}",
+                    f"No {FRAME_FAMILIES[d['family']].lower()} passes on its own at {m['L']:.0f} mm. With the support only half the "
+                    f"length works, and {braced_fam['name']} passes.", {"braces": [mid], "mix": {mid: dict(own, sec=braced_fam["id"])}})
+            elif anyq:
+                fix("bad", f"Use {FRAME_FAMILIES[anyq['family']].lower()} {anyq['name']} for: {m['name'].lower()}",
+                    f"No {FRAME_FAMILIES[d['family']].lower()} passes here; this deeper section does.",
+                    {"mix": {mid: dict(own, sec=anyq["id"])}})
+            else:
+                fix("bad", f"Shorten or support: {m['name'].lower()}", "No section on the list passes. Shorten the member, "
+                    "bring the actuators closer, or build it as a truss.", {})
+        elif can_brace and m["governs"] == "stiffness" and m["util"] > 0.8:
+            st2, de2, _lim, u2, _al = rate(half_m, FRAME_SECTIONS[m["section"]], mat_id)
+            fix("tip", f"Stiffen with {what}: {m['name'].lower()}",
+                f"It bends {m['defl']:.1f} mm at full force ({m['util'] * 100:.0f}% of its allowance, stiffness governs). With the "
+                f"support it bends about {de2:.1f} mm ({u2 * 100:.0f}%).", {"braces": [mid], "mix": {mid: dict(own, sec=m["section"])}})
+    if d["drive"] == "rotary" and m_peak < 1.5:
+        new_ctc = max(25.0, math.floor(d["ctc"] * m_peak / 1.5))
+        if new_ctc < d["ctc"] - 1:
+            fix("bad" if m_peak < 1.0 else "warn", f"Shorten the lever to {new_ctc:.0f} mm",
+                f"The force is {m_peak:.1f} times what a quick move asks for. A {new_ctc:.0f} mm lever gives 1.5 times, with "
+                f"{2 * new_ctc * math.sin(math.radians(d['swing'])):.0f} mm of travel instead of {travel:.0f} mm.", {"ctc": new_ctc})
+    if seat.get("better") is not None and abs(seat["better"] - d["cg_off"]) > 40:
+        fix("warn" if d["layout"] == "seat2" and abs(d["cg_off"]) > 60 else "tip", "Move the seat: " + seat["move"], seat["why"],
+            {"cg_off": seat["better"]})
+    for j in joints:
+        if j["u"] > 1.0:
+            fix("bad", f"Strengthen the joint: {j['name'].lower()}", f"It is at {j['u'] * 100:.0f}% with {j['hw']}. Choose a "
+                "thicker-walled section for that member, add steel backing plates under the bolts, or brace the member.", {})
+            break
+    # the frame and its joints are sized for the most the actuators can push; when that is far more than a move
+    # needs and something is overloaded, the first thing to do is to cap the force, not to add metal
+    if (any(m["util"] > 1.0 for m in mem) or any(j["u"] > 1.0 for j in joints)) and f_peak > 2.2 * f_need:
+        key, now, floor_ = ("servo_peak", d["servo_peak"], d["servo_torque"]) if d["drive"] == "linear" else ("torque_peak", d["torque_peak"], d["torque"])
+        new = max(floor_, round(now * 1.6 * f_need / f_peak, 2))
+        if new < now * 0.9:
+            fixes.insert(0, {"level": "bad", "first": True, "title": f"Limit the actuators' peak torque to {new:.1f} Nm",
+                             "text": f"The frame and every joint are sized for the hardest the actuators can push: {_frame_n(f_peak)} each. "
+                                     f"A quick move needs only {_frame_n(f_need)}. Set the torque limit in the "
+                                     + ("servo drive" if d["drive"] == "linear" else "motor driver (its current limit)")
+                                     + f" so the peak is {new:.1f} Nm instead of {now:.1f} Nm: the rig still has 1.6 times the force it "
+                                       "needs, and the frame and joints carry a fraction of the load. Do this first, then see what is left to fix.",
+                             "patch": {key: new, "preset": "custom"}})
+    brace_cut = {}
+    for mb in model["members"]:
+        if mb.get("brace"):
+            key = (mb["nm"], mb["sec"], round(math.dist(mb["a"], mb["b"]) / 5.0) * 5)
+            brace_cut[key] = brace_cut.get(key, 0) + 1
+    for (nm, sec, ln), q in brace_cut.items():
+        wide = max(FRAME_SECTIONS[sec]["shape"]["b"], FRAME_SECTIONS[sec]["shape"]["h"])
+        cut.append({"what": nm + " (both ends cut at 45 degrees; the length is the long side)", "section": FRAME_SECTIONS[sec]["name"],
+                    "qty": q, "len": round(ln + wide), "group": "base"})
+    if "rails" in d["braces"] and fam == "pivot":
+        cut.append({"what": "Extra levelling foot under the middle of each base rail", "section": "M10 or M12 foot", "qty": 2,
+                    "len": 0, "group": "base"})
+    parts = []
+    if d["drive"] == "rotary":
+        rod = max(4 * d["ctc"], 250)
+        parts += [f"{n} x gear motor: {d['rpm']:.0f} rpm, {d['torque']:.0f} Nm rated, {d['volts']:.0f} V"
+                  + (f", with {d['ratio']:.1f}:1 extra gearing" if geared else ""),
+                  f"{n} x lever, {d['ctc']:.0f} mm between centres, keyed or clamped to the shaft (steel, 8 mm or thicker)",
+                  f"{n} x push rod about {_frame_mm(rod)} long with two M10 or M12 rod ends (keep each rod within "
+                  f"15 deg of the direction it pushes)",
+                  f"{n} x position sensor on each lever shaft: a 10k pot or a Hall sensor (TT 6127 type), 1:1 by belt or coupling",
+                  f"{n} x motor driver rated for the stall current (about {i_stall:.0f} A here): BTS7960 / IBT-2 for small "
+                  f"motors, a 60 A class driver for wheelchair motors",
+                  f"Power supply: {d['volts']:.0f} V, at least {i_rated * n * 0.7:.0f} A ({i_rated:.0f} A rated per motor; "
+                  f"they rarely all pull at once)",
+                  "Arduino UNO R4 WiFi with the SMC3 R4 firmware (3 motors per board)"
+                  + (f": {math.ceil(n / 3)} boards for {n} motors" if n > 3 else "")]
+    else:
+        parts += [f"{n} x linear actuator: {d['travel']:.0f} mm travel, {d['lead']:.0f} mm screw lead, "
+                  f"{d['servo_torque']:.2g} Nm servo at {d['servo_rpm']:.0f} rpm ({act['servo_w']:.0f} W)",
+                  f"{n} x servo drive matched to the motors (they bring their own position loop; the controller sends "
+                  f"step/direction, as the SFX-100 project does)",
+                  "Mains wiring with an emergency stop that cuts the drives' power",
+                  f"{n} x foot or swivel joint under each actuator"]
+    if fam == "pivot":
+        parts.append("1 x universal joint from a car's steering column or propshaft (not rod ends), bolted to plates top and bottom"
+                     if d["layout"] == "seat2" else
+                     "1 x rear support joint: a universal joint or a large (M16) rod end, on the traction-loss carriage")
+    if "yaw" in axes and fam != "hexapod":
+        parts.append("Traction loss: a yaw pivot bolt (M12, 8.8) with a thrust bearing, and rollers or ball transfers under the sliding end")
+    if "surge" in axes and fam != "hexapod":
+        parts.append("Surge: two linear rails with four bearing blocks (20 mm class) or V-wheels on tube")
+    if fam == "hexapod":
+        parts.append("12 x leg joints: universal joints or rod ends with at least +/-30 deg of swing")
+    parts.append("Seat slider pair (car seat rails, about 220 mm of travel) with side brackets: it bolts to the two seat "
+                 "cross-members and raises the seat about 55 mm")
+    parts.append("Wheel deck plate, 6 mm (1/4 in), about 340 mm long and as wide as the deck frame, drilled for the wheelbase: it lies on "
+                 "the two deck arms and the two deck cross-members, so the long wheelbase is carried along its whole length")
+    parts.append("Pedal plate on the two pedal deck cross-members" + ("" if ck["cock"] else " (on the base: on this rig wheel and pedals do not move)"))
+    parts.append("Thread lock or nyloc nuts on everything that moves; the frame's own fasteners are in the mounting hardware list")
+
+    cost = _frame_cost(d, fam, n, axes, model, mem, i_rated, i_stall, act, ck)
+    model.pop("_buy", None)
+
+    steps = _frame_steps(d, fam, n, axes, travel, rng, mem, one, jmethods, seat)
+
+    out = {"inputs": d, "layout_name": lname, "layout_what": lwhat, "axes": axes, "family": fam,
+           "mass": mass, "weight_n": W,
+           "actuator": dict(act, travel=travel, speed_noload=v0, speed_loaded=v_load, force_rated=f_rated,
+                            force_peak=f_peak, force_static=f_static, force_need=f_need, force_avg=f_cont,
+                            margin_peak=m_peak, margin_cont=m_cont, amps_rated=i_rated, amps_stall=i_stall),
+           "extra": [{"name": nm, "need": nd} for nm, nd in extra],
+           "ranges": ranges,
+           "checks": checks, "members": mem, "frame_kg": frame_kg,
+           "material": mat_name, "allow": allow, "yield": fy_use, "design_force": f_des,
+           "one_size": one["name"] if one else None, "one_size_id": one["id"] if one else None,
+           "cut": cut, "parts": parts, "steps": steps,
+           "sizes": [{"id": s_["id"], "name": s_["name"]} for s_ in cand],
+           "verdict": "bad" if any(c["level"] == "bad" for c in checks) else
+                      "warn" if any(c["level"] == "warn" for c in checks) else "ok"}
+    out["drawings"] = _frame_drawings(d, fam, geo, mem, travel, seat, ck)
+    out["balance"] = {"cg": cg, "cg0": ck["cg0"], "slide": ck["slide"], "shift": ck["shift"], "pivot": fam == "pivot",
+                      "ref": ("the pivot" if d["layout"] == "seat2" else "the rear support") if fam == "pivot" else "the middle of the rig",
+                      "items": [{"name": nm_, "kg": kg_, "x": x_} for nm_, kg_, x_ in (
+                          ("Driver", d["driver_kg"], ck["back"] + 280), ("Seat and slider", ck["seat_kg"], ck["back"] + 250),
+                          ("Wheel and wheelbase", ck["wheel_kg"], ck["x_wheel"]), ("Pedals", ck["pedal_kg"], ck["x_ped"]),
+                          ("Moving frame and the rest", ck["rest_kg"], ck["back0"] + (450 if ck["cock"] else 250))) if kg_ > 0]}
+    out["model3d"] = model
+    out["cost"] = cost
+    out["joints"] = _frame_joint_rows(joints)
+    out["hardware"] = hardware
+    out["join_methods"] = [{"id": k, "name": FRAME_JOIN[k][0], "how": FRAME_JOIN[k][1]} for k in jmethods]
+    out["joint_pictures"] = _frame_joint_pictures(d, joints, jmethods, model)
+    out["cut_picture"] = _frame_cut_picture(cut)
+    out["assembly"] = _frame_assembly(d, fam, model)
+    out["fixes"] = fixes
+    out["seat"] = seat
+    out["braces"] = d["braces"]
+    out["sections"] = {sid: v["shape"] for sid, v in FRAME_SECTIONS.items()}
+    out["all_sizes"] = [{"id": v["id"], "name": v["name"], "family": v["family"]} for v in
+                        sorted(FRAME_SECTIONS.values(), key=lambda q: (list(FRAME_FAMILIES).index(q["family"]), q["area"]))]
+    out["chan_out"] = d["chan_out"]
+    out["family_pictures"] = {f_: next(x["shape"] for x in sorted(FRAME_SECTIONS.values(), key=lambda q: q["area"])
+                                       if x["family"] == f_ and x["h"] >= 50) for f_ in FRAME_FAMILIES}
+    return out
+
+
+FRAME_PRICE_KG = {"al6061": 11.0, "al6063": 9.5, "steel": 4.0, "tslot": 15.0}     # USD per kg, cut lengths bought retail
+FRAME_PRICE_HW = (      # what to look for in a hardware line -> USD each (bolt sets include nut, washers and sleeve)
+    ("the yaw pivot", 14.0), ("M16", 4.5), ("M12", 2.4), ("M10", 1.6), ("screw with T-nut", 1.1), ("M8", 1.0),
+    ("joining plate", 9.0), ("45 degree T-slot bracket", 6.0), ("T-slot corner bracket", 4.0), ("swivel", 18.0),
+    ("Flange", 12.0), ("pipe fitting", 14.0), ("Angle cleat", 3.0), ("Brace end bracket", 4.0), ("Welded gusset", 3.0),
+    ("plate", 2.5))
+
+
+def _frame_cost(d, fam, n, axes, model, mem, i_rated, i_stall, act, ck):
+    """A ball-park of what the parts cost (USD, retail, small quantities) - to see the size of the bill, not to quote."""
+    use = {m["id"]: m for m in mem}
+    items = []
+
+    def add(group, what, qty, each):
+        if qty > 0:
+            items.append({"group": group, "what": what, "qty": qty, "each": round(each, 2), "total": round(qty * each, 2)})
+    kg = {}
+    for mb in model["members"]:
+        m = use.get(mb["id"])
+        sec = FRAME_SECTIONS[mb["sec"]]
+        mat = "tslot" if sec["family"] == "tslot" else (m["material_id"] if m and m["material_id"] in FRAME_MATERIALS else d["material"])
+        rho = 2.70 if mat == "tslot" else FRAME_MATERIALS[mat][4]
+        kg[mat] = kg.get(mat, 0.0) + sec["area"] * rho / 1000.0 * math.dist(mb["a"], mb["b"]) / 1000.0
+    names = {"al6061": "aluminium 6061", "al6063": "aluminium 6063", "steel": "steel", "tslot": "T-slot extrusion"}
+    for mat, w in kg.items():
+        add("Frame", f"{names[mat]}, about {w * 1.1:.0f} kg with offcuts ({FRAME_PRICE_KG[mat]:.0f} USD a kg)", 1, w * 1.1 * FRAME_PRICE_KG[mat])
+    nb = cb = npl = cpl = 0.0
+    for key, q in model.get("_buy", []):
+        each = next(v for k_, v in FRAME_PRICE_HW if k_ in key) if any(k_ in key for k_, _v in FRAME_PRICE_HW) else 3.0
+        if "bolt" in key or "screw" in key:
+            nb += q; cb += q * each
+        else:
+            npl += q; cpl += q * each
+    if nb:
+        add("Fasteners", "bolts and screws with their nuts, washers, sleeves and T-nuts", int(nb), cb / nb)
+    if npl:
+        add("Fasteners", "plates, brackets and fittings for the joints", int(npl), cpl / npl)
+    add("Fasteners", "fixed wheels under the traction-loss frame", len(model.get("rollers", [])), 9.0)
+    add("Fasteners", "levelling feet", len(model.get("feet", [])), 5.0)
+    if d["drive"] == "rotary":
+        motor = {"wheelchair": 90.0, "wheelchair75": 90.0, "worm180": 75.0, "wiper": 35.0}.get(d["preset"], 40.0 + 0.25 * d["motor_w"])
+        add("Drive", "gear motor" + (" (wheelchair motors are usually bought used)" if d["preset"].startswith("wheelchair") else ""), n, motor)
+        add("Drive", "lever, push rod and two rod ends", n, 35.0)
+        add("Drive", "position sensor (pot or Hall) with its coupling", n, 10.0)
+        add("Electronics", "motor driver", n, 60.0 if i_stall > 43 else 14.0)
+        watts = d["volts"] * i_rated * n * 0.7
+        add("Electronics", f"power supply, {d['volts']:.0f} V {watts / d['volts']:.0f} A", 1, 20.0 + 0.07 * watts)
+        add("Electronics", "wiring, fuses and an emergency stop", 1, 45.0)
+    else:
+        add("Drive", f"servo motor with its drive ({act['servo_w']:.0f} W)", n, 230.0 if act["servo_w"] >= 600 else 170.0)
+        add("Drive", "actuator mechanics: ball screw, bearings, profile, coupling, printed or machined parts", n, 120.0 + 0.5 * d["travel"])
+        add("Drive", "foot or rod end under each actuator", n, 9.0)
+        add("Electronics", "mains wiring, cables and an emergency stop", 1, 70.0)
+    add("Electronics", "Arduino UNO R4 WiFi", math.ceil(n / 3), 28.0)
+    if fam == "pivot":
+        add("Joints", "universal joint or large rod end for the pivot", 1, 40.0)
+    if "surge" in axes and fam != "hexapod":
+        add("Joints", "linear rails with bearing blocks for the surge slide", 1, 120.0)
+    if fam == "hexapod":
+        add("Joints", "leg joints (universal joints or rod ends)", 12, 12.0)
+    add("Cockpit", "seat slider pair with brackets", 1, 45.0)
+    add("Cockpit", "wheel deck plate and pedal plate, 6 mm aluminium", 1, 40.0)
+    total = sum(i_["total"] for i_ in items)
+    groups = []
+    for i_ in items:
+        if i_["group"] not in groups:
+            groups.append(i_["group"])
+    r10 = lambda v: int(round(v / 10.0) * 10)
+    return {"currency": "USD", "items": items, "groups": [{"name": g_, "total": round(sum(i_["total"] for i_ in items if i_["group"] == g_))} for g_ in groups],
+            "total": r10(total), "low": r10(total * 0.75), "high": r10(total * 1.4),
+            "note": "A ball-park in US dollars for new parts bought retail in small quantities (wheelchair motors priced used). Prices move "
+                    "with the supplier, the country and the day, and scrap-yard metal or surplus motors can halve it - so read the range, "
+                    "not the middle. Not included: the seat, the steering wheel and wheelbase, the pedals, screens, tools, paint, "
+                    "shipping and tax."}
+
+
+def _frame_steps(d, fam, n, axes, travel, rng, mem, one, jmethods=(), seat=None):
+    sec = one["name"] if one else mem[0]["section_name"]
+    s = []
+    s.append(("Buy and check the parts", "Order the motors, drivers, sensors and joints first and measure them: the "
+              "shaft size, the mounting holes and the real no-load speed decide the brackets. Bench-test every motor "
+              "with its driver and the SMC3 R4 firmware before any metal is cut."))
+    s.append(("Cut the frame", f"Cut the pieces in the cut list from {sec} (or the size listed per member). Square "
+              "ends matter more than exact lengths: clamp a stop to the saw so equal pieces come out equal. Deburr, "
+              "and mark each piece. The cut list picture shows every piece to scale."))
+    if jmethods:
+        s.append(("How the pieces are joined", " ".join(FRAME_JOIN[k][1] for k in jmethods) + " The mounting hardware "
+                  "list gives the bolts, plates and brackets to buy; the pictures show a joint of each kind, and the "
+                  "assembly pictures show what to put together first."))
+    if fam == "pivot":
+        s.append(("Build the base", f"Lay the two long rails parallel, {d['spacing'] + 200:.0f} mm apart, and join them "
+                  "with the three cross-members: front, under the pivot, and at the actuators. Check the diagonals are "
+                  "equal before tightening. Add four levelling feet."))
+        if d["layout"] == "seat2":
+            s.append(("Pivot post and universal joint", f"Fix the post over the middle cross-member with gussets on all "
+                      f"four sides (its foot is a marked stress point). Bolt the universal joint on top, {d['pivot_h']:.0f} mm "
+                      "above the base, as close under the seat as it will go."))
+            s.append(("Moving frame", f"Join the spine and the actuator cross-member as a T, {d['arm']:.0f} mm from the pivot "
+                      f"plate to the cross-member and {d['spacing']:.0f} mm between the two rod ends. Gusset the T joint and the "
+                      "pivot plate: both are marked stress points."))
+            s.append(("Find the balance point", "Bolt the seat" + (" with wheel and pedals" if d["moves"] == "cockpit" else "")
+                      + " to the moving frame, sit in it on a round bar across two blocks, and slide it until it balances. "
+                      "That line goes over the universal joint (the FAQ's centre-of-gravity method)."))
+        else:
+            s.append(("Rear support", f"The platform's rear stands on one joint (a universal joint or a large rod end) "
+                      f"{d['pivot_h']:.0f} mm above the base, on the carriage the traction-loss motor slides sideways. "
+                      "Gusset its post: the foot is a marked stress point."))
+            s.append(("Moving frame", f"Make the platform from two side rails and the cross-member the lifts push on, "
+                      f"{d['arm']:.0f} mm ahead of the rear support, with {d['spacing']:.0f} mm between the two rod ends. "
+                      "Add cross-members under the seat and gusset where the rails meet the lift cross-member."))
+            s.append(("Place the weight", f"Mount the seat so the centre of gravity, with you in it, sits about "
+                      f"{d['cg_off']:.0f} mm ahead of the rear support: the lifts then carry what this design assumes. "
+                      "Weigh the front on bathroom scales under the two lift points to check."))
+    elif fam == "corner":
+        s.append(("Build the moving frame", f"Make a rectangle {d['wheelbase']:.0f} x {d['track']:.0f} mm from the side "
+                  "rails and end cross-members, check the diagonals, then add the two seat cross-members. Use corner "
+                  "gussets or brackets at every joint."))
+        s.append(("Actuator brackets", f"Fix a bracket at each of the {n if 'yaw' not in axes else 4} actuator positions, "
+                  "as close to the rail as the actuator allows: the further out, the harder the bracket and rail work."))
+        s.append(("Stand it on the actuators", "Fit a foot with a swivel under each actuator. With the frame on blocks "
+                  "at mid travel, bolt the actuators on, then lower it and check that all feet carry weight."))
+    else:
+        s.append(("Base and platform", f"Build the base as a triangle or hexagon with the six lower joints in three "
+                  f"pairs on a {d['base_r']:.0f} mm radius, and the platform the same way on {d['plat_r']:.0f} mm, turned "
+                  "60 deg so each pair on the platform sits between two pairs on the base."))
+        s.append(("Legs", "Make the six legs identical, to within a millimetre between joint centres. Fit them with the "
+                  f"platform propped at {d['hex_h']:.0f} mm, its mid height."))
+    if d["drive"] == "rotary":
+        s.append(("Motors, levers and push rods", f"Mount each motor so its lever is square to the push rod at mid travel; "
+                  f"the lever then swings +/-{d['swing']:.0f} deg for {travel:.0f} mm at the rod. Fit the position sensor "
+                  "to the lever shaft so mid travel reads the middle of its range (512), using the page's Centre the pots."))
+    else:
+        s.append(("Actuators", "Bolt each actuator's body to the moving frame, beside it, with the rod pointing down and the "
+                  "motor on top - the way SFX-100 rigs carry them. The long body then stands up beside the frame instead of "
+                  "having to fit under it, and only the rod and its foot are below. "
+                  + ("The foot stands on a floor plate. " if fam == "corner" else "The rod's end needs a rod end (ball joint) on the "
+                     "frame below, and the body bracket must let the actuator lean a little as the platform tilts. ")
+                  + f"Set it at mid travel ({travel / 2:.0f} mm out) with the rig level. Run the motor and encoder cables so "
+                  "nothing is stretched or pinched over the whole travel."))
+    if "yaw" in axes and fam != "hexapod":
+        s.append(("Traction loss", "The traction-loss frame is as long as the frame under it. Its pivot bolt goes "
+                  "through a cross-member in both frames, with a thrust bearing between them. Under the other end, fixed "
+                  "wheels ride on the lower frame's cross-member: point each wheel's axle at the pivot, so it rolls "
+                  "sideways along the arc the frame swings. The traction-loss motor pushes that end sideways through a "
+                  "rod end, square to the frame at centre. Add mechanical end stops just outside its travel."))
+    if "surge" in axes and fam != "hexapod":
+        s.append(("Surge slide", "Mount everything above on two parallel linear rails. Shim until the carriage runs "
+                  "freely over the whole travel by hand, then connect the surge motor."))
+    if seat:
+        s.append(("Seat position", seat["text"]))
+    s.append(("Wiring and a stop button", "Wire each motor to its driver with cable sized for the stall current, fuse "
+              "the supply, and put an emergency stop where you can reach it from the seat. Keep sensor cables away from "
+              "motor cables."))
+    s.append(("First movements, seat empty", "Flash the firmware, open this page, and run Seat Setup: level, find the "
+              "travel, set the end stops inside the mechanical limits. Then Auto-Tune each motor. Watch the marked "
+              "stress points while a motion preset runs in the 3D view: nothing should flex visibly or creak."))
+    s.append(("Then with a driver", "Sit in it, re-run Auto-Tune with your weight, set the park position, and start "
+              "SimHub with low gains. Re-tighten every bolt after the first hour."))
+    return [{"title": t, "text": x} for t, x in s]
+
+
+def _frame_both(v):
+    return f"{v:.0f} mm / {v / FRAME_IN:.1f} in"
+
+
+def _frame_tl_xs(d, x0, x1):
+    """Where the cross-members of the base and of the traction-loss frame go (2 lifts + traction loss):
+    one at the yaw pivot in both, one under the rollers / at the slide, one under the rear support, and one near
+    each end unless a cross-member is already there."""
+    xp, xr = d["arm"], d["arm"] - d["tl_radius"]
+
+    def closers(xs):
+        out = list(xs)
+        for xe in (x0 + 40, x1 - 40):
+            if all(abs(xe - q) > 200 for q in out):
+                out.append(xe)
+        return out
+    base = closers([xp, xr])
+    tl = [xp, 0.0] + ([xr] if abs(xr) > 80 else [])
+    return [x for x in base if x != xp], [x for x in closers(tl) if x != xp], xp, xr
+
+
+def _frame_seat(d, fam, mass, f_rated, W, ck):
+    """Where the seat goes: the seat back's lower edge, measured forwards from the pivot (or the rig's centre), so the
+    weight - driver, seat, wheel, pedals, frame - balances where the design wants it; and what sliding the seat does."""
+    k = ck["k"]
+    out = {"cg_ahead": k, "better": None, "back_x": ck["back"], "back0": ck["back0"], "slide": ck["slide"]}
+    parts = f"{d['driver_kg']:.0f} kg of driver and {ck['seat_kg']:.0f} kg of seat"
+    if ck["cock"]:
+        parts += (f", {ck['wheel_kg']:.1f} kg of wheel and wheelbase {ck['x_wheel'] - ck['back0']:.0f} mm ahead of the seat back, "
+                  f"{ck['pedal_kg']:.1f} kg of pedals {ck['x_ped'] - ck['back0']:.0f} mm ahead, and {ck['rest_kg']:.0f} kg of frame and the rest")
+    else:
+        parts += f" and {ck['rest_kg']:.0f} kg of frame (wheel and pedals stay on the floor)"
+    slid = ""
+    if abs(ck["slide"]) >= 1:
+        slid = (f" The seat is slid {abs(ck['slide']):.0f} mm {'forwards' if ck['slide'] > 0 else 'back'}: that moves the centre "
+                f"of gravity {abs(ck['shift']):.0f} mm the same way.")
+    adj = (f" A seat on its slider moves about 120 mm each way; over that the centre of gravity moves "
+           f"{120 * (d['driver_kg'] + ck['seat_kg']) / mass:.0f} mm each way, and the forces here follow it.")
+    if fam == "pivot":
+        ref = "the pivot" if d["layout"] == "seat2" else "the rear support"
+        if d["layout"] == "seat2":
+            out["better"] = 0.0
+            out["move"] = "balance it over the pivot"
+            out["why"] = ("With the centre of gravity over the pivot the motors only work when something moves. Seat back "
+                          f"about {k:.0f} mm behind the pivot.")
+        else:
+            a = d["arm"]
+            best = max(40.0, min(0.35 * a, round(0.25 * f_rated * 2 * a / W / 10.0) * 10.0))
+            out["better"] = best
+            out["move"] = f"centre of gravity {best:.0f} mm ahead of the rear support"
+            out["why"] = (f"Each lift then holds about a quarter of what it can make all day, so the platform stays down "
+                          f"on the lifts and the motors keep most of their force for moving. Now it is {d['cg_off']:.0f} mm.")
+        bx = ck["back0"]
+        out["text"] = (f"With the slider in the middle of its travel, put the seat so its back's lower edge is about {abs(bx):.0f} mm "
+                       f"({abs(bx) / FRAME_IN:.1f} in) {'behind' if bx < 0 else 'ahead of'} {ref}. That balances {parts}, so the "
+                       f"centre of gravity is {abs(d['cg_off']):.0f} mm {'ahead of' if d['cg_off'] >= 0 else 'behind'} {ref}, as this design assumes"
+                       + (f" (best: {out['move']})" if abs(out["better"] - d["cg_off"]) > 40 else "") + "." + slid + adj
+                       + " Check it: " + ("balance the loaded rig on a round bar." if d["layout"] == "seat2" else
+                                          "weigh the front on scales under the two lift points."))
+    else:
+        out["text"] = (f"Centre the weight between the actuators: with the slider in the middle of its travel, the seat back's "
+                       f"lower edge about {k:.0f} mm ({k / FRAME_IN:.1f} in) behind the middle of the rig, as low as it will go. "
+                       f"That balances {parts}." + slid + adj + " Check with scales under the feet.")
+    return out
+
+
+def _frame_box(items, cw=24):
+    xs, ys = [], []
+    for it in items:
+        if it["t"] == "line":
+            xs += [it["x1"], it["x2"]]; ys += [it["y1"], it["y2"]]
+        elif it["t"] == "rect":
+            xs += [it["x"], it["x"] + it["w"]]; ys += [it["y"], it["y"] + it["h"]]
+        elif it["t"] == "poly":
+            xs += [q[0] for q in it["pts"]]; ys += [q[1] for q in it["pts"]]
+        elif it["t"] == "text":
+            wd = len(it["s"]) * cw
+            xs += [it["x"] - (wd if it["a"] == "end" else wd / 2 if it["a"] == "middle" else 0),
+                   it["x"] + (wd if it["a"] == "start" else wd / 2 if it["a"] == "middle" else 0)]
+            ys += [it["y"] - 30, it["y"] + 40]
+        else:
+            lab = len(it.get("label", "")) * 24
+            xs += [it["x"] - 60, it["x"] + 60 + lab]; ys += [it["y"] - 60, it["y"] + 60]
+    return [min(xs) - 60, min(ys) - 60, max(xs) + 60, max(ys) + 60]
+
+
+def _frame_drawings(d, fam, geo, mem, travel, seat, ck):
+    """Top, side and front views as plain shapes (mm; x forwards, y to the left, z up), drawn by the page and the PDF:
+    members at their true width, motors and actuators drawn, arrows for what moves, and the main distances."""
+    top, side, front = [], [], []
+    rotary = d["drive"] == "rotary"
+    half = travel / 2.0
+    sec = {m["id"]: FRAME_SECTIONS[m["section"]]["shape"] for m in mem}
+    first = next(iter(sec.values()))
+
+    def sec_id(mid):
+        return next((m["section"] for m in mem if m["id"] == mid), mem[0]["section"])
+
+    def wid(mid, deep=False):
+        sh = sec.get(mid, first)
+        return max(sh["h"] if deep else sh["b"], 18.0)
+
+    def line(v, x1, y1, x2, y2, c, w=6, mm=None):
+        v.append({"t": "line", "x1": x1, "y1": y1, "x2": x2, "y2": y2, "c": c, "w": w, "mm": mm})
+
+    def rect(v, x, y, w, h, c, fill=False):
+        v.append({"t": "rect", "x": x, "y": y, "w": w, "h": h, "c": c, "fill": fill})
+
+    def dot(v, x, y, r, c, label="", fill=True):
+        v.append({"t": "dot", "x": x, "y": y, "r": r, "c": c, "label": label, "fill": fill})
+
+    def text(v, x, y, s_, c="text", anchor="middle"):
+        v.append({"t": "text", "x": x, "y": y, "s": s_, "c": c, "a": anchor})
+
+    def poly(v, pts, c, w=3, fill=False):
+        v.append({"t": "poly", "pts": [[round(px, 1), round(py, 1)] for px, py in pts], "c": c, "w": w, "fill": fill})
+
+    def head(v, x, y, ang, c, size=34.0):
+        a1, a2 = ang + math.radians(152), ang - math.radians(152)
+        poly(v, [(x, y), (x + size * math.cos(a1), y + size * math.sin(a1)), (x + size * math.cos(a2), y + size * math.sin(a2))], c, 1, True)
+
+    def arrow(v, x1, y1, x2, y2, label="", c="move"):
+        line(v, x1, y1, x2, y2, c, 3)
+        ang = math.atan2(y2 - y1, x2 - x1)
+        head(v, x2, y2, ang, c); head(v, x1, y1, ang + math.pi, c)
+        if label:
+            text(v, (x1 + x2) / 2 + 26 * abs(math.sin(ang)), (y1 + y2) / 2 + 40 * abs(math.cos(ang)), label, c,
+                 "start" if abs(math.sin(ang)) > 0.5 else "middle")
+
+    def arc(v, cx, cy, r, a0, a1, label="", c="move"):
+        n = max(6, int(abs(a1 - a0) / 6))
+        pts = [(cx + r * math.cos(math.radians(a0 + (a1 - a0) * i / n)), cy + r * math.sin(math.radians(a0 + (a1 - a0) * i / n)))
+               for i in range(n + 1)]
+        poly(v, pts, c, 3)
+        sgn = 1 if a1 > a0 else -1
+        head(v, pts[-1][0], pts[-1][1], math.radians(a1 + sgn * 90), c); head(v, pts[0][0], pts[0][1], math.radians(a0 - sgn * 90), c)
+        if label:
+            am = math.radians((a0 + a1) / 2)
+            text(v, cx + (r + 55) * math.cos(am), cy + (r + 55) * math.sin(am), label, c,
+                 "start" if math.cos(am) > 0.3 else "end" if math.cos(am) < -0.3 else "middle")
+
+    def dimh(v, x1, x2, y, label):
+        line(v, x1, y, x2, y, "dim", 1.5)
+        for x in (x1, x2):
+            line(v, x, y - 28, x, y + 28, "dim", 1.5)
+        text(v, (x1 + x2) / 2, y - 62 if y < 0 else y + 48, label, "dim")
+
+    def dimv(v, x, y1, y2, label, anchor="start"):
+        line(v, x, y1, x, y2, "dim", 1.5)
+        for y in (y1, y2):
+            line(v, x - 28, y, x + 28, y, "dim", 1.5)
+        text(v, x + (30 if anchor == "start" else -30), (y1 + y2) / 2, label, "dim", anchor)
+
+    def ujoint(v, x, y, label):
+        dot(v, x, y, 40, "pivot", "", False)
+        line(v, x - 40, y, x + 40, y, "pivot", 4); line(v, x, y - 40, x, y + 40, "pivot", 4)
+        dot(v, x, y, 12, "pivot", label)
+
+    def motor_top(v, x, y, out_, label):
+        """From above: a lever motor lying across the rig, or an actuator standing up."""
+        if rotary:
+            rect(v, x - 45, y + (35 if out_ > 0 else -185), 90, 150, "motor", True)       # the motor can
+            rect(v, x - 60, y - 55, 120, 110, "motor")                                    # its gearbox
+            dot(v, x, y, 16, "motor", label)
+        else:
+            rect(v, x - 50, y - 50, 100, 100, "motor")
+            dot(v, x, y, 30, "motor", label)
+
+    def motor_side(v, xa, z_top, toward, label, z0=0.0, say=True):
+        """From the side (or the front): the lever motor with its lever, push rod and swing; or the actuator and its travel."""
+        if rotary:
+            zs = z0 + 95
+            xs = xa - toward * d["ctc"]
+            rect(v, xs - 60, zs - 60, 120, 120, "motor")
+            rect(v, xs - toward * 60 - (150 if toward > 0 else 0), zs - 40, 150, 80, "motor", True)
+            line(v, xs, zs, xa, zs, "motor", 9)                                           # the lever, square to the rod
+            line(v, xa, zs, xa, z_top, "motor", 4)                                        # the push rod
+            dot(v, xa, zs, 11, "motor"); dot(v, xa, z_top, 11, "motor"); dot(v, xs, zs, 14, "motor", "")
+            a_mid = 0 if toward > 0 else 180
+            arc(v, xs, zs, d["ctc"] + 70, a_mid - d["swing"], a_mid + d["swing"])
+            if say:
+                text(v, xa + toward * 150, zs - 20, f"lever {d['ctc']:.0f} mm, +/-{d['swing']:.0f} deg", "move", "start" if toward > 0 else "end")
+        else:
+            body = travel + 90                                                            # hung from the frame, rod down
+            xb = xa + toward * 80
+            rect(v, xb - 34, z_top - 30, 68, body, "motor")
+            rect(v, xb - 34, z_top - 30 + body, 68, 80, "motor", True)                    # the servo on top
+            rect(v, min(xa, xb) - (0 if toward > 0 else 40), z_top - 28, 80 + 40, 56, "sub")   # its mounting bracket
+            line(v, xb, z0, xb, z_top - 30, "motor", 7)
+            rect(v, xb - 45, z0, 90, 16, "motor", True)                                   # its foot
+            line(v, xa, z_top, xb, z_top, "motor", 6)                                     # the bracket to the frame
+        arrow(v, xa + toward * 110, z_top - half, xa + toward * 110, z_top + half)
+        if say:
+            text(v, xa + toward * 150, z_top + 20, f"travel {_frame_both(travel)}", "move", "start" if toward > 0 else "end")
+        if label:
+            text(v, xa, z0 - 55, label, "text")
+
+    wheel_hw = next((m["L_full"] for m in mem if m["id"] == "wheelp"), ck["wheel_h"])
+    gear_col = "moving" if ck["cock"] else "base"       # wheel and pedals ride on the moving frame, or stand on the base
+
+    def cockpit_top(yr, yp, yu):
+        """The seat's cross-members and slider, the pedal deck and the wheel deck, from above."""
+        for xs in ck["seat_xs"]:
+            line(top, xs, -yr, xs, yr, "moving", 6, wid("seatx"))
+        for sy in (-170, 170):
+            line(top, ck["back0"] + 20, sy, ck["back0"] + 480, sy, "dim", 4)
+        for xs in ck["ped_xs"]:
+            line(top, xs, -yp, xs, yp, gear_col, 5, wid("seatx"))
+        rect(top, ck["ped_xs"][0] - 30, -190, 260, 380, "seat")
+        text(top, ck["x_ped"], 215, "pedals", "dim")
+        for sy in (-yu, yu):                                    # the deck frame: two arms, two cross-members
+            line(top, ck["x_up"] - 110, sy, ck["x_up"] + 210, sy, gear_col, 5, wid("deck"))
+        for xd in (ck["x_up"] - 110, ck["x_up"] + 210):
+            line(top, xd, -yu, xd, yu, gear_col, 5, wid("deck"))
+        rect(top, ck["x_up"] - 100, -70, 300, 140, "seat")
+        line(top, ck["x_up"] - 190, -160, ck["x_up"] - 190, 160, "seat", 9)
+        text(top, ck["x_up"] + 50, -125, "wheel", "dim")
+
+    def cockpit_side(z, deep, gz=None, gdeep=None):
+        """The seat raised on its slider, the wheel on its deck and the pedals, from the side (gz: where the wheel's
+        uprights stand, when that is not the moving frame)."""
+        zs = z + deep / 2 + 55
+        sb = seat["back_x"]
+        rect(side, ck["back0"] + 20, z + deep / 2, 460, 28, "dim", True)
+        rect(side, sb, zs, 500, 110, "seat"); rect(side, sb, zs + 110, 110, 520, "seat")
+        text(side, sb + 55, zs + 670, "seat, on its slider", "dim")
+        gz = z if gz is None else gz
+        gd = deep if gdeep is None else gdeep
+        zw = gz + wheel_hw
+        line(side, ck["x_up"], gz, ck["x_up"], zw, gear_col, 7, wid("wheelp"))
+        line(side, ck["x_up"] - 110, zw, ck["x_up"] + 210, zw, gear_col, 7, wid("deck", True))
+        rect(side, ck["x_up"] - 100, zw + 26, 300, 110, "seat")
+        line(side, ck["x_up"] - 220, zw - 60, ck["x_up"] - 160, zw + 240, "seat", 9)
+        text(side, ck["x_up"] + 70, zw + 190, "wheel", "dim", "start")
+        line(side, ck["x_ped"] - 90, gz + gd / 2, ck["x_ped"] + 110, gz + gd / 2, "seat", 6)
+        line(side, ck["x_ped"] + 60, gz + gd / 2, ck["x_ped"] - 20, gz + gd / 2 + 250, "seat", 9)
+        text(side, ck["x_ped"] + 90, gz + gd / 2 + 150, "pedals", "dim", "start")
+
+    axes = FRAME_LAYOUTS[d["layout"]][3]
+    zt = 0.0
+    if fam == "pivot":
+        seat2 = d["layout"] == "seat2"
+        sx = -1 if seat2 else 1
+        a, b, ph = d["arm"], d["spacing"], d["pivot_h"]
+        x0, x1, xmr, xmf = _frame_pivot_x(d, ck)
+        bw = b / 2 + 100
+        zt = (FRAME_SECTIONS[sec_id("rails")]["shape"]["h"] / 2 + FRAME_SECTIONS[sec_id("tl")]["shape"]["h"] / 2 + 45) if "yaw" in axes else 0.0
+        # top
+        for yy in (-bw, bw):
+            line(top, x0, yy, x1, yy, "base", 6, wid("rails"))
+        if not zt:
+            for xc in (x0 + 40, 0, sx * a):
+                line(top, xc, -bw, xc, bw, "base", 5, wid("rails"))
+        else:
+            bxs, txs, xp_, xr_ = _frame_tl_xs(d, x0, x1)
+            for xc in bxs:
+                line(top, xc, -bw, xc, bw, "base", 5, wid("rails"))
+            line(top, xp_, -bw, xp_, bw, "base", 5, wid("pivx"))
+            line(top, xr_, -bw - 330, xr_, -bw, "base", 5, wid("rails"))            # the traction-loss motor stands on this
+            for yy in (-b / 2 - 40, b / 2 + 40):
+                line(top, x0, yy, x1, yy, "sub", 6, wid("tl"))
+            for xc in txs:
+                line(top, xc, -b / 2 - 40, xc, b / 2 + 40, "sub", 6, wid("tl"))
+            line(top, xp_, -b / 2 - 40, xp_, b / 2 + 40, "sub", 6, wid("pivx"))
+        if seat2:
+            line(top, xmr, 0, xmf, 0, "moving", 9, wid("spine"))
+            cockpit_top(220, 180 if ck["cock"] else bw, 150 if ck["cock"] else 200)
+            line(top, ck["x_up"], -(150 if ck["cock"] else bw), ck["x_up"], 150 if ck["cock"] else bw, gear_col, 5, wid("wheelp"))
+        else:
+            for s_ in (-1, 1):
+                line(top, xmr, s_ * (b / 2 - 60), xmf, s_ * (b / 2 - 60), "moving", 9, wid("spine"))
+            line(top, 0, -b / 2 + 60, 0, b / 2 - 60, "moving", 7, wid("cross"))
+            cockpit_top(b / 2 - 60, b / 2 - 60, b / 2 - 60)
+        line(top, sx * a, -b / 2, sx * a, b / 2, "moving", 9, wid("cross"))
+        seat_x = seat["back_x"]
+        rect(top, seat_x, -250, 500, 500, "seat")
+        text(top, seat_x + 250, -215, "seat", "dim")
+        line(top, seat_x, -250, seat_x, 250, "seat", 5)
+        ujoint(top, 0, 0, "pivot" if seat2 else "rear support")
+        for s_ in (-1, 1):
+            motor_top(top, sx * a, s_ * b / 2, s_, "M1" if s_ > 0 else "M2")
+        text(top, x1 + 60, bw + 60, "front >", "dim", "start")
+        dimh(top, 0, sx * a, -bw - 250, f"{'pivot' if seat2 else 'rear support'} to the actuators {_frame_both(a)}")
+        dimv(top, (x1 if sx > 0 else x0) + sx * 130, -b / 2, b / 2, _frame_both(b), "start" if sx > 0 else "end")
+        if "yaw" in axes:
+            R = d["tl_radius"]
+            xr = sx * a - sx * R
+            dot(top, sx * a, 0, 22, "pivot", "yaw pivot")
+            arrow(top, xr - 110, -150, xr - 110, 150)
+            text(top, xr - 110, 190, f"yaw {2 * math.degrees(math.atan(half / R)):.1f} deg in total", "move", "end" if sx > 0 else "start")
+            rect(top, xr - 60, -b / 2 - 235, 120, 110, "motor"); rect(top, xr - 45, -b / 2 - 385, 90, 150, "motor", True)
+            line(top, xr, -b / 2 - 180, xr, 0, "motor", 4)
+            text(top, xr + 80, -b / 2 - 300, "M3 slides the rear sideways", "text", "start")
+            dimh(top, min(xr, sx * a), max(xr, sx * a), bw + 150, f"yaw pivot to the slide {_frame_both(R)}")
+        # side
+        line(side, x0, 0, x1, 0, "base", 9, wid("rails", True))
+        if zt:
+            line(side, x0, zt, x1, zt, "sub", 9, wid("tl", True))
+            line(side, sx * a, -wid("rails", True) / 2, sx * a, zt + wid("tl", True) / 2, "pivot", 7)       # the yaw pivot bolt, through both
+            rz = wid("tl", True) / 2
+            dot(side, sx * a - sx * d["tl_radius"], zt - rz - (zt - rz - wid("rails", True) / 2) / 2, (zt - rz - wid("rails", True) / 2) / 2, "text", "", False)
+            text(side, x0 - 20, zt, "traction-loss frame", "dim", "end"); text(side, x0 - 20, 0, "base", "dim", "end")
+        ph0, ph = ph, ph + zt
+        line(side, 0, zt, 0, ph, "sub" if zt else "base", 9, wid("post"))
+        for sgn, col in ((1, "ghost"), (-1, "ghost")):
+            line(side, 0, ph, sx * a, ph + sgn * half, col, 3)
+        line(side, xmr, ph, xmf, ph, "moving", 9, wid("spine", True))
+        if seat2 and not ck["cock"]:
+            cockpit_side(ph, wid("spine", True), 0.0, wid("rails", True))
+        else:
+            cockpit_side(ph, wid("spine", True))
+        motor_side(side, sx * a, ph, sx, "motor, lever and push rod" if rotary else "actuator", zt)
+        ujoint(side, 0, ph, "universal joint" if seat2 else "rear support joint")
+        cgx, cgz = ck["cg"], ph + d["cg_h"]
+        dot(side, cgx, cgz, 26, "dim", "", False); line(side, cgx - 26, cgz, cgx + 26, cgz, "dim", 2); line(side, cgx, cgz - 26, cgx, cgz + 26, "dim", 2)
+        text(side, cgx, cgz + 60, "centre of gravity", "dim")
+        text(side, sx * a * 0.5, ph + half + 130, f"pitch {2 * math.degrees(geo['th_p']):.1f} deg in total", "move")
+        dimh(side, 0, sx * a, -150, _frame_both(a))
+        dimv(side, -sx * 120, zt, ph, _frame_both(ph0), "end" if sx > 0 else "start")
+        if d["cg_h"] > 30:
+            dimv(side, cgx - sx * 190, ph, cgz, f"{d['cg_h']:.0f} mm", "end" if sx > 0 else "start")
+        if abs(cgx) > 30:
+            dimh(side, 0, cgx, cgz + 110, f"{abs(cgx):.0f} mm")
+        # front
+        line(front, -bw, 0, bw, 0, "base", 9, wid("rails", True))
+        if zt:
+            line(front, -b / 2 - 60, zt, b / 2 + 60, zt, "sub", 9, wid("tl", True))
+        line(front, 0, zt, 0, ph, "sub" if zt else "base", 9, wid("post"))
+        for sgn, col in ((1, "ghost"), (-1, "ghost"), (0, "moving")):
+            line(front, -b / 2, ph - sgn * half, b / 2, ph + sgn * half, col, 9 if sgn == 0 else 3, wid("cross", True) if sgn == 0 else None)
+        motor_side(front, -b / 2, ph, -1, "M2", zt, say=False); motor_side(front, b / 2, ph, 1, "M1", zt)
+        ujoint(front, 0, ph, "")
+        rect(front, -250, ph + 40, 500, 420, "seat"); text(front, 0, ph + 250, "seat", "dim")
+        arc(front, 0, ph, 330, 90 - 14, 90 + 14, f"roll {2 * math.degrees(geo['th_r']):.1f} deg in total")
+        dimh(front, -b / 2, b / 2, -150, _frame_both(b))
+    elif fam == "corner":
+        L, B, nl = d["wheelbase"], d["track"], geo["nl"]
+        hgt = 300 + travel
+        cxr, cxf = min(-L / 2 - 50, ck["rear"]), max(L / 2 + 50, ck["front"])
+        for yy in (-B / 2, B / 2):
+            line(top, cxr, yy, cxf, yy, "moving", 9, wid("side"))
+        for xc in (-L / 2, L / 2):
+            line(top, xc, -B / 2, xc, B / 2, "moving", 6, wid("seatx"))
+        cockpit_top(B / 2, B / 2, B / 2)
+        rect(top, seat["back_x"], -250, 500, 500, "seat")
+        text(top, seat["back_x"] + 250, -215, "seat", "dim")
+        line(top, seat["back_x"], -250, seat["back_x"], 250, "seat", 5)
+        pts = [(L / 2, B / 2), (L / 2, -B / 2)] + ([(-L / 2, 0)] if nl == 3 else [(-L / 2, B / 2), (-L / 2, -B / 2)])
+        for i, (px, py) in enumerate(pts):
+            motor_top(top, px, py, 1 if py >= 0 else -1, f"M{i + 1}")
+        text(top, L / 2, -B / 2 - 420, "front >", "dim", "end")
+        dimh(top, -L / 2, L / 2, -B / 2 - 330, f"front to rear {_frame_both(L)}")
+        dimv(top, L / 2 + 230, -B / 2, B / 2, _frame_both(B))
+        if "yaw" in axes:
+            dot(top, L / 2 + 90, 0, 22, "pivot", "yaw pivot")
+            rect(top, -L / 2 - 170, -B / 2 - 235, 120, 110, "motor"); rect(top, -L / 2 - 155, -B / 2 - 385, 90, 150, "motor", True)
+            line(top, -L / 2 - 110, -B / 2 - 180, -L / 2 - 110, 0, "motor", 4)
+            text(top, -L / 2 - 30, -B / 2 - 300, "M5 swings the rear", "text", "start")
+            arrow(top, -L / 2 - 200, -150, -L / 2 - 200, 150)
+            text(top, -L / 2 - 230, 190, f"yaw {2 * math.degrees(math.atan(half / L)):.1f} deg in total", "move", "end")
+        if "surge" in axes:
+            rect(top, -L / 2 - 260, -B / 2 - 150, L + 520, B + 300, "base")
+            rect(top, -L / 2 - 480, B / 2 - 60, 150, 110, "motor", True); text(top, -L / 2 - 405, B / 2 + 90, "M6 (surge)", "text")
+            arrow(top, -250, B / 2 + 230, 250, B / 2 + 230, "surge")
+        # side
+        line(side, -L / 2 - 120, 0, L / 2 + 120, 0, "base", 4)
+        line(side, -L / 2, hgt - half, L / 2, hgt + half, "ghost", 3)
+        line(side, cxr, hgt, cxf, hgt, "moving", 9, wid("side", True))
+        motor_side(side, -L / 2, hgt, -1, "", say=False); motor_side(side, L / 2, hgt, 1, "motor, lever and push rod" if rotary else "actuator")
+        cockpit_side(hgt, wid("side", True))
+        arrow(side, cxr - 120, hgt + 250, cxr - 120, hgt + 250 + max(travel, 80), f"heave {travel:.0f} mm")
+        text(side, L * 0.25, hgt + half + 110, f"pitch {2 * math.degrees(math.atan(travel / L)):.1f} deg in total", "move")
+        dimh(side, -L / 2, L / 2, -150, _frame_both(L))
+        dimv(side, -L / 2 - 330, 0, hgt, _frame_both(hgt), "end")
+        # front
+        line(front, -B / 2 - 120, 0, B / 2 + 120, 0, "base", 4)
+        for sgn, col in ((1, "ghost"), (-1, "ghost"), (0, "moving")):
+            line(front, -B / 2, hgt - sgn * half, B / 2, hgt + sgn * half, col, 9 if sgn == 0 else 3, wid("seatx", True) if sgn == 0 else None)
+        motor_side(front, -B / 2, hgt, -1, "M2", say=False); motor_side(front, B / 2, hgt, 1, "M1")
+        rect(front, -250, hgt + 40, 500, 420, "seat"); text(front, 0, hgt + 250, "seat", "dim")
+        arc(front, 0, hgt, 330, 90 - 14, 90 + 14, f"roll {2 * math.degrees(math.atan(travel / B)):.1f} deg in total")
+        dimh(front, -B / 2, B / 2, -150, _frame_both(B))
+    else:
+        rb, rp, hh = d["base_r"], d["plat_r"], d["hex_h"]
+        bp = [(rb * math.cos(math.radians(a_)), rb * math.sin(math.radians(a_))) for c in (0, 120, 240) for a_ in (c - 12, c + 12)]
+        pp = [(rp * math.cos(math.radians(a_)), rp * math.sin(math.radians(a_))) for c in (60, 180, 300) for a_ in (c - 12, c + 12)]
+        for i in range(6):
+            line(top, bp[i][0], bp[i][1], bp[(i + 1) % 6][0], bp[(i + 1) % 6][1], "base", 6, wid("plat"))
+            line(top, pp[i][0], pp[i][1], pp[(i + 1) % 6][0], pp[(i + 1) % 6][1], "moving", 8, wid("plat"))
+        order = [(1, 0), (2, 1), (3, 2), (4, 3), (5, 4), (0, 5)]
+        for i, (bi, pi_) in enumerate(order):
+            line(top, bp[bi][0], bp[bi][1], pp[pi_][0], pp[pi_][1], "motor", 7)
+            rect(top, bp[bi][0] - 40, bp[bi][1] - 40, 80, 80, "motor", True)
+            text(top, bp[bi][0] * 1.16, bp[bi][1] * 1.16, f"M{i + 1}", "text")
+        for sy in (-200, 200):
+            line(top, ck["rear"], sy, ck["front"], sy, "moving", 7, wid("side"))
+        cockpit_top(200, 200, 200)
+        rect(top, seat["back_x"], -250, 500, 500, "seat"); text(top, seat["back_x"] + 250, -215, "seat", "dim")
+        text(top, rb, -rb - 160, "front >", "dim", "end")
+        line(top, 0, 0, rb, 0, "dim", 1.5); text(top, rb * 0.55, 45, f"base {_frame_both(rb)}", "dim")
+        line(top, 0, 0, pp[2][0] * 0.98, pp[2][1] * 0.98, "dim", 1.5); text(top, pp[2][0] * 0.5 - 30, pp[2][1] * 0.5 + 60, f"platform {rp:.0f} mm", "dim")
+        arc(top, 0, 0, rp * 0.45, 60, 120, "yaw")
+        line(side, -rb, 0, rb, 0, "base", 8, wid("plat", True))
+        line(side, -rp, hh, rp, hh, "moving", 9, wid("plat", True))
+        for xb, xp in ((-rb, -rp * 0.5), (-rb * 0.4, -rp), (rb * 0.4, rp), (rb, rp * 0.5)):
+            line(side, xb, 0, xp, hh, "motor", 7)
+            rect(side, xb - 40, 0, 80, 60, "motor", True)
+        zr_ = hh + wid("plat", True) / 2 + wid("side", True) / 2
+        line(side, ck["rear"], zr_, ck["front"], zr_, "moving", 7, wid("side", True))
+        cockpit_side(zr_, wid("side", True))
+        arrow(side, rp + 150, hh - half, rp + 150, hh + half, f"heave {travel / math.cos(geo['beta']):.0f} mm")
+        dimv(side, -rb - 150, 0, hh, _frame_both(hh), "end")
+        text(side, 0, -90, f"legs lean {math.degrees(geo['beta']):.0f} deg at mid height", "dim")
+    # stress markers
+    lift = zt if fam == "pivot" else 0.0
+    for m in mem:
+        v, x, y = m["mark"]
+        if v == "side" and lift and m["id"] in ("post", "wheelp", "deck"):
+            y += lift
+        col = "bad" if m["util"] > 1.0 else "warn" if m["util"] > 0.8 else "ok"
+        (top if v == "top" else side).append({"t": "stress", "x": x, "y": y, "c": col, "label": f"{m['util'] * 100:.0f}%",
+                                              "id": m["id"]})
+        del m["mark"]
+
+    box = _frame_box
+    out = {"top": {"title": "Top view", "box": box(top), "items": top},
+           "side": {"title": "Side view", "box": box(side), "items": side}}
+    if front:
+        out["front"] = {"title": "Front view", "box": box(front), "items": front}
+    return out
+
+
+def _frame_model3d(d, fam, geo, mem, travel, ranges, f_des=0.0, seat=None, ck=None):
+    """The rig as 3D pieces for the page's test view (mm; x forwards, y to the left, z up).  Groups nest
+    base > surge > yaw > tilt; each group turns or slides about its 'pivot'."""
+    use = {m["id"]: m for m in mem}
+    first = mem[0]["section"]
+    members, acts, mounts = [], [], []
+
+    def bar(group, a, b, mid=None, sec=None, bow=(0, 0, -1), fix="a", nm=None):
+        m = use.get(mid)
+        mb = {"g": group, "a": [round(v, 1) for v in a], "b": [round(v, 1) for v in b], "id": mid,
+              "sec": sec or (m["section"] if m else first), "bow": list(bow), "fix": fix,
+              "nm": nm or FRAME_SHORT.get(mid, "cross-member"), "model": m["model"] if m else "simple"}
+        if isinstance(fix, float):                 # held part-way along (a rail that runs on past its support)
+            mb["fix"], mb["fx"] = "t", round(min(1.0, max(0.0, fix)), 4)
+        members.append(mb)
+
+    def seat_part(z, sec_main, yseat):
+        """Two cross-members under the seat with the slider on them (z: the moving frame's centre height)."""
+        deep = FRAME_SECTIONS[sec_main]["shape"]["h"]
+        sxs = use["seatx"]["section"] if "seatx" in use else sec_main
+        skip = [mb["a"][0] for mb in members if mb["g"] == "tilt" and abs(mb["a"][0] - mb["b"][0]) < 1 and abs(mb["a"][2] - z) < 1]
+        for xs in ck["seat_xs"]:
+            if all(abs(xs - q) > 70 for q in skip):
+                bar("tilt", (xs, -yseat, z), (xs, yseat, z), "seatx", fix="mid")
+        zs = z + deep / 2
+        out["cockpit"] = {"slide": ck["slide"], "rail": [ck["back0"] + 20, ck["back0"] + 480, 170.0, zs], "wheel": None, "pedals": None}
+        out["seat"] = [ck["back0"] + 250, 0, zs + 55]
+        seat_n = (d["driver_kg"] + d["seat_kg"]) * FRAME_G * (1 + d["accel"] / FRAME_G)
+        for xs in ck["seat_xs"]:
+            for sy in (-170.0, 170.0):
+                mounts.append({"g": "tilt", "p": [round(xs, 1), sy, zs], "name": "Seat slider on the seat cross-members", "V": seat_n / 4.0,
+                               "M": 0.0, "sec": sxs, "kind": "plate", "nrm": [0, 0, 1], "flag": "bare"})
+        return zs, sxs
+
+    def gear_part(g, z, top_z, ys, yped, sec_ped, foot_bar=False):
+        """The pedal deck and the wheel on its own deck frame, in group g: two uprights, an arm along the top of each
+        and a cross-member at each end of the arms, so the long wheelbase lies on a frame and not on one bar."""
+        skip = [mb["a"][0] for mb in members if mb["g"] == g and abs(mb["a"][0] - mb["b"][0]) < 1 and abs(mb["a"][2] - z) < 1]
+        for xs in ck["ped_xs"]:
+            if all(abs(xs - q) > 70 for q in skip):
+                bar(g, (xs, -yped, z), (xs, yped, z), None, sec_ped, nm="pedal deck cross-member")
+        ws, ds = use["wheelp"]["section"], use["deck"]["section"]
+        zw = z + use["wheelp"]["L_full"]
+        xu, yu = ck["x_up"], max(ys)
+        if foot_bar:
+            fw = yu if foot_bar is True else foot_bar
+            bar(g, (xu, -fw, z), (xu, fw, z), None, ws, nm="upright foot cross-member")
+        for yy in ys:
+            bar(g, (xu, yy, z), (xu, yy, zw), "wheelp", bow=(1, 0, 0))
+            bar(g, (xu - 110, yy, zw), (xu + 210, yy, zw), "deck", fix=110.0 / 320.0)
+        for xd in (xu - 110, xu + 210):
+            bar(g, (xd, -yu, zw), (xd, yu, zw), None, ds, nm="wheel deck cross-member")
+        dh = FRAME_SECTIONS[ds]["shape"]["h"] / 2
+        out["cockpit"]["wheel"] = {"p": [xu + 50, 0, zw + dh], "kg": d["wheel_kg"], "g": g, "deck": [340, 2 * yu + 40]}
+        out["cockpit"]["pedals"] = {"p": [ck["x_ped"], 0, top_z], "kg": d["pedal_kg"], "g": g}
+        for sy in (-yu, yu):
+            mounts.append({"g": g, "p": [xu + 50, sy, zw], "name": "Wheel deck plate on the deck frame", "V": (350.0 + d["wheel_kg"] * FRAME_G) / 2,
+                           "M": 0.0, "sec": ds, "kind": "plate", "nrm": [0, 0, 1], "flag": "bare"})
+        mounts.append({"g": g, "p": [ck["x_ped"], 0, top_z], "name": "Pedal plate on the pedal deck", "V": 600.0,
+                       "M": 0.0, "sec": sec_ped, "kind": "plate", "nrm": [0, 0, 1], "flag": "bare"})
+
+    def act(name, axis, group, base, top, direction, flip=False, to=(0, 0)):
+        acts.append({"name": name, "axis": axis, "g": group, "base": [round(v, 1) for v in base],
+                     "top": [round(v, 1) for v in top], "dir": direction, "flip": flip, "to": [round(to[0], 1), round(to[1], 1)]})
+    lin = d["drive"] == "linear"         # a screw actuator hangs from the moving frame, beside it, rod down (the SFX-100 way)
+
+    def mount(group, p, name, load, sec, moment=0.0, kind="plate", nrm=(0, 0, 1)):
+        mounts.append({"g": group, "p": [round(v, 1) for v in p], "name": name, "V": load, "M": moment, "sec": sec,
+                       "kind": kind, "nrm": list(nrm)})
+
+    axes = FRAME_LAYOUTS[d["layout"]][3]
+    half = travel / 2.0
+    rng = {r["name"].split(" ")[0].lower(): r["range"] / 2.0 for r in ranges}
+    out = {"family": fam, "layout": d["layout"], "drive": d["drive"], "ctc": d["ctc"], "swing": d["swing"], "travel": travel,
+           "axes": axes, "limits": {k: rng.get(k, 0.0) for k in ("pitch", "roll", "yaw", "heave", "surge")},
+           "pivots": {}, "members": members, "acts": acts, "mounts": mounts, "feet": [], "rollers": []}
+    back = seat["back_x"] if seat else -250.0
+    tlf = max((e_["need"] if isinstance(e_, dict) else 0.0) for e_ in [{}]) if False else 0.0
+    if "pivx" in use:
+        tlf = use["pivx"]["P"]
+
+    def roller(p, pivot, r=22.5):
+        ux, uy = p[0] - pivot[0], p[1] - pivot[1]
+        ln = math.hypot(ux, uy) or 1.0
+        out["rollers"].append({"p": [round(v, 1) for v in p], "ax": [round(ux / ln, 4), round(uy / ln, 4)], "r": r})
+
+    if fam == "pivot":
+        seat2 = d["layout"] == "seat2"
+        sx = -1 if seat2 else 1
+        a, b, ph = d["arm"], d["spacing"], d["pivot_h"]
+        x0, x1, xmr, xmf = _frame_pivot_x(d, ck)
+        bw = b / 2 + 100
+        rs = use["rails"]["section"]
+        hr = FRAME_SECTIONS[rs]["shape"]["h"]
+        yaw = "yaw" in axes
+        ht = FRAME_SECTIONS[use["tl"]["section"]]["shape"]["h"] if yaw else 0.0
+        zt = (hr / 2 + ht / 2 + 45) if yaw else 0.0
+        for yy in (-bw, bw):
+            bar("base", (x0, yy, 0), (x1, yy, 0), "rails")
+            out["feet"] += [[x0 + 30, yy, -hr / 2], [x1 - 30, yy, -hr / 2]] + ([[(x0 + x1) / 2, yy, -hr / 2]] if "rails" in d["braces"] else [])
+        if not yaw:
+            for xc in (x0 + 40, 0, sx * a):
+                bar("base", (xc, -bw, 0), (xc, bw, 0), None, rs, nm="base cross-member")
+        else:                                      # the traction-loss frame rides above the base, as long as the base
+            bxs, txs, xp, xr = _frame_tl_xs(d, x0, x1)
+            ts, yt = use["tl"]["section"], b / 2 + 40
+            for xc in bxs:
+                bar("base", (xc, -bw, 0), (xc, bw, 0), None, rs, nm="base cross-member")
+            bar("base", (xp, -bw, 0), (xp, bw, 0), "pivx", bow=(1, 0, 0))
+            bar("base", (xr, -bw - 330, 0), (xr, -bw, 0), None, rs, nm="traction-loss motor mount (base)")
+            for s_ in (-1, 1):
+                bar("yaw", (x0, s_ * yt, zt), (x1, s_ * yt, zt), "tl", bow=(0, 1, 0))
+            for xc in txs:
+                bar("yaw", (xc, -yt, zt), (xc, yt, zt), None, ts, nm="traction-loss cross-member")
+            bar("yaw", (xp, -yt, zt), (xp, yt, zt), "pivx", bow=(1, 0, 0))
+            out["pivots"]["yaw"] = [xp, 0, zt / 2]
+            out["yaw_pin"] = [-hr / 2 - 12, zt + FRAME_SECTIONS[use["pivx"]["section"]]["shape"]["h"] / 2 + 12]
+            out["yaw_r"] = d["tl_radius"]
+            for s_ in (-1, 1):
+                roller((xr, s_ * yt, zt - ht / 2 - 22.5), (xp, 0))
+            act("M3", "yaw", "base", (xr, -bw - 260, zt), (xr, -yt, zt), [0, 1, 0])
+            mount("base", (xp, 0, zt / 2), "Yaw pivot bolt, through both cross-members", tlf, use["pivx"]["section"], kind="pin")
+            mount("base", (xr, -bw - 260, hr / 2), "Traction-loss motor mount", tlf, rs)
+        bar("yaw", (0, 0, zt), (0, 0, zt + ph), "post", bow=(1, 0, 0))
+        mount("yaw", (0, 0, zt + ph), "Universal joint plates" if seat2 else "Rear support joint plates", use["post"]["P"],
+              use["post"]["section"])
+        ph += zt
+        held = (0.0 - xmr) / (xmf - xmr)             # the rails run on past the pivot: under the whole seat, out to the pedals
+        if seat2:
+            bar("tilt", (xmr, 0, ph), (xmf, 0, ph), "spine", fix=held)
+        else:
+            for s_ in (-1, 1):
+                bar("tilt", (xmr, s_ * (b / 2 - 60), ph), (xmf, s_ * (b / 2 - 60), ph), "spine", fix=held)
+            bar("tilt", (0, -b / 2 + 60, ph), (0, b / 2 - 60, ph), None, use["cross"]["section"], nm="moving-frame rear cross-member")
+        # a screw actuator stands beside the end of the cross-member, so the cross-member stops short of it
+        yo = (45 + FRAME_SECTIONS[use["cross"]["section"]]["shape"]["b"] / 2) if lin else 0.0
+        bar("tilt", (sx * a, -b / 2 + yo, ph), (sx * a, b / 2 - yo, ph), "cross", fix="mid")
+        if seat2:
+            zs_, sxs_ = seat_part(ph, use["spine"]["section"], 220.0)
+            if ck["cock"]:
+                gear_part("tilt", ph, zs_, (-150.0, 150.0), 180.0, sxs_, foot_bar=True)
+            else:                                  # wheel and pedals stand on the base and stay still
+                gear_part("base", 0.0, hr / 2, (-200.0, 200.0), bw, rs, foot_bar=bw)
+        else:
+            zs_, sxs_ = seat_part(ph, use["spine"]["section"], b / 2 - 60)
+            gear_part("tilt", ph, zs_, (-(b / 2 - 60), b / 2 - 60), b / 2 - 60, sxs_)
+        for i, s_ in enumerate((1, -1)):
+            ya = s_ * b / 2
+            act(f"M{i + 1}", "lift", "yaw", (sx * a, ya, zt), (sx * a, ya, ph), [sx, 0, 0], lin, (0, -s_ * yo))
+            mount("tilt", (sx * a, s_ * (b / 2 - yo), ph), "Actuator body bracket on the end of the cross-member (rod down)" if lin else
+                  "Push-rod bracket on the moving frame", f_des, use["cross"]["section"], nrm=(0, s_, 0) if lin else (0, 0, -1))
+            mount("yaw", (sx * a, ya, zt),
+                  "Motor mount" if not lin else "Rod-end mount under the actuator", f_des, use["pivx"]["section"] if yaw else rs)
+        out["pivots"]["tilt"] = [0, 0, ph]
+        out["clear"] = ph
+        out["floor"] = zt + (ht if yaw else hr) / 2
+    elif fam == "corner":
+        L, B, nl = d["wheelbase"], d["track"], geo["nl"]
+        hgt = 300 + travel
+        cxr, cxf = min(-L / 2 - 50, ck["rear"]), max(L / 2 + 50, ck["front"])
+        yo = (45 + FRAME_SECTIONS[use["side"]["section"]]["shape"]["b"] / 2) if lin else 0.0     # screw actuators stand outside the frame
+        Bf = B - 2 * yo
+        for yy in (-Bf / 2, Bf / 2):
+            bar("tilt", (cxr, yy, hgt), (cxf, yy, hgt), "side")
+        for xc in (-L / 2, L / 2):
+            x_ = xc + yo if (nl == 3 and xc < 0) else xc
+            bar("tilt", (x_, -Bf / 2, hgt), (x_, Bf / 2, hgt), "rear" if (nl == 3 and xc == -L / 2) else "seatx")
+        zs_, sxs_ = seat_part(hgt, use["side"]["section"], Bf / 2)
+        gear_part("tilt", hgt, zs_, (-Bf / 2, Bf / 2), Bf / 2, sxs_)
+        pts = [(L / 2, B / 2), (L / 2, -B / 2)] + ([(-L / 2, 0)] if nl == 3 else [(-L / 2, B / 2), (-L / 2, -B / 2)])
+        for i, (px, py) in enumerate(pts):
+            mx, my = (px + yo, py) if py == 0 else (px, py - (yo if py > 0 else -yo))
+            act(f"M{i + 1}", "lift", "yaw", (px, py, 0), (px, py, hgt), [1 if px > 0 else -1, 0, 0], lin, (mx - px, my - py))
+            mount("tilt", (mx, my, hgt), "Actuator body bracket on the side of the frame (rod down)" if lin else "Actuator bracket", f_des,
+                  use["side"]["section"], use["mount"]["M"], nrm=((-1, 0, 0) if py == 0 else (0, 1 if py > 0 else -1, 0)) if lin else (0, 0, -1))
+        out["pivots"]["tilt"] = [0, 0, hgt]
+        out["clear"] = hgt
+        if "yaw" in axes:
+            ts, ss = use["tl"]["section"], use["side"]["section"]
+            ht, hs = FRAME_SECTIONS[ts]["shape"]["h"], FRAME_SECTIONS[ss]["shape"]["h"]
+            zb = -40 - ht / 2 - hs / 2 - 45
+            xp, xr = L / 2 + 90, -L / 2 - 110
+            out["pivots"]["yaw"] = [xp, 0, (-40 + zb) / 2]
+            out["yaw_pin"] = [zb - hs / 2 - 12, -40 + FRAME_SECTIONS[use["pivx"]["section"]]["shape"]["h"] / 2 + 12]
+            out["yaw_r"] = L
+            for yy in (-B / 2 - 70, B / 2 + 70):
+                bar("yaw", (xr, yy, -40), (xp + 100, yy, -40), "tl", bow=(0, 1, 0))
+                roller((xr, yy, -40 - ht / 2 - 22.5), (xp, 0))
+            bar("yaw", (xr, -B / 2 - 70, -40), (xr, B / 2 + 70, -40), None, ts, nm="traction-loss cross-member")
+            bar("yaw", (xp, -B / 2 - 70, -40), (xp, B / 2 + 70, -40), "pivx", bow=(1, 0, 0))
+            grp = "surge" if "surge" in axes else "base"       # the frame the sub-frame swings on
+            act("M5", "yaw", grp, (xr, -B / 2 - 380, -40), (xr, 0, -40), [0, 1, 0])
+            for yy in (-B / 2 - 150, B / 2 + 150):
+                bar(grp, (-L / 2 - 250, yy, zb), (L / 2 + 250, yy, zb), None, ss, nm="lower frame rail")
+            for xc in (-L / 2 - 250, xr, L / 2 + 250):
+                bar(grp, (xc, -B / 2 - 150, zb), (xc, B / 2 + 150, zb), None, ss, nm="lower frame cross-member")
+            bar(grp, (xp, -B / 2 - 150, zb), (xp, B / 2 + 150, zb), "pivx", bow=(1, 0, 0))
+            bar(grp, (xr, -B / 2 - 450, zb), (xr, -B / 2 - 150, zb), None, ss, nm="traction-loss motor mount (lower frame)")
+            mount(grp, (xp, 0, (-40 + zb) / 2), "Yaw pivot bolt, through both cross-members", tlf, use["pivx"]["section"], kind="pin")
+            mount(grp, (xr, -B / 2 - 380, zb + hs / 2), "Traction-loss motor mount", tlf, ss)
+            if "surge" in axes:
+                zf = zb - hs - 45
+                for yy in (-B / 2 - 150, B / 2 + 150):
+                    bar("base", (-L / 2 - 420, yy, zf), (L / 2 + 520, yy, zf), None, ss, nm="surge base rail")
+                for xc in (-L / 2 - 420, L / 2 + 520):
+                    bar("base", (xc, -B / 2 - 150, zf), (xc, B / 2 + 150, zf), None, ss, nm="surge base cross-member")
+                act("M6", "surge", "base", (L / 2 + 520, 0, zf), (L / 2 + 250, 0, zb), [1, 0, 0])
+    else:
+        rb, rp, hh = d["base_r"], d["plat_r"], d["hex_h"]
+        bp = [(rb * math.cos(math.radians(a_)), rb * math.sin(math.radians(a_))) for c in (0, 120, 240) for a_ in (c - 12, c + 12)]
+        pp = [(rp * math.cos(math.radians(a_)), rp * math.sin(math.radians(a_))) for c in (60, 180, 300) for a_ in (c - 12, c + 12)]
+        for i in range(6):
+            bar("base", (bp[i][0], bp[i][1], 0), (bp[(i + 1) % 6][0], bp[(i + 1) % 6][1], 0), None, use["plat"]["section"], nm="base side")
+            bar("tilt", (pp[i][0], pp[i][1], hh), (pp[(i + 1) % 6][0], pp[(i + 1) % 6][1], hh), "plat")
+        for i, (bi, pi_) in enumerate([(1, 0), (2, 1), (3, 2), (4, 3), (5, 4), (0, 5)]):
+            act(f"M{i + 1}", "leg", "base", (bp[bi][0], bp[bi][1], 0), (pp[pi_][0], pp[pi_][1], hh), [0, 0, 1])
+            mount("tilt", (pp[pi_][0], pp[pi_][1], hh), "Leg mount on the platform", f_des, use["plat"]["section"], use["legm"]["M"], nrm=(0, 0, -1))
+            mount("base", (bp[bi][0], bp[bi][1], 0), "Leg mount on the base", f_des, use["plat"]["section"], use["legm"]["M"])
+        out["pivots"]["tilt"] = [0, 0, hh]
+        zr = hh + FRAME_SECTIONS[use["plat"]["section"]]["shape"]["h"] / 2 + FRAME_SECTIONS[use["side"]["section"]]["shape"]["h"] / 2
+        for sy in (-200.0, 200.0):                 # two rails across the platform carry the seat, the wheel and the pedals
+            bar("tilt", (ck["rear"], sy, zr), (ck["front"], sy, zr), "side")
+        zs_, sxs_ = seat_part(zr, use["side"]["section"], 200.0)
+        gear_part("tilt", zr, zs_, (-200.0, 200.0), 200.0, sxs_)
+        out["clear"] = hh
+        out["limits"]["sway"] = out["limits"]["surge"] = rng.get("surge", 0.0)
+        out["axes"] = ["pitch", "roll", "yaw", "heave", "surge", "sway"]
+    return out
+
+
+def _frame_joints(d, model, mem):
+    """Where members meet, and what holds them: every member end that lands on another member becomes a joint, sized
+    for the shear and the moment the member brings to it (beams are sized as if their ends were free to turn; the
+    joints are sized as if they were stiff, so both are on the safe side).  Adds 'joints' and the braces to the model
+    and returns (joints, hardware list, joining methods used)."""
+    use = {m["id"]: m for m in mem}
+    M = model["members"]
+    surge_ax = d["layout"] == "corner4tlsurge"
+    rg = {"base": 0, "surge": 1 if surge_ax else 0}
+    rg["yaw"] = 2 if "yaw" in model["pivots"] else rg["surge"]
+    rg["tilt"] = 3
+
+    def sub(a, b): return (a[0] - b[0], a[1] - b[1], a[2] - b[2])
+    def dot(a, b): return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+    def unit(a):
+        ln = math.sqrt(dot(a, a))
+        return (a[0] / ln, a[1] / ln, a[2] / ln) if ln > 1e-9 else (0.0, 0.0, 0.0)
+
+    def mat_of(mb):
+        m = use.get(mb["id"])
+        return m["material_id"] if m else ("tslot" if FRAME_SECTIONS[mb["sec"]]["family"] == "tslot" else d["material"])
+
+    def method(sec, mat_a, mat_b=None):
+        f_ = FRAME_SECTIONS[sec]["family"]
+        if f_ == "tslot":
+            return "tslot"
+        if d["join"] == "welded" and (mat_b is None or mat_a == mat_b):
+            return "weld"
+        return {"sq": "gusset", "rect": "gusset", "round": "clamp", "chan": "cleat"}[f_]
+
+    def size(V, Mo, sec, mat_id, meth, single=False):
+        """(hardware words, bolt, count, use) for a shear V (N) and a moment Mo (N m) at a joint on this section."""
+        q = FRAME_SECTIONS[sec]
+        sh = q["shape"]
+        lever = 80.0 if single else max(60.0, 1.5 * max(sh["h"], sh["b"]))
+        if meth == "weld":
+            mid_ = mat_id if mat_id in FRAME_MATERIALS else "al6061"
+            al = FRAME_MATERIALS[mid_][2] / FRAME_SF
+            u = Mo * 1000.0 / q["S"] / al + V / (0.6 * al * q["area"] * 0.5)
+            return "a fillet weld all round" + (" and a gusset" if u > 0.8 else ""), "weld", 0, u
+        if meth == "tslot":
+            opts = [("M8", n_, 2000.0) for n_ in ((2, 4, 8) if single else (4, 8, 12, 16, 24))]
+        elif meth == "clamp":
+            cap = 8900.0 if mat_id == "steel" else 4450.0
+            opts = [("set screw", 2, cap), ("set screw", 4, cap)]
+        else:
+            fy = FRAME_MATERIALS[mat_id if mat_id in FRAME_MATERIALS else "al6061"][1]
+            planes = 2 if (meth == "gusset" and not single) else 1
+            opts = []
+            for b_, n_ in ((("M8", 2), ("M8", 4), ("M10", 4), ("M12", 4), ("M12", 6)) if single else
+                           (("M8", 4), ("M8", 6), ("M10", 4), ("M10", 6), ("M12", 6), ("M12", 8))):
+                dia, As, _tq = FRAME_BOLTS[b_]
+                opts.append((b_, n_, planes * min(0.6 * FRAME_BOLT_FUB * As, 1.6 * fy * dia * max(sh["t"], 2.0)) / FRAME_SF))
+        us = [(Mo * 1000.0 / lever / (n_ / 2.0) + V / n_) / cap for _b, n_, cap in opts]
+        pick = next((i_ for i_, u_ in enumerate(us) if u_ <= 0.85), next((i_ for i_, u_ in enumerate(us) if u_ <= 1.0), len(opts) - 1))
+        (b_, n_, cap), u = opts[pick], us[pick]
+        if meth == "clamp":
+            return f"{n_ // 2} pipe fitting{'s' if n_ > 2 else ''} ({n_} set screws)", b_, n_, u
+        if meth == "tslot":
+            return (f"{n_} x M8 screws and T-nuts" if single else f"2 joining plates ({2 * n_} x M8 screws and T-nuts)" if n_ > 16 else
+                    f"{n_ // 2} corner brackets ({2 * n_} x M8 screws and T-nuts)"), b_, n_, u
+        if single:
+            return f"{n_} x {b_} bolts through a 6 mm plate", b_, n_, u
+        return (f"gusset plates with {2 * n_} x {b_} bolts" if meth == "gusset" else f"angle cleat with {2 * n_} x {b_} bolts"), b_, n_, u
+
+    def end_load(mb, e):
+        m = use.get(mb["id"])
+        if not m:
+            return 0.0, 0.0, 1.0
+        kw = m["P_work"] / m["P"] if m["P"] else 1.0
+        if m["model"] == "cantilever":
+            return m["P"], (m["M"] if mb["fix"] == e else 0.0), kw
+        return m["P"] / 2.0, m["P"] * m["L"] / 8000.0, kw
+
+    found = {}
+    for i, mi in enumerate(M):
+        shi = FRAME_SECTIONS[mi["sec"]]["shape"]
+        for e in ("a", "b"):
+            p, far = mi[e], mi["b" if e == "a" else "a"]
+            d1 = unit(sub(far, p))
+            best = None
+            for j, mj in enumerate(M):
+                if j == i or rg[mj["g"]] != rg[mi["g"]]:
+                    continue
+                ab = sub(mj["b"], mj["a"])
+                lj = math.sqrt(dot(ab, ab))
+                if lj < 1:
+                    continue
+                u = unit(ab)
+                if abs(dot(d1, u)) > 0.9:
+                    continue
+                sj = max(0.0, min(lj, dot(sub(p, mj["a"]), u)))
+                q = (mj["a"][0] + u[0] * sj, mj["a"][1] + u[1] * sj, mj["a"][2] + u[2] * sj)
+                dist = math.dist(p, q)
+                shj = FRAME_SECTIONS[mj["sec"]]["shape"]
+                if dist > (max(shi["b"], shi["h"]) + max(shj["b"], shj["h"])) / 2.0 + 20:
+                    continue
+                if best is None or dist < best[0]:
+                    best = (dist, j, sj, lj, u)
+            if not best:
+                continue
+            dist, j, sj, lj, u = best
+            mj = M[j]
+            V, Mo, kw = end_load(mi, e)
+            mjm = use.get(mj["id"])
+            if mjm and mjm["model"] == "cantilever" and mj["fix"] in ("mid", "t"):       # the member passing through hangs off this joint
+                arm_ = min(sj, lj - sj) / 1000.0 if mj["fix"] == "mid" else (mjm["L"] / 1000.0 if abs(sj / lj - mj["fx"]) < 0.06 else 0.0)
+                if mj["fix"] == "mid" or arm_ > 0:
+                    V, Mo = max(V, mjm["P"]), max(Mo, mjm["P"] * arm_)
+                    kw = mjm["P_work"] / mjm["P"] if mjm["P"] else kw
+            corner = sj < 60 or lj - sj < 60
+            d2 = u if (not corner or sj < lj / 2) else (-u[0], -u[1], -u[2])
+            key = (min(i, j), max(i, j))
+            old = found.get(key)
+            if old and (old["V"], old["M"]) >= (V, Mo) and old["dist"] <= dist:
+                continue
+            if old:
+                V, Mo = max(V, old["V"]), max(Mo, old["M"])
+            mj_a = mj["a"]                                     # the joint sits on the axis of the member that is met
+            pj = [round(mj_a[k] + u[k] * sj, 1) for k in range(3)]
+            found[key] = {"g": mi["g"], "p": pj, "d1": [round(v, 4) for v in d1], "d2": [round(v, 4) for v in d2],
+                          "tee": not corner, "V": V, "M": Mo, "kw": kw, "i": i, "j": j, "e": e, "t": sj / lj, "dist": dist}
+    for i in range(len(M)):                     # members that cross in the middle (a seat cross-member over a spine)
+        for j in range(i + 1, len(M)):
+            if (i, j) in found or rg[M[i]["g"]] != rg[M[j]["g"]]:
+                continue
+            a_, b_ = (i, j) if math.dist(M[i]["a"], M[i]["b"]) <= math.dist(M[j]["a"], M[j]["b"]) else (j, i)
+            mi, mj = M[a_], M[b_]
+            da, db, w0 = sub(mi["b"], mi["a"]), sub(mj["b"], mj["a"]), sub(mi["a"], mj["a"])
+            aa, bb, cc, dd, ee = dot(da, da), dot(da, db), dot(db, db), dot(da, w0), dot(db, w0)
+            den = aa * cc - bb * bb
+            if den < 1e-6 * aa * cc or aa < 1 or cc < 1:
+                continue
+            ti, tj = (bb * ee - cc * dd) / den, (aa * ee - bb * dd) / den
+            if not (0.03 < ti < 0.97 and 0.03 < tj < 0.97):
+                continue
+            p = [mj["a"][k] + db[k] * tj for k in range(3)]
+            q = [mi["a"][k] + da[k] * ti for k in range(3)]
+            shi, shj = FRAME_SECTIONS[mi["sec"]]["shape"], FRAME_SECTIONS[mj["sec"]]["shape"]
+            if math.dist(p, q) > (max(shi["b"], shi["h"]) + max(shj["b"], shj["h"])) / 2.0 + 20:
+                continue
+            m, mjm = use.get(mi["id"]), use.get(mj["id"])
+            V, Mo, kw = 0.0, 0.0, 1.0
+            if m:
+                kw = m["P_work"] / m["P"] if m["P"] else 1.0
+                V, Mo = (2 * m["P"], m["M"]) if m["model"] == "cantilever" else (m["P"] / 2.0, m["P"] * m["L"] / 8000.0)
+            if mjm and mjm["model"] == "cantilever" and mj["fix"] == "t" and abs(tj - mj["fx"]) < 0.06:
+                V, Mo = max(V, mjm["P"]), max(Mo, mjm["M"])
+            found[(i, j)] = {"g": mi["g"], "p": [round(v, 1) for v in p], "d1": [round(v, 4) for v in unit(da)],
+                             "d2": [round(v, 4) for v in unit(db)], "tee": True, "V": V, "M": Mo, "kw": kw, "i": a_, "j": b_,
+                             "e": "x", "t": tj, "ti": ti, "dist": 0.0}
+    joints = []
+    for jt in found.values():
+        mi, mj = M[jt["i"]], M[jt["j"]]
+        meth = method(mi["sec"], mat_of(mi), mat_of(mj))
+        hw, bolt, nb, u = size(jt["V"], jt["M"], mi["sec"], mat_of(mi), meth)
+        sh = FRAME_SECTIONS[mi["sec"]]["shape"]
+        nrm = (jt["d1"][1] * jt["d2"][2] - jt["d1"][2] * jt["d2"][1], jt["d1"][2] * jt["d2"][0] - jt["d1"][0] * jt["d2"][2],
+               jt["d1"][0] * jt["d2"][1] - jt["d1"][1] * jt["d2"][0])
+        through = sh["h"] if abs(nrm[2]) > 0.7 else sh["b"]
+        uw = u * jt["kw"]
+
+        def at(mb, t):                       # how hard the member itself works at this point (it peaks at stiff joints)
+            m = use.get(mb["id"])
+            if not m:
+                return 0.0
+            if m["model"] == "cantilever":
+                if mb["fix"] == "t":
+                    return m["util_work"] * max(0.0, 1 - abs(t - mb["fx"]) / max(mb["fx"], 1 - mb["fx"]))
+                return m["util_work"] * ((1 - t) if mb["fix"] == "a" else t if mb["fix"] == "b" else 1 - abs(2 * t - 1))
+            return m["util_work"] * (1.0 if t in (0.0, 1.0) else 0.85 * math.sin(math.pi * t) ** 2)
+        te = 0.0 if jt["e"] == "a" else 1.0 if jt["e"] == "b" else round(jt["ti"], 3)
+        # how much of each member there is on each side of the joint, so a plate never runs off the end of one
+        pa, pb = dot(sub(mi["a"], jt["p"]), jt["d1"]), dot(sub(mi["b"], jt["p"]), jt["d1"])
+        qa, qb = dot(sub(mj["a"], jt["p"]), jt["d2"]), dot(sub(mj["b"], jt["p"]), jt["d2"])
+        rem = [round(max(pa, pb, 0.0), 1), round(max(-pa, -pb, 0.0), 1), round(max(qa, qb, 0.0), 1), round(max(-qa, -qb, 0.0), 1)]
+        uh = max(uw, at(mi, te), at(mj, 0.0 if jt["t"] < 0.08 else 1.0 if jt["t"] > 0.92 else jt["t"]))
+        joints.append({"g": jt["g"], "p": jt["p"], "d1": jt["d1"], "d2": jt["d2"], "tee": jt["tee"], "kind": meth, "bolt": bolt,
+                       "n": nb, "u": u, "uw": uw, "uh": uh, "sec2": mj["sec"], "r": rem, "V": jt["V"], "M": jt["M"], "hw": hw, "sec": mi["sec"], "through": through,
+                       "name": f"{mi['nm'][0].upper() + mi['nm'][1:]} to {mj['nm']}", "single": False})
+        mi.setdefault("hot", []).append([te, round(uh, 3)])
+        mj.setdefault("hot", []).append([round(jt["t"], 3), round(uh, 3)])
+    # braces: one diagonal where it does some good - at the foot of a post or of a wheel upright, and in the corners
+    # where the yaw-pivot cross-member meets the rails the traction-loss motor bends; each end gets its own bracket
+    cen = {}
+    for g_ in ("base", "surge", "yaw", "tilt"):
+        pts = [mb[k] for mb in M if mb["g"] == g_ for k in ("a", "b")]
+        cen[g_] = [sum(q[k] for q in pts) / len(pts) for k in range(3)] if pts else [0.0, 0.0, 0.0]
+    seen = set()
+
+    def brace(mb, m, p, along, other, sg):
+        lb = min(0.45 * math.dist(mb["a"], mb["b"]), 380.0)
+        a_ = [round(p[k] + along[k] * lb, 1) for k in range(3)]
+        b_ = [round(p[k] + other[k] * lb * sg, 1) for k in range(3)]
+        key = tuple(sorted((tuple(round(v / 10) for v in a_), tuple(round(v / 10) for v in b_))))
+        if key in seen:
+            return
+        seen.add(key)
+        M.append({"g": mb["g"], "a": a_, "b": b_, "id": None, "sec": mb["sec"], "bow": [0, 0, -1], "fix": "a",
+                  "nm": f"Diagonal brace for: {m['name'].lower()}", "model": "simple", "brace": True, "leg": lb, "hot": [[0.0, 0.0]]})
+        nr = (along[1] * other[2] - along[2] * other[1], along[2] * other[0] - along[0] * other[2], along[0] * other[1] - along[1] * other[0])
+        nr = unit(nr) if dot(nr, nr) > 1e-6 else (0.0, 0.0, 1.0)
+        for q in (a_, b_):
+            model["mounts"].append({"g": mb["g"], "p": q, "name": "Brace end bracket", "V": m["P"], "M": 0.0, "sec": mb["sec"],
+                                    "kind": "plate", "nrm": list(nr), "flag": "brace"})
+    for jt in list(found.values()):
+        if jt["e"] == "x":
+            continue
+        mi, mj = M[jt["i"]], M[jt["j"]]
+        m, mo, p = use.get(mi["id"]), use.get(mj["id"]), jt["p"]
+        if m and m["braced"] and mi["id"] in ("post", "wheelp") and mi["fix"] == jt["e"]:
+            if mi["id"] == "wheelp":                       # one strut, forwards along the rail, clear of the driver's legs
+                brace(mi, m, p, jt["d1"], jt["d2"], 1 if jt["d2"][0] >= 0 else -1)
+            else:
+                for sg in ((1, -1) if jt["tee"] else (1,)):
+                    brace(mi, m, p, jt["d1"], jt["d2"], sg)
+        elif mi["id"] == "pivx" and ((m and m["braced"]) or (mj["id"] == "tl" and mo and mo["braced"])):
+            who = m if (m and m["braced"]) else mo
+            sg = 1
+            if jt["tee"]:                                  # towards the middle of the frame
+                sg = 1 if (cen[mi["g"]][0] - p[0]) * jt["d2"][0] + (cen[mi["g"]][1] - p[1]) * jt["d2"][1] >= 0 else -1
+            brace(mi, who, p, jt["d1"], jt["d2"], sg)
+    for mt in model["mounts"]:
+        mat_id = d["material"] if FRAME_SECTIONS[mt["sec"]]["family"] != "tslot" else "tslot"
+        if mt["kind"] == "pin":
+            b_ = "M12"
+            cap = 2 * 0.6 * FRAME_BOLT_FUB * FRAME_BOLTS[b_][1] / FRAME_SF
+            if mt["V"] > cap:
+                b_ = "M16"
+                cap = 2 * 0.6 * FRAME_BOLT_FUB * FRAME_BOLTS[b_][1] / FRAME_SF
+            hw, bolt, nb, u = f"1 x {b_} bolt (8.8) in double shear, with a thrust bearing", b_, 1, mt["V"] / cap
+            meth = "pin"
+        else:
+            meth = method(mt["sec"], mat_id)
+            meth = "gusset" if meth == "weld" else meth                       # a mount is bolted on, so it can come off
+            hw, bolt, nb, u = size(mt["V"], mt["M"], mt["sec"], mat_id, meth, single=True)
+        kw = min(1.0, (use["cross"]["P_work"] / use["cross"]["P"]) if "cross" in use and use["cross"]["P"] else
+                 (mem[0]["P_work"] / mem[0]["P"] if mem[0]["P"] else 1.0))
+        sh = FRAME_SECTIONS[mt["sec"]]["shape"]
+        near, axis, shift = 1e9, [0, 0, 0], 0.0     # the member it sits on: its plate runs along it and is no wider
+        for mb in M:
+            if rg[mb["g"]] != rg[mt["g"]] or mb.get("brace"):
+                continue
+            ab = sub(mb["b"], mb["a"])
+            lj = math.sqrt(dot(ab, ab))
+            if lj < 1:
+                continue
+            u_ = unit(ab)
+            sj = max(0.0, min(lj, dot(sub(mt["p"], mb["a"]), u_)))
+            dist = math.dist(mt["p"], [mb["a"][k] + u_[k] * sj for k in range(3)])
+            if dist < near:
+                near, axis = dist, [round(v, 4) for v in u_]
+                shift = (max(65.0, min(lj - 65.0, sj)) - sj) if lj >= 130 else (lj / 2.0 - sj)      # keep the plate on the member
+        joints.append({"g": mt["g"], "p": mt["p"], "d1": mt["nrm"], "d2": axis if near < 150 else [0, 0, 0], "off": round(shift, 1) if near < 150 else 0.0, "tee": False, "kind": meth, "bolt": bolt,
+                       "n": nb, "u": u, "uw": u * kw, "uh": u * kw, "V": mt["V"], "M": mt["M"], "hw": hw, "sec": mt["sec"], "through": sh["t"] + 6,
+                       "name": mt["name"], "single": True, "brace": mt.get("flag") == "brace", "bare": mt.get("flag") == "bare"})
+    model["joints"] = [{k: (round(v, 3) if isinstance(v, float) else v) for k, v in j.items() if k not in ("V", "M", "hw", "name")}
+                       for j in joints]
+    # ---- the hardware to buy ----
+    tally, plates = {}, {}
+
+    def add(dct, key, q):
+        dct[key] = dct.get(key, 0) + q
+
+    def blen(grip, dia):
+        ln = grip + dia + 8
+        return int(math.ceil(ln / 5.0) * 5) if ln <= 70 else int(math.ceil(ln / 10.0) * 10)
+    meths = []
+    for j in joints:
+        k = j["kind"]
+        if k not in meths and k != "pin":
+            meths.append(k)
+        dia = FRAME_BOLTS[j["bolt"]][0] if j["bolt"] in FRAME_BOLTS else 0
+        if k == "pin":
+            add(tally, f"{j['bolt']} x {blen(j['through'] * 0 + 160, dia)} mm bolt (grade 8.8) with nyloc nut, 2 washers and a thrust bearing: the yaw pivot", 1)
+        elif j["single"]:
+            if k == "tslot":
+                add(tally, "M8 x 16 mm screw with T-nut", j["n"])
+            elif k == "clamp":
+                add(plates, "Single-socket swivel (adjustable-angle) pipe fitting, for a brace end" if j["brace"] else
+                    "Flange or clamp-on mounting fitting for the tube size", max(1, j["n"] // 2))
+            else:
+                add(tally, f"{j['bolt']} x {blen(j['through'] + 6, dia)} mm bolt (grade 8.8) with nyloc nut and 2 washers", j["n"])
+            if j["brace"] and k != "clamp":
+                add(plates, "45 degree T-slot bracket (or pivot joint) for a brace end" if k == "tslot" else
+                    "Brace end bracket: 6 mm (1/4 in) plate tab, 50 x 130 mm, bent or cut to 45 degrees", 1)
+            elif k != "clamp" and not j["bare"]:
+                add(plates, "Mounting plate, 6 mm (1/4 in), about 120 mm long and no wider than the member it sits on", 1)
+        elif k == "gusset":
+            add(tally, f"{j['bolt']} x {blen(j['through'] + 12, dia)} mm bolt (grade 8.8) with nyloc nut, 2 wide washers and a spacer sleeve", 2 * j["n"])
+            wide = max(FRAME_SECTIONS[j['sec']]['shape']['b'], FRAME_SECTIONS[j['sec']]['shape']['h'])
+            add(plates, ("Tee plate (T shape)" if j["tee"] else "Corner plate (L shape)") + f", 6 mm (1/4 in), {wide:.0f} mm wide like the "
+                f"member it lies on, legs about {max(70, int(1.6 * wide / 10) * 10)} mm past the joint", 2)
+        elif k == "cleat":
+            add(tally, f"{j['bolt']} x {blen(FRAME_SECTIONS[j['sec']]['shape']['t'] + 6, dia)} mm bolt (grade 8.8) with nyloc nut and 2 washers", 2 * j["n"])
+            add(plates, "Angle cleat 50 x 50 x 6 mm (2 x 2 x 1/4 in), as long as the web is tall", 2 if j["tee"] else 1)
+        elif k == "tslot":
+            add(tally, "M8 x 16 mm screw with T-nut", 2 * j["n"])
+            add(plates, "T-slot joining plate (tee or corner, 6 holes a leg), one each side of the joint" if j["n"] > 16 else
+                "T-slot corner bracket (gusset) for the profile size", 2 if j["n"] > 16 else j["n"] // 2)
+        elif k == "clamp":
+            add(plates, ("Tee" if j["tee"] else "Elbow") + " pipe fitting with set screws, for the tube's outside diameter", j["n"] // 2)
+        elif k == "weld" and j["u"] > 0.8:
+            add(plates, "Welded gusset, 6 mm (1/4 in), legs about 80 mm", 2)
+    hardware = [f"{q} x {k}" for k, q in sorted(tally.items())] + [f"{q} x {k}" for k, q in sorted(plates.items())]
+    if "weld" in meths and len(meths) == 1 and not any("gusset" in h for h in hardware):
+        hardware.append("Welding wire or rod for the material; no fasteners in the frame itself")
+    if model.get("rollers"):
+        hardware.append(f"{len(model['rollers'])} x fixed (not swivel) wheel or roller, about 45 mm, with its bolts: under the traction-loss frame, axle pointing at the yaw pivot")
+    if model.get("feet"):
+        hardware.append(f"{len(model['feet'])} x levelling foot, M10 or M12, with a threaded insert or a nut plate in the rail")
+    torque = sorted({j["bolt"] for j in joints if j["bolt"] in FRAME_BOLTS and j["kind"] not in ("tslot",)}, key=lambda b_: FRAME_BOLTS[b_][0])
+    if torque:
+        hardware.append("Tightening (grade 8.8, dry): " + ", ".join(f"{b_} {FRAME_BOLTS[b_][2]} Nm ({FRAME_BOLTS[b_][2] * 0.7376:.0f} lb ft)" for b_ in torque)
+                        + " - on solid stacks only; through a hollow tube without a sleeve, stop at snug")
+    model["_buy"] = list(tally.items()) + list(plates.items())
+    return joints, hardware, meths
+
+
+def _frame_joint_rows(joints):
+    """The joints for the tables: the same joint in several places is one row with a count."""
+    rows = {}
+    for j in joints:
+        key = (j["name"], j["hw"])
+        r = rows.setdefault(key, {"name": j["name"], "hw": j["hw"], "count": 0, "u": 0.0, "V": 0.0, "M": 0.0, "kind": j["kind"]})
+        r["count"] += 1
+        r["u"], r["V"], r["M"] = max(r["u"], j["u"]), max(r["V"], j["V"]), max(r["M"], j["M"])
+    return sorted(rows.values(), key=lambda r: -r["u"])
+
+
+class _FrameSketch:
+    """A small drawing in the same shapes as the layout drawings, in real millimetres times k."""
+
+    def __init__(self, k=4.0):
+        self.it, self.k = [], k
+
+    def line(self, x1, y1, x2, y2, c, w=3, mm=None):
+        k = self.k
+        self.it.append({"t": "line", "x1": x1 * k, "y1": y1 * k, "x2": x2 * k, "y2": y2 * k, "c": c, "w": w, "mm": mm * k if mm else None})
+
+    def rect(self, x, y, w, h, c, fill=False):
+        k = self.k
+        self.it.append({"t": "rect", "x": x * k, "y": y * k, "w": w * k, "h": h * k, "c": c, "fill": fill})
+
+    def dot(self, x, y, r, c, fill=True):
+        k = self.k
+        self.it.append({"t": "dot", "x": x * k, "y": y * k, "r": r * k, "c": c, "label": "", "fill": fill})
+
+    def text(self, x, y, s_, c="text", a="start"):
+        self.it.append({"t": "text", "x": x * self.k, "y": y * self.k, "s": s_, "c": c, "a": a})
+
+    def poly(self, pts, c, w=3, fill=False):
+        k = self.k
+        self.it.append({"t": "poly", "pts": [[round(px * k, 1), round(py * k, 1)] for px, py in pts], "c": c, "w": w, "fill": fill})
+
+    def dimh(self, x1, x2, y, label):
+        self.line(x1, y, x2, y, "dim", 1.5)
+        for x in (x1, x2):
+            self.line(x, y - 7, x, y + 7, "dim", 1.5)
+        self.text((x1 + x2) / 2, y - 18, label, "dim", "middle")
+
+    def dimv(self, x, y1, y2, label, left=False):
+        self.line(x, y1, x, y2, "dim", 1.5)
+        for y in (y1, y2):
+            self.line(x - 7, y, x + 7, y, "dim", 1.5)
+        self.text(x + (-10 if left else 10), (y1 + y2) / 2, label, "dim", "end" if left else "start")
+
+    def done(self, title, note=""):
+        out = {"title": title, "box": _frame_box(self.it, 30 if self.k > 1 else 24), "items": self.it, "note": note}
+        if self.k > 1:
+            out["fs"] = 52          # the letter size the box was measured for
+        return out
+
+
+def _frame_joint_pictures(d, joints, meths, model=None):
+    """One picture per joining method in the design: how two pieces meet, a close-up of the fastener, and the sizes
+    needed to cut and drill the plates.  With braces: one more for a brace and its end brackets."""
+    out = []
+    mm = lambda v: f"{v:.0f} mm ({v / FRAME_IN:.2f} in)"
+    for k in meths:
+        js = [j for j in joints if j["kind"] == k and not j["single"]] or [j for j in joints if j["kind"] == k]
+        j = max(js, key=lambda q: q["u"])
+        sh = FRAME_SECTIONS[j["sec"]]["shape"]
+        b, h, t = sh["b"], sh["h"], max(sh["t"], 3.0)
+        bolt = j["bolt"] if j["bolt"] in FRAME_BOLTS else "M8"
+        dia = FRAME_BOLTS[bolt][0]
+        sk = _FrameSketch(4.0)
+        sk.line(b / 2, 0, 330, 0, "base", mm=b)
+        sk.line(0, -b / 2, 0, 330, "base", mm=b)
+        ox = 600.0                                              # the close-up sits to the right
+        if k == "gusset":
+            g = max(90.0, 1.6 * max(b, h)) + b / 2
+            sk.poly([(-b / 2, -b / 2), (g, -b / 2), (g, b / 2), (b / 2, b / 2), (b / 2, g), (-b / 2, g), (-b / 2, -b / 2)], "sub", 4)
+            for f_ in (0.5, 0.85):
+                sk.dot(g * f_, 0, dia * 0.8, "text"); sk.dot(0, g * f_, dia * 0.8, "text")
+            sk.dimh(-b / 2, g, -b / 2 - 28, f"plate {mm(g + b / 2)} each way, 6 mm thick, {b:.0f} mm wide")
+            sk.text(b / 2 + 45, 300, "an L plate, no wider than the tubes, on both faces")
+            sk.text(b / 2 + 45, 266, f"drill {dia + 1:.0f} mm for {bolt}: holes {g * 0.5:.0f} and {g * 0.85:.0f} mm")
+            sk.text(b / 2 + 45, 232, "from the centre of the corner, along each tube")
+            sk.text(b / 2 + 45, 198, f"{bolt} bolts, grade 8.8, through both tubes")
+            sk.rect(ox - b / 2, 0, b, h, "base"); sk.rect(ox - b / 2 + t, t, b - 2 * t, h - 2 * t, "base")
+            sk.rect(ox - b / 2 - 22, h, b + 44, 6, "sub", True); sk.rect(ox - b / 2 - 22, -6, b + 44, 6, "sub", True)
+            sk.line(ox, -24, ox, h + 24, "text", 5)
+            sk.rect(ox - dia, h + 9, 2 * dia, 7, "text", True); sk.rect(ox - dia, -22, 2 * dia, 9, "text", True)
+            sk.line(ox - dia * 1.6, h + 7.5, ox + dia * 1.6, h + 7.5, "dim", 4); sk.line(ox - dia * 1.6, -7.5, ox + dia * 1.6, -7.5, "dim", 4)
+            sk.line(ox - dia * 0.9, t, ox - dia * 0.9, h - t, "motor", 3); sk.line(ox + dia * 0.9, t, ox + dia * 0.9, h - t, "motor", 3)
+            sk.text(ox, h + 62, "close-up: a cut through one bolt", "dim", "middle")
+            ln = j["through"] + 12 + dia + 8
+            ln = math.ceil(ln / 5.0) * 5 if ln <= 70 else math.ceil(ln / 10.0) * 10
+            sk.dimv(ox - b / 2 - 50, -22, h + 16, f"{bolt} x {ln:.0f} mm", True)
+            sk.text(ox + b / 2 + 40, h + 12, "bolt head, wide washer")
+            sk.text(ox + b / 2 + 40, h / 2, f"spacer sleeve, {h - 2 * t:.0f} mm long, in the tube", "motor")
+            sk.text(ox + b / 2 + 40, -14, "wide washer, nyloc nut")
+            sk.dimh(ox - b / 2, ox + b / 2, -58, mm(b))
+        elif k == "clamp":
+            sk.rect(-b * 0.95, -b * 0.72, b * 1.9, b * 1.44, "sub"); sk.rect(-b * 0.72, b * 0.72, b * 1.44, b * 1.0, "sub")
+            for px, py in ((-b * 0.62, 0), (b * 0.62, 0), (0, b * 1.3)):
+                sk.dot(px, py, 6, "text")
+            sk.text(b + 45, 300, "tee fitting: the tubes slide in, no drilling"); sk.text(b + 45, 266, "a set screw locks each socket (hex key)")
+            sk.text(b + 45, 232, "elbow fittings at corners, flanges at the feet")
+            sk.dimh(-b / 2, b / 2, b * 1.72 + 40, f"fitting for {mm(b)} tube")
+            sk.dot(ox, 60, b / 2 + 9, "sub", False); sk.dot(ox, 60, b / 2, "base", False); sk.dot(ox, 60, b / 2 - t, "base", False)
+            sk.line(ox, 60 + b / 2 - 3, ox, 60 + b / 2 + 26, "text", 6)
+            sk.text(ox, 60 + b / 2 + 60, "close-up: the set screw bites the tube", "dim", "middle")
+            sk.text(ox + b / 2 + 30, 60, "cut the tube square; push it", "text"); sk.text(ox + b / 2 + 30, 28, "fully into the socket", "text")
+        elif k == "cleat":
+            c0 = b / 2
+            sk.poly([(c0, c0), (c0 + 60, c0), (c0 + 60, c0 + 6), (c0 + 6, c0 + 6), (c0 + 6, c0 + 60), (c0, c0 + 60), (c0, c0)], "sub", 3, True)
+            for f_ in (22, 45):
+                sk.line(c0 + f_, c0 - 16, c0 + f_, c0 + 16, "text", 5); sk.line(c0 - 16, c0 + f_, c0 + 16, c0 + f_, "text", 5)
+            sk.text(c0 + 85, 300, f"angle cleat 50 x 50 x 6 mm, cut {max(h - 2 * t - 4, 20):.0f} mm long")
+            sk.text(c0 + 85, 266, f"{bolt} bolts through both webs; drill {dia + 1:.0f} mm,"); sk.text(c0 + 85, 232, "holes 22 and 45 mm from the corner")
+            sk.text(c0 + 85, 198, "backing plate where an actuator pushes")
+            sk.rect(ox, 0, t, h, "base", True); sk.rect(ox + t, 10, 6, h - 20, "sub", True)
+            sk.line(ox - 22, h / 2, ox + t + 30, h / 2, "text", 5)
+            sk.rect(ox - 22, h / 2 - dia, 7, 2 * dia, "text", True); sk.rect(ox + t + 14, h / 2 - dia, 9, 2 * dia, "text", True)
+            sk.text(ox, h + 50, "close-up: bolt, washers, nyloc nut", "dim", "middle")
+            sk.dimh(ox - 22, ox + t + 23, -40, f"{bolt} x {math.ceil((t + 6 + dia + 8) / 5.0) * 5:.0f} mm")
+        elif k == "tslot":
+            c0 = b / 2
+            sk.poly([(c0, c0), (c0 + 75, c0), (c0, c0 + 75), (c0, c0)], "sub", 3, True)
+            for px, py in ((c0 + 28, c0 + 9), (c0 + 52, c0 + 9), (c0 + 9, c0 + 28), (c0 + 9, c0 + 52)):
+                sk.dot(px, py, 5, "text")
+            sk.text(c0 + 100, 300, "corner bracket, M8 screws into T-nuts"); sk.text(c0 + 100, 266, "one bracket on each side of the joint")
+            sk.text(c0 + 100, 232, "cut the profile square; no drilling")
+            sk.rect(ox - b / 2, 0, b, b, "base"); sk.rect(ox - 5, b - 12, 10, 12, "base"); sk.rect(ox - 11, b - 20, 22, 8, "sub", True)
+            sk.rect(ox - 30, b, 60, 6, "sub", True); sk.line(ox, b - 16, ox, b + 16, "text", 5); sk.rect(ox - dia, b + 6, 2 * dia, 8, "text", True)
+            sk.text(ox, b + 62, "close-up: screw, bracket, T-nut in the slot", "dim", "middle")
+            sk.text(ox + b / 2 + 30, b + 8, "M8 x 16 mm screw"); sk.text(ox + b / 2 + 30, b - 18, "T-nut (drop-in or slide-in)", "sub")
+            sk.dimh(ox - b / 2, ox + b / 2, -40, mm(b))
+        else:
+            zz = [(b / 2 + (6 if i % 2 else -6), -b / 2 + i * b / 8.0) for i in range(9)]
+            sk.poly(zz, "motor", 4)
+            sk.poly([(b / 2, b / 2), (b / 2 + 85, b / 2), (b / 2, b / 2 + 85), (b / 2, b / 2)], "sub", 3)
+            sk.text(b / 2 + 110, 300, "fillet weld all round the joint", "motor"); sk.text(b / 2 + 110, 266, "gusset where a joint is marked amber or red")
+            sk.dimh(b / 2, b / 2 + 85, b / 2 - 30, "gusset 85 x 85 x 6 mm")
+        out.append(sk.done(FRAME_JOIN[k][0], FRAME_JOIN[k][1]))
+    br = [m for m in (model["members"] if model else []) if m.get("brace")]
+    if br:
+        m = br[0]
+        sh = FRAME_SECTIONS[m["sec"]]["shape"]
+        w, leg = max(sh["b"], sh["h"]), m["leg"]
+        long_ = leg * math.sqrt(2) + w
+        k_ = 230.0 / leg                                            # drawn to fit; the sizes are in the labels
+        L = 230.0
+        sk = _FrameSketch(4.0)
+        sk.line(-40, 0, 360, 0, "base", mm=w * k_); sk.line(0, 0, 0, 360, "base", mm=w * k_)
+        sk.line(L, 0, 0, L, "moving", mm=w * k_)
+        for px, py in ((L, 0), (0, L)):
+            sk.rect(px - 22, py - 22, 44, 44, "sub"); sk.dot(px - 9, py - 9, 4, "text"); sk.dot(px + 9, py + 9, 4, "text")
+        sk.dimh(0, L, -w * k_ / 2 - 30, mm(leg)); sk.dimv(-w * k_ / 2 - 30, 0, L, mm(leg), True)
+        sk.text(L * 0.6 + 50, L * 0.6 + 60, f"brace: cut {mm(long_)} on its long side,")
+        sk.text(L * 0.6 + 50, L * 0.6 + 26, "both ends at 45 degrees")
+        sk.text(L + 60, 80, "a bracket at each end: a 6 mm plate tab"); sk.text(L + 60, 46, "(or a 45 degree bracket), bolted to both pieces")
+        out.append(sk.done("A diagonal brace and its end brackets",
+                           "Each brace is cut at 45 degrees at both ends and held by a bracket at each end, bolted through the "
+                           "brace and through the member it meets. Measure the two legs from the centre of the joint."))
+    return out
+
+
+def _frame_cut_picture(cut):
+    """Every piece of the cut list as a bar to scale, with how many and how long - one line each."""
+    sk = _FrameSketch(1.0)
+    rows = [c for c in cut if c["len"] > 0]
+    pitch, fs = 130.0, 50.0
+    top = len(rows) * pitch
+    right = 0.0
+    for i, c in enumerate(rows):
+        y = top - i * pitch
+        sk.rect(0, y, c["len"], 62, c.get("group", "base"), True)
+        what = c["what"] if len(c["what"]) <= 46 else c["what"][:44] + ".."
+        label = f"{c['qty']} x {c['len']:.0f} mm ({c['len'] / FRAME_IN:.1f} in)   {c['section']}   {what}"
+        sk.text(c["len"] + 40, y + 31, label)
+        right = max(right, c["len"] + 40 + len(label) * fs * 0.56)
+    out = sk.done("Cut list, to scale")
+    out["box"] = [-60, 40, right + 60, top + 150]
+    out["fs"] = fs
+    return out
+
+
+def _frame_assembly(d, fam, model):
+    """What to put together first: one top view per stage, the new pieces coloured, the earlier ones grey."""
+    M = model["members"]
+    flat = lambda m: abs(m["a"][2] - m["b"][2]) < 1 or math.hypot(m["a"][0] - m["b"][0], m["a"][1] - m["b"][1]) > 50
+    stages = []
+    for g, title, text in (("base", "Base frame", "Rails and cross-members on the floor: square it (equal diagonals), then tighten and fit the feet."),
+                           ("surge", "Lower frame on its slide", "The frame that carries the traction-loss pivot, on the surge rails."),
+                           ("yaw", "Traction-loss frame" if "yaw" in model["pivots"] else "Support post",
+                            "Set it on the pivot bolt and the rollers; it must swing freely by hand before anything else goes on."
+                            if "yaw" in model["pivots"] else "The post and its joint, gusseted at the foot."),
+                           ("tilt", "Moving frame", "Build it flat on the floor, square it, then lift it onto its joint or its actuators.")):
+        ms = [m for m in M if m["g"] == g]
+        if g == "yaw" and "yaw" in model["pivots"]:
+            posts = [m for m in ms if not flat(m)]
+            ms = [m for m in ms if flat(m)]
+            if ms:
+                stages.append((title, text, ms, []))
+            if posts:
+                stages.append(("Rear support post", "The post and its joint on the traction-loss frame, gusseted at the foot.", posts, []))
+        elif ms:
+            stages.append((title, text, ms, []))
+    stages.append(("Motors and push rods" if d["drive"] == "rotary" else "Actuators",
+                   "Last: mount them at mid travel, then the sensors and the wiring.", [], model["acts"]))
+    out, done = [], []
+    allpts = [m[k][:2] for m in M for k in ("a", "b")] + [a[k][:2] for a in model["acts"] for k in ("base", "top")]
+    for n_, (title, text, ms, acts) in enumerate(stages):
+        sk = _FrameSketch(1.0)
+        for px, py in allpts:                                    # the same frame for every stage
+            sk.it.append({"t": "line", "x1": px, "y1": py, "x2": px, "y2": py, "c": "dim", "w": 0.1, "mm": None})
+
+        def draw(m, col):
+            w = max(FRAME_SECTIONS[m["sec"]]["shape"]["b"], 22.0)
+            if flat(m):
+                sk.line(m["a"][0], m["a"][1], m["b"][0], m["b"][1], col, mm=w)
+            else:
+                sk.rect(m["a"][0] - w / 2, m["a"][1] - w / 2, w, w, col, True)
+        for m in done:
+            draw(m, "base")
+        for m in ms:
+            draw(m, "moving")
+        for a in acts:
+            if math.hypot(a["base"][0] - a["top"][0], a["base"][1] - a["top"][1]) > 50:
+                sk.line(a["base"][0], a["base"][1], a["top"][0], a["top"][1], "motor", 8)
+                sk.rect(a["base"][0] - 60, a["base"][1] - 60, 120, 120, "motor", True)
+            else:
+                sk.dot(a["top"][0], a["top"][1], 55, "motor")
+        done += ms
+        dr = sk.done(f"{n_ + 1}. {title}", text)
+        out.append(dr)
+    bx = [min(o["box"][0] for o in out), min(o["box"][1] for o in out), max(o["box"][2] for o in out), max(o["box"][3] for o in out)]
+    for o in out:
+        o["box"] = bx
+    return out
+
+
+# ---------------- a small PDF writer (standard library only) ----------------
+_PDF_W = [278, 278, 355, 556, 556, 889, 667, 191, 333, 333, 389, 584, 278, 333, 278, 278, 556, 556, 556, 556, 556, 556, 556,
+          556, 556, 556, 278, 278, 584, 584, 584, 556, 1015, 667, 667, 722, 722, 667, 611, 778, 722, 278, 500, 667, 556, 833,
+          722, 778, 667, 778, 722, 667, 611, 722, 667, 944, 667, 667, 611, 278, 278, 278, 469, 556, 333, 556, 556, 500, 556,
+          556, 278, 556, 556, 222, 222, 500, 222, 833, 556, 556, 556, 556, 333, 500, 278, 556, 500, 722, 500, 500, 500, 334,
+          260, 334, 584]
+_PDF_COL = {"sub": (.35, .62, .45), "move": (0, .55, .65), "text": (.1, .12, .16), "dim": (.42, .46, .52), "base": (.45, .5, .56), "moving": (.1, .42, .85),
+            "ghost": (.6, .75, .95), "seat": (.7, .73, .78), "motor": (.85, .45, .05), "pivot": (.45, .2, .7),
+            "ok": (.1, .6, .25), "warn": (.9, .6, 0), "bad": (.85, .15, .15), "info": (.1, .42, .85), "line": (.82, .85, .89)}
+
+
+class FramePdf:
+    """Just enough PDF: Letter pages, Helvetica, wrapped text, lines, rectangles, circles."""
+    # (colours: the drawings' names; "sub" is the traction-loss frame)
+    W, H, MARGIN = 612.0, 792.0, 48.0
+
+    def __init__(self, title):
+        self.pages, self.ops, self.y, self.title = [], [], 0.0, title
+        self.new_page()
+
+    @staticmethod
+    def width(s, size, bold=False):
+        w = sum(_PDF_W[ord(c) - 32] if 32 <= ord(c) < 127 else 556 for c in s)
+        return w * size / 1000.0 * (1.07 if bold else 1.0)
+
+    def new_page(self):
+        if self.ops:
+            self.pages.append(self.ops)
+        self.ops, self.y = [], self.H - self.MARGIN
+
+    def need(self, h):
+        if self.y - h < self.MARGIN + 14:
+            self.new_page()
+
+    def color(self, c, stroke=False):
+        r, g, b = _PDF_COL.get(c, _PDF_COL["text"])
+        self.ops.append(f"{r:.3f} {g:.3f} {b:.3f} {'RG' if stroke else 'rg'}")
+
+    def text_at(self, x, y, s, size=10, bold=False, c="text", anchor="start"):
+        if anchor != "start":
+            w = self.width(s, size, bold)
+            x -= w if anchor == "end" else w / 2.0
+        raw = s.encode("cp1252", "replace").replace(b"\\", b"\\\\").replace(b"(", b"\\(").replace(b")", b"\\)")
+        self.color(c)
+        self.ops.append(f"BT /F{2 if bold else 1} {size} Tf {x:.2f} {y:.2f} Td (".encode("latin-1") + raw + b") Tj ET")
+
+    def wrap(self, s, size, width, bold=False):
+        out, cur = [], ""
+        for word in s.split():
+            t = (cur + " " + word).strip()
+            if cur and self.width(t, size, bold) > width:
+                out.append(cur); cur = word
+            else:
+                cur = t
+        return out + ([cur] if cur else [])
+
+    def para(self, s, size=10, bold=False, c="text", indent=0.0, gap=4.0, width=None):
+        width = width or (self.W - 2 * self.MARGIN - indent)
+        for ln in self.wrap(s, size, width, bold):
+            self.need(size * 1.35)
+            self.y -= size * 1.35
+            self.text_at(self.MARGIN + indent, self.y, ln, size, bold, c)
+        self.y -= gap
+
+    def heading(self, s, size=14):
+        self.need(size * 2.6)
+        self.y -= size * 0.9
+        self.para(s, size, True, gap=2)
+        self.line(self.MARGIN, self.y, self.W - self.MARGIN, self.y, "line", 0.8)
+        self.y -= 5
+
+    def line(self, x1, y1, x2, y2, c="text", w=1.0):
+        self.color(c, True)
+        self.ops.append(f"{w:.2f} w 1 J {x1:.2f} {y1:.2f} m {x2:.2f} {y2:.2f} l S")
+
+    def rect(self, x, y, w, h, c="text", fill=False, lw=1.0):
+        self.color(c, not fill)
+        self.ops.append(f"{lw:.2f} w {x:.2f} {y:.2f} {w:.2f} {h:.2f} re {'f' if fill else 'S'}")
+
+    def circle(self, x, y, r, c="text", fill=True):
+        k = 0.5523 * r
+        self.color(c, not fill)
+        self.ops.append(f"{x + r:.2f} {y:.2f} m {x + r:.2f} {y + k:.2f} {x + k:.2f} {y + r:.2f} {x:.2f} {y + r:.2f} c "
+                        f"{x - k:.2f} {y + r:.2f} {x - r:.2f} {y + k:.2f} {x - r:.2f} {y:.2f} c "
+                        f"{x - r:.2f} {y - k:.2f} {x - k:.2f} {y - r:.2f} {x:.2f} {y - r:.2f} c "
+                        f"{x + k:.2f} {y - r:.2f} {x + r:.2f} {y - k:.2f} {x + r:.2f} {y:.2f} c {'f' if fill else 'S'}")
+
+    def table(self, cols, rows, size=9):
+        """cols: (title, width, anchor); rows: lists of strings (a cell may be (string, colour)). Cells wrap."""
+        x0 = self.MARGIN
+
+        def put(cells, bold):
+            wrapped = []
+            for (ttl, w, an), cell in zip(cols, cells):
+                s, c = cell if isinstance(cell, tuple) else (cell, "text")
+                wrapped.append((self.wrap(str(s), size, w - 6, bold) or [""], c))
+            hgt = max(len(wl) for wl, _ in wrapped) * size * 1.3 + 5
+            self.need(hgt)
+            x = x0
+            for (ttl, w, an), (wl, c) in zip(cols, wrapped):
+                for i, ln in enumerate(wl):
+                    self.text_at(x + (w - 3 if an == "end" else 3), self.y - size * 1.3 * (i + 1), ln, size, bold, c, an)
+                x += w
+            self.y -= hgt
+            self.line(x0, self.y, x0 + sum(c[1] for c in cols), self.y, "line", 0.5)
+        put([c[0] for c in cols], True)
+        for r in rows:
+            put(r, False)
+        self.y -= 8
+
+    def drawing(self, dr, height=210.0, frame=True):
+        self.need(height + 26)
+        self.y -= 13
+        self.text_at(self.MARGIN, self.y, dr["title"], 10, True)
+        bx = dr["box"]
+        wmm, hmm = bx[2] - bx[0], bx[3] - bx[1]
+        avail = self.W - 2 * self.MARGIN
+        if not frame:
+            height = min(height, hmm * avail / wmm + 8)
+        k = min(avail / wmm, (height - 8) / hmm)
+        ox = self.MARGIN + (avail - wmm * k) / 2.0
+        oy = self.y - 6 - (height - 8 - hmm * k) / 2.0 - hmm * k
+
+        def px(x): return ox + (x - bx[0]) * k
+
+        def py(y): return oy + (y - bx[1]) * k
+        if frame:
+            self.rect(self.MARGIN, self.y - height + 2, avail, height - 6, "line")
+        for it in dr["items"]:
+            if it["t"] == "line" and it.get("mm"):
+                self.line(px(it["x1"]), py(it["y1"]), px(it["x2"]), py(it["y2"]), it["c"], max(1.2, it["mm"] * k))
+        for it in dr["items"]:
+            if it["t"] == "rect":
+                self.rect(px(it["x"]), py(it["y"]), it["w"] * k, it["h"] * k, it["c"], it.get("fill", False), 1.0)
+        for it in dr["items"]:
+            if it["t"] == "line" and not it.get("mm"):
+                self.line(px(it["x1"]), py(it["y1"]), px(it["x2"]), py(it["y2"]), it["c"], max(0.5, it["w"] * 0.22))
+            elif it["t"] == "poly":
+                self.color(it["c"], not it["fill"])
+                path = " ".join(f"{px(q[0]):.2f} {py(q[1]):.2f} {'m' if i == 0 else 'l'}" for i, q in enumerate(it["pts"]))
+                self.ops.append(f"0.9 w {path} {'f' if it['fill'] else 'S'}")
+        for it in dr["items"]:
+            if it["t"] == "dot":
+                r_ = max(2.0, it["r"] * k)
+                self.circle(px(it["x"]), py(it["y"]), r_, it["c"], it.get("fill", True))
+                if it["label"]:
+                    self.text_at(px(it["x"]) + r_ + 3, py(it["y"]) - 3, it["label"], 7, False, "text")
+            elif it["t"] == "text":
+                self.text_at(px(it["x"]), py(it["y"]) - 2.5, it["s"], 6.5, False, it["c"],
+                             {"middle": "middle", "end": "end"}.get(it["a"], "start"))
+        for it in dr["items"]:
+            if it["t"] == "stress":
+                x, y = px(it["x"]), py(it["y"])
+                self.circle(x, y, 9.5, it["c"], False)
+                self.circle(x, y, 7.5, it["c"])
+                self.ops.append("1 1 1 rg")
+                w = self.width(it["label"], 6, True)
+                self.ops.append(f"BT /F2 6 Tf {x - w / 2:.2f} {y - 2.1:.2f} Td ({it['label']}) Tj ET")
+        self.y -= height
+
+    def bytes(self):
+        if self.ops:
+            self.pages.append(self.ops); self.ops = []
+        objs = [b"<< /Type /Catalog /Pages 2 0 R >>", None,
+                b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+                b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>"]
+        kids = []
+        for i, ops in enumerate(self.pages):
+            foot = f"{self.title}  -  page {i + 1} of {len(self.pages)}"
+            r, g, b = _PDF_COL["dim"]
+            ops = ops + [f"{r:.3f} {g:.3f} {b:.3f} rg", f"BT /F1 8 Tf {self.MARGIN:.2f} 30 Td ({foot}) Tj ET"]
+            body = b"\n".join(o if isinstance(o, bytes) else o.encode("latin-1") for o in ops)
+            objs.append(b"<< /Length " + str(len(body)).encode() + b" >>\nstream\n" + body + b"\nendstream")
+            content = len(objs)
+            objs.append(f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {self.W:.0f} {self.H:.0f}] /Contents {content} 0 R "
+                        f"/Resources << /Font << /F1 3 0 R /F2 4 0 R >> >> >>".encode())
+            kids.append(len(objs))
+        objs[1] = ("<< /Type /Pages /Kids [" + " ".join(f"{k} 0 R" for k in kids) + f"] /Count {len(kids)} >>").encode()
+        out, offs = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n"), []
+        for i, o in enumerate(objs):
+            offs.append(len(out))
+            out += f"{i + 1} 0 obj\n".encode() + o + b"\nendobj\n"
+        xref = len(out)
+        out += f"xref\n0 {len(objs) + 1}\n0000000000 65535 f \n".encode()
+        for o in offs:
+            out += f"{o:010d} 00000 n \n".encode()
+        out += f"trailer\n<< /Size {len(objs) + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode()
+        return bytes(out)
+
+
+def frame_pdf(raw, version=""):
+    """The design as a PDF: summary, checks, drawings with the stress points, frame, cut list, parts, build steps."""
+    r = frame_design(raw)
+    d, a = r["inputs"], r["actuator"]
+    p = FramePdf("Motion rig frame design")
+    p.para("Motion rig frame design", 20, True, gap=2)
+    p.para(r["layout_name"], 12, False, "dim", gap=2)
+    p.para(f"Made {time.strftime('%Y-%m-%d %H:%M')} with SMC3 R4" + (f" page {version}" if version else ""), 8.5, False, "dim", gap=8)
+    word = {"ok": ("Looks buildable", "ok"), "warn": ("Buildable, with points to look at", "warn"),
+            "bad": ("Change the design before building", "bad")}[r["verdict"]]
+    p.para(word[0], 13, True, word[1], gap=2)
+    p.para(r["layout_what"], 10, gap=6)
+
+    p.heading("What it does")
+    p.table([("Movement", 170, "start"), ("Range in total", 150, "end"), ("Speed", 150, "end")],
+            [[x["name"], f"{x['range']:.1f} {x['unit']}" + (f" ({x['range'] / FRAME_IN:.1f} in)" if x["unit"] == "mm" else ""),
+              f"{x['speed']:.0f} {x['speed_unit']}"] for x in r["ranges"]])
+    rows = [["Moving weight (driver + what moves with them)", f"{r['mass']:.0f} kg ({r['mass'] * 2.2046:.0f} lb)"],
+            ["Travel at the actuator", _frame_mm(a["travel"])],
+            ["Speed with no load / under load", f"{a['speed_noload']:.0f} / {a['speed_loaded']:.0f} mm/s"],
+            ["Force each can make: continuous / at most", f"{_frame_n(a['force_rated'])} / {_frame_n(a['force_peak'])}"],
+            ["Force a quick move asks for", _frame_n(a["force_need"])],
+            ["Force to hold the rig still", _frame_n(a["force_static"])]]
+    if d["drive"] == "rotary":
+        rows += [["Motor", f"{d['rpm']:.0f} rpm, {d['torque']:.0f} Nm rated, {d['torque_peak']:.0f} Nm at most, {d['volts']:.0f} V"
+                  + (f", {d['ratio']:.1f}:1 extra gearing" if abs(d['ratio'] - 1) > 1e-6 else "")],
+                 ["Lever", f"{d['ctc']:.0f} mm between centres, swinging +/-{d['swing']:.0f} deg"],
+                 ["Current per motor: rated / stalled", f"{a['amps_rated']:.0f} A / {a['amps_stall']:.0f} A"]]
+    else:
+        rows += [["Actuator", f"{d['lead']:.0f} mm screw lead, {d['servo_torque']:.2g} Nm servo at {d['servo_rpm']:.0f} rpm"]]
+    p.table([("Actuator", 250, "start"), ("", 266, "start")], rows)
+
+    p.heading("Checks")
+    mark = {"ok": "OK", "warn": "LOOK", "bad": "CHANGE", "info": "NOTE"}
+    for c in r["checks"]:
+        p.need(34)
+        p.para(f"{mark[c['level']]}: {c['title']}", 10, True, c["level"], gap=0)
+        p.para(c["text"], 9.5, indent=12, gap=5)
+    if r["fixes"]:
+        p.heading("What would make it better")
+        for f in r["fixes"]:
+            p.need(34)
+            p.para(("FIX: " if f["level"] == "bad" else "LOOK: " if f["level"] == "warn" else "IDEA: ") + f["title"], 10, True,
+                   "info" if f["level"] == "tip" else f["level"], gap=0)
+            p.para(f["text"], 9.5, indent=12, gap=5)
+    p.heading("Where the seat goes")
+    p.para(r["seat"]["text"], 9.5)
+
+    p.new_page()
+    p.heading("Layout and stress points")
+    p.para("The numbered discs are where each member works hardest; the number is how much of its allowance is used "
+           "(green up to 80%, amber to 100%, red over). Put gussets there and keep welds and bolt holes out of them.", 9.5, gap=2)
+    p.para("Orange: motors and actuators. Teal arrows: what moves and how far. Grey lines with ticks: distances.", 9.5, gap=2)
+    p.drawing(r["drawings"]["top"], 270)
+    p.drawing(r["drawings"]["side"], 215)
+    if "front" in r["drawings"]:
+        p.drawing(r["drawings"]["front"], 215)
+
+    p.heading("Frame")
+    p.para(f"{r['material']}, {'welded' if d['join'] == 'welded' else 'bolted'} joints: {r['yield']:.0f} MPa "
+           f"({r['yield'] / 6.895:.0f} ksi) yield, {r['allow']:.0f} MPa allowed (a factor of {FRAME_SF:.0f} against the "
+           f"largest force an actuator can make, {_frame_n(r['design_force'])}). "
+           + (f"One size that passes everywhere: {r['one_size']}." if r["one_size"] else "No single size in this family passes everywhere."), 9.5)
+    p.table([("Member", 168, "start"), ("Section", 92, "start"), ("Load", 62, "end"), ("Moment", 54, "end"),
+             ("Stress", 50, "end"), ("Bends", 46, "end"), ("Used", 44, "end")],
+            [[m["name"], m["section_name"], f"{m['P']:.0f} N", f"{m['M']:.0f} Nm", f"{m['stress']:.0f} MPa",
+              f"{m['defl']:.1f} mm", (f"{m['util'] * 100:.0f}%", "bad" if m["util"] > 1 else "warn" if m["util"] > .8 else "ok")]
+             for m in r["members"]], 8.5)
+    p.para(f"Frame members listed: about {r['frame_kg']:.1f} kg ({r['frame_kg'] * 2.2046:.0f} lb).", 9, False, "dim")
+    if d["braces"]:
+        p.para("Braced or supported: " + ", ".join(m["name"].lower() for m in r["members"] if m["braced"]) + ".", 9, False, "dim")
+
+    p.heading("Joints: how the pieces are held together")
+    p.para("Joints usually give up before beams do, so each is sized for the largest force an actuator can make, as a "
+           "stiff joint (the beams themselves are sized as if their ends could turn - both on the safe side). 'Used' is "
+           "how much of the bolts' shear strength, or of the wall they bear on, that takes.", 9.5)
+    for jm in r["join_methods"]:
+        p.need(40)
+        p.para(jm["name"], 10, True, gap=0)
+        p.para(jm["how"], 9.5, indent=12, gap=5)
+    for dr in r["joint_pictures"]:
+        p.drawing(dr, 215)
+    p.table([("Joint", 190, "start"), ("How many", 48, "end"), ("What holds it", 170, "start"), ("Shear", 54, "end"), ("Used", 44, "end")],
+            [[j["name"], str(j["count"]), j["hw"], f"{j['V']:.0f} N" if j["V"] else "light",
+              (f"{j['u'] * 100:.0f}%", "bad" if j["u"] > 1 else "warn" if j["u"] > .8 else "ok")] for j in r["joints"]], 8.5)
+
+    p.heading("Mounting hardware to buy")
+    for h_ in r["hardware"]:
+        p.para("-  " + h_, 9.5, gap=2)
+    p.para("Buy a few spare of each. Counts are for the frame's own joints and mounts; the motors, joints and rod ends "
+           "are in the parts list.", 9, False, "dim")
+
+    p.heading("Cut list")
+    p.table([("Piece", 250, "start"), ("Section", 130, "start"), ("How many", 56, "end"), ("Length", 80, "end")],
+            [[c["what"], c["section"], str(c["qty"]), (f"{c['len']:.0f} mm ({c['len'] / FRAME_IN:.1f} in)" if c["len"] else "-")] for c in r["cut"]], 9)
+    p.drawing(r["cut_picture"], 300, frame=False)
+
+    p.need(230)
+    p.heading("What to assemble first")
+    for dr in r["assembly"]:
+        p.drawing(dr, 150)
+        p.para(dr["note"], 9, False, "dim", gap=4)
+    p.heading("Parts")
+    for s in r["parts"]:
+        p.para("-  " + s, 9.5, gap=2)
+
+    c = r["cost"]
+    p.need(160)
+    p.heading("Ball-park cost of the parts")
+    p.para(f"About {c['low']:,} to {c['high']:,} US dollars; the sums below come to {c['total']:,}.", 10.5, True)
+    p.table([("What", 300, "start"), ("How many", 60, "end"), ("Each, about", 70, "end"), ("About", 70, "end")],
+            [[f"{i_['group']}: {i_['what']}", str(i_["qty"]), f"{i_['each']:,.0f} USD" if i_["qty"] > 1 else "", f"{i_['total']:,.0f} USD"] for i_ in c["items"]]
+            + [["Total of the lines above", "", "", f"{c['total']:,} USD"]], 9)
+    p.para(c["note"], 9, False, "dim")
+
+    p.heading("Step by step")
+    for i, s in enumerate(r["steps"]):
+        p.need(40)
+        p.para(f"{i + 1}. {s['title']}", 10.5, True, gap=0)
+        p.para(s["text"], 9.5, indent=14, gap=5)
+
+    p.heading("Read this before building")
+    p.para("These numbers come from simple beam and lever formulas with a safety factor, for sizing a first design. "
+           "They do not model fatigue, weld quality, bolted-joint slip, buckling of thin walls or torsion, and the "
+           "motor figures are only as good as the values entered. Treat a part marked amber or red as a part to make "
+           "stronger, and have a design you will sit in checked by someone qualified. A motion rig can hurt you: test "
+           "with nobody in the seat first, fit mechanical end stops, and keep an emergency stop within reach.", 9.5)
+    return p.bytes(), r
+
+
+class FrameStore:
+    """The frame design's inputs, kept in the data folder so the wizard opens where it was left."""
+
+    def __init__(self, data_dir):
+        self.path = os.path.join(data_dir, "frame.json")
+        self.lock = threading.Lock()
+        self.inputs = None
+        try:
+            with open(self.path) as fh:
+                self.inputs = frame_inputs(json.load(fh))
+        except (OSError, ValueError):
+            pass
+
+    def load(self):
+        with self.lock:
+            return dict(self.inputs) if self.inputs else frame_inputs({})
+
+    def save(self, inputs):
+        with self.lock:
+            if inputs == self.inputs:
+                return
+            self.inputs = dict(inputs)
+            try:
+                tmp = self.path + ".tmp"
+                with open(tmp, "w") as fh:
+                    json.dump(self.inputs, fh)
+                os.replace(tmp, self.path)
+            except OSError:
+                pass
+
+    @staticmethod
+    def meta():
+        return {"layouts": [{"id": k, "motors": v[0], "family": v[1], "name": v[2], "axes": v[3], "what": v[4]}
+                            for k, v in FRAME_LAYOUTS.items()],
+                "layout_defaults": FRAME_LAYOUT_DEFAULTS,
+                "presets": [{"id": k, "drive": v[0], "name": v[1], "values": v[2]} for k, v in FRAME_PRESETS.items()],
+                "materials": [{"id": k, "name": v[0]} for k, v in FRAME_MATERIALS.items()],
+                "families": [{"id": k, "name": v} for k, v in FRAME_FAMILIES.items()]}
+
+
+# --------------------------------------------------------------------------------------------------------------
 # Web page and artwork (seat logo, rig and motor pictures cropped from the dashboard design; Michroma font,
 # SIL Open Font License 1.1, Copyright 2011 The Michroma Project Authors)
 # --------------------------------------------------------------------------------------------------------------
@@ -15194,6 +17791,79 @@ main[data-view=settings]{grid-template-columns:repeat(2,minmax(0,1fr));grid-temp
 main[data-view=help]{grid-template-columns:1fr;grid-template-areas:"help"}
 main[data-view=seat]{grid-template-columns:minmax(0,1fr) minmax(300px,380px);grid-template-areas:"seat seatlive" "park seatlive" "graphs graphs"}
 main[data-view=view3d]{grid-template-columns:1fr;grid-template-areas:"v3d"}
+main[data-view=frame]{grid-template-columns:minmax(0,1fr) minmax(0,1.05fr);grid-template-areas:"frwiz frres";align-items:start}
+/* ---------- frame design (2.9.4) ---------- */
+.frsteps{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 14px}
+.frsteps button{display:flex;align-items:center;gap:7px;height:32px;padding:0 12px 0 6px;border-radius:16px;border:1px solid var(--line-2);background:var(--card-2);color:var(--dim);cursor:pointer;font-size:13px}
+.frsteps button b{display:grid;place-items:center;width:20px;height:20px;border-radius:50%;background:var(--line-2);color:var(--text);font-size:11.5px}
+.frsteps button.on{border-color:var(--blue);color:var(--text)}.frsteps button.on b{background:var(--blue);color:#fff}
+.frhead{font-size:15.5px;font-weight:600;margin:0 0 4px}.frsub{color:var(--dim);font-size:13.5px;margin:0 0 12px;max-width:70ch}
+.frgrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px 14px;margin:0 0 12px}
+.ffld{display:block;min-width:0}.ffld>span{display:block;font-size:13px;margin:0 0 3px}
+.ffld .fin{display:flex;align-items:center;gap:7px}.ffld .fin i{font-style:normal;color:var(--dim);font-size:12.5px;white-space:nowrap;min-width:38px}
+.ffld small{display:block;color:var(--dim);font-size:12px;line-height:1.35;margin:3px 0 0}
+.frpick{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 12px}
+.frpick button{min-width:46px;height:38px;padding:0 14px;border-radius:8px;border:1px solid var(--line-2);background:var(--card-2);color:var(--text);cursor:pointer;font-weight:600}
+.frpick button.on{background:var(--blue);border-color:var(--blue);color:#fff}
+.frlay{display:grid;gap:8px;margin:0 0 12px}
+.frlay button{text-align:left;padding:10px 12px;border-radius:9px;border:1px solid var(--line-2);background:var(--card-2);color:var(--text);cursor:pointer}
+.frlay button b{display:block;font-size:14px}.frlay button span{display:block;color:var(--dim);font-size:12.5px;margin-top:2px}
+.frlay button em{font-style:normal;display:inline-block;margin:5px 5px 0 0;padding:1px 8px;border-radius:10px;border:1px solid var(--line-2);font-size:11.5px;color:var(--dim)}
+.frlay button.on{border-color:var(--blue);box-shadow:inset 0 0 0 1px var(--blue)}
+.frnav{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:14px;border-top:1px solid var(--line);padding-top:12px}.frnav .sp{margin-left:auto}
+.frderived{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin:2px 0 12px}
+.frderived div{border:1px solid var(--line);border-radius:8px;background:var(--card-2);padding:7px 10px;min-width:0}
+.frderived div span{display:block;color:var(--dim);font-size:12px}.frderived div b{font:600 15px var(--mono)}
+.frverd{display:flex;align-items:center;gap:10px;border-radius:9px;padding:9px 12px;margin:0 0 12px;font-weight:600;border:1px solid var(--fc);background:color-mix(in srgb,var(--fc) 11%,var(--card))}
+.frverd i{width:11px;height:11px;border-radius:50%;background:var(--fc);flex:none}
+.fr-ok{--fc:var(--green-1)}.fr-warn{--fc:var(--amber)}.fr-bad{--fc:var(--red)}.fr-info{--fc:var(--blue)}
+.frdraw{display:grid;grid-template-columns:1fr;gap:8px;margin:0 0 12px}
+.frdraw figure{margin:0;border:1px solid var(--line);border-radius:8px;background:var(--chart);padding:4px 6px 2px}
+.frdraw figcaption{font-size:12px;color:var(--dim);padding:2px 2px 0}
+.frdraw svg{display:block;width:100%;height:auto;max-height:330px}
+.frtab{width:100%;border-collapse:collapse;font-size:13px;margin:0 0 12px}
+.frtab th{font-weight:600;color:var(--dim);font-size:12px;text-align:left}
+.frtab td,.frtab th{border-top:1px solid var(--line);padding:6px 8px 6px 0;vertical-align:top}
+.frtab td.n,.frtab th.n{text-align:right;font-family:var(--mono);white-space:nowrap;padding-right:0;padding-left:8px}
+.frbar{display:inline-block;width:64px;height:7px;border-radius:4px;background:var(--line);vertical-align:middle;margin-right:7px;overflow:hidden}
+.frbar i{display:block;height:100%;background:var(--fc)}
+.frchk{border-left:3px solid var(--fc);padding:2px 0 2px 10px;margin:0 0 9px;font-size:13.5px}
+.frchk b{display:block;color:color-mix(in srgb,var(--fc) 75%,var(--text))}.frchk span{color:var(--dim)}
+.frlist{margin:0 0 12px;padding-left:20px;font-size:13.5px}.frlist li{margin:0 0 6px}.frlist li b{display:block}
+.frnote{color:var(--dim);font-size:12.5px;line-height:1.45;border-top:1px solid var(--line);padding-top:9px;margin-top:4px}
+.frunits{margin-left:auto;display:flex;gap:0}.frunits button{height:28px;padding:0 10px;border:1px solid var(--line-2);background:var(--card-2);color:var(--dim);cursor:pointer;font-size:12.5px}
+.frunits button:first-child{border-radius:7px 0 0 7px}.frunits button:last-child{border-radius:0 7px 7px 0;border-left:0}
+.frunits button.on{background:var(--blue);border-color:var(--blue);color:#fff}
+.frfam{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px;margin:0 0 12px}
+.frfam button{display:flex;flex-direction:column;align-items:center;gap:6px;padding:9px 4px 8px;border-radius:9px;border:1px solid var(--line-2);background:var(--card-2);color:var(--text);cursor:pointer;font-size:12.5px;line-height:1.2;text-align:center}
+.frfam button.on{border-color:var(--blue);box-shadow:inset 0 0 0 1px var(--blue)}.frfam svg{width:58px;height:58px}
+.frsec{width:30px;height:30px;vertical-align:middle;margin-right:7px;flex:none}
+.frfix{border:1px solid var(--line-2);border-radius:9px;background:var(--card-2);padding:10px 12px;margin:0 0 12px}
+.frfix h4{display:flex;align-items:center;gap:10px;margin:0 0 8px;font-size:14px}.frfix h4 button{margin-left:auto}
+.frfix .frchk{display:flex;gap:10px;align-items:flex-start;margin:0 0 8px}.frfix .frchk>div{flex:1;min-width:0}.frfix .frchk:last-child{margin-bottom:0}
+.frfix .frchk button{flex:none;height:28px;padding:0 10px;border-radius:7px;border:1px solid var(--line-2);background:var(--card);color:var(--text);cursor:pointer;font-size:12.5px}
+.fr-tip{--fc:#22c7dd}
+.frpics{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin:0 0 12px}.frpics.one{grid-template-columns:1fr}
+.frpics figure{margin:0;border:1px solid var(--line);border-radius:8px;background:var(--chart);padding:4px 6px 4px}
+.frpics figcaption{font-size:12px;color:var(--dim);padding:2px 2px 0}.frpics figcaption b{display:block;color:var(--text);font-size:12.5px}
+.frpics svg{display:block;width:100%;height:auto;max-height:300px}.frpics.tall svg{max-height:none}
+.f3wrap{position:relative;height:540px;border:1px solid var(--line);border-radius:8px;overflow:hidden;margin:0 0 12px;background:#0a111b}
+.f3wrap canvas{display:block;width:100%;height:100%;touch-action:none}
+.f3hud{position:absolute;left:10px;top:10px;right:10px;pointer-events:none;font-size:12.5px;line-height:1.35}
+.f3views,.f3views button{pointer-events:auto}.f3hud div{display:table;background:rgba(8,14,22,.84);border-left:3px solid var(--fc);padding:4px 9px;margin:0 0 4px;border-radius:4px;color:#e7edf5;max-width:100%}
+.f3hud{right:190px}
+.f3views{position:absolute;right:10px;top:10px;display:flex}.f3views button{height:30px;padding:0 12px;border:1px solid #2c3b4f;background:rgba(8,14,22,.84);color:#9fb3c8;cursor:pointer;font-size:12.5px}
+.f3views button:first-child{border-radius:7px 0 0 7px}.f3views button:last-child{border-radius:0 7px 7px 0;border-left:0}.f3views button.on{background:var(--blue);border-color:var(--blue);color:#fff}
+.f3legend{position:absolute;right:10px;bottom:10px;width:210px;font-size:11px;color:#9fb3c8;background:rgba(8,14,22,.84);border-radius:6px;padding:6px 9px;pointer-events:none}
+.f3legend i{display:block;height:9px;border-radius:5px;margin:3px 0;background:linear-gradient(90deg,#2b6cff 0%,#2fd46a 41.7%,#f5d000 66.7%,#ff7a00 83.3%,#e0202a 100%)}
+.f3legend div{display:flex;justify-content:space-between}.f3legend b{font-weight:400}
+.frmix{height:30px;font-size:12.5px;padding:0 6px;margin-top:4px;max-width:190px}
+.f3pose{position:absolute;left:10px;bottom:26px;font:12px var(--mono);color:#9fb3c8;pointer-events:none}
+.f3tip{position:absolute;left:10px;bottom:7px;font-size:11.5px;color:#7f93a8;pointer-events:none}
+.fsl>span{display:flex;justify-content:space-between;gap:8px}.fsl>span b{font:600 13px var(--mono)}
+.fsl input[type=range]{width:100%;accent-color:var(--blue-1);height:28px}
+.frtog{display:flex;flex-wrap:wrap;gap:6px 18px;margin:0 0 12px}
+@media (max-width:860px){.frpics{grid-template-columns:1fr}.frfam{grid-template-columns:repeat(3,minmax(0,1fr))}.f3wrap{height:400px}.frgrid{grid-template-columns:1fr}.frderived{grid-template-columns:1fr 1fr}.frtab{font-size:12px}.frtab td,.frtab th{padding-right:4px;overflow-wrap:anywhere}.frtab td.n,.frtab th.n{white-space:normal;padding-left:4px}.frbar{display:none}.frsteps button{padding:0 9px 0 5px;font-size:12px}.frverd{flex-wrap:wrap}.frverd span{margin-left:0!important}}
 main[data-view] > [data-views]{align-self:stretch}
 .mrow{display:grid;grid-template-columns:repeat(var(--n,3),minmax(0,1fr));gap:14px;min-width:0}
 
@@ -15753,6 +18423,7 @@ details.oks .flist{margin-top:6px}
   <a href="#profiles"><svg class="i" viewBox="0 0 24 24"><path d="M6 2h9l5 5v15H6z"/><path d="M14 2v6h6M9 13h8M9 17h6"/></svg>Profiles</a>
   <a href="#autotune"><svg class="i" viewBox="0 0 24 24"><path d="M4 20L15 9M13 4l1 2 2 1-2 1-1 2-1-2-2-1 2-1zM19 11l.7 1.3L21 13l-1.3.7L19 15l-.7-1.3L17 13l1.3-.7z"/></svg>Auto-Tune</a>
   <a href="#seat"><svg class="i" viewBox="0 0 24 24"><rect x="2.5" y="9" width="19" height="6" rx="3"/><circle cx="12" cy="12" r="1.6"/><path d="M8.5 9v6M15.5 9v6M12 3v3M12 18v3"/></svg>Seat Setup</a>
+  <a href="#frame"><svg class="i" viewBox="0 0 24 24"><path d="M3 20h18M5 20V9l7-5 7 5v11M5 13h14M12 4v16"/></svg>Frame Design</a>
   <a href="#eeprom"><svg class="i" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="1.5"/><path d="M9 2v4M15 2v4M9 18v4M15 18v4M2 9h4M2 15h4M18 9h4M18 15h4"/></svg>EEPROM</a>
   <a href="#settings"><svg class="i" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M4.9 19.1L7 17M17 7l2.1-2.1"/></svg>Settings<span class="nbadge" id="navbadge" data-k="navbadge" hidden></span></a>
   <a href="#help"><svg class="i" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9.5"/><path d="M9.1 9a3 3 0 0 1 5.8 1c0 2-3 3-3 3M12 17h.01"/></svg>Help</a>
@@ -16318,6 +18989,19 @@ details.oks .flist{margin-top:6px}
  </section>
 
  <!-- help -->
+ <!-- frame design (2.9.4) -->
+ <section class="card wide" id="frwiz" style="grid-area:frwiz" data-views="frame">
+  <div class="ct">Frame design<span class="frunits" id="fr_units"><button data-u="metric">mm / kg</button><button data-u="imperial">in / lb</button></span></div>
+  <div class="frsteps" id="fr_steps"></div>
+  <div id="fr_body"></div>
+  <div class="frnav"><button class="btn b-grey" id="fr_back">Back</button><button class="btn b-ghost" id="fr_reset">Start over</button><span class="sp"></span><button class="btn b-blue" id="fr_pdf">Export PDF</button><button class="btn b-green" id="fr_next">Next</button></div>
+ </section>
+ <section class="card wide" id="frres" style="grid-area:frres" data-views="frame">
+  <div class="ct">Your design</div>
+  <div id="f3box" hidden><div class="f3wrap"><canvas id="f3c"></canvas><div class="f3hud" id="f3hud"></div><div class="f3views" id="f3views"><button data-view="rig" class="on">Rig</button><button data-view="heat">Heat map</button></div><div class="f3legend" id="f3legend" hidden><span>load used - joints first, then along the beam</span><i></i><div><b>0</b><b>50%</b><b>80%</b><b>100%</b><b>120%+</b></div></div><div class="f3pose" id="f3pose"></div><div class="f3tip">drag: turn - wheel or pinch: zoom - right-drag: move</div></div></div>
+  <div id="fr_out"><p class="frsub">Working it out...</p></div>
+ </section>
+
  <section class="card help" style="grid-area:help" data-views="help">
   <div class="ct">Help</div>
   <div class="cols">
@@ -16333,6 +19017,7 @@ details.oks .flist{margin-top:6px}
     <h3>Diagnostics</h3><p>Settings section. <b>Quick check</b> reads the board and listens for a few seconds; <b>Full check</b> also moves each motor a little to see which way it goes, how much drive it needs, whether the wiring is swapped and how it answers a small step - and can ask you what you saw. Both make one file (saved on the NAS too) to download and give to whoever helps you. The page also watches while you drive and notes pot glitches, a motor moving the wrong way or stalling, hunting, cutoffs, the tilt limit and board restarts. It also keeps a <b>load map</b>: where each motor falls behind or runs at full power, each way across its travel - a quick check after a session names where the rig struggles (lifting a heavy driver, say). With the motion sensor, the full check also measures the seat itself: degrees per count, bounce and play in the linkage - for the traction-loss motor, how far the seat turns. For the rear slide it asks whether the rear went left or right.</p>
     <h3>Test signals on several motors (page 2.9)</h3><p>The Test Signal card's <b>Together</b> list, and Presets <b>Twist</b>, <b>Heave</b>, <b>Corner</b> and <b>Wave</b>, run one signal on several motors at once, each around its own centre (the level seat): Twist moves the two front lifts opposite each other - one goes down while the other goes up, the most twist the rig can do; Heave moves the lifts together; Corner the front lifts opposite each other with the rear slide; Wave every motor in turn, a third of a cycle apart. Only what the rig has the motors for is offered.</p>
     <h3>Restart the board (page 2.9, firmware 2.0)</h3><p>The <b>Restart</b> button next to Settings restarts the board as its RESET button does: the motors switch off first, the board is back in a few seconds and the page reconnects by itself (over the cable, once the port is back). It is refused while SimHub sends positions - a game is running - and while auto-tune, Seat setup or the full check runs. Nothing in the firmware restarts the board by itself; only this button, a firmware update you start, the RESET button or a power cut do.</p>
+    <h3>Frame Design (page 2.9.4)</h3><p>A wizard for planning a rig before any metal is cut; nothing in it talks to the board. Six steps: <b>Motors</b> (2 to 6: a seat mover, 2 lifts + traction loss, 3 or 4 corner actuators, traction loss and surge under four corners, or a Stewart platform), <b>Drive</b> (a gear motor with a lever and push rod, or a ball-screw actuator), <b>Size</b> (the weights - driver, seat, wheel and wheelbase, pedals - and the distances), <b>Frame</b> (the section family, the material, bolted or welded; any member can have its own section and material; every joint with its fasteners and a picture), <b>Build</b> (the cut list to scale, the mounting hardware, the parts with a ball-park cost, what to assemble first, the steps) and <b>3D test</b>. The right-hand side shows the drawings with the main distances, the range and speed of every movement, the force each actuator needs against what it can make, and the checks; <b>What would make it better</b> lists suggestions and <b>Fix it for me</b> applies the ones that are needed. In the 3D test, turn the rig with the mouse, put a weight on the seat, slide the seat forwards or back and move each axis: <b>Rig</b> shows every part as built, <b>Heat map</b> shows where the load goes - the joints first - and lets the parts bend (drawn 20 times larger than life); an actuator turns red when it runs out of travel or of force. <b>Export PDF</b> saves all of it. It uses lever and beam formulas with a safety factor - a first design to check, not a finite-element analysis - and it never talks to the board.</p>
     <h3>Status bar</h3><p>LOW POWER means no position commands for 15 s, so the board runs at quarter drive until SimHub or this page sends targets again.</p>
     <h3>Firmware update (firmware 1.9.2)</h3><p>Settings, Firmware update installs new firmware over WiFi - no USB cable, and SimHub can stay open (with its motion output paused). In the Arduino IDE open the new .ino and use <b>Sketch, Export Compiled Binary</b>; choose that .bin on the page and press Install. The page checks the file (an SMC3_R4 build for the UNO R4 WiFi, and which version), the board switches the motors off, its WiFi module downloads and checks the file and installs it, and the page confirms the new version once the board is back. The board remembers the WiFi name and password it last joined with, so a build with the placeholders still connects. Needs the WiFi module's own firmware 0.4.0 or newer (0.5.0+ shows progress): Arduino IDE, Tools, Firmware Updater, with SimHub closed (it keeps the USB port busy) - and since that erases the sketch on the board, upload SMC3_R4 again over USB afterwards. The first install of it (SMC3_R4_v1.9.3.ino - 1.9.2 didn't compile in the Arduino IDE) goes over USB.</p>
     <h3>USB cable for calibration (page 2.8, firmware 1.9.5; 2.0 recommended)</h3><p>The board's WiFi module now and then holds the board up for a second or more, so the page's moves can lag and auto-tune redoes a test move. For calibration, link the page to the board over its USB cable instead: close SimHub, then flip the switch at the top of the page to <b>USB</b>. In Chrome, Edge, Brave or Firefox 151+ on the PC with the cable (page 2.9) the page opens the port itself - pick the Arduino in the browser's list once; the page must be a secure one (https, or localhost), and Settings, USB cable says how when it isn't. With firmware 2.0 the port is the main chip's own (a COM port of its own): no USB stall, no lost bytes; an Arduino IDE upload goes through the WiFi chip, so press <b>WiFi chip until the next reset</b> in Settings, USB cable first (or press the board's RESET twice, about a second apart). Other browsers, or another PC: press <b>Win+R</b> on the PC with the cable and paste the line from <b>Settings, USB cable</b>. That starts a small bridge (Windows PowerShell, nothing to install) which finds the board's COM port and links it to the page; the switch at the top of the page then shows <b>USB</b> and the board makes no WiFi calls at all. When you're done flip the switch to <b>WiFi</b> and start SimHub again: the bridge lets go of the port and waits, so from then on the switch moves between WiFi and the cable (close SimHub before flipping to USB). Closing the bridge window ends it. Settings, USB cable can also turn bridges away (WiFi only). Firmware updates from the page still go over WiFi.</p>
@@ -16716,7 +19401,7 @@ function chartHeight(){const base={dashboard:108,graphs:230}[curView]||150;const
 function toggleExpand(){location.hash=curView==='graphs'?(prevView||'dashboard'):'graphs';}
 
 // ---------- views ----------
-const VIEWS=['dashboard','tuning','motors','graphs','view3d','tools','profiles','autotune','seat','eeprom','settings','help'];
+const VIEWS=['dashboard','tuning','motors','graphs','view3d','tools','profiles','autotune','seat','frame','eeprom','settings','help'];
 function showView(){let v=location.hash.slice(1);if(!VIEWS.includes(v))v='dashboard';
  if(v!=='graphs')prevView=v; curView=v;
  $('main').dataset.view=v;
@@ -16725,9 +19410,448 @@ function showView(){let v=location.hash.slice(1);if(!VIEWS.includes(v))v='dashbo
  const eb=$('expBtn');eb.dataset.k=v==='graphs'?'collapse':'expand';eb.dataset.tip=TIPS[eb.dataset.k];
  eb.innerHTML=v==='graphs'?'<svg class="i" viewBox="0 0 24 24"><path d="M4 14h6v6M20 10h-6V4M14 10l7-7M3 21l7-7"/></svg>':'<svg class="i" viewBox="0 0 24 24"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>';
  if(v==='profiles'){loadProfiles();loadGenres();} if(v==='settings'){fillSettings();diagLists();loadBoard(true);fwLoad(true);updLoad();usbLoad();} if(v==='tuning')loadBoard(true); if(v==='eeprom')loadBackups();
- if(v==='seat'){ssFilled=null;ssPoll();} if(typeof v3Show==='function')v3Show(v==='view3d');
+ if(v==='seat'){ssFilled=null;ssPoll();} if(v==='frame')frOpen();else if(typeof f3Close==='function')f3Close(); if(typeof v3Show==='function')v3Show(v==='view3d');
  chartHeight();}
 window.addEventListener('hashchange',showView);
+
+// ---------- frame design (2.9.4) ----------
+let FR=null,frIn=null,frMeta=null,frStep=0,frUnits='metric',frTimer=null,frSeq=0;
+try{frUnits=localStorage.getItem('frUnits')==='imperial'?'imperial':'metric';}catch(e){}
+const FRU={len:['mm','in',1/25.4,1],mass:['kg','lb',2.2046,0],torque:['Nm','lbf ft',0.7376,1]};
+const FRF={   // field: label, unit (a kind in FRU, or the unit as text), step, note
+ driver_kg:['Driver','mass',1,'The heaviest person who will sit in it.'],
+ moving_kg:['Everything else that moves','mass',1,'All of it except the driver: seat, moving frame, and wheel, pedals and screen if they move too. The parts below are counted inside this.'],
+ seat_kg:['of which: seat and its slider','mass',1,'A bucket seat is 7-10 kg, a car seat 15-25 kg; the slider adds about 3 kg.'],
+ wheel_kg:['of which: wheel and wheelbase','mass',0.5,'Direct drive: a Simagic Alpha Evo is 6.3 kg, the Evo Pro 8.6 kg; add about 1.5 kg for the rim.'],
+ pedal_kg:['of which: pedals','mass',0.5,'A load-cell set is 7-9 kg (Simagic P1000: 6.9 kg with two pedals, 8.4 kg with three).'],
+ seat_slide:['Seat slid forwards (+) or back (-)','len',5,''],
+ accel:['How hard it should accelerate','m/s²',0.5,'At the actuator. 3 is lively for racing; 5 is very sharp; 1.5 suits flying.'],
+ rpm:['Speed at the motor\'s output shaft','rpm',1,'With no load, at the voltage you will run it on.'],
+ torque:['Torque it can give all day','torque',1,'The rated (continuous) torque at the output shaft.'],
+ torque_peak:['Torque at most','torque',1,'What it gives for a moment, with the current your driver allows.'],
+ motor_w:['Motor power','W',10,'From the label; used for the current and the power supply.'],
+ volts:['Supply voltage','V',1,''],
+ ratio:['Extra gearing after the motor','to 1',0.1,'1 = the lever is on the motor\'s own shaft. 2 = half the speed, twice the torque.'],
+ ctc:['Lever length, centre to centre','len',1,'Shaft centre to rod-end centre (CTC). Shorter = more force, less travel and speed.'],
+ swing:['Lever swing each way','°',1,'From square to the push rod. 45 is a good target; never more than 60.'],
+ travel:['Travel','len',5,'End to end.'],
+ lead:['Screw lead','mm per turn',1,'1605 screw = 5, 1610 screw = 10.'],
+ servo_torque:['Servo torque it can give all day','torque',0.1,'Rated torque: 2.4 Nm for a 750 W, 3000 rpm servo.'],
+ servo_peak:['Servo torque at most','torque',0.1,'Usually three times the rated torque.'],
+ servo_rpm:['Servo speed','rpm',100,''],
+ arm:['Pivot to the line of the actuators','len',10,'Measured along the rig. Longer = more force and finer control, less tilt.'],
+ spacing:['Between the two actuators','len',10,'Measured across the rig, rod end to rod end.'],
+ cg_h:['Centre of gravity above the pivot','len',10,'With the driver in. Lower is easier on the motors.'],
+ cg_off:['Centre of gravity ahead of the pivot','len',10,'0 = balanced over the pivot, which is what you want.'],
+ pivot_h:['Pivot above the base','len',10,''],
+ tl_radius:['Yaw pivot to the traction-loss slide','len',10,''],
+ wheelbase:['Front to rear actuators','len',10,''],
+ track:['Left to right actuators','len',10,''],
+ base_r:['Base joints: radius','len',10,''],
+ plat_r:['Platform joints: radius','len',10,''],
+ hex_h:['Platform above the base at mid travel','len',10,''],
+};
+const FRSTEPS=['Motors','Drive','Size','Frame','Build','3D test'];
+function frLab(k){const L=frIn&&frIn.layout;
+ if(L==='lift2tl'){if(k==='arm')return'Rear support to the line of the lifts';if(k==='cg_off')return'Centre of gravity ahead of the rear support';if(k==='cg_h')return'Centre of gravity above the rear support';if(k==='pivot_h')return'Rear support above the base';if(k==='spacing')return'Between the two lifts';}
+ return FRF[k][0];}
+function frNote(k){const L=frIn&&frIn.layout;if(L==='lift2tl'&&k==='cg_off')return'The lifts carry this share of the weight all the time. Closer to the rear support = lighter work for them.';return FRF[k][3];}
+function frConv(k,v,toMetric){const u=FRU[FRF[k][1]];if(!u||frUnits!=='imperial')return v;return toMetric?v/u[2]:v*u[2];}
+function frUnit(k){const u=FRU[FRF[k][1]];return u?(frUnits==='imperial'?u[1]:u[0]):FRF[k][1];}
+function frFmt(k,v){const u=FRU[FRF[k][1]];const x=frConv(k,v,false);const d=(u&&frUnits==='imperial')?(FRF[k][1]==='mass'?0:1):(Math.abs(x)<20&&x%1?1:0);return String(+x.toFixed(Math.max(d,(x%1&&Math.abs(x)<20)?2:d)));}
+function frLen(mm){return frUnits==='imperial'?(mm/25.4).toFixed(1)+' in':Math.round(mm)+' mm';}
+function frForce(n){return frUnits==='imperial'?Math.round(n/4.448)+' lbf':Math.round(n)+' N';}
+function frMass(kg){return frUnits==='imperial'?Math.round(kg*2.2046)+' lb':(+kg.toFixed(1))+' kg';}
+function frStress(m){return frUnits==='imperial'?(m/6.895).toFixed(1)+' ksi':Math.round(m)+' MPa';}
+function frField(k){return`<label class="ffld"><span>${esc(frLab(k))}</span><span class="fin"><input type="number" step="any" data-f="${k}" value="${frFmt(k,frIn[k])}"><i>${esc(frUnit(k))}</i></span>${frNote(k)?`<small>${esc(frNote(k))}</small>`:''}</label>`;}
+function frFields(keys){return`<div class="frgrid">${keys.map(frField).join('')}</div>`;}
+async function frOpen(){if(frMeta){frCalc();if(frStep===5)f3Open();return;}
+ try{const r=await (await fetch('/frame/load')).json();frMeta=r.meta;frIn=r.inputs;frRender();frCalc();}catch(e){$('fr_out').innerHTML='<p class="frsub">The page server did not answer. Reload the page.</p>';}}
+function frLayout(){return frMeta.layouts.find(l=>l.id===frIn.layout);}
+function frSetLayout(id){frIn.layout=id;frIn.motors=frMeta.layouts.find(l=>l.id===id).motors;Object.assign(frIn,frMeta.layout_defaults[id]||{});frRender();frCalc();}
+function frRender(){if(!frIn)return;const L=frLayout(),fam=L.family;
+ $('fr_steps').innerHTML=FRSTEPS.map((n,i)=>`<button class="${i===frStep?'on':''}" data-s="${i}"><b>${i+1}</b>${n}</button>`).join('');
+ document.querySelectorAll('#fr_units button').forEach(b=>b.classList.toggle('on',b.dataset.u===frUnits));
+ let h='';
+ if(frStep===0){
+  h+=`<p class="frhead">How many motors?</p><p class="frsub">More motors add movements, cost and tuning. Two already give pitch and roll - the cues that matter most for racing.</p>
+   <div class="frpick" id="fr_n">${[2,3,4,5,6].map(n=>`<button class="${n===frIn.motors?'on':''}" data-n="${n}">${n}</button>`).join('')}</div>
+   <p class="frhead">Layout</p><div class="frlay" id="fr_lay">${frMeta.layouts.filter(l=>l.motors===frIn.motors).map(l=>`<button class="${l.id===frIn.layout?'on':''}" data-l="${l.id}"><b>${esc(l.name)}</b><span>${esc(l.what)}</span>${l.axes.map(a=>`<em>${a}</em>`).join('')}</button>`).join('')}</div>`;
+  if(frIn.layout==='seat2')h+=`<p class="frhead">What moves?</p><div class="frpick" id="fr_moves"><button class="${frIn.moves==='seat'?'on':''}" data-v="seat">The seat only</button><button class="${frIn.moves==='cockpit'?'on':''}" data-v="cockpit">Seat, wheel and pedals together</button></div><p class="frsub">Seat only is lighter and quicker, and your hands and feet feel the movement against a still wheel and pedals. Moving everything suits flying and keeps the controls where your body is.</p>`;
+ }else if(frStep===1){
+  h+=`<p class="frhead">What drives it?</p><div class="frpick" id="fr_drive"><button class="${frIn.drive==='rotary'?'on':''}" data-v="rotary">Gear motor with a lever</button><button class="${frIn.drive==='linear'?'on':''}" data-v="linear">Linear actuator (ball screw)</button></div>
+   <p class="frsub">${frIn.drive==='rotary'?'A wheelchair, worm-gear or wiper motor turns a short lever; a push rod with rod ends moves the rig. Cheap and strong, driven by this project\'s SMC3 R4 board.':'A servo motor turns a ball screw that pushes straight up and down (the SFX-100 kind). Fast and precise; it needs servo drives, which are not the SMC3 R4 board.'}</p>
+   <label class="ffld" style="margin:0 0 12px"><span>Start from</span><select id="fr_preset"><option value="custom">My own values</option>${frMeta.presets.filter(p=>p.drive===frIn.drive).map(p=>`<option value="${p.id}"${p.id===frIn.preset?' selected':''}>${esc(p.name)}</option>`).join('')}</select><small>Typical values to start from. Check them against your motor's label or data sheet.</small></label>`
+   +frFields(frIn.drive==='rotary'?['rpm','torque','torque_peak','ratio','ctc','swing','motor_w','volts']:['travel','lead','servo_torque','servo_peak','servo_rpm'])
+   +`<div class="frderived" id="fr_der"></div>`;
+ }else if(frStep===2){
+  h+=`<p class="frhead">Weight</p>`+frFields(['driver_kg','moving_kg','seat_kg'].concat(frIn.moves==='cockpit'?['wheel_kg','pedal_kg']:[],['accel']))+`<p class="frhead">Distances</p>`
+   +frFields(fam==='pivot'?['arm','spacing','cg_h','cg_off','pivot_h'].concat(frIn.layout==='lift2tl'?['tl_radius']:[]):fam==='corner'?['wheelbase','track']:['base_r','plat_r','hex_h'])
+   +`<div class="frderived" id="fr_der"></div>`;
+ }else if(frStep===3){
+  const mats=frIn.family==='tslot'?[]:frMeta.materials;
+  h+=`<p class="frhead">What is the frame made of?</p><div class="frfam" id="fr_fam">${frMeta.families.map(f=>`<button class="${f.id===frIn.family?'on':''}" data-fam="${f.id}"><span id="fp_${f.id}"></span>${esc(f.name)}</button>`).join('')}</div>
+   <p class="frsub">Square tube is the easy all-rounder. Rectangular on edge is stiffest for its weight. Round is hard to join. Channel twists. T-slot bolts together and can be changed later. The drawings and the 3D test use the section you choose.</p><div class="frgrid">
+   <label class="ffld"><span>Material</span><select id="fr_material"${mats.length?'':' disabled'}>${mats.length?mats.map(m=>`<option value="${m.id}"${m.id===frIn.material?' selected':''}>${esc(m.name)}</option>`).join(''):'<option>6105-T5 extrusion</option>'}</select><small>6061-T6 is the structural aluminium. 6063 is softer. Steel is heavier, cheaper and easy to weld.</small></label>
+   <label class="ffld"><span>Joints</span><select id="fr_join"${frIn.family==='tslot'?' disabled':''}><option value="bolted"${frIn.join==='bolted'?' selected':''}>Bolted (brackets, gussets)</option><option value="welded"${frIn.join==='welded'?' selected':''}>Welded</option></select><small>Welding softens aluminium next to the weld; the sizes allow for it.</small></label>
+   <label class="ffld"><span>Size</span><select id="fr_size"></select><small>Lightest that passes picks a size for each member. Choose one size to see how it does everywhere.</small></label></div>
+   <div id="fr_mem"></div>`;
+ }else if(frStep===4){
+  h+=`<div id="fr_build"></div>`;
+ }else{
+  const keys=(fam==='pivot'?['arm','spacing','pivot_h','cg_h']:fam==='corner'?['wheelbase','track']:['base_r','plat_r','hex_h']).concat(frIn.drive==='rotary'?['ctc']:['travel']);
+  const R={arm:[200,1600,10],spacing:[200,1200,10],pivot_h:[80,700,10],cg_h:[0,800,10],wheelbase:[600,2200,10],track:[300,1200,10],base_r:[300,1200,10],plat_r:[200,1000,10],hex_h:[250,1200,10],ctc:[20,150,1],travel:[40,400,5],driver_kg:[30,200,1],seat_slide:[-120,120,5]};
+  const sl=k=>{const u=FRU[FRF[k][1]],imp=u&&frUnits==='imperial',c=v=>imp?+(v*u[2]).toFixed(u===FRU.mass?0:1):v;return`<label class="ffld fsl"><span>${esc(frLab(k))}<b>${frFmt(k,frIn[k])} ${esc(frUnit(k))}</b></span><input type="range" data-f="${k}" min="${c(R[k][0])}" max="${c(R[k][1])}" step="${imp?(u===FRU.mass?1:0.1):R[k][2]}" value="${frFmt(k,frIn[k])}"></label>`;};
+  h+=`<p class="frhead">Test it in 3D</p><p class="frsub">The rig as designed, with its real sections, motors and an x-ray seat. Put a weight on the seat and move it: members colour green, amber or red by how much of their allowance the load uses; a motor or actuator turns red when it runs out of travel or of force. <b>Rig</b> shows every part straight, as built; <b>Heat map</b> shows the stress and lets the parts bend (drawn 20 times larger than life) - switch back and forth to compare.</p>
+   <p class="frhead">Weight on the seat</p>${sl('driver_kg')}
+   <div class="frpick" id="f3_w">${[[68,'150 lb'],[100,'220 lb'],[136,'300 lb'],[181,'400 lb']].map(w=>`<button data-w="${w[0]}">${frUnits==='imperial'?w[1]:w[0]+' kg'}</button>`).join('')}</div>
+   <p class="frhead">Slide the seat</p>${sl('seat_slide')}
+   <p class="frsub" id="f3_cg">The driver slides the seat to reach the wheel and pedals; the weight moves with it.</p>
+   <p class="frhead">Move it</p><div class="frpick" id="f3_move"></div>
+   <label class="ffld fsl"><span>How far<b id="f3_ampv">${Math.round(f3Amp*100)}% of its range</b></span><input type="range" id="f3_amp" min="0" max="150" step="5" value="${Math.round(f3Amp*100)}"></label>
+   <p class="frsub">Over 100% pushes past what the actuators reach, to see what would hit first.</p>
+   <p class="frhead">Adjust the design</p><div class="frgrid">${keys.map(sl).join('')}</div>
+   <div class="frtog"><label class="chk"><input type="checkbox" id="f3_xray"${f3Opt.xray?' checked':''}> X-ray seat</label><label class="chk"><input type="checkbox" id="f3_stress"${f3Opt.stress?' checked':''}> Stress colours</label><label class="chk"><input type="checkbox" id="f3_bend"${f3Opt.bend?' checked':''}> Bending in the heat map (20 times)</label></div>`;
+ }
+ $('fr_body').innerHTML=h;
+ $('fr_back').disabled=frStep===0;$('fr_next').hidden=frStep===FRSTEPS.length-1;
+ $('f3box').hidden=frStep!==5;
+ frShow();if(frStep===5)f3Open();else f3Close();}
+function frSecSvg(sh,cls){const b=sh.b,h=sh.h,t=Math.max(sh.t,b*0.05),m=Math.max(b,h)*1.12,x=-b/2,y=-h/2,steel=frIn&&frIn.material==='steel'&&sh.k!=='tslot';
+ const fill=steel?'#7b8794':'#c3ccd6',st=steel?'#4a5562':'#8b97a5';let d;
+ if(sh.k==='round')d=`<path fill-rule="evenodd" d="M${-b/2} 0a${b/2} ${b/2} 0 1 0 ${b} 0a${b/2} ${b/2} 0 1 0 ${-b} 0ZM${-b/2+t} 0a${b/2-t} ${b/2-t} 0 1 0 ${b-2*t} 0a${b/2-t} ${b/2-t} 0 1 0 ${-(b-2*t)} 0Z"/>`;
+ else if(sh.k==='chan')d=`<path d="M${x} ${y}h${b}v${t}h${-(b-t)}v${h-2*t}h${b-t}v${t}h${-b}Z"/>`;
+ else if(sh.k==='tslot'){const g=Math.min(b,h)*0.11,dp=Math.min(b,h)*0.2,n=Math.max(1,Math.round(h/b));let q=`M${x} ${y}H${-g}v${dp}h${2*g}v${-dp}H${-x}`;
+  for(let i=0;i<n;i++){const c=y+(i+0.5)*h/n;q+=`V${c-g}h${-dp}v${2*g}h${dp}`;}q+=`V${-y}H${g}v${-dp}h${-2*g}v${dp}H${x}`;
+  for(let i=n-1;i>=0;i--){const c=y+(i+0.5)*h/n;q+=`V${c+g}h${dp}v${-2*g}h${-dp}`;}d=`<path d="${q}Z"/>`+Array.from({length:n},(_,i)=>`<circle cx="0" cy="${y+(i+0.5)*h/n}" r="${Math.min(b,h)*0.09}" fill="var(--card-2)"/>`).join('');}
+ else d=`<path fill-rule="evenodd" d="M${x} ${y}h${b}v${h}h${-b}ZM${x+t} ${y+t}v${h-2*t}h${b-2*t}v${-(h-2*t)}Z"/>`;
+ return`<svg class="${cls||'frsec'}" viewBox="${-m/2} ${-m/2} ${m} ${m}" fill="${fill}" stroke="${st}" stroke-width="${m*0.018}" stroke-linejoin="round">${d}</svg>`;}
+function frSvg(dr){const b=dr.box,w=b[2]-b[0],hh=b[3]-b[1],fs=dr.fs||Math.max(w,hh*1.6)/46,Y=y=>b[1]+b[3]-y;
+ const C={base:'var(--dim)',moving:'var(--blue)',ghost:'var(--blue)',seat:'var(--faint)',motor:'var(--orange)',sub:'#4fb477',move:'#22c7dd',pivot:'#a56bff',ok:'var(--green-1)',warn:'var(--amber)',bad:'var(--red)',text:'var(--text)',dim:'var(--dim)'};
+ let o=`<svg viewBox="${b[0]} ${b[1]} ${w} ${hh}" role="img" aria-label="${esc(dr.title)}">`;
+ for(const it of dr.items)if(it.t==='line'&&it.mm)o+=`<line x1="${it.x1}" y1="${Y(it.y1)}" x2="${it.x2}" y2="${Y(it.y2)}" stroke="${C[it.c]}" stroke-width="${it.mm}" opacity=".9"/>`;
+ for(const it of dr.items)if(it.t==='rect')o+=`<rect x="${it.x}" y="${Y(it.y+it.h)}" width="${it.w}" height="${it.h}" fill="${it.fill?C[it.c]:'none'}" stroke="${C[it.c]}" stroke-width="${fs*0.2}" ${it.c==='seat'?`stroke-dasharray="${fs*0.5}"`:''}/>`;
+ for(const it of dr.items){
+  if(it.t==='line'&&!it.mm)o+=`<line x1="${it.x1}" y1="${Y(it.y1)}" x2="${it.x2}" y2="${Y(it.y2)}" stroke="${C[it.c]}" stroke-width="${it.w*fs/16}" stroke-linecap="round" ${it.c==='ghost'?'opacity=".45"':''}/>`;
+  else if(it.t==='poly')o+=`<polyline points="${it.pts.map(q=>q[0]+','+Y(q[1])).join(' ')}" fill="${it.fill?C[it.c]:'none'}" stroke="${C[it.c]}" stroke-width="${it.w*fs/16}" stroke-linejoin="round" stroke-linecap="round"/>`;}
+ for(const it of dr.items){
+  if(it.t==='dot'){const r=Math.max(it.r,fs*0.3);o+=`<circle cx="${it.x}" cy="${Y(it.y)}" r="${r}" fill="${it.fill===false?'none':C[it.c]}" stroke="${C[it.c]}" stroke-width="${fs*0.16}"/>`;if(it.label)o+=`<text x="${it.x+r+fs*0.3}" y="${Y(it.y)+fs*0.35}" font-size="${fs}" fill="var(--text)" paint-order="stroke" stroke="var(--chart)" stroke-width="${fs*0.25}">${esc(it.label)}</text>`;}
+  else if(it.t==='text')o+=`<text x="${it.x}" y="${Y(it.y)+fs*0.35}" font-size="${fs*0.92}" fill="${C[it.c]}" text-anchor="${it.a}" paint-order="stroke" stroke="var(--chart)" stroke-width="${fs*0.25}">${esc(it.s)}</text>`;}
+ for(const it of dr.items)if(it.t==='stress'){const m=FR.members.find(x=>x.id===it.id);
+  o+=`<g><title>${esc(m?m.name+': '+it.label+' used with '+m.section_name:'')}</title><circle cx="${it.x}" cy="${Y(it.y)}" r="${fs*1.45}" fill="${C[it.c]}" stroke="var(--card)" stroke-width="${fs*0.2}"/><text x="${it.x}" y="${Y(it.y)+fs*0.33}" font-size="${fs*0.92}" font-weight="700" fill="#fff" text-anchor="middle">${it.label}</text></g>`;}
+ return o+'</svg>';}
+function frShow(){if(!FR)return;const a=FR.actuator,d=FR.inputs;
+ const word={ok:'Looks buildable',warn:'Buildable, with points to look at',bad:'Change the design before building'}[FR.verdict];
+ let o=`<div class="frverd fr-${FR.verdict}"><i></i>${word}<span style="margin-left:auto;font-weight:400;color:var(--dim);font-size:13px">${esc(FR.layout_name)}</span></div>`;
+ if(frStep!==5)o+=`<div class="frdraw"><figure>${frSvg(FR.drawings.top)}<figcaption>Top view. Orange: motors and actuators. Teal arrows: what moves. The discs are where each member works hardest: the number is how much of its allowance is used.</figcaption></figure><figure>${frSvg(FR.drawings.side)}<figcaption>Side view, with the travel drawn in.</figcaption></figure>${FR.drawings.front?`<figure>${frSvg(FR.drawings.front)}<figcaption>Front view.</figcaption></figure>`:''}</div>`;
+ o+=`<table class="frtab"><tr><th>Movement</th><th class="n">Range in total</th><th class="n">Speed</th></tr>${FR.ranges.map(r=>`<tr><td>${esc(r.name)}</td><td class="n">${r.unit==='mm'?frLen(r.range):r.range.toFixed(1)+'°'}</td><td class="n">${r.speed_unit==='mm/s'?(frUnits==='imperial'?(r.speed/25.4).toFixed(1)+' in/s':Math.round(r.speed)+' mm/s'):Math.round(r.speed)+'°/s'}</td></tr>`).join('')}</table>`;
+ o+=`<table class="frtab"><tr><th>Each actuator</th><th class="n"></th></tr>
+  <tr><td>Travel</td><td class="n">${frLen(a.travel)}</td></tr>
+  <tr><td>Speed under load (with no load)</td><td class="n">${Math.round(a.speed_loaded)} (${Math.round(a.speed_noload)}) mm/s</td></tr>
+  <tr><td>Force a quick move asks for</td><td class="n">${frForce(a.force_need)}</td></tr>
+  <tr><td>Force it can make at most (all day)</td><td class="n">${frForce(a.force_peak)} (${frForce(a.force_rated)})</td></tr>
+  <tr><td>Moving weight</td><td class="n">${frMass(FR.mass)}</td></tr></table>`;
+ if(FR.fixes.length){const n=FR.fixes.filter(f=>f.level!=='tip'&&Object.keys(f.patch).length).length;
+  o+=`<div class="frfix" id="fr_fixes"><h4>What would make it better${n?`<button class="btn b-blue" id="fr_fixall">Fix it for me (${n})</button>`:''}</h4>${FR.fixes.map((f,i)=>`<div class="frchk fr-${f.level}"><div><b>${esc(f.title)}</b><span>${esc(f.text)}</span></div>${Object.keys(f.patch).length?`<button data-fix="${i}">${f.level==='tip'?'Try it':'Apply'}</button>`:''}</div>`).join('')}</div>`;}
+ if((FR.braces||[]).length)o+=`<p class="frsub">Braced or supported: ${FR.members.filter(m=>m.braced).map(m=>esc(m.name.toLowerCase())).join('; ')}. <a href="#frame" id="fr_braceclear">Remove the braces</a>.</p>`;
+ o+=FR.checks.map(c=>`<div class="frchk fr-${c.level}"><b>${esc(c.title)}</b><span>${esc(c.text)}</span></div>`).join('');
+ o+=`<div class="frchk fr-info"><b>Where the seat goes</b><span>${esc(FR.seat.text)}</span></div>`;
+ o+=`<p class="frnote">Lever and beam formulas with a safety factor of 2 against the largest force an actuator can make - a first design to check, not a finite-element analysis. Fatigue, weld quality and torsion are not modelled. A motion rig can hurt you: have a design you will sit in checked, fit mechanical end stops and keep an emergency stop within reach.</p>`;
+ $('fr_out').innerHTML=o;
+ const der=$('fr_der');
+ if(der)der.innerHTML=frStep===1?`<div><span>Travel</span><b>${frLen(a.travel)}</b></div><div><span>Speed, no load</span><b>${Math.round(a.speed_noload)} mm/s</b></div><div><span>Force at most</span><b>${frForce(a.force_peak)}</b></div>`
+  :FR.ranges.slice(0,3).map(r=>`<div><span>${esc(r.name)}</span><b>${r.unit==='mm'?frLen(r.range):r.range.toFixed(1)+'°'}</b></div>`).join('');
+ const sz=$('fr_size');
+ if(sz){sz.innerHTML=`<option value="auto">Lightest that passes, per member</option>`+FR.sizes.map(s=>`<option value="${esc(s.id)}"${s.id===d.size?' selected':''}>${esc(s.name)}</option>`).join('');
+  $('fr_mem').innerHTML=`<table class="frtab"><tr><th>Member</th><th>Section</th><th class="n">Stress</th><th class="n">Bends</th><th class="n">Used</th></tr>${FR.members.map(m=>{const lv=m.util>1?'bad':m.util>0.8?'warn':'ok';return`<tr><td>${esc(m.name)}<br><span style="color:var(--dim);font-size:12px">${esc(m.note)} - ${frForce(m.P)} over ${frLen(m.L)}</span></td><td>${frSecSvg(FR.sections[m.section])}<select class="frmix" data-mixsec="${m.id}"><option value="">Auto: ${esc(m.own_sec?m.rec_name:m.section_name)}</option>${frMeta.families.map(f=>`<optgroup label="${esc(f.name)}">${FR.all_sizes.filter(z=>z.family===f.id).map(z=>`<option value="${esc(z.id)}"${z.id===m.own_sec?' selected':''}>${esc(z.name)}</option>`).join('')}</optgroup>`).join('')}</select><br><select class="frmix" data-mixmat="${m.id}" style="margin-left:37px;max-width:153px"${m.material_id==='tslot'?' disabled':''}><option value="">${m.material_id==='tslot'?'6105-T5 extrusion':'Material: as above'}</option>${m.material_id==='tslot'?'':frMeta.materials.map(z=>`<option value="${z.id}"${z.id===m.own_mat?' selected':''}>${esc(z.name)}</option>`).join('')}</select></td><td class="n">${frStress(m.stress)}</td><td class="n">${frUnits==='imperial'?(m.defl/25.4).toFixed(2)+' in':m.defl.toFixed(1)+' mm'}</td><td class="n fr-${lv}"><span class="frbar"><i style="width:${Math.min(100,m.util*100)}%"></i></span>${Math.round(m.util*100)}%</td></tr>`;}).join('')}</table>
+   <p class="frsub"><b>Mix and match:</b> give any member its own section and material in its row - a deeper tube where it is at its limit, lighter stock where it has margin. ${Object.keys(FR.inputs.mix||{}).length?'<a href="#frame" id="fr_mixclear">Back to one family for all</a>.':''} <label class="chk" style="display:inline-flex;margin-left:6px"><input type="checkbox" id="fr_chanout"${FR.inputs.chan_out?' checked':''}> Channels open outwards (otherwise inwards)</label></p>
+   <p class="frhead">Joints: what holds the pieces together</p>
+   <p class="frsub">Joints usually give up before beams do - a bolt shears, or the hole in a thin wall stretches. Each joint is sized for the largest force an actuator can make.</p>
+   ${FR.join_methods.map(j=>`<div class="frchk fr-info"><b>${esc(j.name)}</b><span>${esc(j.how)}</span></div>`).join('')}
+   <div class="frpics${FR.joint_pictures.length<2?' one':''}">${FR.joint_pictures.map(p=>`<figure>${frSvg(p)}<figcaption><b>${esc(p.title)}</b></figcaption></figure>`).join('')}</div>
+   <table class="frtab"><tr><th>Joint</th><th>What holds it</th><th class="n">Shear</th><th class="n">Used</th></tr>${FR.joints.map(j=>{const lv=j.u>1?'bad':j.u>0.8?'warn':'ok';return`<tr><td>${j.count>1?j.count+' x ':''}${esc(j.name)}</td><td>${esc(j.hw)}</td><td class="n">${j.V?frForce(j.V):'light'}</td><td class="n fr-${lv}"><span class="frbar"><i style="width:${Math.min(100,j.u*100)}%"></i></span>${Math.round(j.u*100)}%</td></tr>`;}).join('')}</table>
+   <p class="frsub">${esc(FR.material)}: ${frStress(FR.yield)} yield, ${frStress(FR.allow)} allowed. ${FR.one_size?'One size that passes everywhere: <b>'+esc(FR.one_size)+'</b>.':'No single size in this family passes everywhere.'} These members weigh about ${frMass(FR.frame_kg)}. In most rigs stiffness decides the size, not strength: a frame that flexes soaks up the motion you paid for.</p>`;}
+ for(const f of frMeta.families){const e=$('fp_'+f.id);if(e)e.innerHTML=frSecSvg(FR.family_pictures[f.id],'x');}
+ if(frStep===5&&F3&&F3.on)f3Build();
+ const bl=$('fr_build');
+ if(bl)bl.innerHTML=`<p class="frhead">Cut list</p><table class="frtab"><tr><th>Piece</th><th>Section</th><th class="n">How many</th><th class="n">Length</th></tr>${FR.cut.map(c=>`<tr><td>${esc(c.what)}</td><td>${esc(c.section)}</td><td class="n">${c.qty}</td><td class="n">${c.len?frLen(c.len):'-'}</td></tr>`).join('')}</table>
+  <div class="frpics one tall"><figure>${frSvg(FR.cut_picture)}<figcaption>Every piece to scale. Blue: the moving frame. Green: the traction-loss frame. Grey: the base.</figcaption></figure></div>
+  <p class="frhead">Mounting hardware</p><ul class="frlist">${FR.hardware.map(x=>`<li>${esc(x)}</li>`).join('')}</ul>
+  <div class="frpics${FR.joint_pictures.length<2?' one':''}">${FR.joint_pictures.map(p=>`<figure>${frSvg(p)}<figcaption><b>${esc(p.title)}</b>${esc(p.note)}</figcaption></figure>`).join('')}</div>
+  <p class="frhead">What to assemble first</p>
+  <div class="frpics">${FR.assembly.map(p=>`<figure>${frSvg(p)}<figcaption><b>${esc(p.title)}</b>${esc(p.note)}</figcaption></figure>`).join('')}</div>
+  <p class="frhead">Parts</p><ul class="frlist">${FR.parts.map(x=>`<li>${esc(x)}</li>`).join('')}</ul>
+  <p class="frhead">Ball-park cost of the parts</p>
+  <p class="frsub" id="fr_cost"><b>About ${FR.cost.low.toLocaleString('en-US')} to ${FR.cost.high.toLocaleString('en-US')} US dollars.</b> ${esc(FR.cost.note)}</p>
+  <table class="frtab"><tr><th>What</th><th class="n">How many</th><th class="n">About</th></tr>${FR.cost.items.map(c=>`<tr><td>${esc(c.group)}: ${esc(c.what)}</td><td class="n">${c.qty}</td><td class="n">${Math.round(c.total).toLocaleString('en-US')} USD</td></tr>`).join('')}<tr><td><b>Total of the lines above</b></td><td></td><td class="n"><b>${FR.cost.total.toLocaleString('en-US')} USD</b></td></tr></table>
+  <p class="frhead">Step by step</p><ol class="frlist">${FR.steps.map(x=>`<li><b>${esc(x.title)}</b>${esc(x.text)}</li>`).join('')}</ol>
+  <p class="frsub">Export PDF saves all of this with the drawings, the checks and the frame table. Next: test the design in 3D.</p>`;}
+// ---------- frame design: the 3D test view (2.9.4) ----------
+// The designed rig from /frame/calc's model3d: members extruded with their real section, motors and actuators drawn,
+// an x-ray seat. Orbit / zoom, move each axis, put a weight on the seat: members colour by how much of their allowance
+// the load uses and bend (drawn larger than life), actuators turn red when they run out of travel or of force.
+let F3=null,f3Busy=false,f3Move='still',f3Amp=1,f3Fit='',f3View='rig';
+function f3Heat(u){const T=F3.THREE,st=[[0,0x2b6cff],[0.5,0x2fd46a],[0.8,0xf5d000],[1,0xff7a00],[1.2,0xe0202a]];u=Math.max(0,Math.min(1.2,u));
+ for(let i=1;i<st.length;i++)if(u<=st[i][0])return new T.Color(st[i-1][1]).lerp(new T.Color(st[i][1]),(u-st[i-1][0])/(st[i][0]-st[i-1][0]));return new T.Color(0xe0202a);}
+function f3Label(txt){const T=F3.THREE,c=document.createElement('canvas');c.width=320;c.height=112;const x=c.getContext('2d');x.fillStyle='rgba(10,17,27,.88)';x.strokeStyle='#ff8a3d';x.lineWidth=5;
+ x.beginPath();x.roundRect(4,4,312,104,18);x.fill();x.stroke();x.fillStyle='#fff';x.font='bold 58px sans-serif';x.textAlign='center';x.textBaseline='middle';x.fillText(txt,160,60);
+ const sp=new T.Sprite(new T.SpriteMaterial({map:new T.CanvasTexture(c),depthTest:false,transparent:true}));sp.scale.set(0.42,0.147,1);sp.renderOrder=5;return sp;}
+const f3Opt={xray:true,bend:true,stress:true};
+async function f3Open(){
+ if(!F3&&!f3Busy){f3Busy=true;$('f3hud').innerHTML='Starting the 3D view...';
+  try{await f3Init();}catch(e){$('f3hud').innerHTML='<b class="fr-bad" style="color:var(--red)">The 3D view could not start.</b> It needs WebGL (hardware acceleration on). '+esc(e&&e.message||e);}
+  f3Busy=false;}
+ if(!F3)return;F3.on=true;f3Build();F3.resize();requestAnimationFrame(f3Frame);}
+function f3Close(){if(F3)F3.on=false;}
+async function f3Init(){
+ const THREE=await import('three');const {OrbitControls}=await import('three/addons/controls/OrbitControls.js');
+ const canvas=$('f3c'),R=new THREE.WebGLRenderer({canvas,antialias:true});R.setPixelRatio(Math.min(2,window.devicePixelRatio||1));
+ const scene=new THREE.Scene();scene.background=new THREE.Color(0x0a111b);
+ const cam=new THREE.PerspectiveCamera(38,1,0.05,80);cam.position.set(2.6,1.8,2.8);
+ const ctl=new OrbitControls(cam,canvas);ctl.enableDamping=true;ctl.dampingFactor=0.1;ctl.minDistance=0.5;ctl.maxDistance=14;ctl.target.set(0,0.35,0);
+ scene.add(new THREE.HemisphereLight(0xe6eeff,0x1a222c,1.25));
+ const dl=new THREE.DirectionalLight(0xffffff,1.7);dl.position.set(3,6,2.5);scene.add(dl);
+ const d2=new THREE.DirectionalLight(0x9fc4ff,0.6);d2.position.set(-4,2,-3);scene.add(d2);
+ scene.add(new THREE.GridHelper(8,32,0x2c3d55,0x162030));
+ F3={THREE,R,scene,cam,ctl,root:null,on:false,acts:[],tiltBars:[],
+  resize(){const p=canvas.parentNode,w=p.clientWidth,h=p.clientHeight;if(!w||!h)return;R.setSize(w,h,false);cam.aspect=w/h;cam.updateProjectionMatrix();}};
+ new ResizeObserver(()=>F3.resize()).observe(canvas.parentNode);}
+function f3Shape(sh){const T=F3.THREE,b=sh.b/1000,h=sh.h/1000,t=Math.max(sh.t/1000,0.0015),s=new T.Shape();
+ const rectPath=(p,w,hh,cw)=>{const x=w/2,y=hh/2;if(cw){p.moveTo(-x,-y);p.lineTo(-x,y);p.lineTo(x,y);p.lineTo(x,-y);}else{p.moveTo(-x,-y);p.lineTo(x,-y);p.lineTo(x,y);p.lineTo(-x,y);}p.closePath();};
+ if(sh.k==='round'){s.absarc(0,0,b/2,0,Math.PI*2,false);const o=new T.Path();o.absarc(0,0,b/2-t,0,Math.PI*2,true);s.holes.push(o);}
+ else if(sh.k==='chan'){const x=b/2,y=h/2;s.moveTo(-x,-y);s.lineTo(x,-y);s.lineTo(x,-y+t);s.lineTo(-x+t,-y+t);s.lineTo(-x+t,y-t);s.lineTo(x,y-t);s.lineTo(x,y);s.lineTo(-x,y);s.closePath();}
+ else if(sh.k==='tslot'){const x=b/2,y=h/2,g=Math.min(b,h)*0.11,dp=Math.min(b,h)*0.2,n=Math.max(1,Math.round(h/b)),P=[];   // slots on every face
+  P.push([-x,-y]);P.push([-g,-y]);P.push([-g,-y+dp]);P.push([g,-y+dp]);P.push([g,-y]);P.push([x,-y]);
+  for(let i=0;i<n;i++){const c=-y+(i+0.5)*h/n;P.push([x,c-g]);P.push([x-dp,c-g]);P.push([x-dp,c+g]);P.push([x,c+g]);}
+  P.push([x,y]);P.push([g,y]);P.push([g,y-dp]);P.push([-g,y-dp]);P.push([-g,y]);P.push([-x,y]);
+  for(let i=n-1;i>=0;i--){const c=-y+(i+0.5)*h/n;P.push([-x,c+g]);P.push([-x+dp,c+g]);P.push([-x+dp,c-g]);P.push([-x,c-g]);}
+  P.forEach((q,i)=>i?s.lineTo(q[0],q[1]):s.moveTo(q[0],q[1]));s.closePath();}
+ else{rectPath(s,b,h,false);const o=new T.Path();rectPath(o,b-2*t,h-2*t,true);s.holes.push(o);}
+ return s;}
+function f3Build(){if(!F3||!FR)return;const T=F3.THREE,M=FR.model3d,V=p=>new T.Vector3(p[0]/1000,p[2]/1000,-p[1]/1000);
+ if(F3.root){F3.scene.remove(F3.root);F3.root.traverse(o=>{if(o.geometry)o.geometry.dispose();if(o.material){if(o.material.map)o.material.map.dispose();o.material.dispose();}});}
+ const heat=f3View==='heat';
+ const root=new T.Group(),G={base:new T.Group(),surge:new T.Group(),yaw:new T.Group(),tilt:new T.Group()};
+ root.add(G.base);root.add(G.surge);G.surge.add(G.yaw);G.yaw.add(G.tilt);G.yaw.matrixAutoUpdate=false;G.tilt.matrixAutoUpdate=false;
+ F3.root=root;F3.G=G;F3.acts=[];F3.tiltBars=[];F3.scene.add(root);
+ const by={};FR.members.forEach(m=>by[m.id]=m);
+ const stressCol=u=>new T.Color(u>1?0xe03b3b:u>0.8?0xf5b301:0x2fae3e);
+ const cen={};for(const g of ['base','surge','yaw','tilt']){const ms=M.members.filter(x=>x.g===g),c=new T.Vector3();ms.forEach(x=>c.add(V(x.a)).add(V(x.b)));if(ms.length)c.multiplyScalar(0.5/ms.length);cen[g]=c;}
+ for(const mb of M.members){const a=V(mb.a),b=V(mb.b),L=a.distanceTo(b);if(L<1e-4)continue;
+  const sh=FR.sections[mb.sec]||{k:'tube',b:50,h:50,t:3},geo=new T.ExtrudeGeometry(f3Shape(sh),{depth:L,steps:14,bevelEnabled:false});
+  const z=b.clone().sub(a).normalize(),up=Math.abs(z.y)>0.9?new T.Vector3(1,0,0):new T.Vector3(0,1,0),x=up.clone().cross(z).normalize(),y=z.clone().cross(x);
+  if(sh.k==='chan'){const to=cen[mb.g].clone().sub(a.clone().add(b).multiplyScalar(0.5));to.y=0;const dt=to.dot(x);   // a mirrored pair: every channel opens towards the middle (or all away from it)
+   if(Math.abs(dt)>0.01&&((dt<0)!==!!FR.chan_out)){x.negate();y.negate();}}
+  geo.applyMatrix4(new T.Matrix4().makeBasis(x,y,z).setPosition(a));
+  if(heat){const m0=by[mb.id],u0=m0?m0.util_work:0,pos=geo.attributes.position,cols=new Float32Array(pos.count*3),grey=new T.Color(0x3a4656),hot=mb.hot||[],p=new T.Vector3(),c=new T.Color(),memo={};
+   // stress shows at the connections first (bolt holes, stiff corners) and fades along the beam
+   for(let i=0;i<pos.count;i++){p.fromBufferAttribute(pos,i);const t=Math.round(Math.min(1,Math.max(0,p.sub(a).dot(z)/L))*40)/40;let cc=memo[t];
+    if(!cc){let sp=0,wm=0;for(const h of hot){const w=Math.exp(-Math.abs(t-h[0])*L/0.13);if(h[1]*w>sp)sp=h[1]*w;if(h[1]>0&&w>wm)wm=w;}
+     if(m0){const e=Math.min(t,1-t),pr=mb.model==='cantilever'?(mb.fix==='t'?Math.max(0,1-Math.abs(t-mb.fx)/Math.max(mb.fx,1-mb.fx)):mb.fix==='a'?1-t:mb.fix==='b'?t:1-Math.abs(2*t-1)):Math.max(Math.exp(-e*L/0.12),0.85*Math.pow(Math.sin(Math.PI*t),2));cc=f3Heat(Math.max(u0*pr,sp));}
+     else cc=grey.clone().lerp(f3Heat(wm?sp/wm:0),wm);memo[t]=cc;}
+    cols[i*3]=cc.r;cols[i*3+1]=cc.g;cols[i*3+2]=cc.b;}
+   geo.setAttribute('color',new T.BufferAttribute(cols,3));}
+  const m=by[mb.id],u=m?m.util_work:0,steel=m?m.material_id==='steel':(FR.inputs.material==='steel'&&sh.k!=='tslot'),metal=new T.Color(steel?0x6b7785:0xb7c0ca);
+  // parts bend only in the heat map: the rig view keeps every part straight
+  if(m&&f3Opt.bend&&heat){const bow=new T.Vector3(mb.bow[0],mb.bow[2],-mb.bow[1]),amp=m.defl_work/1000*20,pos=geo.attributes.position,p=new T.Vector3();
+   for(let i=0;i<pos.count;i++){p.fromBufferAttribute(pos,i);const t=Math.min(1,Math.max(0,p.clone().sub(a).dot(z)/L)),f=mb.model==='cantilever'?(mb.fix==='t'?(t>mb.fx?Math.pow((t-mb.fx)/Math.max(1e-6,1-mb.fx),2):0):t*t):Math.sin(Math.PI*t);
+    pos.setXYZ(i,p.x+bow.x*amp*f,p.y+bow.y*amp*f,p.z+bow.z*amp*f);}
+   pos.needsUpdate=true;geo.computeVertexNormals();}
+  let col=metal.clone();if(heat)col=new T.Color(0xffffff);else if(m&&f3Opt.stress)col.lerp(stressCol(u),u>0.8?0.9:0.35);
+  const mat=new T.MeshStandardMaterial({vertexColors:heat,color:col,metalness:heat?0.1:0.55,roughness:heat?0.7:0.42,emissive:(m&&(heat||f3Opt.stress)&&u>1)?0x7a0e0e:0x000000});
+  const mesh=new T.Mesh(geo,mat);mesh.userData={id:mb.id,a,b,h:sh.h/1000,base:col.clone()};G[mb.g].add(mesh);if(mb.g==='tilt')F3.tiltBars.push(mesh);}
+ for(const J of (M.joints||[]))f3Joint(J,G,heat);
+ for(const f of (M.feet||[])){const ft=new T.Mesh(new T.CylinderGeometry(0.03,0.036,0.03,18),new T.MeshStandardMaterial({color:0x1c2128,roughness:0.7}));const p=V(f);p.y-=0.015;ft.position.copy(p);ft.userData={a:1};G.base.add(ft);}
+ // the seat: x-ray by default, so it never hides the frame
+ const seat=new T.Group(),sp=V(M.seat),ck=M.cockpit||{slide:0};F3.seat=seat;F3.seatX=sp.x;seat.position.copy(sp);seat.position.x+=(ck.slide||0)/1000;
+ const dk=()=>new T.MeshStandardMaterial({color:0x20262e,metalness:0.5,roughness:0.5}),st=()=>new T.MeshStandardMaterial({color:0x8793a1,metalness:0.7,roughness:0.35});
+ if(ck.rail){const r=ck.rail,len=(r[1]-r[0])/1000;   // the slider: a rail fixed on the seat cross-members, a rail under the seat that runs on it
+  for(const sy of [-1,1]){const lo=new T.Mesh(new T.BoxGeometry(len,0.024,0.034),st());lo.position.set((r[0]+r[1])/2000,r[3]/1000+0.012,-sy*r[2]/1000);G.tilt.add(lo);
+   const up=new T.Mesh(new T.BoxGeometry(len,0.031,0.026),dk());up.position.set(0,-0.0155,-sy*r[2]/1000);seat.add(up);}}
+ const tag=(txt,at,g)=>{const l=f3Label(txt);l.scale.multiplyScalar(0.55);l.position.copy(at);(g||G.tilt).add(l);},kgs=k=>frUnits==='imperial'?Math.round(k*2.2046)+' lb':(+k.toFixed(1))+' kg';
+ if(ck.wheel){const w=new T.Group();w.position.copy(V(ck.wheel.p));   // the wheelbase on its deck, the rim towards the driver
+  const wb=new T.Mesh(new T.BoxGeometry(0.3,0.11,0.13),dk());wb.position.set(0,0.055+0.006,0);w.add(wb);const dk2=ck.wheel.deck||[340,300],pl=new T.Mesh(new T.BoxGeometry(dk2[0]/1000,0.006,dk2[1]/1000),st());pl.position.set(0,0.003,0);w.add(pl);   // the deck plate lies on the whole deck frame
+  const sh=new T.Mesh(new T.CylinderGeometry(0.018,0.018,0.09,14),st());sh.rotation.z=Math.PI/2;sh.position.set(-0.195,0.061,0);w.add(sh);
+  const rim=new T.Mesh(new T.TorusGeometry(0.15,0.016,12,36),new T.MeshStandardMaterial({color:0x111418,roughness:0.8}));rim.rotation.y=Math.PI/2;rim.position.set(-0.24,0.061,0);w.add(rim);
+  const hub=new T.Mesh(new T.BoxGeometry(0.012,0.05,0.28),rim.material);hub.position.copy(rim.position);w.add(hub);const wg=G[ck.wheel.g||'tilt'];wg.add(w);tag(kgs(ck.wheel.kg),w.position.clone().add(new T.Vector3(0,0.3,0)),wg);}
+ if(ck.pedals){const p=new T.Group();p.position.copy(V(ck.pedals.p));   // the pedal plate with three pedals
+  const pl=new T.Mesh(new T.BoxGeometry(0.26,0.008,0.38),st());pl.position.set(0,0.004,0);p.add(pl);
+  for(const z of [-0.12,0,0.12]){const pd=new T.Mesh(new T.BoxGeometry(0.014,0.2,z===0?0.075:0.055),dk());pd.rotation.z=-0.42;pd.position.set(0.05,0.1,z);p.add(pd);}
+  const pg=G[ck.pedals.g||'tilt'];pg.add(p);tag(kgs(ck.pedals.kg),p.position.clone().add(new T.Vector3(0.06,0.3,0)),pg);}
+ const xm=()=>(f3Opt.xray||heat)?new T.MeshBasicMaterial({color:0x7fd4ff,transparent:true,opacity:heat?0.04:0.09,depthWrite:false}):new T.MeshStandardMaterial({color:0x27303c,roughness:0.8});
+ for(const [w,h,dd,px,py] of [[0.5,0.1,0.5,0,0.05],[0.1,0.62,0.5,-0.25,0.41],[0.1,0.2,0.26,-0.25,0.82]]){const g=new T.BoxGeometry(w,h,dd),ms=new T.Mesh(g,xm());ms.position.set(px,py,0);seat.add(ms);
+  const e=new T.LineSegments(new T.EdgesGeometry(g),new T.LineBasicMaterial({color:0x7fd4ff,transparent:true,opacity:f3Opt.xray?0.45:0.25}));e.position.copy(ms.position);seat.add(e);}
+ const kg=FR.inputs.driver_kg,wz=0.16+kg/900,wt=new T.Mesh(new T.CylinderGeometry(wz*0.62,wz*0.78,wz,24),new T.MeshStandardMaterial({color:0x4a5361,metalness:0.7,roughness:0.35}));   // the weight on the seat, with its amount
+ wt.position.set(0.03,0.1+wz/2,0);seat.add(wt);const hd=new T.Mesh(new T.TorusGeometry(wz*0.3,wz*0.07,10,24),wt.material.clone());hd.position.set(0.03,0.1+wz+wz*0.2,0);seat.add(hd);
+ const lb=f3Label(frUnits==='imperial'?Math.round(kg*2.2046)+' lb':Math.round(kg)+' kg');lb.position.set(0.03,0.1+wz+wz*0.75+0.1,0);seat.add(lb);
+ G.tilt.add(seat);
+ // pivots
+ const pm=new T.MeshStandardMaterial({color:0xa56bff,metalness:0.3,roughness:0.4});
+ if(M.pivots.tilt&&M.family==='pivot'){const s=new T.Mesh(new T.SphereGeometry(0.045,20,14),pm);s.position.copy(V(M.pivots.tilt));G.yaw.add(s);}
+ if(M.pivots.yaw){const pin=M.yaw_pin||[-60,60],hh=(pin[1]-pin[0])/1000,pv=V(M.pivots.yaw);   // the pivot bolt goes through a cross-member in both frames
+  const s=new T.Mesh(new T.CylinderGeometry(0.014,0.014,hh,16),pm);s.position.set(pv.x,(pin[0]+pin[1])/2000,pv.z);G.surge.add(s);
+  for(const yy of [pin[0]/1000+0.006,pin[1]/1000-0.006]){const hd=new T.Mesh(new T.CylinderGeometry(0.026,0.026,0.012,6),pm);hd.position.set(pv.x,yy,pv.z);G.surge.add(hd);}
+  const tb=new T.Mesh(new T.CylinderGeometry(0.045,0.045,0.014,24),new T.MeshStandardMaterial({color:0xc9a227,metalness:0.6,roughness:0.4}));tb.position.copy(pv);G.surge.add(tb);}
+ for(const r of (M.rollers||[])){const rr=r.r/1000,wm=new T.MeshStandardMaterial({color:0x20262e,roughness:0.6}),w=new T.Mesh(new T.CylinderGeometry(rr,rr,0.03,22),wm);   // a fixed wheel: its axle points at the yaw pivot, so it rolls along the arc
+  const ax=new T.Vector3(r.ax[0],0,-r.ax[1]).normalize();w.quaternion.setFromUnitVectors(new T.Vector3(0,1,0),ax);w.position.copy(V(r.p));G.yaw.add(w);
+  const axle=new T.Mesh(new T.CylinderGeometry(0.006,0.006,0.056,10),new T.MeshStandardMaterial({color:0xb7c0ca,metalness:0.7,roughness:0.3}));axle.quaternion.copy(w.quaternion);axle.position.copy(w.position);G.yaw.add(axle);
+  for(const sg of [-1,1]){const fk=new T.Mesh(new T.BoxGeometry(0.004,rr*1.25,rr*0.9),new T.MeshStandardMaterial({color:0x6b7785,metalness:0.6,roughness:0.4}));fk.quaternion.setFromUnitVectors(new T.Vector3(1,0,0),ax);fk.position.copy(w.position).addScaledVector(ax,sg*0.021);fk.position.y+=rr*0.45;G.yaw.add(fk);}}
+ // motors and actuators
+ const om=()=>new T.MeshStandardMaterial({color:0xf08a1c,metalness:0.35,roughness:0.5}),dm=()=>new T.MeshStandardMaterial({color:0x39424e,metalness:0.6,roughness:0.45});
+ const stick=r=>{const m=new T.Mesh(new T.CylinderGeometry(r,r,1,14),om());root.add(m);return m;};
+ const rotary=M.drive==='rotary',ctc=M.ctc/1000;
+ for(const A of M.acts){const g=G[A.g],base=V(A.base),top=V(A.top),dir=new T.Vector3(A.dir[0],A.dir[2],-A.dir[1]),o={A,g,base,top,topG:A.axis==='yaw'?G.yaw:A.axis==='surge'?G.surge:G.tilt,neutral:base.distanceTo(top),parts:[]};
+  if(A.axis==='lift'&&rotary){o.shaft=base.clone().add(new T.Vector3(0,0.095,0)).sub(dir.clone().multiplyScalar(ctc));o.dir=dir;
+   const gb=new T.Mesh(new T.BoxGeometry(0.12,0.12,0.1),dm());gb.position.copy(o.shaft);g.add(gb);
+   const can=new T.Mesh(new T.CylinderGeometry(0.045,0.045,0.17,18),om());can.rotation.z=Math.PI/2;can.position.copy(o.shaft).sub(dir.clone().multiplyScalar(0.145));if(Math.abs(dir.x)<0.5)can.rotation.set(Math.PI/2,0,0);g.add(can);
+   o.lever=stick(0.016);o.rod=stick(0.009);o.parts=[o.lever,o.rod,can];}
+  else{const horiz=A.axis==='yaw'||A.axis==='surge';o.body=stick(0.034);o.rod=stick(0.013);o.parts=[o.body,o.rod];
+   if(A.flip){o.cap=new T.Mesh(new T.CylinderGeometry(0.03,0.03,1,14),dm());root.add(o.cap);   // body on the moving frame with the servo on top; the rod and its foot below
+    const ft=new T.Mesh(new T.CylinderGeometry(0.04,0.045,0.018,18),dm());ft.position.copy(base).add(new T.Vector3(0,0.009,0));g.add(ft);
+    const to=new T.Vector3((A.to||[0,0])[0]/1000,0,-(A.to||[0,0])[1]/1000),tl=to.length();   // its mounting bracket: a clamp round the body, bolted to the frame
+    const sm=new T.MeshStandardMaterial({color:0x8793a1,metalness:0.7,roughness:0.35});
+    const col=new T.Mesh(new T.CylinderGeometry(0.046,0.046,0.075,20),sm);col.position.copy(top);o.topG.add(col);
+    if(tl>0.005){const bk=new T.Mesh(new T.BoxGeometry(tl,0.075,0.1),sm);bk.quaternion.setFromUnitVectors(new T.Vector3(1,0,0),to.clone().normalize());bk.position.copy(top).addScaledVector(to,0.5);o.topG.add(bk);
+     for(const sg of [-1,1]){const b2=new T.Mesh(new T.CylinderGeometry(0.006,0.006,0.02,6),dm());const e=to.clone().normalize();b2.quaternion.setFromUnitVectors(new T.Vector3(0,1,0),e);b2.position.copy(top).addScaledVector(to,0.55).add(new T.Vector3(0,sg*0.022,0));o.topG.add(b2);}}}
+   else if(horiz||rotary){const bx=new T.Mesh(new T.BoxGeometry(0.13,0.12,0.13),dm());bx.position.copy(base);g.add(bx);}
+   else{const sv=new T.Mesh(new T.BoxGeometry(0.07,0.14,0.07),dm());sv.position.copy(base).add(new T.Vector3(0.07,0.07,0));g.add(sv);}}
+  F3.acts.push(o);}
+ root.position.y=0;root.updateMatrixWorld(true);{const bb=new T.Box3();root.traverse(o=>{if(o.isMesh&&o.userData&&o.userData.a)bb.expandByObject(o);});if(bb.min.y<0)root.position.y=-bb.min.y;}
+ const lg=$('f3legend');if(lg)lg.hidden=!heat;document.querySelectorAll('#f3views button').forEach(b=>b.classList.toggle('on',b.dataset.view===f3View));
+ const key=M.layout;
+ if(f3Fit!==key){f3Fit=key;const bx=new T.Box3();root.traverse(o=>{if(o.isMesh&&o.userData&&o.userData.a)bx.expandByObject(o);});bx.max.y+=0.9;const c=bx.getCenter(new T.Vector3()),sz=bx.getSize(new T.Vector3()).length();
+  F3.ctl.target.copy(c);F3.cam.position.set(c.x+sz*0.75,c.y+sz*0.55,c.z+sz*0.85);}
+ const cgt=$('f3_cg');if(cgt&&FR.balance){const B=FR.balance,a=FR.actuator;cgt.textContent='Centre of gravity now '+frLen(Math.abs(B.cg))+(B.cg>=0?' ahead of ':' behind ')+B.ref
+   +(Math.abs(B.slide)>=1?' (the seat moved it '+frLen(Math.abs(B.shift))+')':'')+'. Each '+(M.family==='pivot'&&M.layout!=='seat2'?'lift':'actuator')+' holds '+frForce(a.force_static)+' at rest and a quick move asks for '+frForce(a.force_need)+'.';}
+ f3Controls();}
+// a joint and what holds it: gusset plates with through-bolts on tube, angle cleats on channel, corner brackets on
+// T-slot, clamp fittings on round tube, a weld bead - or a mounting plate with its bolts
+function f3Joint(J,G,heat){const T=F3.THREE,D=v=>new T.Vector3(v[0],v[2],-v[1]),p=new T.Vector3(J.p[0]/1000,J.p[2]/1000,-J.p[1]/1000),sh=FR.sections[J.sec]||{b:50,h:50,t:3,k:'tube'},g=G[J.g];
+ const hc=heat?f3Heat(J.uh):null,hot=!heat&&f3Opt.stress&&J.uw>0.8,pc=heat?hc:new T.Color(hot?(J.uw>1?0xe03b3b:0xf5b301):0x8793a1),bc=heat?hc.clone().multiplyScalar(0.55):new T.Color(0x1b1f25);
+ const pm=new T.MeshStandardMaterial({color:pc,metalness:heat?0.1:0.6,roughness:0.45,emissive:J.uw>1?0x7a0e0e:0}),bm=new T.MeshStandardMaterial({color:bc,metalness:0.5,roughness:0.4});
+ const dia=({M8:8,M10:10,M12:12,M16:16}[J.bolt]||8)/1000,Y=new T.Vector3(0,1,0);
+ const cyl=(at,dir,len,r,mat,seg)=>{const m=new T.Mesh(new T.CylinderGeometry(r,r,len,seg||6),mat);m.quaternion.setFromUnitVectors(Y,dir.clone().normalize());m.position.copy(at);g.add(m);return m;};
+ if(J.single){if(J.kind==='pin'||J.bare)return;const n=D(J.d1).normalize(),e1=Math.abs(n.y)>0.9?new T.Vector3(1,0,0):new T.Vector3(0,1,0).cross(n).normalize(),e2=n.clone().cross(e1);
+  const off=(sh.h/2000)+0.004,c=p.clone().addScaledVector(n,off);
+  if(J.kind==='clamp'){cyl(p.clone().addScaledVector(n,off+0.01),n,0.03,sh.b/2000+0.012,pm,20);return;}
+  // the plate runs along the member it sits on and is no wider than it
+  const ax=D(J.d2||[0,0,0]);ax.addScaledVector(n,-ax.dot(n));const along=ax.lengthSq()>0.2,f1=along?ax.normalize():e1,f2=n.clone().cross(f1).normalize();
+  const wd=along?Math.min(0.1,Math.max(0.03,Math.min(sh.b,sh.h)/1000)):0.1,ln=along?0.13:0.1,pg2=new T.BoxGeometry(ln,0.007,wd);
+  if(along)c.addScaledVector(f1,(J.off||0)/1000);pg2.applyMatrix4(new T.Matrix4().makeBasis(f1,n,f2).setPosition(c));{const ms=new T.Mesh(pg2,pm);ms.userData={plate:1};g.add(ms);}
+  const wide=wd>=0.07,k=J.n<=2?[[-1,0],[1,0]]:wide?(J.n<=4?[[-1,-1],[1,-1],[1,1],[-1,1]]:[[-1,-1],[1,-1],[1,1],[-1,1],[0,-1],[0,1]]):(J.n<=4?[[-1,0],[-0.34,0],[0.34,0],[1,0]]:[[-1,0],[-0.6,0],[-0.2,0],[0.2,0],[0.6,0],[1,0]]);
+  for(const q of k)cyl(c.clone().addScaledVector(f1,q[0]*ln*0.38).addScaledVector(f2,q[1]*wd*0.3).addScaledVector(n,0.004),n,0.016,Math.min(dia*0.85,wd*0.22),bm);return;}
+ const d1=D(J.d1).normalize(),d2=D(J.d2).normalize(),n=d1.clone().cross(d2);if(n.lengthSq()<0.2)return;n.normalize();const e2=n.clone().cross(d1).normalize();
+ const hn=(Math.abs(n.y)>0.7?sh.h:sh.b)/1000,w2=Math.max(sh.b,sh.h)/2000,sides=J.tee?[1,-1]:[1],per=Math.max(2,Math.min(4,Math.round(J.n/2)));
+ const prism=(pts,th,zoff,mat)=>{const s=new T.Shape();pts.forEach((q,i)=>i?s.lineTo(q[0],q[1]):s.moveTo(q[0],q[1]));s.closePath();const ge=new T.ExtrudeGeometry(s,{depth:th,bevelEnabled:false});
+  ge.applyMatrix4(new T.Matrix4().makeBasis(d1,e2,n).setPosition(p.clone().addScaledVector(n,zoff)));g.add(new T.Mesh(ge,mat));};
+ const c2=sg=>[d2.dot(d1)*sg,d2.dot(e2)*sg];                          // d2 in the joint's own plane
+ if(J.kind==='gusset'){   // an L or T plate on both faces, each leg exactly as wide as the member under it: nothing sticks out past the frame
+  const s2=FR.sections[J.sec2]||sh,flat=Math.abs(n.y)>0.7,wIn=(q,dir)=>(Math.abs(dir.y)>0.5?Math.min(q.b,q.h):flat?q.b:q.h)/2000,dOut=(q,dir)=>(Math.abs(dir.y)>0.5?Math.max(q.b,q.h):flat?q.h:q.b)/1000;
+  const wi=wIn(sh,d1),wj=wIn(s2,d2),hz=Math.max(dOut(sh,d1),dOut(s2,d2)),li=Math.max(0.07,3.2*wi),lj=Math.max(0.07,3.2*wj);
+  const strip=(dir,half,from,to,z)=>{const e=n.clone().cross(dir).normalize(),g2=new T.BoxGeometry(to-from,half*2,0.006);g2.applyMatrix4(new T.Matrix4().makeBasis(dir,e,n).setPosition(p.clone().addScaledVector(dir,(from+to)/2).addScaledVector(n,z)));const ms=new T.Mesh(g2,pm);ms.userData={plate:1,half};g.add(ms);};
+  const R=(J.r||[9e3,0,9e3,9e3]).map(v=>v/1000),fl=R[1]>R[0],da=fl?d1.clone().negate():d1,ra=fl?R[1]:R[0];   // a member crossing over: the leg goes along its longer side
+  const ti=Math.max(wj+0.02,Math.min(wj+li,ra)),tp=Math.min(wi+lj,Math.max(R[2],wi)),tn=R[3]<wi?wi:Math.min(J.tee?wi+lj:wi,R[3]);
+  for(const z of [hz/2+0.003,-hz/2-0.003]){strip(da,wi,-wj,ti,z);strip(d2,wj,-tn,tp,z);}
+  for(let i=0;i<per;i++){const f=0.3+0.55*i/Math.max(1,per-1);cyl(p.clone().addScaledVector(da,wj+(ti-wj)*f),n,hz+0.034,Math.min(dia*0.8,wi*0.5),bm);
+   if(tp-wi>0.03)cyl(p.clone().addScaledVector(d2,wi+(tp-wi)*f),n,hz+0.034,Math.min(dia*0.8,wj*0.5),bm);if(tn-wi>0.03)cyl(p.clone().addScaledVector(d2,-(wi+(tn-wi)*f)),n,hz+0.034,Math.min(dia*0.8,wj*0.5),bm);}}
+ else if(J.kind==='clamp'){const r=sh.b/2000+0.008;cyl(p.clone().addScaledVector(d1,w2*1.3),d1,w2*2.6,r,pm,20);cyl(p,d2,w2*3.4,r,pm,20);
+  cyl(p.clone().addScaledVector(d1,w2*1.7).addScaledVector(n,r),n,0.012,0.005,bm);for(const sg of [1,-1])cyl(p.clone().addScaledVector(d2,sg*w2*1.2).addScaledVector(n,r),n,0.012,0.005,bm);}
+ else{const s=J.kind==='weld'?0.022:J.kind==='tslot'?0.07:0.06,th=J.kind==='cleat'?hn*0.8:J.kind==='tslot'?Math.min(hn*0.8,0.036):hn;
+  for(const sg of sides){const q=c2(sg),o=[w2+q[0]*w2,q[1]*w2],pts=[o,[o[0]+s,o[1]],[o[0]+q[0]*s,o[1]+q[1]*s]];
+   prism(pts,th,-th/2,J.kind==='weld'?new T.MeshStandardMaterial({color:heat?hc:0x596373,metalness:0.4,roughness:0.6}):pm);
+   if(J.kind!=='weld'){const cn=p.clone().addScaledVector(d1,w2).addScaledVector(d2,sg*w2);
+    for(let i=0;i<2;i++){const f=0.02+0.028*i;cyl(cn.clone().addScaledVector(d1,f).addScaledVector(d2,sg*0.004),d2,0.014,dia*0.75,bm);cyl(cn.clone().addScaledVector(d2,sg*f).addScaledVector(d1,0.004),d1,0.014,dia*0.75,bm);}}}}}
+function f3Stick(m,p,q){const T=F3.THREE,d=q.clone().sub(p),L=Math.max(d.length(),1e-4);m.position.copy(p).addScaledVector(d,0.5);m.scale.set(1,L,1);m.quaternion.setFromUnitVectors(new T.Vector3(0,1,0),d.multiplyScalar(1/L));}
+function f3Pose(t){const M=FR.model3d,L=M.limits,a=FR.actuator,k=f3Amp,w=2*Math.PI,P={pitch:0,roll:0,yaw:0,heave:0,surge:0,sway:0};
+ const s=(per,ph)=>Math.sin(w*t/per+(ph||0));
+ if(f3Move==='all'){P.pitch=L.pitch*k*0.6*s(3.1);P.roll=L.roll*k*0.6*s(2.3,1);P.yaw=(L.yaw||0)*k*0.7*s(4.1,2);P.heave=(L.heave||0)*k*0.4*s(1.9,0.5);P.surge=(L.surge||0)*k*0.6*s(3.7,1.2);P.sway=(L.sway||0)*k*0.5*s(2.9,2.2);}
+ else if(f3Move!=='still')P[f3Move]=(L[f3Move]||0)*k*s(2.6);
+ F3.drop=a.force_static>a.force_peak;
+ if(F3.drop){const q=Math.min(1,(t%6)/1.2);if(M.family==='pivot'){P.pitch=-L.pitch*q*(M.layout==='seat2'?-1:1);P.roll=0;}else P.heave=-(L.heave||M.travel/2)*q;}   // the motors cannot hold it: it sinks onto its stops
+ return P;}
+function f3Frame(){if(!F3||!F3.on||!F3.root||!FR)return;requestAnimationFrame(f3Frame);
+ const T=F3.THREE,M=FR.model3d,G=F3.G,P=f3Pose(performance.now()/1000),rad=Math.PI/180,mm=0.001;
+ G.surge.position.set(M.family==='hexapod'?P.surge*mm:P.surge*mm,0,-P.sway*mm);
+ const m4=new T.Matrix4(),tr=(v,s)=>new T.Matrix4().makeTranslation(v.x*s,v.y*s,v.z*s);
+ if(M.pivots.yaw&&M.family!=='hexapod'){const pv=new T.Vector3(M.pivots.yaw[0]*mm,0,-M.pivots.yaw[1]*mm);G.yaw.matrix.copy(tr(pv,1)).multiply(m4.makeRotationY(P.yaw*rad)).multiply(tr(pv,-1));}else G.yaw.matrix.identity();
+ const pt=new T.Vector3(M.pivots.tilt[0]*mm,M.pivots.tilt[2]*mm,-M.pivots.tilt[1]*mm);
+ const rot=new T.Matrix4().makeRotationFromEuler(new T.Euler(P.roll*rad,M.family==='hexapod'?P.yaw*rad:0,P.pitch*rad,'YZX'));
+ G.tilt.matrix.copy(new T.Matrix4().makeTranslation(pt.x,pt.y+P.heave*mm,pt.z)).multiply(rot).multiply(tr(pt,-1));
+ F3.root.updateMatrixWorld(true);
+ const say=[],a=FR.actuator,half=M.travel/2*mm,red=new T.Color(0xe03b3b),amber=new T.Color(0xf5b301),org=new T.Color(0xf08a1c);
+ const weak=a.margin_peak<1,heat=f3View==='heat',hc=heat?f3Heat(a.force_need/Math.max(a.force_peak,1)):null;let out=[];
+ for(const o of F3.acts){const b=o.g.localToWorld(o.base.clone()),tp=o.topG.localToWorld(o.top.clone());let ext;
+  if(o.lever){const sh=o.g.localToWorld(o.shaft.clone()),dz=tp.y-(b.y+(o.top.y-o.base.y)),ctc=M.ctc*mm,al=Math.asin(Math.max(-1,Math.min(1,dz/ctc)));
+   const dw=o.dir.clone().transformDirection(o.g.matrixWorld),end=sh.clone().addScaledVector(dw,ctc*Math.cos(al)).add(new T.Vector3(0,ctc*Math.sin(al),0));
+   f3Stick(o.lever,sh,end);f3Stick(o.rod,end,tp);ext=dz;}
+  else{ext=b.distanceTo(tp)-o.neutral;const d=tp.clone().sub(b).normalize(),bl=Math.max(0.05,o.neutral-half-0.04);
+   if(o.A.flip){const e=tp.clone().addScaledVector(d,M.travel*mm+0.07);f3Stick(o.body,tp.clone().addScaledVector(d,-0.04),e);f3Stick(o.cap,e,e.clone().addScaledVector(d,0.075));f3Stick(o.rod,b,tp);}
+   else{f3Stick(o.body,b,b.clone().addScaledVector(d,bl));f3Stick(o.rod,b,tp);}}
+  const over=Math.abs(ext)>half*1.02+0.0005;if(over)out.push(o.A.name);
+  const c=over||F3.drop?red:heat?hc:weak?amber:org;o.parts.forEach(p=>{p.material.color.copy(c);p.material.emissive.setHex(over||F3.drop?0x5a0a0a:0);});}
+ if(F3.drop)say.push(['bad','The motors cannot hold this weight: the platform sinks onto its stops.']);
+ else if(weak)say.push(['warn','The motors can hold it still but not move it this hard: it will feel soft and lag.']);
+ if(a.margin_cont<1&&!F3.drop)say.push(['warn','The motors work above their continuous rating: they will run hot.']);
+ if(out.length)say.push(['bad',out.join(', ')+' out of travel here: the mechanism would hit its end stop'+(M.drive==='rotary'?' or the lever go over centre.':'.')]);
+ let hit=false;const floor=M.family==='pivot'?(M.floor||30)*mm+F3.root.position.y+0.002:-1;
+ for(const ms of F3.tiltBars){const lo=Math.min(G.tilt.localToWorld(ms.userData.a.clone()).y,G.tilt.localToWorld(ms.userData.b.clone()).y)-ms.userData.h/2,h=lo<floor;
+  if(h)hit=true;ms.material.color.copy(h?red:ms.userData.base);if(h)ms.material.emissive.setHex(0x5a0a0a);else if(!((f3Opt.stress||heat)&&FR.members.some(m=>m.id===ms.userData.id&&m.util_work>1)))ms.material.emissive.setHex(0);}
+ if(hit)say.push(['bad','The moving frame hits the base here. Raise the pivot or shorten the travel.']);
+ for(const m of FR.members)if(m.util_work>1)say.push(['bad',m.name+': '+Math.round(m.util_work*100)+'% of its allowance with '+m.section_name+' - it bends '+(frUnits==='imperial'?(m.defl_work/25.4).toFixed(2)+' in':m.defl_work.toFixed(1)+' mm')+'.']);
+  else if(m.util_work>0.8)say.push(['warn',m.name+': '+Math.round(m.util_work*100)+'% of its allowance.']);
+ for(const j of (FR.joints||[]))if(j.u>1)say.push(['bad','Joint: '+j.name+' - '+Math.round(j.u*100)+'% of what '+j.hw+' should carry.']);else if(j.u>0.8)say.push(['warn','Joint: '+j.name+' - '+Math.round(j.u*100)+'% with '+j.hw+'.']);
+ if(!say.length)say.push(['ok','Nothing complains at this weight and movement.']);
+ const key=say.map(x=>x[1]).join('|');
+ if(key!==F3.said){F3.said=key;$('f3hud').innerHTML=say.map(x=>`<div class="fr-${x[0]}"><i></i>${esc(x[1])}</div>`).join('');$('f3hud').dataset.level=say.some(x=>x[0]==='bad')?'bad':say.some(x=>x[0]==='warn')?'warn':'ok';}
+ const pz=$('f3pose');if(pz){const now=performance.now();if(!F3.pt||now-F3.pt>150){F3.pt=now;pz.textContent=M.axes.map(x=>x+' '+(P[x]>=0?'+':'')+P[x].toFixed(x==='heave'||x==='surge'||x==='sway'?0:1)+(x==='heave'||x==='surge'||x==='sway'?' mm':'°')).join('   ');}}
+ F3.ctl.update();F3.R.render(F3.scene,F3.cam);}
+function f3Controls(){const mv=$('f3_move');if(!mv||!FR)return;const ax=FR.model3d.axes;
+ if(f3Move!=='still'&&f3Move!=='all'&&!ax.includes(f3Move))f3Move='still';
+ mv.innerHTML=['still'].concat(ax,['all']).map(x=>`<button class="${x===f3Move?'on':''}" data-mv="${x}">${x==='still'?'Still':x==='all'?'Everything':x[0].toUpperCase()+x.slice(1)}</button>`).join('');}
+
+function frCalc(sync){clearTimeout(frTimer);frTimer=setTimeout(async()=>{const seq=++frSeq;
+ try{const r=await post('/frame/calc',{inputs:frIn});if(seq!==frSeq||!r.ok)return;FR=r.design;
+  if(sync){frIn=Object.assign({},FR.inputs);frRender();}else{for(const k of['motors','layout','moves','drive','material','family','join','size','mix','chan_out','braces'])frIn[k]=FR.inputs[k];frShow();}
+ }catch(e){}},sync?0:220);}
+async function frPdf(){const b=$('fr_pdf');b.disabled=true;
+ try{const r=await fetch('/frame/pdf',{method:'POST',headers:{'X-SMC3':'1'},body:JSON.stringify({inputs:frIn})});if(!r.ok)throw 0;
+  const blob=await r.blob(),a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='motion-rig-frame-design.pdf';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(a.href),8000);toast('PDF saved: motion-rig-frame-design.pdf');
+ }catch(e){toast('Could not make the PDF.',1);}b.disabled=false;}
+$('frwiz').addEventListener('input',e=>{if(e.target.id==='f3_amp'){f3Amp=e.target.value/100;$('f3_ampv').textContent=e.target.value+'% of its range';return;}
+ const k=e.target.dataset&&e.target.dataset.f;if(!k)return;const v=parseFloat(e.target.value);if(!isFinite(v))return;frIn[k]=frConv(k,v,true);if(k==='seat_slide'&&F3&&F3.seat)F3.seat.position.x=F3.seatX+frIn.seat_slide/1000;if(e.target.type==='range'){const b=e.target.parentNode.querySelector('b');if(b)b.textContent=e.target.value+' '+frUnit(k);}if(['rpm','torque','torque_peak','motor_w','volts','ratio','travel','lead','servo_torque','servo_peak','servo_rpm'].includes(k)){frIn.preset='custom';const ps=$('fr_preset');if(ps)ps.value='custom';}frCalc();});
+$('frwiz').addEventListener('change',e=>{const t=e.target;
+ if(t.dataset&&t.dataset.f){if(t.type==='range')frCalc();else frCalc(true);return;}
+ if(t.id==='f3_xray'||t.id==='f3_stress'||t.id==='f3_bend'){f3Opt[t.id.slice(3)]=t.checked;f3Build();return;}
+ if(t.dataset&&(t.dataset.mixsec||t.dataset.mixmat)){const id=t.dataset.mixsec||t.dataset.mixmat,mx=Object.assign({},frIn.mix||{}),e=Object.assign({},mx[id]||{});
+  if(t.dataset.mixsec){if(t.value)e.sec=t.value;else delete e.sec;}else{if(t.value)e.mat=t.value;else delete e.mat;}
+  if(Object.keys(e).length)mx[id]=e;else delete mx[id];frIn.mix=mx;frCalc();return;}
+ if(t.id==='fr_chanout'){frIn.chan_out=t.checked;frCalc();return;}
+ if(t.id==='fr_preset'){const p=frMeta.presets.find(x=>x.id===t.value);frIn.preset=t.value;if(p)Object.assign(frIn,p.values);frRender();frCalc();}
+ else if(t.id==='fr_material'){frIn.material=t.value;frCalc(true);}
+ else if(t.id==='fr_join'){frIn.join=t.value;frCalc();}
+ else if(t.id==='fr_size'){frIn.size=t.value;frCalc();}});
+function frPatch(list){for(const p of list)for(const k in p){if(k==='mix'){const mx=Object.assign({},frIn.mix||{});for(const id in p.mix)mx[id]=Object.assign({},mx[id]||{},p.mix[id]);frIn.mix=mx;}
+  else if(k==='braces')frIn.braces=Array.from(new Set((frIn.braces||[]).concat(p.braces)));else frIn[k]=p[k];}frCalc(true);}
+document.addEventListener('click',e=>{const t=e.target.closest&&e.target.closest('[data-fix],#fr_fixall,#fr_braceclear');if(!t||!FR)return;e.preventDefault();
+ if(t.id==='fr_braceclear'){frIn.braces=[];frCalc(true);}
+ else if(t.id==='fr_fixall'){const fl=FR.fixes.filter(f=>f.first);frPatch((fl.length?fl:FR.fixes.filter(f=>f.level!=='tip')).map(f=>f.patch));}
+ else frPatch([FR.fixes[+t.dataset.fix].patch]);});
+$('f3views').addEventListener('click',e=>{const b=e.target.closest('button');if(b){f3View=b.dataset.view;f3Build();}});
+$('frwiz').addEventListener('click',e=>{if(e.target.id==='fr_mixclear'){e.preventDefault();frIn.mix={};frCalc();return;}const b=e.target.closest('button');if(!b)return;
+ if(b.dataset.s!==undefined){frStep=+b.dataset.s;frRender();}
+ else if(b.dataset.u){frUnits=b.dataset.u;try{localStorage.setItem('frUnits',frUnits);}catch(x){}frRender();}
+ else if(b.dataset.fam){frIn.family=b.dataset.fam;frIn.size='auto';frIn.mix={};frIn.braces=[];frCalc(true);}
+ else if(b.dataset.mv){f3Move=b.dataset.mv;f3Controls();}
+ else if(b.dataset.w){frIn.driver_kg=+b.dataset.w;frCalc(true);}
+ else if(b.dataset.n){const n=+b.dataset.n;if(n!==frIn.motors)frSetLayout(frMeta.layouts.find(l=>l.motors===n).id);}
+ else if(b.dataset.l){if(b.dataset.l!==frIn.layout)frSetLayout(b.dataset.l);}
+ else if(b.parentNode.id==='fr_moves'){frIn.moves=b.dataset.v;frIn.moving_kg=b.dataset.v==='seat'?25:70;frRender();frCalc();}
+ else if(b.parentNode.id==='fr_drive'){if(frIn.drive!==b.dataset.v){frIn.drive=b.dataset.v;const p=frMeta.presets.find(x=>x.drive===frIn.drive);frIn.preset=p.id;Object.assign(frIn,p.values);frRender();frCalc();}}
+ else if(b.id==='fr_back'){if(frStep>0){frStep--;frRender();}}
+ else if(b.id==='fr_next'){if(frStep<FRSTEPS.length-1){frStep++;frRender();$('frwiz').scrollIntoView({block:'nearest'});}}
+ else if(b.id==='fr_reset'){if(confirm('Start the frame design over with the starting values?')){frIn={};frStep=0;post('/frame/calc',{inputs:{}}).then(r=>{FR=r.design;frIn=Object.assign({},FR.inputs);frRender();});}}
+ else if(b.id==='fr_pdf')frPdf();});
+
 
 // ---------- theme ----------
 const mq=matchMedia('(prefers-color-scheme: light)');
@@ -18683,6 +21807,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.fwup.sent(len(body))
             except OSError:
                 pass
+        elif u.path == "/frame/load":                    # 2.9.4: the frame design wizard
+            self._json({"inputs": self.frame.load(), "meta": FrameStore.meta()})
         elif u.path == "/seat/status":
             self._json(self.seat.status())
         elif u.path == "/seat/geometry":
@@ -19244,6 +22370,20 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"ok": False, "error": "unknown"}, 404)
                 return
             self._json({"ok": bool(ok), "error": None if ok else msg, "park": pk.status()})
+        elif p == "/frame/calc":                         # 2.9.4: the frame design, from the wizard's inputs
+            design = frame_design(req.get("inputs"))
+            self.frame.save(design["inputs"])
+            self._json({"ok": True, "design": design})
+        elif p == "/frame/pdf":
+            body, design = frame_pdf(req.get("inputs"), VERSION)
+            self.frame.save(design["inputs"])
+            self.send_response(200)
+            self.send_header("Content-Type", "application/pdf")
+            self.send_header("Content-Disposition", 'attachment; filename="motion-rig-frame-design.pdf"')
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
         elif p == "/show/start":                         # 2.9.3: a motion preset (the 3D view)
             name = str(req.get("name") or "")
             if name not in SHOWS:
@@ -19697,6 +22837,7 @@ def main():
     Handler.usb_busy = usb_busy
     Handler.manual = ManualControl(board, cfg, events)
     Handler.park = ParkControl(board, cfg, events, Handler.manual)          # 2.9.3
+    Handler.frame = FrameStore(args.data)                                   # 2.9.4
     Handler.park.busy = lambda: busy(park=False) or ("A firmware update is running." if Handler.fwup.state == "running"
                                                      else None)
     Handler.monitor.park = Handler.park
