@@ -329,7 +329,7 @@ Page 2.9.4. A new page in the menu for planning a rig before any metal is cut. I
 board - nothing in it talks to the board, so it is safe to open any time, and it works without a rig. It keeps your
 design between visits.
 
-![Frame Design: the wizard on the left, the drawings, movements and checks on the right](docs/img/frame-design_v2.9.4.png)
+![Frame Design: the wizard on the left, the drawings, movements and checks on the right](docs/img/frame-design-overview_v2.9.4.png)
 
 The wizard has six steps; the right-hand side follows every change with a top, side and front drawing (motors and
 actuators drawn, arrows for what moves, the main distances), the range and speed of each movement, what each
@@ -360,7 +360,7 @@ actuator must push against what it can, and a list of checks in plain words.
    bending and how much of its allowance is used - or pick **one size** for everything, or give any member **its own
    section and material**. Left and right channels are a mirrored pair, opening inwards or outwards.
 
-   ![The Frame step: each member with its section, stress, bending and use](docs/img/frame-design-frame_v2.9.4.png)
+   ![The Frame step: each member with its section, stress, bending and use](docs/img/frame-design-frame-step_v2.9.4.png)
 
    **Joints** are sized too, each kind of section its own way, for the largest force an actuator can make:
 
@@ -386,7 +386,7 @@ actuator must push against what it can, and a list of checks in plain words.
    plates, brackets, fittings, tightening torques), the parts, a **ball-park cost**, **what to assemble first** as a
    row of pictures, and the steps.
 
-   ![The Build step: cut list, hardware, cost, assembly order and steps](docs/img/frame-design-build_v2.9.4.png)
+   ![The Build step: cut list, hardware, assembly order and cost](docs/img/frame-design-build-step_v2.9.4.png)
 
 6. **3D test** - the rig as designed: real sections, plates and bolts, motors or actuators with their brackets, the
    seat on its slider, the wheelbase on its deck, the pedals. Drag to turn it, scroll to zoom.
