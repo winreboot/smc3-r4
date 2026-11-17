@@ -116,6 +116,15 @@ ap.add_argument("--imu-lost-at", type=float, default=0)
 ap.add_argument("--imu-baud", type=int, default=0, help="the sensor's baud rate at start (default 9600 at <= 20 Hz, else 115200; 460800 = one the board doesn't try)")
 ap.add_argument("--imu-angles-only", action="store_true", help="the sensor sends angles only (no acceleration / gyro)")
 ap.add_argument("--imu-race", action="store_true", help="firmware <= 2.1's timing bug: with the sensor switched on the board loses it every few seconds")
+ap.add_argument("--fw220", action="store_true", help="firmware 2.2.0b1 (DC build): 2.1.2b1 + the beta LED")
+ap.add_argument("--servo", action="store_true", help="firmware 2.2.0b1 servo build (SERVO_STEPDIR): step/direction servo "
+                "actuators, open loop, homed at power-up; no pots")
+ap.add_argument("--servo-switches", action="store_true", help="servo build: home switches saved as the home method at start")
+ap.add_argument("--servo-broken", type=int, default=0, help="servo build: motor M's home switch never closes (broken wire)")
+ap.add_argument("--servo-wrongdir", type=int, default=0, help="servo build: motor M's drive turns the other way (Pn097)")
+ap.add_argument("--servo-start", type=float, default=2500, help="servo build: where the actuators are at power-up (pulses)")
+ap.add_argument("--fw212", action="store_true", help="firmware 2.1.2b1: 2.1.1 + the motor driver type as a setting ([kD n], EEPROM 110-111)")
+ap.add_argument("--drv", type=int, default=-1, help="2.1.2b1: the driver type saved at start (0 IBT-2, 1 PWM + direction; default: never set)")
 ap.add_argument("--fw211b1", action="store_true", help="firmware 2.1.1b1: 2.1 + the sensor lock fixed, [rdj] SM3I, set-up only to a found sensor")
 ap.add_argument("--fw2112", action="store_true", help="firmware 2.1.1b2: 2.1.1b1 + a motor creeps back from outside its end stops (robust to glitches, also with soft start off)")
 ap.add_argument("--fw211", action="store_true", help="firmware 2.1.1: park, coming back up from wherever a motor rests, the sensor lock fix")
@@ -250,7 +259,7 @@ for st_ in args.start:
     m_, pot_ = st_.split(":")
     START[int(m_) - 1] = float(pot_)
 FW = {"ver": ("1.9" if args.old19 else ("1.9.1" if args.fw191 else ("1.9.3" if args.no_potfilter else
-       ("1.9.4" if args.fw194 else ("1.9.5" if args.fw195 else ("1.9.6" if args.fw196 else ("1.9.7" if (args.fw197 or args.fw197_stuck) else ("2.0b1" if args.fw20b1 else ("2.1.1" if args.fw211 else ("2.1.1b5" if args.fw2115 else ("2.1.1b4" if args.fw2114 else ("2.1.1b3" if args.fw2113 else ("2.1.1b2" if args.fw2112 else ("2.1.1b1" if args.fw211b1 else ("2.1" if args.fw21 else ("2.0" if (args.fw20 or args.fw20_esp) else "1.9.8")))))))))))))))) if args.fw >= 19
+       ("1.9.4" if args.fw194 else ("1.9.5" if args.fw195 else ("1.9.6" if args.fw196 else ("1.9.7" if (args.fw197 or args.fw197_stuck) else ("2.0b1" if args.fw20b1 else ("2.2.0b1" if (args.fw220 or args.servo) else ("2.1.2b1" if args.fw212 else ("2.1.1" if args.fw211 else ("2.1.1b5" if args.fw2115 else ("2.1.1b4" if args.fw2114 else ("2.1.1b3" if args.fw2113 else ("2.1.1b2" if args.fw2112 else ("2.1.1b1" if args.fw211b1 else ("2.1" if args.fw21 else ("2.0" if (args.fw20 or args.fw20_esp) else "1.9.8")))))))))))))))))) if args.fw >= 19
       else f"{args.fw // 10}.{args.fw % 10}"}
 
 
@@ -291,8 +300,240 @@ def pot_filter():                             # firmware 1.9.4: pot glitch filte
     return _PF["on"]
 
 
+DRV = {"type": 0}                             # 2.1.2b1: 0 IBT-2, 1 PWM + direction
+FREQ = [25, 25]                               # [~xy]: PWM kHz for motors 1+2 and motor 3 (2.9.5: kept, read back)
+
+
+def drv_fw():                                 # firmware 2.1.2b1: the driver type is a setting ([kD n])
+    return args.fw >= 19 and _vt(FW["ver"]) >= (2, 1, 2)
+
+
+def servo_fw():                               # firmware 2.2.0b1 servo build (SERVO_STEPDIR 1)
+    return args.servo and _vt(FW["ver"]) >= (2, 2)
+
+
+HS_NONE, HS_SETTLE, HS_READY, HS_SEEK, HS_HOMED = 0, 1, 2, 3, 4
+SF_SWITCHES, SF_SON_LOW, SF_ESTOP = 1, 2, 32
+SERVO = {"travel": 10000, "accel": 500, "flags": SF_SWITCHES if args.servo_switches else 0,   # EEPROM 220-225
+         "state": HS_NONE, "since": 0.0, "want": 0, "fault": 0, "son": False,
+         "pos": [0.0, 0.0, 0.0], "v": [0, 0, 0], "seek": [0, 0, 0], "from": [0.0, 0.0, 0.0], "same": [0, 0, 0],
+         "phys": [args.servo_start] * 3, "off": [0.0, 0.0, 0.0], "rehomes": 0,
+         "estop_in": False, "estop": False, "es_open": 0.0, "es_closed": 0.0}      # [ze 1/0]: the button (simulator only)
+SERVO_SW_AT = 150.0                           # the home switch opens below this (pulses above the bottom)
+SERVO_SINK_PPS = 4000.0                       # released, the seat's weight back-drives the ball screws this fast
+
+
+def servo_sign(m):                            # +1: more pulses = up; -1 when the drive and the flag disagree
+    wrong = args.servo_wrongdir == m + 1
+    inv = bool((SERVO["flags"] >> 2 >> m) & 1)
+    return -1.0 if wrong != inv else 1.0
+
+
+def servo_switch_open(m):                     # normally closed to GND: open (or a broken wire) = at home
+    return args.servo_broken == m + 1 or SERVO["phys"][m] <= SERVO_SW_AT
+
+
+def servo_on(on):
+    S = SERVO
+    if on and not S["son"]:                   # the drive holds where the actuator is now
+        for m in range(3):
+            S["off"][m] = S["phys"][m] - servo_sign(m) * S["pos"][m]
+    S["son"] = on
+
+
+def servo_set_pos(m, v):                      # the board's count changes; the actuator doesn't move
+    S = SERVO
+    S["pos"][m] = v
+    S["off"][m] = S["phys"][m] - servo_sign(m) * v
+
+
+def servo_home_start(release, now=None):
+    S = SERVO
+    for m in range(3):
+        S["v"][m] = 0; S["seek"][m] = 0
+        if not C[m].disabled:
+            S["want"] |= 1 << m
+        C[m].disabled, C[m].reason = True, 7
+    S["fault"] = 0
+    S["since"] = now if now is not None else time.time()
+    if not (S["flags"] & SF_SWITCHES) and release:
+        servo_on(False); S["state"] = HS_SETTLE
+    else:
+        servo_on(True); S["state"] = HS_READY
+
+
+def servo_boot():
+    S = SERVO
+    S["pos"] = [0.0, 0.0, 0.0]; S["v"] = [0, 0, 0]; S["seek"] = [0, 0, 0]; S["fault"] = 0
+    S["son"] = False                          # reset: SON released (pins are inputs) - the seat sinks
+    S["want"] = 7; S["state"] = HS_SETTLE; S["since"] = time.time()
+    for c in C:
+        c.disabled, c.reason = True, 7
+        c.fb_q = c.raw_q = c.lastpos = 0; c.goal_acc = 0; c.goal_q = 0
+    if S["flags"] & SF_SWITCHES:
+        servo_home_start(False)
+
+
+def servo_estop(now):
+    S = SERVO
+    if not S["flags"] & SF_ESTOP:
+        S["estop"] = False
+        return
+    if S["estop_in"]:
+        S["es_closed"] = 0.0
+        S["es_open"] = S["es_open"] or now
+        if not S["estop"] and now - S["es_open"] >= 0.02:
+            S["estop"] = True
+            for c in C:
+                c.disabled, c.reason = True, 8
+            S["v"][:] = [0, 0, 0]; S["seek"][:] = [0, 0, 0]
+            S["want"] = 0; S["state"] = HS_NONE
+            servo_on(False)
+            print("simboard: emergency stop", flush=True)
+    else:
+        S["es_open"] = 0.0
+        S["es_closed"] = S["es_closed"] or now
+        if S["estop"] and now - S["es_closed"] >= 0.5:
+            S["estop"] = False
+
+
+def servo_task(now):
+    S = SERVO
+    if 1 <= OTA["state"] <= 5:
+        return
+    servo_estop(now)
+    if S["estop"]:
+        return
+    if S["state"] == HS_SETTLE and now - S["since"] >= 4.0:
+        servo_on(True); S["state"] = HS_READY; S["since"] = now
+    elif S["state"] == HS_READY and now - S["since"] >= 0.3:
+        if S["flags"] & SF_SWITCHES:
+            for m in range(3):
+                S["same"][m] = 0; S["from"][m] = S["pos"][m]
+                S["seek"][m] = 1 if servo_switch_open(m) else 2
+            S["state"] = HS_SEEK
+        else:
+            for m in range(3):
+                servo_set_pos(m, 0.0)
+            S["state"] = HS_HOMED
+        S["since"] = now
+    if S["state"] == HS_SEEK and not any(S["seek"]):
+        S["state"] = HS_HOMED
+        for m in range(3):
+            if S["fault"] & (1 << m):
+                C[m].reason = 6
+    if S["state"] == HS_HOMED and S["want"]:
+        want, S["want"] = S["want"], 0
+        for m in range(3):
+            if not want & (1 << m):
+                continue
+            if S["fault"] & (1 << m):
+                C[m].reason = 6; continue
+            enable(C[m])
+
+
+def servo_rehome():                           # [kG1]
+    simhub = usb["last_tgt"] and time.time() - usb["last_tgt"] < 10.0
+    if simhub or (1 <= OTA["state"] <= 5) or SERVO["estop"] or not all(c.disabled for c in C):
+        return False
+    SERVO["want"] = 0; SERVO["state"] = HS_NONE; SERVO["rehomes"] += 1
+    servo_home_start(True)
+    print("simboard [kG1]: homing again", flush=True)
+    return True
+
+
+def servo_setting(f, v):                      # fields 83 travel, 84 acceleration, 86 flags
+    S = SERVO
+    all_off = all(c.disabled for c in C)
+    if f == 83 and all_off and 200 <= v <= 32000: S["travel"] = v
+    elif f == 84 and 10 <= v <= 5000: S["accel"] = v
+    elif f == 86 and all_off and 0 <= v <= 63:
+        son = S["son"]
+        S["son"] = False
+        S["flags"] = v
+        servo_on(son)
+    else:
+        return
+    print(f"simboard servo setting {f} = {v}", flush=True)
+
+
+def servo_state_byte():
+    S = SERVO
+    return (1 | (2 if S["state"] == HS_HOMED else 0) | (4 if S["state"] in (HS_SETTLE, HS_READY, HS_SEEK) else 0) |
+            (8 if S["flags"] & SF_SWITCHES else 0) | (16 if S["flags"] & SF_SON_LOW else 0) | (32 if S["son"] else 0) |
+            (64 if S["state"] == HS_SETTLE else 0) | (128 if S["estop"] else 0))
+
+
+def servo_inputs():
+    return sum(1 << m for m in range(3) if servo_switch_open(m)) | (8 if (SERVO["flags"] & SF_ESTOP and SERVO["estop_in"]) else 0)
+
+
+def servo_ctl(c):
+    """ServoControl(): the speed planner instead of the pot and the PID (one 4 kHz tick)."""
+    S = SERVO; m = c.i; tr = S["travel"]
+    p = int(S["pos"][m])
+    fbq = int(p * 16368 / tr)
+    c.fb_q = c.raw_q = fbq
+    fbd = max(0, fbq)                         # (below zero while homing: the diagnostics' range is unsigned)
+    c.fmin = min(c.fmin, fbd); c.fmax = max(c.fmax, fbd)
+    if S["state"] == HS_SEEK and S["seek"][m]:
+        op = servo_switch_open(m)
+        want = (not op) if S["seek"][m] == 1 else op
+        S["same"][m] = S["same"][m] + 1 if want else 0
+        moved = p - S["from"][m]
+        if S["same"][m] >= 8:
+            S["same"][m] = 0
+            if S["seek"][m] == 1:
+                S["seek"][m] = 2; S["from"][m] = p
+            else:
+                S["seek"][m] = 0; S["v"][m] = 0; servo_set_pos(m, 0.0); c.fb_q = 0
+        elif (S["seek"][m] == 1 and moved > tr // 6) or (S["seek"][m] == 2 and -moved > tr + tr // 4):
+            S["seek"][m] = 0; S["v"][m] = 0; S["fault"] |= 1 << m
+        vel = 1500 if S["seek"][m] == 1 else (-1500 if S["seek"][m] == 2 else 0)
+        S["v"][m] = vel
+        c.pid_q = vel * FULL // 20000
+        return
+    if c.disabled or S["state"] != HS_HOMED:
+        S["v"][m] = 0; c.pid_q = 0
+        return
+    goal = int(c.goal_q * tr / 16368)
+    goal = max(0, min(tr, goal))
+    err = goal - p
+    vmax = c.pwmmax * 20000 // 255
+    if power_scale > 7:
+        vmax >>= 2
+    acc = S["accel"] * 1000
+    dv = max(1, acc // PID_HZ)
+    ae = abs(err)
+    vstop = min(int(math.sqrt(2.0 * acc * ae)), vmax)
+    vdes = 0 if ae <= 1 else (vstop if err > 0 else -vstop)
+    v = S["v"][m]
+    if v < vdes: v = min(v + dv, vdes)
+    elif v > vdes: v = max(v - dv, vdes)
+    S["v"][m] = v
+    c.pid_q = int(v * FULL / 20000)
+
+
+def servo_phys():
+    """The pulses move the actuators (a servo follows within a few pulses); released, they sink to the bottom."""
+    S = SERVO
+    top = S["travel"] * 1.03
+    for m in range(3):
+        if S["son"]:
+            S["pos"][m] += S["v"][m] * DT
+            ph = S["off"][m] + servo_sign(m) * S["pos"][m]
+            if ph < 0.0 or ph > top:          # the nut at a mechanical end: the drive faults in reality
+                ph = max(0.0, min(top, ph))
+            S["phys"][m] = ph
+        else:
+            S["phys"][m] = max(0.0, S["phys"][m] - SERVO_SINK_PPS * DT)
+        P[m].x = P[m].pot_x = P[m].link = S["phys"][m] * 1023.0 / S["travel"]
+
+
 def build_flags():                            # what [rd!] and the diagnostics frame say about the build
     f = (2 | 4 | 8) if args.fw >= 18 else (2 | 8) if args.fw >= 17 else 0
+    if drv_fw() and (DRV["type"] == 1 or servo_fw()):
+        f &= ~2                               # 2.1.2b1: bit1 = the running driver type is IBT-2 (2.2: DC build only)
     f |= (32 if pot_filter() else 0)
     if native_fw():
         f |= (64 if USBO["native"] else 0) | (128 if USBO["saved"] else 0)
@@ -438,6 +679,23 @@ def creep_fix():                              # firmware 2.1.1b2: back from outs
 
 
 def enable(c):
+    if servo_fw():                            # 2.2.0b1 servo build: home first; then creep up from where it is
+        S = SERVO
+        if S["estop"]:
+            c.reason = 8; return
+        if S["state"] != HS_HOMED:
+            S["want"] |= 1 << c.i; c.reason = 7
+            if S["state"] == HS_NONE:
+                servo_home_start(True)
+            return
+        if S["fault"] & (1 << c.i):
+            c.reason = 6; return
+        c.fb_q = int(int(S["pos"][c.i]) * 16368 / S["travel"]); S["v"][c.i] = 0
+        if c.disabled:
+            soft_start_from(c)
+            c.out_back, c.soft_out = False, 0
+        c.disabled, c.reason = False, 0
+        return
     lo, hi = c.cut_window()
     outside = c.fb_q > hi * 16 or c.fb_q < lo * 16
     if c.disabled and soft_fw() and (SOFT["rate"] > 0 or (creep_fix() and outside)):
@@ -475,6 +733,8 @@ def boot(cold=True):
             h.kp, h.ki, h.kd, h.dz, h.pwmmin = 2600, 0, 0, 0, 90
         eeprom = bytearray(128)
         save_eeprom()
+        if args.drv in (0, 1) and drv_fw():
+            eeprom[110], eeprom[111] = 0xD2, args.drv
         if args.seat_setup and args.fw >= 19:   # a seat set-up made earlier (Seat setup in the page)
             for c, (tr, lo, hi) in zip(C, ((18, 140, 880), (-24, 150, 870), (6, 160, 860))):
                 c.trim, c.tlo, c.thi, c.elo, c.ehi = tr, lo, hi, lo - 15, hi + 15
@@ -490,6 +750,7 @@ def boot(cold=True):
                      baud_idx=eeprom[65] % 7)
     if args.fw >= 19:
         load_seat()
+    DRV["type"] = (1 if eeprom[111] else 0) if (drv_fw() and eeprom[110] == 0xD2) else 0
     if soft_fw() and eeprom[105] == 0xB5:
         SOFT["rate"] = struct.unpack(">h", bytes(eeprom[106:108]))[0]
     link_reset(time.time()); SEAT.packets = 0; SEAT.bad = 0
@@ -503,7 +764,10 @@ def boot(cold=True):
         else:                                 # (simplified: the real board also heads for 512 without one)
             c.target = max(lo, min(hi, int(p.pot_x)))
         c.disabled, c.reason = True, 3
-        enable(c)                             # 1.9.1: creeps from where it is
+        if not servo_fw():
+            enable(c)                         # 1.9.1: creeps from where it is
+    if servo_fw():
+        servo_boot()                          # 2.2.0b1 servo build: released, settle, home, then on
     power_scale = 7
     last_target_t = 0.0
     t0 = time.time()
@@ -525,7 +789,7 @@ def save_eeprom():
     e[27], e[28], e[29] = C[0].pwmrev, C[1].pwmrev, C[2].pwmrev
     for i, a in enumerate((44, 46, 48)):
         e[a], e[a + 1] = (C[i].ks >> 8) & 255, C[i].ks & 255
-    e[50], e[51], e[52] = 1, 25, 25
+    e[50], e[51], e[52] = 1, FREQ[0], FREQ[1]
     if args.fw >= 16:
         e[53], e[54], e[55] = fshift, frate // 100, 0x5A
 
@@ -795,6 +1059,9 @@ def chan_tick(c):
             step = max(-lim, min(lim, step))
     c.goal_acc += step
     c.goal_q = (c.goal_acc + 128) >> 8
+    if servo_fw():                            # 2.2.0b1 servo build: no pot, no PID, no end stops
+        servo_ctl(c)
+        return 0.0, True
     p = P[potmap[c.i]]
     noise = 5.0 if args.noisy == c.i + 1 else POT_NOISE.get(c.i, 0.35)
     pos = p.pot_x + random.gauss(0, noise)
@@ -1007,11 +1274,16 @@ def sim_loop():
                     if tot > 0.6:
                         k = 1.0 / (1.0 + args.supply_sag * (tot - 0.6))
                         out = [(d * k, br) for d, br in out]
-                for i in range(3):
-                    d, br = out[i]
-                    phys_tick(P[drvmap[i]], d, br)
+                if servo_fw():
+                    servo_phys()
+                else:
+                    for i in range(3):
+                        d, br = out[i]
+                        phys_tick(P[drvmap[i]], d, br)
                 seat_tick()
             now = time.time()
+            if servo_fw():
+                servo_task(now)
             sensor_tick(now)
             ms = int((now - t0) * 1000)
             status = 16 + sum((1 << i) for i, c in enumerate(C) if c.disabled)
@@ -1084,7 +1356,7 @@ def diag_frame():
                      build_flags(), fwnum())
     for c in C:
         pl += struct.pack("<BHhHHHH", c.reason, c.trips, c.trip_at, c.jumps, min(65535, c.jmax), c.fmin, c.fmax)
-        c.jmax, c.fmin, c.fmax = 0, c.fb_q, c.fb_q
+        c.jmax, c.fmin, c.fmax = 0, max(0, c.fb_q), max(0, c.fb_q)
     if args.fw < 18:
         pl += bytes([64]) + bytes(eeprom[:64])
         return b"SM3D" + bytes([1, len(pl)]) + pl
@@ -1256,6 +1528,8 @@ def handle_cmd(c, a, b, out, cl=None):
             board["last_pos"] = time.time()
         elif c == "w" and args.fw >= 19:
             VREG[0] = w - 65536 if w >= 32768 else w
+        elif c == "~" and 1 <= a <= 40 and 1 <= b <= 40:
+            FREQ[0], FREQ[1] = a, b
         elif c == "k" and a == ord("O") and native_fw() and cl is not None:   # 2.0: who gets the USB connector
             n = b - ord("0") if ord("0") <= b <= ord("2") else b
             if n in (0, 1, 2):
@@ -1266,6 +1540,15 @@ def handle_cmd(c, a, b, out, cl=None):
                 USBP["on"] = False; USB_CL["extras"] = False   # (under handle_cmd's lock: not usb_page_end())
                 if was_native != USBO["native"] and args.usb:
                     USBP["replug"] = time.time() + 0.3    # another port on the PC: the old one goes away, a new one appears
+        elif c == "k" and a == ord("G") and b != ord("=") and servo_fw() and cl is not None:   # 2.2 servo: home again
+            if b in (1, ord("1")):
+                servo_rehome()
+        elif c == "k" and a == ord("D") and b != ord("=") and drv_fw() and not servo_fw() and cl is not None:   # 2.1.2b1: driver type
+            n = b - ord("0") if b in (ord("0"), ord("1")) else b
+            simhub = usb["last_tgt"] and time.time() - usb["last_tgt"] < 10.0
+            if n in (0, 1) and not simhub and not (1 <= OTA["state"] <= 5) and all(ch.disabled for ch in C):
+                DRV["type"] = n; eeprom[110], eeprom[111] = 0xD2, n
+                print(f"simboard [kD {n}]: driver type {'PWM + direction' if n else 'IBT-2'}", flush=True)
         elif c == "k" and a == ord("Z") and reboot_fw() and cl is not None:   # 2.0: the page's reboot
             simhub = usb["last_tgt"] and time.time() - usb["last_tgt"] < 10.0
             if b == ord("R") and not simhub and not (1 <= OTA["state"] <= 5):
@@ -1282,6 +1565,8 @@ def handle_cmd(c, a, b, out, cl=None):
                 elif a in (80, 81):
                     if -9000 <= v <= 9000:
                         board["lv_r" if a == 80 else "lv_p"] = v; save_board()
+                elif a in (83, 84, 86) and servo_fw():
+                    servo_setting(a, v)
                 elif a == 82 and soft_fw():
                     if 0 <= v <= 1000:
                         SOFT["rate"] = v; eeprom[105] = 0xB5; eeprom[106:108] = struct.pack(">h", v)
@@ -1344,7 +1629,10 @@ def handle_cmd(c, a, b, out, cl=None):
         elif c == "d" and a == ord("i") and args.fw >= 15:
             if b == ord("s"):
                 for ch in C: ch.disabled, ch.reason = True, 2
-            elif ord("1") <= b <= ord("3"): C[b - ord("1")].disabled, C[b - ord("1")].reason = True, 2
+                if servo_fw(): SERVO["want"] = 0; SERVO["v"][:] = [0, 0, 0]
+            elif ord("1") <= b <= ord("3"):
+                C[b - ord("1")].disabled, C[b - ord("1")].reason = True, 2
+                if servo_fw(): SERVO["want"] &= ~(1 << (b - ord("1"))); SERVO["v"][b - ord("1")] = 0
         elif c == "f" and args.fw >= 16:
             fshift, frate = min(a, 8), b * 100
         elif c == "u" and ota_fw() and cl is not None and not cl.get("usb"):   # 1.9.2: firmware update (WiFi only)
@@ -1371,6 +1659,8 @@ def handle_cmd(c, a, b, out, cl=None):
                     for ch in C: ch.disabled, ch.reason = True, 5
                     ota_set(state=1)
                     threading.Thread(target=ota_run, daemon=True).start()
+        elif c == "z" and a == ord("e"):          # simulator only: [ze 1] press / [ze 0] release the emergency stop
+            SERVO["estop_in"] = b in (1, ord("1"))
         elif c == "z" and a == ord("s"):          # simulator only: fake SimHub on/off
             SIMHUB[0] = (b == ord("1"))
         elif c == "z" and a == ord("t"):          # simulator only: [zt b] motor b>>4 (1-3), (b & 15) - 8 teeth of its pot belt
@@ -1398,7 +1688,11 @@ def handle_cmd(c, a, b, out, cl=None):
             elif k in "STU": ch = C["STU".index(k)]; out.append(reply2(k, ch.cut, ch.clip))
             elif k in "VWX": ch = C["VWX".index(k)]; out.append(reply2(k, ch.dz, ch.pwmrev))
             elif k == "Y": out.append(reply2("Y", 16 + sum((1 << i) for i, ch in enumerate(C) if ch.disabled), 0))
-            elif k == "~": out.append(reply2("~", 25, 25))
+            elif k == "~": out.append(reply2("~", FREQ[0], FREQ[1]))
+            elif k == "q" and servo_fw(): out.append(reply2("q", servo_state_byte(), SERVO["fault"] | (SERVO["want"] << 3)))
+            elif k == "p" and servo_fw(): out.append(replyw("p", SERVO["travel"]))
+            elif k == "g" and servo_fw(): out.append(replyw("g", SERVO["accel"]))
+            elif k == "h" and servo_fw(): out.append(reply2("h", SERVO["flags"], servo_inputs()))
             elif k == "$": out.append(replyw("$", 70))
             elif k == "!" and args.fw >= 14:
                 out.append(reply2("!", build_flags(), fwnum()))

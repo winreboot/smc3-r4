@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-smc3_scope v2.9.4 - live scope, tuner and auto-tuner for the SMC3_R4 motion controller (Arduino UNO R4 WiFi).
+smc3_scope v2.9.5 - live scope, tuner and auto-tuner for the SMC3_R4 motion controller (Arduino UNO R4 WiFi).
 
 Connects to the board's TCP telemetry port, keeps a rolling buffer of samples and serves a web page with live
 charts, a parameter editor (sends ordinary SMC3 commands back to the board), test signals and a per-motor
@@ -17,6 +17,30 @@ or, on Windows with nothing installed, the PowerShell bridge from Settings, USB 
 Every option can also come from the environment (Docker): SMC3_HOST, SMC3_PORT, SMC3_WEB_PORT, SMC3_BIND,
 SMC3_DATA_DIR.  Settings changed in the page (board address, theme, auto-find) are saved to
 <data dir>/config.json and survive restarts and upgrades.  Standard-library Python 3.8+ only.
+
+v2.9.5 (firmware 2.1.1 unchanged; beta firmware 2.2.0b1 built in): Electronics Design, a second wizard in the menu,
+        for everything between the wall socket and the motors - and the firmware that goes with it. Nothing in it
+        talks to the board.
+        What moves the seat: a gear motor with a lever, or a ball-screw actuator with an AC servo (SFX-100 style).
+        Motors: 1 to 6, from presets (wheelchair, worm and wiper motors), the label's own values or the Frame Design's
+        motor. Drivers: IBT-2, Cytron MD30C / MD13S / MDD10A / SmartDriveDuo-30 / SmartDriveDuo-60, 100 A class bridges,
+        Monster Moto, Sabertooth, your own - what each carries, the voltage and PWM it takes, how the board drives it;
+        two-channel boards drawn and counted as boards. Power: adjustable, LED, industrial, server (HP DPS-1200FB) and
+        PC (ATX) supplies, alone or two in series for 24 V, or batteries; sized for what the motors draw on average
+        while driving ("How hard do the motors work?", from the Frame Design when there is one), with the peaks left to
+        the capacitors and the supply's current limit; one for all motors or one per motor. Braking energy,
+        protection (fuse and wire per motor, emergency stop, sensors), the WT901C motion sensor.
+        Pictures: the whole rig, power wiring, signal wiring for every board (pin to pin, with each board's own 12 V
+        adapter), braking energy, emergency stop, the supplies, and for servo actuators the actuator cut open and its
+        wiring; for lever drives a 1:1 lever template with the sensor cap, the push rod with its ball joints, the
+        sensor mount, and a 1:1 template for the sensor's C bracket with its bend lines. Build: wiring list, parts with
+        searches and a ball-park cost, the first power-up step by step. It checks the design as you go and offers a
+        fix for each finding; Export PDF saves it all (the templates at 1:1).
+        Firmware for the design: the sketch for the chosen build, named after it, with its starting values set (driver
+        type, PWM frequency, the motion sensor; servo stroke, homing, e-stop), and All firmware - a table of every
+        sketch the page can make, with what each runs and how it differs, each one downloadable.
+        Beta firmware 2.2.0b1 (marked BETA in the page): the driver type as a setting (Settings, Motor drivers: IBT-2
+        or PWM + direction, no recompiling) and a servo build for ball-screw actuators (Settings, Servo actuators).
 
 v2.9.4 (firmware 2.1.1 unchanged): Frame Design, a new page in the menu - a wizard that plans a motion rig before any
         metal is cut. Nothing in it talks to the board.
@@ -372,12 +396,14 @@ v1.4: settings dialog (board address, port, find-board scan, auto-find), day/nig
       fixed a thread race that made the page flash "not reachable".
 """
 
-VERSION = "2.9.4"
+VERSION = "2.9.5"
 
 import argparse
 import base64
 import collections
+import gzip
 import hashlib
+import io
 import json
 import math
 import os
@@ -393,7 +419,9 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+import zipfile
 import zlib
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -416,6 +444,14 @@ def fw_text(num, diag=None, ver=None):
         if "soft_start" in diag:
             return t + ".1"
     return t
+
+
+SERVO_NO_TUNE = ("Auto-tune tunes the PID loop that drives DC motors from their pots. The servo firmware has no PID or pots: "
+                 "each servo drive runs its own loop. Tune the drives themselves (their gain parameters in the drive's manual; "
+                 "the SFX-100 parameter list is a good start) and set speed with PWMmax and the acceleration limit under "
+                 "Settings, Servo actuators.")
+SERVO_NO_FULL = ("The full check measures how much drive each DC motor needs and how its pot answers - the servo firmware "
+                 "has neither. Use the Quick check; a servo's own alarms show on its drive's display.")
 
 
 TL_DEFAULT_DEG = 0.02          # degrees the seat turns per count of the traction-loss motor, until Seat setup measures it
@@ -475,7 +511,8 @@ class Config:
                 "motors": 3, "disable_unused": True, "motor_names": ["", "", ""],
                 "layout": "tl", "tl_dir": 1, "lift_dir": {}, "lift_sink": {}, "rider_mode": "empty", "rider_kg": 0, "rider_unit": "lb",
                 "tune_speed": {}, "update_check": True, "update_repo": "", "usb_link": True, "sensor_type": "pot",
-                "motor_rest_off": [None, None, None], "park": None}
+                "motor_rest_off": [None, None, None], "park": None,
+                "servo_mech": {"stroke": 100, "lead": 5, "ppr": 500}}
     # layout: "tl" = motors 1 and 2 lift the front corners, motor 3 slides the rear left / right (traction loss,
     #         the seat turning about a pivot at the front); "lifts" = all three motors lift the seat.
     # tl_dir: +1 = higher numbers move the rear to the right, -1 = to the left (Seat setup or the full check asks).
@@ -491,6 +528,8 @@ class Config:
     # usb_link: a USB bridge on the PC with the cable may take over from WiFi (page 2.8; off = WiFi only).
     # park: page 2.9.3 - the park position {"pos": [pot counts per motor], "angles": [roll, pitch] seen there,
     #          "when", "beyond": set past the travel limits (firmware 2.1.1), "speed": counts/s}; None = the default.
+    # servo_mech: page 2.9.5 - the servo build's actuators: usable stroke (mm), ball-screw lead (mm per turn) and pulses
+    #          per motor turn (the drive's electronic gear), so the page shows mm and mm/s^2 for the board's pulses.
     # sensor_type: what gives the position feedback (page 2.9.1) - "pot" (a potentiometer with a wiper) or "hall"
     #          (a contactless Hall-effect sensor, e.g. TT Electronics 6127): the advice for noise and jumps differs.
 
@@ -575,6 +614,15 @@ PARAM_CODES = {
     "l": ("LED", "p"),                                                   # (matrix view, flags) - 1.8+
     "i": ("SENSOR", "p"),                                                # (sensor state, tilt limit) - 1.8+
 }
+# page 2.9.5 / firmware 2.2.0b1 servo build (SERVO_STEPDIR): asked only of 2.2+ boards - a DC build doesn't answer
+SERVO_CODES = {
+    "q": ("SERVO", "p"),          # (state: 1 servo build, 2 homed, 4 homing, 8 home switches, 16 servo-on active LOW, 32 servos
+                                  #  on, 64 settling, 128 emergency stop pressed; home faults bits 0-2 | to switch on bits 3-5)
+    "p": ("STRAVEL", "w"),        # pulses for the whole travel (0..1023)
+    "g": ("SACCEL", "w"),         # acceleration limit, 1000 pulses/s^2
+    "h": ("SFLAGS", "p"),         # (flags: 1 switches, 2 servo-on active LOW, 4/8/16 motor 1/2/3 reversed, 32 e-stop on A3;
+                                  #  inputs open: bits 0-2 home switches, bit 3 the e-stop contact)
+}
 
 
 class Board:
@@ -610,6 +658,9 @@ class Board:
         self.ver_asks = 0                    # [rdu] asked again on this connection (the answer got lost)
         self.ver_ask_at = 0.0
         self.conn_id = 0                     # counts connections, so work for one that already dropped can stop
+        self.servo_conn = -1                 # 2.9.5: the connection on which the board answered [rdq] (servo build)
+        self.servo_ask_conn = -1             # ... and the one [rdq] was last asked on, when
+        self.servo_ask_at = 0.0
         self.connected_at = 0.0
         # page 2.8: the USB cable, through a bridge on the PC it is plugged into (firmware 1.9.5 "USB page mode")
         self.link = "wifi"                   # what self.sock is: "wifi" (the board's TCP port) or "usb" (a bridge)
@@ -759,6 +810,8 @@ class Board:
         page; SMC3Utils changing them over USB isn't seen until the next read). (None, None) before they are known."""
         if off:
             return 0.0, "x"
+        if self.servo_conn == self.conn_id:          # 2.9.5 servo build: the planned speed (255 = 20 000 pulses/s)
+            return p_q / 16.0, "s"
         n = m + 1
         pw, dz, lim = self.pm.get(f"PWM{n}"), self.pm.get(f"DZ{n}"), self.pm.get(f"LIM{n}")
         if not pw or not dz:
@@ -984,6 +1037,145 @@ class Board:
         self._ev("link", f"The board's USB port was handed to {what}. On the PC it is another COM port from now on "
                  "(SimHub and the bridge need the new one; the browser asks which port once).", quiet=False)
         return True, what
+
+    def driver_info(self, fresh=False):
+        """2.9.5 / firmware 2.1.2: which kind of motor driver the board drives. [rd!] flags bit1: set = IBT-2 /
+        BTS7960 (what MODE2 built), clear = PWM + direction (MODE1). Firmware 2.1.2 makes it a setting ([kD n])."""
+        k = self.fw_known or self.fw_version
+        if fresh and self.connected:
+            self.ping(1.0)
+        fl = self.fw_cache[0] if self.fw_cache else None
+        if fl is None and self.diag and isinstance(self.diag.get("build"), int):
+            fl = self.diag["build"]
+        return {"known": fl is not None, "type": None if fl is None else (0 if fl & 2 else 1),
+                "settable": bool(k) and vkey(k) >= (2, 1, 2), "firmware": k}
+
+    def set_driver_type(self, n):
+        """[kD n]: 0 = IBT-2 / BTS7960, 1 = PWM + direction. The board takes it only with all three motors off and
+        SimHub not sending positions; it saves it at once."""
+        if not self.connected:
+            return False, "The page isn't connected to the board."
+        info = self.driver_info()
+        if not info["settable"]:
+            return False, ("Choosing the driver here needs firmware 2.2.0b1 or newer (the beta in All firmware). With older "
+                           "firmware, build the sketch with #define MODE2 (IBT-2) or #define MODE1 (PWM + direction).")
+        if self.simhub_driving():
+            return False, ("SimHub is sending positions to the board (a game is running) - stop SimHub's motion output "
+                           "first.")
+        st = self.latest()
+        if not st or not all(st["dis"][m] for m in range(3)):
+            return False, ("Switch the motors off first (Disable Motors): the board changes the driver type only with "
+                           "all three off.")
+        self.send(b"[kD" + bytes([48 + n]) + b"]")
+        time.sleep(0.25)
+        self.ping(1.0)
+        info = self.driver_info()
+        what = "PWM + direction" if n else "IBT-2 / BTS7960"
+        if info["type"] != n:
+            return False, "The board didn't confirm the change - try again in a few seconds."
+        log(f"motor driver type -> {what} ([kD {n}])")
+        self._ev("link", f"The board now drives {what} motor drivers (saved on the board). Wire them as Electronics, "
+                 "Signal wiring shows before switching the motors on.", quiet=False)
+        return True, what
+
+    # ---- page 2.9.5 / firmware 2.2.0b1: the servo (step / direction) build ----
+    def is_servo(self):
+        """True: this connection's board runs the servo build (it answered [rdq]); False: it doesn't (older than 2.2,
+        or a 2.2 DC build that didn't answer); None: not known yet."""
+        k = self.fw_known or self.fw_version
+        if not k:
+            return None
+        if vkey(k) < (2, 2):
+            return False
+        if self.servo_conn == self.conn_id:
+            return True
+        if self.servo_ask_conn == self.conn_id and time.time() - self.servo_ask_at > 2.0:
+            return False
+        return None
+
+    def servo_info(self, fresh=False):
+        """The servo build's state and settings ([rdq] [rdp] [rdg] [rdh])."""
+        k = self.fw_known or self.fw_version
+        if (fresh and self.connected and k and vkey(k) >= (2, 2)
+                and (self.is_servo() is not False or time.time() - self.servo_ask_at > 30)):   # (a DC build: not every time)
+            for name, _ in SERVO_CODES.values():
+                self.params.pop(name, None)
+            self.servo_ask_conn, self.servo_ask_at = self.conn_id, time.time()
+            self.send(b"[rdq][rdp][rdg][rdh]")
+            t0 = time.time()
+            while time.time() - t0 < 1.0 and "SFLAGS" not in self.params:
+                time.sleep(0.02)
+            if "SERVO" not in self.params:
+                self.servo_ask_at = time.time() - 2.5          # asked and no answer: not a servo build
+        sv = self.is_servo()
+        info = {"servo": sv, "firmware": k, "connected": self.connected}
+        q, h = self.params.get("SERVO"), self.params.get("SFLAGS")
+        if sv and q:
+            a, f = q
+            info.update(homed=bool(a & 2), homing=bool(a & 4), settling=bool(a & 64), switches=bool(a & 8),
+                        son_low=bool(a & 16), son=bool(a & 32), estop=bool(a & 128), fault=[bool((f >> m) & 1) for m in range(3)],
+                        want=[bool((f >> (3 + m)) & 1) for m in range(3)])
+        if sv:
+            info["travel"] = self.params.get("STRAVEL")
+            info["accel"] = self.params.get("SACCEL")
+            if h:
+                info["flags"] = h[0]
+                info["reversed"] = [bool((h[0] >> (2 + m)) & 1) for m in range(3)]
+                info["inputs_open"] = [bool((h[1] >> m) & 1) for m in range(3)]
+                info["estop_input"] = bool(h[0] & 32)
+                info["estop_open"] = bool(h[1] & 8)
+        return info
+
+    def servo_set(self, travel=None, accel=None, flags=None):
+        """Fields 83 (travel pulses), 84 (acceleration) and 86 (flags); the board saves them at once. Travel and flags
+        only with every motor off."""
+        if not self.connected:
+            return False, "The page isn't connected to the board."
+        if self.is_servo() is not True:
+            return False, "The board doesn't run the servo firmware (SMC3_R4_Servo 2.2.0b1)."
+        st = self.latest()
+        off = bool(st and all(st["dis"][m] for m in range(3)))
+        if (travel is not None or flags is not None) and not off:
+            return False, "Switch the motors off first (Disable Motors): travel and wiring settings change only with all three off."
+        if travel is not None:
+            self.seat_field(83, int(travel))
+        if accel is not None:
+            self.seat_field(84, int(accel))
+        if flags is not None:
+            self.seat_field(86, int(flags))
+        time.sleep(0.25)
+        info = self.servo_info(fresh=True)
+        bad = [n for n, v, got in (("travel", travel, info.get("travel")), ("acceleration", accel, info.get("accel")),
+                                   ("wiring", flags, info.get("flags"))) if v is not None and int(v) != got]
+        if bad:
+            return False, "The board didn't take the " + " and ".join(bad) + " - check the values and try again."
+        log(f"servo settings -> travel {info.get('travel')} pulses, acceleration {info.get('accel')}, flags {info.get('flags')}")
+        self._ev("link", "Servo settings saved on the board.", quiet=False)
+        return True, info
+
+    def servo_home(self):
+        """[kG1]: release the servos and home again (bottom: they settle for 4 s first; switches: they drive to them)."""
+        if not self.connected:
+            return False, "The page isn't connected to the board."
+        if self.is_servo() is not True:
+            return False, "The board doesn't run the servo firmware."
+        if self.simhub_driving():
+            return False, "SimHub is sending positions to the board (a game is running) - stop SimHub's motion output first."
+        st = self.latest()
+        if not st or not all(st["dis"][m] for m in range(3)):
+            return False, "Switch the motors off first (Disable Motors)."
+        if self.servo_info(fresh=True).get("estop"):
+            return False, "The emergency stop is pressed - release it first."
+        self.send(b"[kG1]")
+        time.sleep(0.25)
+        info = self.servo_info(fresh=True)
+        if not info.get("homing"):
+            return False, "The board didn't start homing - try again in a few seconds."
+        log("servo homing started ([kG1])")
+        self._ev("link", "Servos released and homing again" + (" (they settle at the bottom for 4 s first)."
+                                                              if not info.get("switches") else " (driving to the home switches)."),
+                 quiet=False)
+        return True, info
 
     def module_reset_ok(self):
         """2.9: can this board restart its USB/WiFi chip on request (firmware 1.9.7; done right from 1.9.8). Not on a
@@ -1395,6 +1587,9 @@ class Board:
                     if ver:
                         self.fw_version = ver
                         self.fw_known = ver
+                        if vkey(ver) >= (2, 2) and self.servo_ask_conn != self.conn_id:   # 2.9.5: servo build?
+                            self.servo_ask_conn, self.servo_ask_at = self.conn_id, time.time()
+                            self.send(b"[rdq]")
                     self.ota_seq += 1
                 buf = buf[need:]
             elif buf[:4] == b"SM3D":                       # firmware 1.7 diagnostics frame
@@ -1441,6 +1636,12 @@ class Board:
 
     def _add_reply(self, code, a, b):
         self.reply_seq += 1
+        if code in SERVO_CODES:                      # 2.9.5: only a servo build answers these
+            if code == "q" and (a & 1):
+                self.servo_conn = self.conn_id
+            name, kind = SERVO_CODES[code]
+            self.params[name] = (a * 256 + b) if kind == "w" else [a, b]
+            return
         if code not in PARAM_CODES:
             return
         name, kind = PARAM_CODES[code]
@@ -4451,7 +4652,8 @@ TILT_DIRS = ("roll_right", "roll_left", "front_up", "front_down")   # roll +, ro
 ACC_G = 32768.0 / 16.0                            # WitMotion raw -> g
 GYRO_DPS = 32768.0 / 2000.0                       # WitMotion raw -> degrees per second
 OFF_REASONS = {0: "on", 1: "safety cutoff", 2: "switched off by command", 3: "not enabled since power-up",
-               4: "tilt limit", 5: "firmware update"}
+               4: "tilt limit", 5: "firmware update", 6: "home switch not found", 7: "homing",   # 6-8: servo build (2.2)
+               8: "emergency stop"}
 LED_VIEWS = {0: "motor bars", 1: "seat horizon", 2: "quiet"}
 # page 2.9.1 / firmware 2.1: what the matrix shows while idle - LedFlags bits 2-4 (bit 0 = on)
 LED_IDLE = {0: "oscilloscope trace", 1: "ping pong", 2: "brick breaker", 3: "missile defense", 4: "snake",
@@ -6703,8 +6905,10 @@ class Diagnostics:
             cause, cold = reset_cause(dg)
             board.update({"last_start_cause": cause, "last_start_cold": cold, "reset_flags": dg["reset_flags"],
                           "wifi_rssi_dbm": dg["rssi"], "loop_max_ms": round(dg["loop_max_us"] / 1000.0, 1),
-                          "build": {"bridge": "IBT-2 / BTS7960 (MODE2)" if dg["build"] & 2 else
-                                    "PWM + direction pins (MODE1)", "reverse_motor1": bool(dg["build"] & 1),
+                          "build": {"bridge": (("IBT-2 / BTS7960" if dg["build"] & 2 else "PWM + direction") +
+                                               " (Settings, Motor drivers)")
+                                    if vkey(board.get("firmware")) >= (2, 1, 2) else
+                                    ("IBT-2 / BTS7960 (MODE2)" if dg["build"] & 2 else "PWM + direction pins (MODE1)"), "reverse_motor1": bool(dg["build"] & 1),
                                     "imu": bool(dg["build"] & 4), "led_matrix": bool(dg["build"] & 8),
                                     "static_ip": bool(dg["build"] & 16), "pot_filter": bool(dg["build"] & 32),
                                     "usb_port": ("main chip (native)" if dg["build"] & 64 else "WiFi chip (bridge)")
@@ -6731,6 +6935,11 @@ class Diagnostics:
                     board["firmware_update"]["meaning"] = ota_error_text(dg["update"]["code"])
             if "module_restart" in dg:               # firmware 1.9.8: how the last USB/WiFi chip restart went
                 board["module_restart"] = {k: v for k, v in dg["module_restart"].items() if k != "wifi_last_code"}
+        if connected and getattr(b, "is_servo", None) and b.is_servo() is not False:   # 2.9.5: the servo build
+            si = b.servo_info(fresh=True)
+            if si.get("servo"):
+                board["servo"] = {k: si.get(k) for k in ("homed", "homing", "settling", "switches", "son", "estop", "fault",
+                                                          "travel", "accel", "flags", "reversed", "estop_input")}
         rep["board"] = board
         fwup = getattr(self, "fwup", None)              # page 2.3: the page's own record of the last firmware update
         if fwup is not None and fwup.state != "idle":
@@ -7033,7 +7242,47 @@ class Diagnostics:
 # Working out what the data means
 # --------------------------------------------------------------------------------------------------------------
 
+_SERVO_SKIP = re.compile(r"pot\b|sensor reads|sensor reading|sensor is (very )?noisy|sensor reaches|Kp is|Kd |Ki |PWMmin|"
+                         r"dead zone|motor drivers|MODE1|PID|swinging|swings out|overshoots|counts short|power limit|"
+                         r"full allowed power|much more drive|struggles moving|sinks under|hums but|Clip \(|safety cutoff|"
+                         r"end stop|default settings|audible|Control loop runs")
+
+
 def analyze(rep):
+    F = analyze_dc(rep)
+    sv = (rep.get("board") or {}).get("servo")
+    if not sv:
+        return F
+    # 2.9.5: the servo build - no pots, no PID, no motor drivers: what is about those doesn't apply
+    F = [f for f in F if not _SERVO_SKIP.search(f["title"])]
+    st = ("the emergency stop is pressed" if sv.get("estop") else "homing" if (sv.get("homing") or sv.get("settling"))
+          else "homed " + ("on the home switches" if sv.get("switches") else "at the bottom") if sv.get("homed") else "not homed")
+    fault = [i + 1 for i, x in enumerate(sv.get("fault") or []) if x]
+    out = [{"level": "info", "motor": None, "code": "servo",
+            "title": "Servo firmware (SMC3_R4_Servo, BETA): pulse + direction, positions counted from home",
+            "detail": f"State: {st}. {sv.get('travel')} pulses for the travel, acceleration {sv.get('accel')} x 1000 pulses/s2, "
+                      f"homing {'on switches' if sv.get('switches') else 'at the bottom'}, emergency-stop contact "
+                      f"{'on A3' if sv.get('estop_input') else 'not set'}. Pot, PID and driver checks don't apply: the "
+                      "drives close the loop (their own alarms show on their displays).",
+            "fix": "Settings, Servo actuators."}]
+    if sv.get("estop"):
+        out.append({"level": "warn", "motor": None, "code": "servo_estop", "title": "The emergency stop is pressed",
+                    "detail": "Every motor is off and the servos are released.",
+                    "fix": "Release the button, then Enable Motors: the board homes first."})
+    for n in fault:
+        if any(f["title"] == f"Motor {n} is switched off" for f in F):
+            continue                                       # (that one names the reason already)
+        out.append({"level": "fail", "motor": n, "code": "servo_home", "title": f"Motor {n}: its home switch was not found",
+                    "detail": "Homing drove it down (or up off the switch) without the switch opening.",
+                    "fix": "Check the switch and its wire (normally closed, A0-A2 to GND), then Settings, Servo actuators, Home again."})
+    if not sv.get("estop_input"):
+        out.append({"level": "warn", "motor": None, "code": "servo_noestop", "title": "No emergency-stop contact set on the board",
+                    "detail": "After an emergency stop that cuts servo-on, the board would carry on counting from where it was.",
+                    "fix": "Wire a normally closed contact of the e-stop from A3 to GND and tick it in Settings, Servo actuators."})
+    return out + F
+
+
+def analyze_dc(rep):
     F = []
 
     def add(level, title, detail="", fix="", motor=None, code=""):
@@ -7124,6 +7373,10 @@ def analyze(rep):
             "hitch in the motion.", "Usually harmless. If you feel hitches while this page is open, close the page and "
             "check whether they go away; a weak WiFi signal makes it worse.", code="loop")
     b = board.get("build") or {}
+    if b and b.get("bridge", "").startswith("PWM + direction (Settings"):
+        add("info", "The board drives PWM + direction motor drivers (Settings, Motor drivers)",
+            "Right for Cytron, VNH and 100 A class bridges. An IBT-2 on this setting runs one way only.",
+            "Wrong driver type? Settings, Motor drivers, with the motors off.", code="mode")
     if b and "MODE1" in b.get("bridge", ""):
         add("warn", "Firmware is built for MODE1 bridges (PWM + two direction pins)",
             "Your rig uses IBT-2 / BTS7960 bridges, which need MODE2 - with the wrong mode the motors behave strangely "
@@ -7232,7 +7485,15 @@ def analyze(rep):
                       "tilt limit": "The motion sensor's tilt limit stopped every motor: the seat tilted further than "
                                     "the limit set under Settings, Motion sensor.",
                       "firmware update": "It was switched off for a firmware update from the page (an update that "
-                                         "finishes restarts the board, so this one stopped part-way)."}.get(why, "It is off.")
+                                         "finishes restarts the board, so this one stopped part-way).",
+                      "home switch not found": "Servo firmware: homing didn't find its home switch (normally closed to "
+                                               "GND on A0 / A1 / A2 - a broken wire or a switch that never closes). Check "
+                                               "it, then Settings, Servo actuators, Home again.",
+                      "emergency stop": "Servo firmware: the emergency-stop contact on A3 opened - every motor "
+                                        "stopped and the positions count as lost. Release the button; Enable Motors "
+                                        "homes first.",
+                      "homing": "Servo firmware: it is homing (released for 4 s so the seat settles at the bottom, or "
+                                "driving to its home switch) and switches on by itself afterwards."}.get(why, "It is off.")
             if why == "tilt limit":
                 fix = ("Find out why the seat tilted so far (a pot slipped or came loose, a motor wired backwards, "
                        "SimHub's output too strong), then press Enable Motors. If the limit is simply too tight for "
@@ -10328,12 +10589,36 @@ class FirmwareUpdate:
             info = inspect_firmware(raw, name)
             if not info["ok"]:
                 return {"ok": False, "error": info["problem"], "file": self._file_public(info)}
+            mis = self._kind_mismatch(info)
+            if mis:
+                info["warnings"].append(mis)
             self.file = info
             self.state, self.msg, self.stage, self.log = "ready", "", "", []
             self.token = None
         self.events.add("setting", f"Firmware file {name!r} ready to install: SMC3_R4 {info['version']} "
                         f"({info['bin_bytes']} bytes).", quiet=True)
         return {"ok": True, **self.status()}
+
+    def _kind_mismatch(self, info, fresh=False):
+        """2.9.5: the servo build (SMC3CAPS ...servo1) and the DC build use the same pins for different things -
+        never swap one for the other from the page, only over USB after rewiring."""
+        is_servo = getattr(self.board, "is_servo", None)
+        if not info or not is_servo:
+            return None
+        servo_file = "servo1" in (info.get("caps") or [])
+        bs = is_servo()
+        if bs is None and fresh and getattr(self.board, "connected", False):
+            bs = self.board.servo_info(fresh=True).get("servo")
+        if servo_file and bs is False:
+            return ("This file is the SERVO firmware (step / direction pulses), but the board runs the DC motor firmware. "
+                    "Both use the same pins for different things: on drivers wired for DC motors it would send pulses "
+                    "to their PWM inputs. If you have rewired the board for servo drives, install it over USB with the "
+                    "Arduino IDE.")
+        if not servo_file and bs is True:
+            return ("This file is the DC motor firmware, but the board runs the SERVO firmware: it would drive the servo "
+                    "drives' pulse and servo-on wires as motor PWM. If you have rewired the board for DC motor drivers, "
+                    "install it over USB with the Arduino IDE; to update the servo firmware, pick SMC3_R4_Servo's .bin.")
+        return None
 
     @staticmethod
     def _file_public(info):
@@ -10376,6 +10661,9 @@ class FirmwareUpdate:
         bv = self.board_view(fresh=True)
         if not bv["capable"]:
             return {"ok": False, "error": bv["problem"] or "The board can't be updated from the page."}
+        mis = self._kind_mismatch(self.file, fresh=True)
+        if mis:
+            return {"ok": False, "error": mis}
         why = self.busy_check() if self.busy_check else None
         if why:
             return {"ok": False, "error": why}
@@ -13462,6 +13750,11 @@ def frame_design(raw):
         rng.append(("Surge", travel, "mm", v0, "mm/s"))
 
     f_cont = f_static + 0.35 * (f_need - f_static)       # what the motor works against on average while driving
+    # 2.9.5: how hard the motors work on average, % of their rated current, over all of them - the Electronics design
+    # sizes the supplies from it. The lifts as above; a traction-loss or surge motor holds no weight, so about a third
+    # of what its quick moves ask (the same 0.35 as the lifts' moving part)
+    per = [min(1.0, f_cont / max(f_rated, 1e-6))] * max(1, n - len(extra)) + [min(1.0, 0.35 * nd / max(f_rated, 1e-6)) for _, nd in extra]
+    act["load"] = min(100.0, max(20.0, round(100.0 * sum(per) / len(per) / 5.0) * 5.0))
     v_load = v0 * max(0.0, 1 - f_cont / f_stall) if d["drive"] == "rotary" else v0
     m_cont, m_peak = f_rated / max(f_cont, 1e-6), f_peak / max(f_need, 1e-6)
 
@@ -13834,8 +14127,9 @@ def frame_design(raw):
                   f"{n} x position sensor on each lever shaft: a 10k pot or a Hall sensor (TT 6127 type), 1:1 by belt or coupling",
                   f"{n} x motor driver rated for the stall current (about {i_stall:.0f} A here): BTS7960 / IBT-2 for small "
                   f"motors, a 60 A class driver for wheelchair motors",
-                  f"Power supply: {d['volts']:.0f} V, at least {i_rated * n * 0.7:.0f} A ({i_rated:.0f} A rated per motor; "
-                  f"they rarely all pull at once)",
+                  f"Power supply: {d['volts']:.0f} V, about {i_rated * n * act['load'] / 100.0 * 1.25:.0f} A ({n} x {i_rated:.0f} A "
+                  f"rated, at the {act['load']:.0f}% they work on average here, a quarter to spare - the peaks come from "
+                  f"capacitors, not more supplies)",
                   "Arduino UNO R4 WiFi with the SMC3 R4 firmware (3 motors per board)"
                   + (f": {math.ceil(n / 3)} boards for {n} motors" if n > 3 else "")]
     else:
@@ -13953,7 +14247,7 @@ def _frame_cost(d, fam, n, axes, model, mem, i_rated, i_stall, act, ck):
         add("Drive", "lever, push rod and two rod ends", n, 35.0)
         add("Drive", "position sensor (pot or Hall) with its coupling", n, 10.0)
         add("Electronics", "motor driver", n, 60.0 if i_stall > 43 else 14.0)
-        watts = d["volts"] * i_rated * n * 0.7
+        watts = d["volts"] * i_rated * n * act["load"] / 100.0 * 1.25        # 2.9.5: as the Electronics design sizes it
         add("Electronics", f"power supply, {d['volts']:.0f} V {watts / d['volts']:.0f} A", 1, 20.0 + 0.07 * watts)
         add("Electronics", "wiring, fuses and an emergency stop", 1, 45.0)
     else:
@@ -15644,6 +15938,4540 @@ class FrameStore:
                 "presets": [{"id": k, "drive": v[0], "name": v[1], "values": v[2]} for k, v in FRAME_PRESETS.items()],
                 "materials": [{"id": k, "name": v[0]} for k, v in FRAME_MATERIALS.items()],
                 "families": [{"id": k, "name": v} for k, v in FRAME_FAMILIES.items()]}
+
+
+# --------------------------------------------------------------------------------------------------------------
+# Electronics design (2.9.5): picture wiring diagrams - parts drawn as small pictures, wires in colour
+# --------------------------------------------------------------------------------------------------------------
+# A scene is plain data so the page (SVG) and the PDF draw the same thing: y runs down, sizes in drawing units.
+#   r: rect x y w h f(ill) s(troke) sw rx      l: polyline p=[[x,y]..] c w d(ash)      c: circle x y r f s sw
+#   p: polygon p f s sw                         x: text x y s z(size) c a(s/m/e) b(old)
+
+EW = {   # wire colours
+    "pos": "#e03131", "neg": "#212529", "L": "#8d5524", "N": "#1c7ed6", "PE": "#37b24d",
+    "ma": "#f08c00", "mb": "#5c5f66", "v5": "#d6336c", "gnd": "#343a40", "pwm": "#1971c2", "dir": "#2f9e44",
+    "en": "#7048e8", "sens": "#0c8599", "coil": "#e64980", "sig": "#1971c2", "usb": "#495057", "wifi": "#1c7ed6", "mains": "#8d5524", "mcab": "#f08c00",
+    "step": "#1971c2", "sdir": "#2f9e44", "son": "#7048e8", "p24": "#e03131",
+    # 2.9.5: the motion sensor's data lines (its TX into D0, D1 into its RX), and a supply's on switch
+    "imutx": "#e9a800", "imurx": "#2b8a3e", "imu": "#e9a800", "ctl": "#f76707",
+    # 2.9.5: the board's own 12 V adapter into its barrel jack
+    "vin": "#a61e4d",
+}
+EW_NAMES = (("pos", "supply +"), ("neg", "supply -"), ("ma", "motor +"), ("mb", "motor -"), ("pwm", "PWM"),
+            ("dir", "direction / RPWM / INA"), ("en", "enable / INB"), ("v5", "5 V"), ("gnd", "GND"),
+            ("sens", "sensor signal"), ("coil", "e-stop / relay coil"), ("L", "mains L (US: black)"), ("N", "mains N (US: white)"),
+            ("PE", "mains earth"), ("sig", "signals: board to driver"), ("usb", "USB cable (SimHub)"),
+            ("wifi", "WiFi (this page)"), ("vin", "board's 12 V adapter"), ("mains", "mains cable (L, N, earth)"), ("mcab", "servo motor cable"), ("step", "pulse (STEP)"),
+            ("sdir", "direction (DIR)"), ("son", "servo-on (SON)"), ("p24", "+24 V, through the e-stop"),
+            ("imutx", "sensor TXD to D0"), ("imurx", "D1 to sensor RXD"),
+            ("imu", "motion sensor (RS-232 through a MAX3232)"), ("ctl", "on switch (PS_ON / breakout board)"))
+FUSE_COL = {5: "#c9a26b", 7.5: "#8d5524", 10: "#e03131", 15: "#1c7ed6", 20: "#fab005", 25: "#f1f3f5", 30: "#40c057",
+            40: "#fd7e14", 50: "#e03131", 60: "#1c7ed6", 80: "#f1f3f5", 100: "#ae3ec9"}
+
+
+class _ESc:
+    def __init__(self, w, h):
+        self.w, self.h, self.it = w, h, []
+
+    def r(self, x, y, w, h, f="#ffffff", s="#495057", sw=2.0, rx=0.0):
+        self.it.append({"t": "r", "x": round(x, 1), "y": round(y, 1), "w": round(w, 1), "h": round(h, 1), "f": f, "s": s,
+                        "sw": sw, "rx": rx})
+
+    def l(self, pts, c, w=3.0, d=0):
+        self.it.append({"t": "l", "p": [[round(a, 1), round(b, 1)] for a, b in pts], "c": c, "w": w, "d": d})
+
+    def c(self, x, y, r, f="#ffffff", s="#495057", sw=2.0):
+        self.it.append({"t": "c", "x": round(x, 1), "y": round(y, 1), "r": r, "f": f, "s": s, "sw": sw})
+
+    def p(self, pts, f, s="", sw=0.0):
+        self.it.append({"t": "p", "p": [[round(a, 1), round(b, 1)] for a, b in pts], "f": f, "s": s, "sw": sw})
+
+    def x(self, x, y, s, z=13, c="#212529", a="s", b=0):
+        self.it.append({"t": "x", "x": round(x, 1), "y": round(y, 1), "s": s, "z": z, "c": c, "a": a, "b": b})
+
+    def tag(self, x, y, s, f, c="#ffffff", z=11, a="m"):
+        w = len(s) * z * 0.6 + 10
+        x0 = x - w / 2 if a == "m" else (x - w if a == "e" else x)
+        self.r(x0, y - z * 0.8, w, z * 1.6, f, "", 0, z * 0.8)
+        self.x(x0 + w / 2, y + z * 0.36, s, z, c, "m", 1)
+        return w
+
+    def dot(self, x, y, c, r=4.5):
+        self.c(x, y, r, c, "", 0)
+
+    def done(self, title, note=""):
+        return {"title": title, "w": self.w, "h": self.h, "items": self.it, "note": note}
+
+
+# ---------------------------------------------------------------------------------------------------- pictures
+def _ic_label(sc, x, y, s, z=13, b=1, c="#212529", a="m"):
+    sc.x(x, y, s, z, c, a, b)
+
+
+def _ic_plug(sc, x, y, mains, top_xs=None):
+    """A wall socket. With top_xs the three wires leave from its top at those x (straight up into a supply)."""
+    w = 74 if not top_xs else max(top_xs) - x + 40
+    sc.r(x, y, w, 74, "#f1f3f5", "#868e96", 2, 10)
+    cx = x + w / 2.0
+    sc.c(cx, y + 37, 26, "#ffffff", "#adb5bd", 2)
+    sc.r(cx - 12, y + 26, 6, 18, "#495057", "", 0, 2); sc.r(cx + 6, y + 26, 6, 18, "#495057", "", 0, 2)
+    sc.c(cx, y + 52, 4, "#495057", "", 0)
+    _ic_label(sc, cx, y + 92, f"Mains {mains} V", 12)
+    if top_xs:
+        return {k: (tx, y) for k, tx in zip(("L", "N", "PE"), top_xs)}
+    return {"L": (x + 74, y + 22), "N": (x + 74, y + 37), "PE": (x + 74, y + 52)}
+
+
+def _ic_psu(sc, x, y, w, h, top, sub, adj=False):
+    """A box with vent holes and a screw strip along the bottom: L N PE -V -V +V +V."""
+    sc.r(x, y, w, h, "#dee2e6", "#868e96", 2, 6)
+    for i in range(12):
+        for j in range(3):
+            sc.c(x + 22 + i * (w - 44) / 11.0, y + 20 + j * 13, 3.2, "#adb5bd", "", 0)
+    sc.x(x + w / 2, y + 74, top, 15, "#212529", "m", 1)
+    sc.x(x + w / 2, y + 94, sub, 13, "#495057", "m", 0)
+    if adj:
+        sc.c(x + w - 26, y + 84, 9, "#fab005", "#e67700", 2); sc.l([(x + w - 26, y + 76), (x + w - 26, y + 84)], "#e67700", 2.5)
+        sc.x(x + w - 26, y + 106, "V adj", 10, "#495057", "m")
+    labs = ("L", "N", "PE", "-V", "-V", "+V", "+V")
+    sw = (w - 20) / 7.0
+    pins = {}
+    sc.r(x + 10, y + h - 30, w - 20, 26, "#343a40", "", 0, 3)
+    for i, lb in enumerate(labs):
+        cx = x + 10 + sw * (i + 0.5)
+        sc.c(cx, y + h - 17, 7, "#ced4da", "#868e96", 1.5)
+        sc.l([(cx - 4, y + h - 17), (cx + 4, y + h - 17)], "#495057", 1.5)
+        sc.x(cx, y + h - 36, lb, 11, "#212529", "m", 1)
+        pins.setdefault(lb, (cx, y + h - 4))
+    pins["+V"] = (x + 10 + sw * 6.5, y + h - 4); pins["-V"] = (x + 10 + sw * 3.5, y + h - 4)
+    return pins
+
+
+def _ic_battery(sc, x, y, label="12 V"):
+    sc.r(x, y + 12, 110, 70, "#343a40", "#212529", 2, 6)
+    sc.r(x + 12, y, 18, 14, "#e03131", "", 0, 2); sc.r(x + 80, y, 18, 14, "#212529", "#868e96", 1, 2)
+    sc.x(x + 21, y + 34, "+", 16, "#ffffff", "m", 1); sc.x(x + 89, y + 34, "-", 16, "#ffffff", "m", 1)
+    sc.x(x + 55, y + 60, label, 14, "#ffffff", "m", 1)
+    return {"+": (x + 21, y), "-": (x + 89, y)}
+
+
+def _ic_kbpc(sc, x, y, big=False):
+    """KBPC5010 bridge rectifier seen from its top: the two ~ tabs sit diagonally (top left, bottom right), + top right
+    (the bevelled corner) and - bottom left."""
+    s = 86 if big else 60
+    if big:                                                    # the heat sink under it
+        sc.r(x - 4, y + s + 8, s + 8, 22, "#ced4da", "#adb5bd", 1, 4)
+        for i in range(6):
+            sc.r(x + i * (s / 5.6), y + s + 30, 8, 20, "#ced4da", "#adb5bd", 1, 2)
+        sc.x(x + s / 2, y + s + 68, "on a heat sink, with thermal paste", 11, "#495057", "m")
+    sc.r(x, y, s, s, "#343a40", "#212529", 2, 4)
+    sc.p([(x + s, y), (x + s - 16, y), (x + s, y + 16)], "#adb5bd")
+    sc.c(x + s / 2, y + s / 2 + 12, 5, "#868e96", "", 0)
+    t = 12
+    pins = {"~1": (x - t, y + 12), "+": (x + s + t, y + 12), "-": (x - t, y + s - 12), "~2": (x + s + t, y + s - 12)}
+    for k, (px, py) in pins.items():
+        sc.r(px if px < x else x + s, py - 4, t, 8, "#ced4da", "#868e96", 1)
+    z = 15 if big else 12
+    sc.x(x + 12, y + 28, "~", z, "#ffffff", "m", 1); sc.x(x + s - 14, y + 30, "+", z, "#ffffff", "m", 1)
+    sc.x(x + 12, y + s - 6, "-", z, "#ffffff", "m", 1); sc.x(x + s - 12, y + s - 6, "~", z, "#ffffff", "m", 1)
+    cx, cy = x + s / 2, y + s / 2 - 6                          # a diode symbol: in at ~, out at +
+    sc.p([(cx - 8, cy - 8), (cx - 8, cy + 8), (cx + 6, cy)], "#ffffff")
+    sc.l([(cx + 7, cy - 8), (cx + 7, cy + 8)], "#ffffff", 2.5)
+    return pins
+
+
+def _ic_relay(sc, x, y):
+    """A relay drawn as its terminals: coil 86 / 85 on top, contacts 30 (in) and 87 (out) on the sides."""
+    w, h = 130, 120
+    sc.r(x, y, w, h, "#212529", "#000000", 2, 8)
+    for i in range(4):
+        sc.c(x + 47 + i * 12, y + 48, 6, "#212529", "#e64980", 2)
+    sc.x(x + w / 2, y + 80, "RELAY", 12, "#ffffff", "m", 1)
+    pins = {"86": (x + 30, y), "85": (x + 100, y), "30": (x, y + 100), "87": (x + w, y + 100)}
+    for k in ("86", "85"):
+        px, py = pins[k]
+        sc.r(px - 5, py - 10, 10, 10, "#ced4da", "#868e96", 1)
+        sc.x(px, py + 22, k, 12, "#ffffff", "m", 1)
+    sc.r(x - 10, y + 95, 10, 10, "#ced4da", "#868e96", 1); sc.x(x + 10, y + 105, "30", 12, "#ffffff", "s", 1)
+    sc.r(x + w, y + 95, 10, 10, "#ced4da", "#868e96", 1); sc.x(x + w - 10, y + 105, "87", 12, "#ffffff", "e", 1)
+    return {"86": (x + 30, y - 10), "85": (x + 100, y - 10), "30": (x - 10, y + 100), "87": (x + w + 10, y + 100)}
+
+
+def _ic_estop(sc, x, y):
+    sc.r(x, y, 90, 90, "#fcc419", "#e67700", 2, 8)
+    sc.c(x + 45, y + 45, 31, "#c92a2a", "#862e2e", 2)
+    sc.c(x + 45, y + 41, 24, "#e03131", "", 0)
+    sc.x(x + 45, y - 22, "EMERGENCY STOP", 11, "#212529", "m", 1)
+    sc.x(x + 45, y - 8, "latching, NC contacts 11-12", 10, "#495057", "m")
+    return {"11": (x, y + 70), "12": (x + 90, y + 70)}
+
+
+def _ic_fuse(sc, x, y, amps, vertical=False):
+    """An inline blade fuse holder; the fuse in its standard colour."""
+    col = FUSE_COL.get(amps, "#adb5bd")
+    if vertical:
+        sc.r(x - 12, y, 24, 52, "#212529", "", 0, 5)
+        sc.r(x - 8, y + 10, 16, 32, col, "#495057", 1, 2)
+        sc.x(x + 18, y + 31, f"{amps:g} A", 12, "#212529", "s", 1)
+        return {"a": (x, y), "b": (x, y + 52)}
+    sc.r(x, y - 12, 52, 24, "#212529", "", 0, 5)
+    sc.r(x + 10, y - 8, 32, 16, col, "#495057", 1, 2)
+    sc.x(x + 26, y - 18, f"{amps:g} A", 12, "#212529", "m", 1)
+    return {"a": (x, y), "b": (x + 52, y)}
+
+
+def _ic_cap(sc, x, y, lab1, lab2=""):
+    """An electrolytic capacitor standing on its leads, leads up: + left, - right (the stripe side)."""
+    sc.l([(x + 10, y), (x + 10, y + 14)], "#868e96", 2); sc.l([(x + 28, y), (x + 28, y + 14)], "#868e96", 2)
+    sc.r(x, y + 14, 36, 64, "#1c7ed6", "#1864ab", 2, 6)
+    sc.r(x, y + 14, 36, 10, "#adb5bd", "#868e96", 1, 4)
+    sc.r(x + 24, y + 24, 10, 54, "#a5d8ff", "", 0, 2)
+    for i in range(3):
+        sc.x(x + 29, y + 40 + i * 15, "-", 11, "#1864ab", "m", 1)
+    sc.x(x + 4, y + 8, "+", 11, "#c92a2a", "e", 1)
+    if lab1:
+        sc.x(x + 18, y + 96, lab1, 11, "#212529", "m", 1)
+    if lab2:
+        sc.x(x + 18, y + 110, lab2, 10, "#495057", "m")
+    return {"+": (x + 10, y), "-": (x + 28, y)}
+
+
+def _ic_res(sc, x, y, lab="", vertical=False):
+    if vertical:
+        sc.l([(x, y), (x, y + 8)], "#868e96", 2); sc.l([(x, y + 36), (x, y + 44)], "#868e96", 2)
+        sc.r(x - 7, y + 8, 14, 28, "#e9d8a6", "#c9a26b", 1.5, 5)
+        for i, col in enumerate(("#8d5524", "#212529", "#e03131", "#fab005")):
+            sc.r(x - 7, y + 11 + i * 6, 14, 3, col, "", 0)
+        if lab:
+            sc.x(x + 14, y + 26, lab, 10, "#495057", "s")
+        return {"a": (x, y), "b": (x, y + 44)}
+    sc.l([(x, y), (x + 14, y)], "#868e96", 2); sc.l([(x + 56, y), (x + 70, y)], "#868e96", 2)
+    sc.r(x + 14, y - 8, 42, 16, "#e9d8a6", "#c9a26b", 1.5, 6)
+    for i, col in enumerate(("#8d5524", "#212529", "#e03131", "#fab005")):
+        sc.r(x + 20 + i * 8, y - 8, 3.5, 16, col, "", 0)
+    if lab:
+        sc.x(x + 35, y + 22, lab, 10, "#495057", "m")
+    return {"a": (x, y), "b": (x + 70, y)}
+
+
+def _ic_fan(sc, x, y):
+    sc.r(x, y, 56, 56, "#343a40", "#212529", 2, 8)
+    sc.c(x + 28, y + 28, 22, "#495057", "", 0)
+    for dx, dy in ((0, -12), (12, 0), (0, 12), (-12, 0)):
+        sc.c(x + 28 + dx, y + 28 + dy, 7, "#adb5bd", "", 0)
+    sc.c(x + 28, y + 28, 5, "#212529", "", 0)
+
+
+def _ic_motor(sc, x, y, n, brake=False):
+    """A wheelchair-style gear motor seen from the side: can, gearbox, output shaft with a lever."""
+    sc.r(x, y + 14, 120, 52, "#adb5bd", "#868e96", 2, 10)                     # the motor can
+    for i in range(5):
+        sc.l([(x + 14 + i * 20, y + 18), (x + 14 + i * 20, y + 62)], "#ced4da", 1.5)
+    sc.r(x + 116, y, 54, 80, "#495057", "#343a40", 2, 8)                       # the gearbox
+    sc.c(x + 143, y + 40, 12, "#868e96", "#343a40", 2)
+    sc.l([(x + 143, y + 40), (x + 186, y + 8)], "#868e96", 8)                  # the lever
+    sc.c(x + 186, y + 8, 6, "#f1f3f5", "#495057", 2)
+    if brake:
+        sc.r(x - 22, y + 22, 24, 36, "#ffffff", "#adb5bd", 1.5, 4)
+        sc.l([(x - 22, y + 22), (x + 2, y + 58)], "#e03131", 2); sc.l([(x + 2, y + 22), (x - 22, y + 58)], "#e03131", 2)
+    sc.x(x + 60, y + 46, f"M{n}", 16, "#212529", "m", 1)
+    return {"+": (x + 30, y + 66), "-": (x + 50, y + 66), "shaft": (x + 143, y + 40)}
+
+
+def _ic_hall(sc, x, y, n):
+    sc.c(x + 30, y + 30, 26, "#212529", "#000000", 2)
+    sc.c(x + 30, y + 30, 8, "#adb5bd", "#868e96", 1.5)
+    sc.x(x + 30, y + 74, f"sensor {n}", 11, "#212529", "m", 1)
+    pins = {}
+    for i, (k, col) in enumerate((("5V", EW["v5"]), ("OUT", EW["sens"]), ("GND", EW["gnd"]))):
+        py = y + 10 + i * 20
+        sc.l([(x + 54, py), (x + 104, py)], col, 3)
+        sc.x(x + 80, py - 4, k, 9, "#495057", "m", 1)
+        pins[k] = (x + 104, py)
+    return pins
+
+
+_UNO_RIGHT = ("SCL", "SDA", "AREF", "GND", "D13", "D12", "D11", "D10", "D9", "D8", None, "D7", "D6", "D5", "D4", "D3",
+              "D2", "D1", "D0")
+_UNO_LEFT = ("", "IOREF", "RESET", "3V3", "5V", "GND", "GND", "VIN", None, "A0", "A1", "A2", "A3", "A4", "A5")
+
+
+def _ic_uno(sc, x, y, used, title="Arduino UNO R4 WiFi", sub="SMC3 R4 firmware"):
+    """The board turned so the USB connector is at the top: the digital pins down its right side, power and analog
+    down its left side - as it lies when you turn a real one that way.  used: pin -> colour ("5V", "GND" and A0-A5
+    on the left, D0-D13 on the right).  Returns the pin ends: "D2".. on the right, "L5V", "LGND", "LA0".. on the left."""
+    w, h = 300, 560
+    sc.r(x, y, w, h, "#00878f", "#005c63", 2.5, 14)
+    for hx, hy in ((x + 18, y + 18), (x + w - 50, y + 22), (x + 40, y + h - 18), (x + w - 60, y + h - 18)):
+        sc.c(hx, hy, 7, "#ffffff", "#005c63", 1.5)
+    sc.r(x + w / 2 - 34, y - 14, 68, 34, "#ced4da", "#868e96", 2, 6)            # USB-C
+    sc.x(x + w / 2, y + 40, "USB", 10, "#ffffff", "m", 1)
+    for i in range(12):                                                         # the LED matrix
+        for j in range(8):
+            sc.c(x + 95 + i * 10, y + 200 + j * 10, 2.4, "#ff6b6b" if (i * 3 + j) % 7 == 0 else "#ffc9c9", "", 0)
+    sc.x(x + w / 2, y + 310, title, 15, "#ffffff", "m", 1)
+    sc.x(x + w / 2, y + 330, sub, 12, "#c3fae8", "m")
+    pins, seen = {}, set()
+    pitch = 24.0
+
+    def pin(px, py, k, on, side):
+        col = used.get(k) if on else None
+        sc.r(px - 7, py - 7, 14, 14, col or "#212529", "#ffffff" if on else "", 1.5 if on else 0, 2)
+        sc.x(px + (-15 if side == "r" else 15), py + 4, k, 11 if on else 10, "#ffffff" if on else "#a5d8dc",
+             "e" if side == "r" else "s", 1 if on else 0)
+    for i, k in enumerate(_UNO_RIGHT):
+        if k is None:
+            continue
+        py = y + 70 + i * pitch
+        pin(x + w - 11, py, k, k in used and k.startswith("D"), "r")
+        pins[k] = (x + w - 4, py)
+    for i, k in enumerate(_UNO_LEFT):
+        if not k:
+            continue
+        py = y + 94 + i * pitch
+        first = ("L" + k) not in pins
+        pin(x + 11, py, k, k in used and first, "l")
+        if first:
+            pins["L" + k] = (x + 4, py)
+    return pins, (x, y, w, h)
+
+
+BOARD_POWER_NOTE = ("Board power: a 12 V adapter (1 A or more, 5.5 x 2.1 mm plug, centre +) in each board's barrel jack (6-24 V). "
+                    "USB alone gives the board about 4.7 V, less with the motors running - too little for the Hall sensors.")
+
+
+def elec_board_power(sc, ux, uy, ax, ay, w=170):
+    """2.9.5: the board's own 12 V adapter into its barrel jack - on the board's top edge left of the USB connector,
+    as _ic_uno draws it (USB up).  USB alone gives the board about 4.7 V (a Schottky diode drops the rest), less with
+    the motors running, and the Hall sensors want 5 V; the barrel jack's buck converter makes a steady 5 V from 6-24 V."""
+    jx, jy = ux + 26, uy - 16
+    sc.r(jx, jy, 40, 30, "#212529", "#000000", 1.5, 4)                       # the barrel jack
+    sc.c(jx + 20, jy + 12, 6.5, "#495057", "#000000", 1)
+    sc.c(jx + 20, jy + 12, 2.2, "#ced4da", "", 0)
+    sc.x(jx + 30, jy + 48, "6-24 V in", 9.5, "#ffffff", "m", 1)
+    sc.r(ax, ay, w, 46, "#343a40", "#0b0d10", 2, 8)                           # the adapter
+    for dx in (12, 20):
+        sc.l([(ax + dx, ay + 15), (ax + dx, ay + 27)], "#ced4da", 3)
+    sc.x(ax + 30, ay + 20, "12 V adapter, 1 A or more", 11, "#ffffff", "s", 1)
+    sc.x(ax + 30, ay + 36, "5.5 x 2.1 mm plug, centre +", 9.5, "#ced4da", "s")
+    sc.l([(ax + w, ay + 23), (jx + 20, ay + 23), (jx + 20, jy)], EW["vin"], 3)
+    return (jx, jy)
+
+
+def _ic_driver_sig(sc, x, y, kind, name, n, khz, rows=None, notes=None, terms=("B+", "B-", "M+", "M-")):
+    """A driver board seen from above: its logic pins down the left side (the ones this board uses), the heat sink,
+    and the screw terminals for the supply and the motor on the right.  2.9.5: rows / terminals of a two-channel
+    board given by the caller; notes = what an unused pin says instead of 'not used'."""
+    rows = rows or {"ibt2": (("RPWM", "dir"), ("LPWM", "pwm"), ("R_EN", "en"), ("L_EN", "en"), ("R_IS", None), ("L_IS", None),
+                             ("VCC", "v5"), ("GND", "gnd")),
+                    "pwmdir": (("PWM", "pwm"), ("DIR", "dir"), ("GND", "gnd")),
+                    "inab": (("INA", "dir"), ("INB", "en"), ("PWM", "pwm"), ("+5V / EN", "v5"), ("GND", "gnd")),
+                    "none": (("S1 (serial / RC)", None), ("0V", None))}[kind]
+    pitch = 24.0
+    h = max(130, len(rows) * pitch + 46)
+    w = 250
+    sc.r(x, y, w, h, "#2b3a55", "#1b263b", 2, 8)
+    for i in range(8):                                                          # heat sink fins
+        sc.r(x + 112 + i * 12, y + 26, 8, h - 40, "#ced4da", "#adb5bd", 1, 2)
+    sc.x(x + 10, y + 18, f"Driver {n}", 12, "#ffffff", "s", 1)
+    sc.x(x + w - 8, y + 18, name, 10, "#c5d3e8", "e")
+    pins = {}
+    for i, (lb, col) in enumerate(rows):
+        py = y + 40 + i * pitch
+        sc.r(x - 6, py - 6, 12, 12, "#ffd43b" if col else "#868e96", "#212529", 1, 2)
+        sc.x(x + 12, py + 4, lb, 11, "#ffffff" if col else "#8a99b3", "s", 1 if col else 0)
+        if col:
+            pins.setdefault(lb, (x - 6, py, col))
+        else:
+            sc.x(x - 12, py + 4, (notes or {}).get(lb, "not used"), 10, "#868e96", "e")
+    for i, lb in enumerate(terms):                                               # screw terminals
+        py = y + 34 + i * ((h - 50) / (len(terms) - 1.0))
+        sc.r(x + w - 22, py - 10, 22, 20, "#2f9e44", "#2b8a3e", 1, 3)
+        sc.c(x + w - 11, py, 5, "#ced4da", "#868e96", 1)
+        sc.x(x + w + 6, py + 4, lb, 11, "#212529", "s", 1)
+    if khz:
+        sc.x(x + 10, y + h - 8, f"PWM {khz:g} kHz", 10, "#ffd8a8", "s", 1)
+    return pins, h
+
+
+def _ic_driver_pwr(sc, x, y, name, n, w=220, h=96):
+    """A driver as the power side sees it: supply in on the left, motor out on the right."""
+    sc.r(x, y, w, h, "#2b3a55", "#1b263b", 2, 8)
+    for i in range(7):
+        sc.r(x + 62 + i * 14, y + 30, 9, h - 40, "#ced4da", "#adb5bd", 1, 2)
+    sc.x(x + 10, y + 20, f"Driver {n}", 13, "#ffffff", "s", 1)
+    sc.x(x + w - 8, y + 20, name, 10, "#c5d3e8", "e")
+    pins = {}
+    for k, py, side in (("B+", y + 40, 0), ("B-", y + 72, 0), ("M+", y + 40, 1), ("M-", y + 72, 1)):
+        px = x + (w - 22 if side else 0)
+        sc.r(px, py - 10, 22, 20, "#2f9e44", "#2b8a3e", 1, 3)
+        sc.c(px + 11, py, 5, "#ced4da", "#868e96", 1)
+        sc.x(px + (28 if not side else -6), py + 4, k, 11, "#ffffff", "s" if not side else "e", 1)
+        pins[k] = (px + (0 if not side else 22), py)
+    sc.x(x + w / 2, y + h + 16, "logic pins: see Signal wiring", 10, "#868e96", "m")
+    return pins
+
+
+def _ic_driver_pwr2(sc, x, y, dr, unit, dy, two, w=220):
+    """2.9.5: a two-channel driver board: one supply input (B+ / B-) on the left, a motor output per channel on the
+    right - channel 2's dy lower than channel 1's."""
+    h = 96 + (dy if two else 0)
+    sc.r(x, y, w, h, "#2b3a55", "#1b263b", 2, 8)
+    for i in range(7):
+        sc.r(x + 62 + i * 14, y + 30, 9, h - 40, "#ced4da", "#adb5bd", 1, 2)
+    sc.x(x + 10, y + 20, f"Driver {unit}", 13, "#ffffff", "s", 1)
+    sc.x(x + w - 8, y + 20, _drv_short(dr) + (", 2 channels" if two else ", channel 1"), 10, "#c5d3e8", "e")
+    pins = {}
+    for k, py in (("B+", y + 40), ("B-", y + 72)):
+        sc.r(x, py - 10, 22, 20, "#2f9e44", "#2b8a3e", 1, 3)
+        sc.c(x + 11, py, 5, "#ced4da", "#868e96", 1)
+        sc.x(x + 28, py + 4, k, 11, "#ffffff", "s", 1)
+        pins[k] = (x, py)
+    names = [c.get("M", f"M{i + 1}A / M{i + 1}B").split(" / ") for i, c in enumerate(dr.get("pins") or ({}, {}))]
+    for c in range(2 if two else 1):
+        for j, py in enumerate((y + 40 + c * dy, y + 72 + c * dy)):
+            px = x + w - 22
+            sc.r(px, py - 10, 22, 20, "#2f9e44", "#2b8a3e", 1, 3)
+            sc.c(px + 11, py, 5, "#ced4da", "#868e96", 1)
+            sc.x(px - 6, py + 4, names[c][j], 11, "#ffffff", "e", 1)
+            pins[(c, j)] = (px + 22, py)
+    sc.x(x + w / 2, y + h + 16, "one supply input for both channels", 10, "#868e96", "m")
+    return pins
+
+
+def _legend(sc, x, y, keys, cols=8):
+    for i, (k, nm) in enumerate([kv for kv in EW_NAMES if kv[0] in keys]):
+        cx, cy = x + (i % cols) * 178, y + (i // cols) * 26
+        sc.l([(cx, cy), (cx + 34, cy)], EW[k], 4 if k in ("pos", "neg", "ma", "mb", "L", "N", "PE", "usb", "mains") else 3,
+             1 if k == "wifi" else 0)
+        sc.x(cx + 42, cy + 4, nm, 11, "#495057", "s")
+
+
+def _drv_short(dr):
+    return dr.get("short") or dr["name"].split(",")[0].split(" (")[0].replace("Cytron ", "")
+
+
+# ---------------------------------------------------------------------------------------------------- the power side
+def _hop_h(x0, x1, y, cross):
+    """A horizontal wire from x0 to x1 that jumps over vertical wires at the x's in cross."""
+    pts = [(x0, y)]
+    for cx in sorted(c for c in cross if min(x0, x1) + 12 < c < max(x0, x1) - 12):
+        pts += [(cx - 11, y), (cx - 7, y - 10), (cx + 7, y - 10), (cx + 11, y)]
+    return pts + [(x1, y)]
+
+
+def _ic_motor_side(sc, x, y, n):
+    """A gear motor lying down: the wires go into the left end of the can, the gearbox and lever on the right."""
+    sc.r(x + 14, y, 120, 52, "#adb5bd", "#868e96", 2, 10)
+    for i in range(5):
+        sc.l([(x + 30 + i * 20, y + 4), (x + 30 + i * 20, y + 48)], "#ced4da", 1.5)
+    sc.r(x + 130, y - 14, 54, 80, "#495057", "#343a40", 2, 8)
+    sc.c(x + 157, y + 26, 12, "#868e96", "#343a40", 2)
+    sc.l([(x + 157, y + 26), (x + 200, y - 6)], "#868e96", 8)
+    sc.c(x + 200, y - 6, 6, "#f1f3f5", "#495057", 2)
+    sc.r(x, y + 10, 16, 32, "#495057", "", 0, 3)
+    sc.x(x + 74, y + 32, f"M{n}", 16, "#212529", "m", 1)
+    return {"+": (x, y + 18), "-": (x, y + 34)}
+
+
+def _caps_row(sc, x0, yplus, yminus, k, nm, first_label=True, res=True):
+    """k capacitors standing below two bus lines (+ above, - below), each + lead jumping over the - line, and the
+    bleeder resistor across the two at the end.  Returns the x where the row ends."""
+    cp = None
+    for j in range(k):
+        cx = x0 + j * 70
+        cp = _ic_cap(sc, cx, yminus + 34, f"10000 uF {nm['cap_v']} V" if first_label and j == 0 else "",
+                     "105 C, low ESR" if first_label and j == 0 else "")
+        sc.l(_hop_v(cp["+"][0], yplus, cp["+"][1], [yminus]), EW["pos"], 3); sc.dot(cp["+"][0], yplus, EW["pos"])
+        sc.l([cp["-"], (cp["-"][0], yminus)], EW["neg"], 3); sc.dot(cp["-"][0], yminus, EW["neg"])
+    xr = x0 + k * 70 + 30
+    if not res:
+        return xr
+    rs = _ic_res(sc, xr, yplus, "1 kohm 2 W", vertical=True)
+    sc.dot(xr, yplus, EW["pos"])
+    if rs["b"][1] < yminus:
+        sc.l([rs["b"], (xr, yminus)], EW["neg"], 2)
+    sc.dot(xr, yminus, EW["neg"])
+    return xr
+
+
+def _fans_text(d, dr):
+    """2.9.5: as many fans as the parts list buys - one per two drivers."""
+    k = max(1, int(math.ceil(math.ceil(d["motors"] / float(dr["ch"])) / 2.0)))
+    return "fan on the heat sinks" if k == 1 else f"{k} fans on the heat sinks"
+
+
+def _psu_title(d):
+    return {"led": "Power supply", "adj": "Adjustable supply", "meanwell": "Industrial supply", "server": "Server supply",
+            "pc": "PC supply (ATX)", "battery": "Battery"}[d["psu"]]
+
+
+def elec_scene_power(d, dr, nm):
+    if nm.get("groups", 1) > 1:                     # 2.9.5: one supply (or pair) per motor - drawn as such
+        return elec_scene_power_each(d, dr, nm)
+    n, v = d["motors"], d["psu_volts"]
+    batt = d["psu"] == "battery"
+    regen = d["regen"] if not batt else "battery_main"
+    relay = d["estop"] == "relay"
+    pitch, top = 150.0, 170.0
+    rows_y = [top + i * pitch + (60 if i >= 3 else 0) for i in range(n)]
+    yp, yn = 420.0, 520.0                                                       # where + and - leave the source
+    sc = _ESc(1500, 100)
+    sc.x(30, 40, "Power wiring", 22, "#212529", "s", 1)
+    sc.x(30, 64, f"{n} motor{'s' if n > 1 else ''}, {v:g} V. " + (f"Each driver board (two motors): {nm.get('fuse_feed', nm['fuse']):g} A fuse"
+                 if dr["ch"] == 2 else f"Each motor: {nm['fuse']:g} A fuse") + f" and {nm['wire']} wire. "
+                 f"The heavy lines carry the motor current - keep them short.", 13, "#495057")
+    low = 0.0                                                                    # lowest thing drawn so far
+    # ---- the source
+    if batt:
+        b1 = _ic_battery(sc, 50, 250)
+        b2 = _ic_battery(sc, 190, 250) if v > 15 else None
+        if b2:
+            sc.l([b1["-"], (b1["-"][0], 232), (b2["+"][0], 232), b2["+"]], EW["neg"], 5)
+            sc.x(160, 222, "1 - to 2 +", 11, "#495057", "m", 1)
+            pos, neg = b1["+"], b2["-"]
+        else:
+            pos, neg = b1["+"], b1["-"]
+        f0 = _ic_fuse(sc, pos[0], 150, 100, vertical=True)
+        sc.l([pos, f0["b"]], EW["pos"], 5)
+        sc.x(pos[0] + 20, 198, "main fuse at the battery", 10, "#c92a2a", "s", 1)
+        src_x = 360.0
+        sc.l([f0["a"], (pos[0], 120), (330, 120), (330, yp), (src_x, yp)], EW["pos"], 5)
+        sc.l([neg, (neg[0], 210), (310, 210), (310, yn), (src_x, yn)], EW["neg"], 5)
+        sc.r(60, 380, 200, 64, "#ffffff", "#adb5bd", 1.5, 8)
+        sc.x(160, 406, "charger", 13, "#495057", "m", 1)
+        sc.x(160, 426, "between sessions", 11, "#868e96", "m")
+        low = 460
+    else:
+        if d["psu"] in ("server", "pc") and v > 15:
+            # 2.9.5: supply 1 is the upper one (its -V on the other's +V): its ground comes off its case
+            nm_ = "Server supply" if d["psu"] == "server" else "PC supply"
+            pa = _ic_psu(sc, 40, 150, 210, 160, nm_ + " 1", "upper: -V off its case")
+            pb = _ic_psu(sc, 270, 150, 210, 160, nm_ + " 2", "lower: as it comes")
+            sc.l([pa["-V"], (pa["-V"][0], 340), (pb["+V"][0], 340), pb["+V"]], EW["neg"], 4)
+            sc.x(250, 404, "1 -V to 2 +V: 24 V", 11, "#495057", "s", 1)
+            pos, neg = pa["+V"], pb["-V"]
+            mains = pa
+            sc.tag(375, 132, "mains and earth to both", "#8d5524", "#ffffff", 10)
+            sc.tag(160, 132, "bypass diodes, on switches: The supplies", EW["ctl"], "#ffffff", 10)
+            src_x = 520.0
+            sc.l(_hop_v(pos[0], pos[1], 380, [340]) + [(src_x - 20, 380), (src_x - 20, yp), (src_x, yp)], EW["pos"], 5)
+            sc.l(_hop_v(neg[0], neg[1], yn, [340, 380]) + [(src_x, yn)], EW["neg"], 5)
+        else:
+            pa = _ic_psu(sc, 40, 150, 300, 180, _psu_title(d), f"{v:g} V  {d['psu_amps']:g} A", d["psu"] == "adj")
+            pos, neg = pa["+V"], pa["-V"]
+            mains = pa
+            if d["psu"] in ("server", "pc"):
+                sc.tag(190, 132, ("breakout board" if d["psu"] == "server" else "12 V from its PCIe / CPU cables")
+                       + ": see The supplies", EW["ctl"], "#ffffff", 10)
+            src_x = 380.0
+            sc.l([pos, (pos[0], yp), (src_x, yp)], EW["pos"], 5)
+            sc.l([neg, (neg[0], yn), (src_x, yn)], EW["neg"], 5)
+        plug = _ic_plug(sc, 40, yn + 70, d["mains"], [mains["L"][0], mains["N"][0], mains["PE"][0]])
+        for k_ in ("L", "N", "PE"):
+            sc.l([plug[k_], mains[k_]], EW[k_], 3)
+        if d["estop"] == "ac":
+            sc.tag(plug["PE"][0] + 60, yn + 100, "e-stop in the mains L wire: see Emergency stop", "#c92a2a", "#ffffff", 10, "s")
+        low = yn + 170
+    x = src_x
+    # ---- buffer battery on the supply side
+    if regen == "battery" and not batt:
+        bb = _ic_battery(sc, x + 10, yn + 60, "12 V" if v < 15 else "2 x 12 V")
+        fz = _ic_fuse(sc, x + 31, yp + 14, 40, vertical=True)
+        sc.l([(x + 31, yp), fz["a"]], EW["pos"], 4); sc.dot(x + 31, yp, EW["pos"])
+        sc.l(_hop_v(x + 31, fz["b"][1], bb["+"][1], [yn]), EW["pos"], 4)
+        sc.l([bb["-"], (bb["-"][0], yn)], EW["neg"], 4); sc.dot(bb["-"][0], yn, EW["neg"])
+        sc.x(x + 10, yn + 162, "buffer battery, fused at its +", 11, "#495057", "s", 1)
+        sc.x(x + 10, yn + 178, "the supply set to its float voltage", 11, "#495057", "s")
+        low = max(low, yn + 190)
+        sc.l([(x, yp), (x + 170, yp)], EW["pos"], 5)
+        x += 170
+    # ---- diode: in at the top ~, the other ~ joined to it underneath, out at +
+    if regen == "diode_cap":
+        kx = x + 60
+        kb = _ic_kbpc(sc, kx, yp - 12)
+        sc.l([(x, yp), kb["~1"]], EW["pos"], 5)
+        jx = kx - 34
+        sc.l([(jx, yp), (jx, yp + 64), (kb["~2"][0] + 16, yp + 64), (kb["~2"][0] + 16, kb["~2"][1]), kb["~2"]], EW["pos"], 3)
+        sc.dot(jx, yp, EW["pos"])
+        sc.x(kx + 30, yp - 24, "diode", 12, "#212529", "m", 1)
+        sc.x(kx + 30, yp + 84, "KBPC5010 on a heat sink", 10, "#495057", "m")
+        if nm.get("n_diode_g", 1) > 1:
+            sc.x(kx + 30, yp - 40, f"x {nm['n_diode_g']}, side by side", 10, "#c92a2a", "m", 1)
+        x = kb["+"][0]
+    # ---- relay and e-stop
+    if relay:
+        rx = x + 70
+        rl = _ic_relay(sc, rx, yp - 100)
+        sc.l([(x, yp), rl["30"]], EW["pos"], 5)
+        tap = (x + 30, yp)
+        es = _ic_estop(sc, tap[0], 150)
+        sc.l([tap, es["11"]], EW["coil"], 2.5); sc.dot(*tap, EW["pos"])
+        sc.l([es["12"], (rl["86"][0], es["12"][1]), rl["86"]], EW["coil"], 2.5)
+        sc.l([rl["85"], (rl["85"][0], 236)], EW["coil"], 2.5)
+        sc.tag(rl["85"][0] + 4, 230, "to supply -", EW["coil"], "#ffffff", 10, "s")
+        dy = yp - 136                                                           # the 1N4007 across the coil
+        dx = (rl["86"][0] + rl["85"][0]) / 2.0
+        sc.l([(rl["86"][0], dy), (dx - 9, dy)], "#868e96", 2); sc.l([(dx + 9, dy), (rl["85"][0], dy)], "#868e96", 2)
+        sc.p([(dx + 8, dy - 7), (dx + 8, dy + 7), (dx - 6, dy)], "#212529"); sc.l([(dx - 8, dy - 8), (dx - 8, dy + 8)], "#212529", 2.5)
+        sc.dot(rl["86"][0], dy, EW["coil"], 3.5); sc.dot(rl["85"][0], dy, EW["coil"], 3.5)
+        sc.x(dx, dy - 12, "1N4007", 10, "#495057", "m", 1)
+        x = rl["87"][0]
+    xb = x + 90.0                                                               # the + and - bus bars
+    sc.l([(x, yp), (xb, yp)], EW["pos"], 5)
+    sc.l([(src_x, yn), (xb + 50, yn)], EW["neg"], 5)
+    y_hi, y_lo = min(rows_y[0] + 30, yp - 10), max(rows_y[-1] + 82, yn + 10)
+    sc.l([(xb, y_hi), (xb, y_lo)], EW["pos"], 9)
+    sc.l([(xb + 50, y_hi), (xb + 50, y_lo)], EW["neg"], 9)
+    sc.x(xb, y_hi - 12, "+ bus", 12, "#c92a2a", "m", 1); sc.x(xb + 50, y_hi - 12, "- bus", 12, "#212529", "m", 1)
+    xd = xb + 210.0
+    xm = xd + 250.0
+    if dr["ch"] == 2:                               # 2.9.5: a two-channel board feeds two motors from one input
+        for u in range(int(math.ceil(n / 2.0))):
+            a, two = 2 * u, 2 * u + 1 < n
+            y = rows_y[a]
+            dy = (rows_y[a + 1] - y) if two else 0
+            pins = _ic_driver_pwr2(sc, xd, y, dr, u + 1, dy, two)
+            f = _ic_fuse(sc, xb + 100, pins["B+"][1], nm.get("fuse_feed", nm["fuse"]))
+            sc.l(_hop_h(xb, f["a"][0], pins["B+"][1], [xb + 50]), EW["pos"], 4); sc.dot(xb, pins["B+"][1], EW["pos"], 5.5)
+            sc.l([f["b"], pins["B+"]], EW["pos"], 4)
+            sc.l([(xb + 50, pins["B-"][1]), pins["B-"]], EW["neg"], 4); sc.dot(xb + 50, pins["B-"][1], EW["neg"], 5.5)
+            for c in range(2 if two else 1):
+                mo = _ic_motor_side(sc, xm, rows_y[a + c] + 22, a + c + 1)
+                sc.l([pins[(c, 0)], mo["+"]], EW["ma"], 4)
+                sc.l([pins[(c, 1)], (xm - 20, pins[(c, 1)][1]), (xm - 20, mo["-"][1]), mo["-"]], EW["mb"], 4)
+    for i in (range(n) if dr["ch"] != 2 else ()):
+        y = rows_y[i]
+        if n > 3 and i in (0, 3):
+            sc.tag(xd + 110, y - 24, f"board {i // 3 + 1}: " + (f"motors {i + 1}-{min(n, i + 3)}" if min(n, i + 3) > i + 1 else f"motor {i + 1}"),
+                   "#00878f", "#ffffff", 11)
+        pins = _ic_driver_pwr(sc, xd, y, _drv_short(dr), i + 1)
+        f = _ic_fuse(sc, xb + 100, pins["B+"][1], nm["fuse"])
+        sc.l(_hop_h(xb, f["a"][0], pins["B+"][1], [xb + 50]), EW["pos"], 4); sc.dot(xb, pins["B+"][1], EW["pos"], 5.5)
+        sc.l([f["b"], pins["B+"]], EW["pos"], 4)
+        sc.l([(xb + 50, pins["B-"][1]), pins["B-"]], EW["neg"], 4); sc.dot(xb + 50, pins["B-"][1], EW["neg"], 5.5)
+        mo = _ic_motor_side(sc, xm, y + 22, i + 1)
+        sc.l([pins["M+"], mo["+"]], EW["ma"], 4)
+        sc.l([pins["M-"], (xm - 20, pins["M-"][1]), (xm - 20, mo["-"][1]), mo["-"]], EW["mb"], 4)
+    if d["fan"]:
+        _ic_fan(sc, xd + 240, rows_y[0] - 76)
+        sc.x(xd + 304, rows_y[0] - 44, _fans_text(d, dr), 11, "#495057", "s", 1)
+    low = max(low, y_lo + 30)
+    if regen == "diode_cap":
+        k = nm.get("cap_k") or int(max(1, math.ceil(nm["cap_uf"] / 10000.0)))      # 2.9.5: every capacitor bought
+        per = min(k, 6)
+        yc = y_lo + 40
+        sc.l([(xb, y_lo), (xb, yc)], EW["pos"], 4); sc.l([(xb + 50, y_lo), (xb + 50, yc + 50)], EW["neg"], 4)
+        x0 = xb + 110
+        for r_ in range(int(math.ceil(k / 6.0))):
+            kk = min(per, k - r_ * 6)
+            yr = yc + r_ * 170
+            if r_:
+                sc.l([(xb, yr - 170), (xb, yr)], EW["pos"], 4); sc.l([(xb + 50, yr - 120), (xb + 50, yr + 50)], EW["neg"], 4)
+            sc.l(_hop_h(xb, x0 + kk * 70 + 30, yr, [xb + 50]), EW["pos"], 3)
+            sc.l([(xb + 50, yr + 50), (x0 + kk * 70 + 30, yr + 50)], EW["neg"], 3)
+            _caps_row(sc, x0, yr, yr + 50, kk, nm, first_label=r_ == 0, res=r_ == 0)
+        yt = yc + 170 * (int(math.ceil(k / 6.0)) - 1) + 214
+        sc.x(x0 - 60, yt, f"capacitors at the drivers: {k} x 10,000 uF = {nm['cap_uf']:,} uF. Stripe (-) to the - bus; "
+                          "the resistor empties them.", 11, "#495057", "s", 1)
+        low = max(low, yt + 20)
+    H = low + 70
+    sc.h = H
+    sc.w = max(1500.0, xm + 230)
+    _legend(sc, 40, H - 40, ("pos", "neg", "ma", "mb", "coil") + (() if batt else ("L", "N", "PE")))
+    return sc.done("Power wiring", "Fuses as close to the + bus as they can be. Heavy wires with crimped ring terminals; "
+                                   "the bus bars can be a terminal strip with bridges.")
+
+
+def _ic_psu_small(sc, x, y, title, sub, w=190, h=72, adj=False):
+    """A small supply: mains in on its left side (L N PE), + and - out on its right side."""
+    sc.r(x, y, w, h, "#dee2e6", "#868e96", 2, 6)
+    for i in range(8):
+        for j in range(2):
+            sc.c(x + 40 + i * 13, y + 12 + j * 10, 2.4, "#adb5bd", "", 0)
+    sc.x(x + w / 2 + 6, y + 46, title, 12, "#212529", "m", 1)
+    sc.x(x + w / 2 + 6, y + 62, sub, 10, "#495057", "m")
+    if adj:
+        sc.c(x + w - 40, y + 18, 6, "#fab005", "#e67700", 1.5)
+    pins = {}
+    for i, k in enumerate(("L", "N", "PE")):
+        py = y + 16 + i * 20
+        sc.r(x - 6, py - 5, 12, 10, "#ced4da", "#868e96", 1, 2)
+        sc.x(x + 10, py + 4, k, 9, "#212529", "s", 1)
+        pins[k] = (x - 6, py)
+    for k, py in (("+V", y + 22), ("-V", y + 50)):
+        sc.r(x + w - 6, py - 5, 12, 10, "#ced4da", "#868e96", 1, 2)
+        sc.x(x + w - 10, py + 4, k, 10, "#212529", "e", 1)
+        pins[k] = (x + w + 6, py)
+    return pins
+
+
+def _ic_relay_small(sc, x, y):
+    """A relay as a small box: coil 86 / 85 on top, 30 in on the left and 87 out on the right, at y + 40."""
+    sc.r(x, y, 74, 54, "#212529", "#000000", 2, 6)
+    for i in range(3):
+        sc.c(x + 26 + i * 11, y + 22, 5, "#212529", "#e64980", 1.5)
+    sc.x(x + 37, y + 46, "RELAY", 9, "#ffffff", "m", 1)
+    for k, px in (("86", x + 14), ("85", x + 60)):
+        sc.r(px - 4, y - 8, 8, 8, "#ced4da", "#868e96", 1)
+        sc.x(px, y + 11, k, 9, "#ffffff", "m", 1)
+    sc.r(x - 8, y + 36, 8, 8, "#ced4da", "#868e96", 1); sc.r(x + 74, y + 36, 8, 8, "#ced4da", "#868e96", 1)
+    sc.x(x + 4, y + 52, "30", 8, "#ced4da", "s"); sc.x(x + 70, y + 52, "87", 8, "#ced4da", "e")
+    return {"86": (x + 14, y - 8), "85": (x + 60, y - 8), "30": (x - 8, y + 40), "87": (x + 82, y + 40)}
+
+
+def elec_scene_power_each(d, dr, nm):
+    """2.9.5: one supply - or one series pair - per motor: every supply drawn with its own diode, relay, fuse and
+    capacitors; the + sides stay apart, the - sides join (the drivers' logic grounds join them at the board anyway)."""
+    n, v = d["motors"], d["psu_volts"]
+    pair = nm.get("series", 1) == 2
+    relay = d["estop"] == "relay"
+    regen = d["regen"]
+    k = nm.get("cap_k", 1)
+    two = dr["ch"] == 2                                           # 2.9.5: one supply per two-channel driver board
+    per = "driver board" if two else "motor"
+    G = int(math.ceil(n / 2.0)) if two else n                     # rows: one per supply (pair)
+    dy2 = 150.0                                                   # channel 2's motor below channel 1's
+    row_h = (236.0 if pair else (226.0 if regen == "diode_cap" else 160.0)) + (dy2 if two else 0)
+    top = 150.0
+    sc = _ESc(1560, 100)
+    sc.x(30, 40, f"Power wiring: one supply per {per}" if not pair else f"Power wiring: a 24 V pair per {per}", 22, "#212529", "s", 1)
+    sc.x(30, 64, f"{n} motors, {v:g} V: {nm.get('psu_units', n)} supplies. Each {per}: its own supply"
+                 + (" pair" if pair else "") + f", {nm.get('fuse_feed', nm['fuse']):g} A fuse and {nm['wire']} wire. The + sides stay "
+                 "apart; the - sides join at the - bus.", 13, "#495057")
+    sc.x(30, 84, "The heavy lines carry the motor current - keep them short.", 12, "#495057")
+    if d["psu"] in ("server", "pc"):
+        sc.tag(640, 84, ("bypass diode across each supply, " if pair else "") + ("breakout boards" if d["psu"] == "server" else
+               "PS_ON switches, 12 V from the PCIe / CPU cables") + ": see The supplies", EW["ctl"], "#ffffff", 10, "s")
+    xs = 120.0
+    trunk = (40.0, 56.0, 72.0)                                    # mains L, N, PE
+    title = {"server": "Server supply", "pc": "PC supply"}.get(d["psu"], _psu_title(d))
+    rows = []
+    for i in range(G):
+        y0 = top + i * row_h
+        if pair:
+            s1 = _ic_psu_small(sc, xs, y0, f"{title} {2 * i + 1}", "upper: -V off its case")
+            s2 = _ic_psu_small(sc, xs, y0 + 96, f"{title} {2 * i + 2}", "lower: as it comes")
+            sc.l([s1["-V"], (s1["-V"][0] + 22, s1["-V"][1]), (s1["-V"][0] + 22, s2["+V"][1]), s2["+V"]], EW["neg"], 4)
+            sc.x(xs + 101, y0 + 88, f"{2 * i + 1} -V to {2 * i + 2} +V: 24 V", 10, "#495057", "m", 1)
+            pos, neg, sup = s1["+V"], s2["-V"], (s1, s2)
+        else:
+            s1 = _ic_psu_small(sc, xs, y0, f"{title} {i + 1}", f"{v:g} V  {d['psu_amps']:g} A", adj=d["psu"] == "adj")
+            pos, neg, sup = s1["+V"], s1["-V"], (s1,)
+        for sp in sup:                                            # mains from the trunk, jumping the other trunk lines
+            for kk, tx in zip(("L", "N", "PE"), trunk):
+                py = sp[kk][1]
+                sc.l(_hop_h(tx, sp[kk][0], py, [t_ for t_ in trunk if t_ > tx]), EW[kk], 2.5)
+                sc.dot(tx, py, EW[kk], 3.5)
+        yl = pos[1]                                               # the + line of this row
+        x = pos[0] + 30
+        sc.l([pos, (x, yl)], EW["pos"], 5)
+        if regen == "diode_cap":
+            kb = _ic_kbpc(sc, x + 50, yl - 12)
+            sc.l([(x, yl), kb["~1"]], EW["pos"], 5)
+            jx = x + 16
+            sc.l([(jx, yl), (jx, yl + 64), (kb["~2"][0] + 16, yl + 64), (kb["~2"][0] + 16, kb["~2"][1]), kb["~2"]], EW["pos"], 3)
+            sc.dot(jx, yl, EW["pos"])
+            sc.x(x + 80, yl - 22, "diode" + (f" x {nm['n_diode_g']}" if nm.get("n_diode_g", 1) > 1 else ""), 10, "#212529", "m", 1)
+            x = kb["+"][0]
+        else:
+            x += 140
+            if regen == "battery":
+                sc.tag(x - 70, yl + 46, "a buffer battery per supply: Braking energy", "#ae3ec9", "#ffffff", 9.5)
+        if relay:
+            rl = _ic_relay_small(sc, x + 50, yl - 40)
+            sc.l([(x, yl), rl["30"]], EW["pos"], 5)
+            sc.l([rl["86"], (rl["86"][0], rl["86"][1] - 14)], EW["coil"], 2)
+            sc.tag(rl["86"][0] - 4, rl["86"][1] - 20, "86: e-stop", EW["coil"], "#ffffff", 8.5, "e")
+            sc.l([rl["85"], (rl["85"][0], rl["85"][1] - 14)], EW["coil"], 2)
+            sc.tag(rl["85"][0] + 4, rl["85"][1] - 20, "85: to -", EW["coil"], "#ffffff", 8.5, "s")
+            x = rl["87"][0]
+        else:
+            x += 132
+        fz = _ic_fuse(sc, x + 40, yl, nm.get("fuse_feed", nm["fuse"]))
+        sc.l([(x, yl), fz["a"]], EW["pos"], 5)
+        x = fz["b"][0]
+        xneg = x + 26                                             # the - bus, just after the fuses
+        x0 = xneg + 44                                            # the capacitors
+        xd = max(1010.0, x0 + (k * 46 + 90 if regen == "diode_cap" else 60))
+        both = two and 2 * i + 1 < n
+        pins = _ic_driver_pwr2(sc, xd, yl - 40, dr, i + 1, dy2, both) if two else _ic_driver_pwr(sc, xd, yl - 40, _drv_short(dr), i + 1)
+        yb_ = pins["B-"][1]
+        x_end = x0 + k * 46 + 70 if regen == "diode_cap" else x0
+        sc.l(_hop_h(x, pins["B+"][0], yl, [xneg] if i else []), EW["pos"], 4)
+        if regen == "diode_cap":                                  # this supply's capacitors, at its driver
+            for j in range(k):
+                cx = x0 + j * 46
+                cp = _ic_cap(sc, cx, yb_ + 28, "", "")
+                sc.l(_hop_v(cp["+"][0], yl, cp["+"][1], [yb_]), EW["pos"], 2.5); sc.dot(cp["+"][0], yl, EW["pos"], 3.5)
+                sc.l([cp["-"], (cp["-"][0], yb_)], EW["neg"], 2.5); sc.dot(cp["-"][0], yb_, EW["neg"], 3.5)
+            sc.x(x0 + k * 23, yb_ + 136, f"{k} x 10,000 uF {nm['cap_v']} V", 10, "#212529", "m", 1)
+            xr = x0 + k * 46 + 14
+            rs = _ic_res(sc, xr, yl, "", vertical=True)
+            sc.dot(xr, yl, EW["pos"], 3.5)
+            sc.l(_hop_v(xr, rs["b"][1], yb_, []), EW["neg"], 2); sc.dot(xr, yb_, EW["neg"], 3.5)
+        # the - side: the supply's -V down below the row's parts, along to the - bus; the bus to the driver's B-
+        y_low = max(neg[1], y0 + 104)
+        sc.l([neg, (neg[0] + 14, neg[1]), (neg[0] + 14, y_low), (xneg, y_low)], EW["neg"], 4)
+        sc.dot(xneg, y_low, EW["neg"], 5)
+        sc.l([(xneg, yb_), pins["B-"]], EW["neg"], 4)
+        sc.dot(xneg, yb_, EW["neg"], 5)
+        for c in range(2 if two and both else 1):
+            mo = _ic_motor_side(sc, xd + 270, yl - 18 + c * dy2, (2 * i + c + 1) if two else i + 1)
+            mp_, mm_ = (pins[(c, 0)], pins[(c, 1)]) if two else (pins["M+"], pins["M-"])
+            sc.l([mp_, mo["+"]], EW["ma"], 4)
+            sc.l([mm_, (xd + 250, mm_[1]), (xd + 250, mo["-"][1]), mo["-"]], EW["mb"], 4)
+        rows.append((y0, yl, yb_, y_low, xneg, xd))
+    # the - bus joining every row
+    xneg, xd = rows[0][4], rows[0][5]
+    sc.l([(xneg, rows[0][2]), (xneg, max(rows[-1][2], rows[-1][3]))], EW["neg"], 7)
+    sc.x(xneg, rows[0][2] - 14, "- bus", 12, "#212529", "m", 1)
+    y_end = top + G * row_h
+    # mains: the plug (and the mains e-stop) below, the trunk up the left
+    yplug = y_end + 30
+    plug = _ic_plug(sc, 120, yplug, d["mains"])
+    first = top + 16
+    for kk, tx in zip(("L", "N", "PE"), trunk):
+        sc.l([(tx, first), (tx, plug[kk][1])], EW[kk], 3)
+        sc.l(_hop_h(tx, plug[kk][0] - 74, plug[kk][1], [t_ for t_ in trunk if t_ > tx]), EW[kk], 3)
+    sc.x(200, yplug + 104, ("a power strip feeds every supply" if d["estop"] != "ac" else
+                            "e-stop in the mains: the button opens the strip's feed"), 11, "#495057", "m", 1)
+    if relay:
+        es = _ic_estop(sc, 420, y_end + 46)
+        sc.tag(560, y_end + 70, "11: from a supply's + (after its diode)", EW["coil"], "#ffffff", 10, "s")
+        sc.tag(560, y_end + 100, "12: to every relay's 86", EW["coil"], "#ffffff", 10, "s")
+        sc.tag(560, y_end + 130, "every relay's 85: to the - bus; a 1N4007 across each coil", EW["coil"], "#ffffff", 10, "s")
+    if d["fan"]:
+        _ic_fan(sc, xd + 240, top - 70)
+        sc.x(xd + 304, top - 38, _fans_text(d, dr), 11, "#495057", "s", 1)
+    H = y_end + 220
+    sc.h = H
+    sc.w = max(1500.0, xd + 500)
+    _legend(sc, 40, H - 40, ("pos", "neg", "ma", "mb", "coil", "L", "N", "PE"))
+    return sc.done("Power wiring", f"Each supply feeds only its own {per}: a supply that cuts out stops " + ("two motors" if two else "one motor")
+                   + ", not all. "
+                                   "Fuses as close to the supply as they can be.")
+
+
+def _hop_v(x, y0, y1, cross):
+    pts = [(x, y0)]
+    for cy in sorted(c for c in cross if min(y0, y1) + 12 < c < max(y0, y1) - 12):
+        pts += [(x, cy - 11), (x + 10, cy - 7), (x + 10, cy + 7), (x, cy + 11)]
+    return pts + [(x, y1)]
+
+
+# ---------------------------------------------------------------------------------------------------- the signal side
+def elec_scene_signals(d, dr, board, khz):
+    """One UNO R4 WiFi and its (up to) three drivers and sensors."""
+    n = d["motors"]
+    first = (board - 1) * 3
+    motors = list(range(first, min(n, first + 3)))
+    kind = dr["wire"]
+    H = 900
+    sc = _ESc(1500, H)
+    sc.x(30, 40, f"Signal wiring{f', board {board}' if n > 3 else ''}: motors {motors[0] + 1}-{motors[-1] + 1}"
+         if len(motors) > 1 else f"Signal wiring: motor {motors[0] + 1}", 22, "#212529", "s", 1)
+    P2 = dr.get("pins") if dr["ch"] == 2 else None
+    sub2 = None
+    if P2 and kind == "pwmdir":
+        sub2 = (f"{_drv_short(dr)}: two motors per board. {P2[0]['PWM']} / {P2[1]['PWM']} take the PWM, {P2[0]['DIR']} / {P2[1]['DIR']} the "
+                "direction. Settings, Motor drivers: 'PWM + direction' (firmware 2.2.0b1)." + (" Switches: see the Driver step." if "MDDS" in _drv_short(dr) else ""))
+    sc.x(30, 64, sub2 or {"ibt2": "IBT-2 (BTS7960): direction on RPWM, PWM on LPWM, both enables together. R_IS and L_IS stay free.",
+                  "pwmdir": "PWM + direction driver: PWM and DIR. Set Settings, Motor drivers to 'PWM + direction' (firmware 2.2.0b1).",
+                  "inab": "PWM + two direction inputs: INA and INB. Set Settings, Motor drivers to 'PWM + direction' (firmware 2.2.0b1).",
+                  "none": "This driver is not driven by this board's pins."}[kind], 13, "#495057")
+    SIG = {0: (2, 3, 9, "A0"), 1: (4, 5, 10, "A1"), 2: (6, 7, 11, "A2")}
+    used = {"5V": EW["v5"], "GND": EW["gnd"]}
+    wires = []                                                                  # (board pin, driver pin, colour)
+    two = dr["ch"] == 2 and dr.get("pins")             # 2.9.5: a two-channel board: its channel's own pins
+    units = sorted({m // 2 for m in motors}) if two else None
+    for j, m in enumerate(motors):
+        a, b, p, fb = SIG[j]
+        used[fb] = EW["sens"]
+        t = units.index(m // 2) if two else j
+        P = dr["pins"][m % 2] if two else {"PWM": "PWM", "DIR": "DIR", "INA": "INA", "INB": "INB"}
+        if kind == "ibt2":
+            wires += [(f"D{a}", (j, "RPWM"), "dir"), (f"D{p}", (j, "LPWM"), "pwm"), (f"D{b}", (j, "R_EN"), "en"), (f"D{b}", (j, "L_EN"), "en")]
+        elif kind == "pwmdir":
+            wires += [(f"D{a}", (t, P["DIR"]), "dir"), (f"D{p}", (t, P["PWM"]), "pwm")]
+        elif kind == "inab":
+            wires += [(f"D{a}", (t, P["INA"]), "dir"), (f"D{b}", (t, P["INB"]), "en"), (f"D{p}", (t, P["PWM"]), "pwm")]
+    for bp, _t, col in wires:
+        used[bp] = EW[col]
+    if d.get("imu") and board == 1:
+        used["D0"], used["D1"] = EW["imutx"], EW["imurx"]
+    ux, uy = 520.0, 130.0
+    up, ubox = _ic_uno(sc, ux, uy, used)
+    elec_board_power(sc, ux, uy, 290, 80)                         # 2.9.5: the board's own 12 V adapter
+    # drivers on the right
+    xd = 1080.0
+    dpins, ys = [], 110.0
+    if two:
+        for u in units:
+            rows_, notes, terms = [], {}, ["B+", "B-"]
+            for c in (0, 1):
+                m = 2 * u + c
+                P = dr["pins"][c]
+                lab = ((P["INA"], "dir"), (P["INB"], "en"), (P["PWM"], "pwm")) if kind == "inab" else ((P["PWM"], "pwm"), (P["DIR"], "dir"))
+                here = m in motors
+                rows_ += [(nm_, col if here else None) for nm_, col in lab]
+                for nm_, _c in lab:
+                    if not here:
+                        notes[nm_] = f"motor {m + 1}: board {m // 3 + 1}" if m < n else "not used"
+                terms += P["M"].split(" / ")
+            rows_ += ([("+5V / EN", "v5")] if kind == "inab" else []) + [("GND", "gnd")]
+            pins, h = _ic_driver_sig(sc, xd, ys, kind, _drv_short(dr) + ", 2 channels", u + 1, khz, rows_, notes, terms)
+            dpins.append(pins)
+            ys += h + 34
+    else:
+        for j, m in enumerate(motors):
+            pins, h = _ic_driver_sig(sc, xd, ys, kind, _drv_short(dr), m + 1, khz)
+            dpins.append(pins)
+            ys += h + 34
+    # signal wires: board pin -> its own lane -> the driver pin
+    lanes = sorted({bp for bp, _t, _c in wires}, key=lambda k: up[k][1])
+    lane_x = {bp: 846 + i * 18 for i, bp in enumerate(lanes)}
+    for bp, (j, dp), col in wires:
+        if dp not in dpins[j]:
+            continue
+        sx, sy = up[bp]
+        tx, ty, _ = dpins[j][dp]
+        lx = lane_x[bp]
+        sc.l([(sx, sy), (lx, sy), (lx, ty), (tx, ty)], EW[col], 3)
+        if sum(1 for w_ in wires if w_[0] == bp) > 1:
+            sc.dot(lx, ty, EW[col], 4)
+    # 5 V and GND: flags - every flag with the same name joins one small terminal strip at the board
+    for key, lab, col in (("L5V", "5V", "v5"), ("LGND", "GND", "gnd")):
+        px_, py_ = up[key]
+        sc.l([(px_, py_), (px_ - 30, py_)], EW[col], 3)
+        sc.tag(px_ - 34, py_, lab + " strip", EW[col], "#ffffff", 10, "e")
+    for j in range(len(dpins)):
+        for dp, k in (("VCC", "v5"), ("+5V / EN", "v5"), ("GND", "gnd")):
+            if dp in dpins[j]:
+                tx, ty, _ = dpins[j][dp]
+                sc.l([(tx, ty), (tx - 22, ty)], EW[k], 3)
+                sc.tag(tx - 26, ty, "5V" if k == "v5" else "GND", EW[k], "#ffffff", 10, "e")
+    # sensors on the left
+    for j, m in enumerate(motors):
+        hy = 170 + j * 170
+        hp = _ic_hall(sc, 60, hy, m + 1)
+        a_pin = up["L" + SIG[j][3]]
+        lane = 300 + j * 24
+        sc.l([hp["OUT"], (lane, hp["OUT"][1]), (lane, a_pin[1]), a_pin], EW["sens"], 3)
+        for k_, col in (("5V", "v5"), ("GND", "gnd")):
+            px_, py_ = hp[k_]
+            sc.tag(px_ + 4, py_, "5V" if k_ == "5V" else "GND", EW[col], "#ffffff", 10, "s")
+    y_end = max(ys, 170 + len(motors) * 170, uy + 650)
+    imu = d.get("imu") and board == 1                 # 2.9.5: the motion sensor, board 1's D0 / D1
+    if imu:
+        y_end = elec_imu_signal(sc, up, 340, y_end + 20, 826, 838) + 10
+    sc.h = H = y_end + 140
+    sc.r(ux + 10, uy + 584, 280, 52, "#fff9db", "#fab005", 1.5, 8)
+    sc.x(ux + 150, uy + 605, "5V strip: the board's 5V + every 5V flag", 11, "#212529", "m", 1)
+    sc.x(ux + 150, uy + 624, "GND strip: the board's GND + every GND flag", 11, "#212529", "m", 1)
+    sc.x(60, H - 104, BOARD_POWER_NOTE, 12, EW["vin"], "s", 1)
+    sc.x(60, H - 84, "Sensor cables: shielded, the shield to GND at the board end only. Flags with the same name join the strip.", 12, "#495057")
+    sc.x(60, H - 64, "Keep sensor and logic wires away from the motor and supply wires; cross them at right angles.", 12, "#495057")
+    _legend(sc, 60, H - 40, tuple(sorted({c_ for _b, _t, c_ in wires}, key=["dir", "pwm", "en"].index)) + ("v5", "gnd", "sens")
+            + (("imutx", "imurx") if imu else ()) + ("vin",), 6)
+    return sc.done(f"Signal wiring{f', board {board}' if n > 3 else ''}",
+                   "Each driver's logic GND goes to the board's GND (the strip); the supply's minus never runs through "
+                   "the board.")
+
+
+# ---------------------------------------------------------------------------------------------------- details
+def elec_scene_braking(d, nm):
+    batt = d["psu"] == "battery"
+    regen = "battery_main" if batt else d["regen"]
+    v = d["psu_volts"]
+    if regen == "battery_main":
+        sc = _ESc(1500, 470)
+        sc.x(30, 40, "Braking energy: the batteries take it", 22, "#212529", "s", 1)
+        sc.x(30, 64, "A battery swallows what a braking motor pushes back. Nothing to add - but fuse it at the terminal.", 13, "#495057")
+        b1 = _ic_battery(sc, 120, 250)
+        b2 = _ic_battery(sc, 290, 250) if v > 15 else None
+        f = _ic_fuse(sc, b1["+"][0], 150, 100, vertical=True)
+        sc.l([b1["+"], f["b"]], EW["pos"], 5); sc.l([f["a"], (b1["+"][0], 120), (800, 120)], EW["pos"], 5)
+        last = b2 or b1
+        if b2:
+            sc.l([b1["-"], (b1["-"][0], 228), (b2["+"][0], 228), b2["+"]], EW["neg"], 5)
+            sc.x(250, 220, "1 - to 2 +: 24 V", 11, "#495057", "m", 1)
+        sc.l([last["-"], (last["-"][0], 200), (440, 200), (440, 380), (800, 380)], EW["neg"], 5)
+        sc.x(810, 126, "to the relay and the + bus", 13, "#c92a2a", "s", 1); sc.x(810, 386, "to the - bus", 13, "#212529", "s", 1)
+        sc.x(b1["+"][0] + 20, 200, "main fuse (ANL or MIDI)", 10, "#c92a2a", "s", 1)
+        for i, s_ in enumerate(("Main fuse within a hand's width of the + terminal.",
+                                "Charge between sessions; a charger left on while driving must be a smart one.",
+                                "A battery gives hundreds of amps into a short: every wire fused, terminals covered.")):
+            sc.x(560, 200 + i * 26, s_, 13, "#212529")
+        return sc.done("Braking energy", "")
+    if regen == "battery":
+        sc = _ESc(1500, 520)
+        sc.x(30, 40, "Braking energy: a buffer battery across the supply", 22, "#212529", "s", 1)
+        sc.x(30, 64, "The battery swallows what a braking motor pushes back and helps on peaks.", 13, "#495057")
+        pa = _ic_psu(sc, 60, 110, 300, 170, "Power supply", f"set to {13.7 * (2 if v > 15 else 1):.1f} V, current limited")
+        b1 = _ic_battery(sc, 560, 330, "12 V" if v < 15 else "2 x 12 V")
+        f = _ic_fuse(sc, b1["+"][0], 240, 40, vertical=True)
+        sc.l([pa["+V"], (pa["+V"][0], 300), (480, 300), (480, 220), (1000, 220)], EW["pos"], 4)
+        sc.l([(b1["+"][0], 220), f["a"]], EW["pos"], 4); sc.l([f["b"], b1["+"]], EW["pos"], 4); sc.dot(b1["+"][0], 220, EW["pos"])
+        sc.l([pa["-V"], (pa["-V"][0], 450), (1000, 450)], EW["neg"], 4)
+        sc.l([b1["-"], (b1["-"][0], 316), (700, 316), (700, 450)], EW["neg"], 4); sc.dot(700, 450, EW["neg"])
+        sc.x(1010, 226, "to the relay and the + bus", 13, "#c92a2a", "s", 1); sc.x(1010, 456, "to the - bus", 13, "#212529", "s", 1)
+        for i, s_ in enumerate(("Set the supply to the batteries' float voltage and limit its current,",
+                                "or it cuts out trying to charge them: 13.7 V per 12 V lead-acid battery.",
+                                "That is above what an IBT-2 takes on a 24 V pair - the checks say so.",
+                                "Fuse the battery at its terminal (40 A here).")):
+            sc.x(760, 300 + i * 24, s_, 12, "#212529")
+        return sc.done("Braking energy", "")
+    # diode + capacitors (shown as the recommendation when nothing is chosen)
+    sc = _ESc(1500, 640)
+    sc.x(30, 40, "Braking energy: a diode and capacitors" + (" - recommended, not in your design yet" if regen == "none" else ""),
+         22, "#c92a2a" if regen == "none" else "#212529", "s", 1)
+    sc.x(30, 64, "A braking motor works as a generator. The diode keeps that voltage out of the supply; the capacitors "
+                 "hold it and give it back on the next move.", 13, "#495057")
+    kb = _ic_kbpc(sc, 300, 170, big=True)
+    yin = kb["~1"][1]
+    sc.l([(60, yin), kb["~1"]], EW["pos"], 5)
+    sc.x(60, yin - 12, "from the supply +V", 13, "#c92a2a", "s", 1)
+    jx = 160
+    sc.l([(jx, yin), (jx, 370), (kb["~2"][0] + 70, 370), (kb["~2"][0] + 70, kb["~2"][1]), kb["~2"]], EW["pos"], 4)
+    sc.dot(jx, yin, EW["pos"])
+    sc.l([kb["+"], (520, kb["+"][1]), (520, 420), (1360, 420)], EW["pos"], 5)
+    sc.x(kb["+"][0] + 8, kb["+"][1] - 10, "+ : out", 13, "#c92a2a", "s", 1)
+    sc.x(kb["-"][0] - 14, kb["-"][1] + 5, "- : leave free", 12, "#868e96", "e", 1)
+    sc.x(jx - 8, 332, "both ~ joined", 12, "#212529", "e", 1)
+    sc.x(jx - 8, 348, "(two diodes in parallel)", 11, "#495057", "e")
+    sc.l([(560, 470), (1360, 470)], EW["neg"], 5)
+    sc.x(1370, 426, "+ bus", 13, "#c92a2a", "s", 1); sc.x(1370, 476, "- bus", 13, "#212529", "s", 1)
+    k = int(min(6, nm.get("cap_k") or max(1, math.ceil(nm["cap_uf"] / 10000.0))))
+    xr = _caps_row(sc, 640, 420, 470, k, nm)
+    g = nm.get("groups", 1)
+    each = f" per supply ({g} supplies)" if g > 1 else ""
+    notes = (f"Diode: a KBPC5010 bridge rectifier (50 A, 1000 V) used as a diode - {nm.get('n_diode_g', nm['n_diode'])} needed{each}. It drops",
+             "about 1 V and warms by about a watt per amp: screw it to a heat sink or the metal back plate.",
+             f"Capacitors: {nm.get('cap_k', k)} x 10,000 uF = {nm['cap_uf']:,} uF{each}, rated {nm['cap_v']} V or more, at the drivers. "
+             "Stripe (-) to the - bus.",
+             "The resistor empties them after switch-off: wait 30 s before touching the bus.")
+    for i, s_ in enumerate(notes):
+        sc.x(560, 160 + i * 24, s_, 12, "#212529")
+    return sc.done("Braking energy", "")
+
+
+def _ic_supply_unit(sc, x, y, kind, title, sub, cables=4):
+    """A server supply on its breakout board, or an ATX PC supply with its cables - seen from above.  Returns the
+    + and - output points (right side), the mains inlet (left side) and the on-switch's position."""
+    if kind == "server":
+        sc.r(x, y + 20, 300, 96, "#ced4da", "#868e96", 2, 4)                         # the long slim supply
+        for i in range(14):
+            sc.l([(x + 16 + i * 14, y + 34), (x + 16 + i * 14, y + 102)], "#adb5bd", 2)
+        sc.c(x + 270, y + 68, 22, "#495057", "#343a40", 2)                            # its fan
+        sc.x(x + 120, y + 62, title, 14, "#212529", "m", 1)
+        sc.x(x + 120, y + 82, sub, 11, "#495057", "m")
+        bx = x + 300                                                                  # the breakout board on its card edge
+        sc.r(bx, y, 110, 136, "#2f9e44", "#2b8a3e", 2, 6)
+        sc.x(bx + 55, y - 8, "breakout board", 11, "#212529", "m", 1)
+        sc.c(bx + 80, y + 34, 13, "#e03131", "#862e2e", 2); sc.x(bx + 80, y + 38, "+12", 9, "#ffffff", "m", 1)
+        sc.c(bx + 80, y + 102, 13, "#212529", "#000000", 2); sc.x(bx + 80, y + 106, "GND", 8, "#ffffff", "m", 1)
+        sc.r(bx + 18, y + 56, 26, 24, "#f8f9fa", "#495057", 1.5, 4); sc.r(bx + 24, y + 60, 8, 16, EW["ctl"], "", 0, 2)
+        sc.x(bx + 31, y + 94, "ON", 9, "#ffffff", "m", 1)
+        out = {"+": (bx + 93, y + 34), "-": (bx + 93, y + 102), "sw": (bx + 31, y + 68)}
+        sc.r(x - 22, y + 50, 22, 40, "#343a40", "", 0, 3)                             # C14 inlet at its back
+        out.update({"L": (x - 22, y + 58), "N": (x - 22, y + 70), "PE": (x - 22, y + 82)})
+        return out
+    sc.r(x, y, 300, 150, "#343a40", "#212529", 2, 8)                                  # ATX: a box with a big fan
+    sc.c(x + 90, y + 75, 56, "#495057", "#212529", 2)
+    for r_ in (46, 34, 22):
+        sc.c(x + 90, y + 75, r_, "", "#868e96", 1.2)
+    sc.l([(x + 34, y + 75), (x + 146, y + 75)], "#868e96", 1.2); sc.l([(x + 90, y + 19), (x + 90, y + 131)], "#868e96", 1.2)
+    sc.x(x + 228, y + 40, title, 13, "#ffffff", "m", 1)
+    sc.x(x + 228, y + 58, sub, 10, "#ced4da", "m")
+    for i in range(cables):                                                           # PCIe / CPU cables: 3 yellow, 3 black each
+        yy = y + 76 + i * (60.0 / max(1, cables - 1) if cables > 1 else 0)
+        sc.r(x + 296, yy - 5, 14, 10, "#868e96", "", 0, 2)
+    sc.x(x + 228, y + 128, f"{cables} x PCIe / CPU 8-pin", 10, "#ced4da", "m", 1)
+    # the bundles: yellow to +, black to -
+    ys = [y + 76 + i * (60.0 / max(1, cables - 1) if cables > 1 else 0) for i in range(cables)]
+    px, nx = x + 360, x + 380
+    for yy in ys:
+        sc.l([(x + 310, yy - 2), (px, yy - 2), (px, y + 40)], "#fab005", 2)
+        sc.l([(x + 310, yy + 2), (nx - 6, yy + 2), (nx - 6, y + 150 + 20), (nx, y + 170)], "#212529", 2)
+    sc.c(px, y + 40, 6, "#fab005", "", 0); sc.c(nx, y + 170, 6, "#212529", "", 0)
+    sc.x(px + 10, y + 30, "every yellow: +12 V", 10, "#e67700", "s", 1)
+    sc.x(nx - 10, y + 186, "every black: ground", 10, "#212529", "e", 1)
+    # the 24-pin plug with its switch: green (16) to black (15)
+    sc.r(x + 190, y + 150, 60, 26, "#f8f9fa", "#495057", 1.5, 3)
+    for i in range(12):
+        for j in range(2):
+            sc.r(x + 193 + i * 4.6, y + 154 + j * 10, 3, 6, "#868e96", "", 0, 1)
+    sc.l([(x + 210, y + 176), (x + 210, y + 196)], "#2f9e44", 2.5); sc.l([(x + 222, y + 176), (x + 222, y + 196)], "#212529", 2.5)
+    sc.r(x + 202, y + 196, 28, 18, "#f8f9fa", "#495057", 1.5, 4); sc.r(x + 206, y + 199, 9, 12, EW["ctl"], "", 0, 2)
+    sc.x(x + 236, y + 210, "on switch: pin 16 (green) to pin 15 (black)", 10, EW["ctl"], "s", 1)
+    sc.r(x - 22, y + 50, 22, 40, "#212529", "", 0, 3)
+    return {"+": (px, y + 40), "-": (nx, y + 170), "sw": (x + 216, y + 205), "L": (x - 22, y + 58), "N": (x - 22, y + 70),
+            "PE": (x - 22, y + 82)}
+
+
+def _bypass_diode(sc, x, ytop, ybot):
+    """A KBPC5010 used as a single diode across a supply: its + to the supply's +, the two ~ joined to the supply's -."""
+    kb = _ic_kbpc(sc, x, (ytop + ybot) / 2.0 - 30)
+    sc.l([kb["+"], (kb["+"][0] + 14, kb["+"][1]), (kb["+"][0] + 14, ytop)], EW["pos"], 3)
+    sc.l([kb["~1"], (kb["~1"][0] - 14, kb["~1"][1]), (kb["~1"][0] - 14, ybot)], EW["neg"], 3)
+    sc.l([kb["~2"], (kb["~2"][0] + 6, kb["~2"][1]), (kb["~2"][0] + 6, kb["~2"][1] + 16), (kb["~1"][0] - 14, kb["~2"][1] + 16)], EW["neg"], 2)
+    sc.dot(kb["~1"][0] - 14, ybot, EW["neg"], 4)
+    sc.dot(kb["+"][0] + 14, ytop, EW["pos"], 4)
+    sc.x(kb["+"][0] + 22, (ytop + ybot) / 2.0 + 4, "bypass diode", 10, "#212529", "s", 1)
+    return kb
+
+
+def elec_scene_supplies(d, nm):
+    """2.9.5: server or PC supplies in detail - how each one is switched on and where the 12 V comes from; for 24 V
+    the pair in series, the upper one's ground off its case, a bypass diode across each."""
+    kind = d["psu"]
+    pair = nm.get("series", 1) == 2
+    v = d["psu_volts"]
+    g = nm.get("groups", 1)
+    cables = max(2, int(math.ceil(min(d["psu_amps"], nm.get("grp_need", nm.get("grp_rated", 30) * 1.25)) / 12.5 - 1e-9))) if kind == "pc" else 0   # 2.9.5: the supply's current
+    sc = _ESc(1500, 100)
+    word = "Server supplies" if kind == "server" else "PC supplies"
+    sc.x(30, 40, (f"{word}: two in series for 24 V" if pair else f"{word[:-8]}supply: 12 V") + (f" - {g} of these, one per motor" if g > 1 else ""),
+         22, "#212529", "s", 1)
+    sc.x(30, 64, ("Each sits on a breakout board: 12 V terminals and the switch that turns it on. " if kind == "server" else
+                  f"12 V comes out of its PCIe and CPU cables - {cables} of them, 12.5 A each by the PCIe spec; the 24-pin plug only "
+                  "switches it on. ") + ("The upper supply's output ground comes off its case; a bypass diode across each." if pair else
+                                         "Its ground stays on its case: the rig's 0 V on earth, like the board's USB ground."), 13, "#495057")
+    x0 = 120.0
+    units = []
+    for i in range(2 if pair else 1):
+        y = 130 + i * 300
+        t_ = (f"{'Server' if kind == 'server' else 'PC'} supply {i + 1}") + ((" (upper)" if i == 0 else " (lower)") if pair else "")
+        sub = ("HP DPS-1200FB, " if kind == "server" else "") + ("ground off its case" if pair and i == 0 else "as it comes")
+        u = _ic_supply_unit(sc, x0, y, kind, t_, sub, cables)
+        units.append(u)
+    # mains: a strip on the left, L N PE to each inlet
+    for i, u in enumerate(units):
+        for k_, dx in (("L", 30), ("N", 44), ("PE", 58)):
+            sc.l([(dx, u[k_][1]), u[k_]], EW[k_], 2.5)
+    for k_, dx in (("L", 30), ("N", 44), ("PE", 58)):
+        sc.l([(dx, units[0][k_][1]), (dx, units[-1][k_][1] + (200 if pair else 140))], EW[k_], 3)
+    sc.x(30, units[-1]["PE"][1] + (220 if pair else 160), "mains from a power strip: earth to every supply's case", 11, "#8d5524", "s", 1)
+    xo = 700.0                                                                       # where the outputs leave
+    if pair:
+        u1, u2 = units
+        xd = 590.0
+        _bypass_diode(sc, xd, u1["+"][1], u1["-"][1])
+        _bypass_diode(sc, xd, u2["+"][1], u2["-"][1])
+        sc.l([u1["+"], (xd + 86, u1["+"][1]), (xo + 300, u1["+"][1])], EW["pos"], 5)
+        sc.l([u1["-"], (xd + 16, u1["-"][1]), (xd + 16, u2["+"][1])], EW["neg"], 5)
+        sc.l([u2["+"], (xd + 86, u2["+"][1])], EW["pos"], 4)
+        sc.l([(xd - 2, u1["-"][1]), (xd - 2, u1["-"][1])], EW["neg"], 1)
+        sc.tag(xd + 30, (u1["-"][1] + u2["+"][1]) / 2.0 + 30, "1 ground to 2 +12 V", EW["neg"], "#ffffff", 10)
+        sc.l([u2["-"], (xo + 300, u2["-"][1])], EW["neg"], 5)
+        sc.x(xo + 310, u1["+"][1] + 5, f"+{v:g} V: to the diode, the relay and the + bus", 13, "#c92a2a", "s", 1)
+        sc.x(xo + 310, u2["-"][1] + 5, "0 V: to the - bus", 13, "#212529", "s", 1)
+        # inside the upper supply
+        ix, iy = 1080.0, 250.0
+        sc.r(ix, iy, 360, 210, "#f8f9fa", "#868e96", 2, 8)
+        sc.x(ix + 180, iy - 12, "Inside supply 1 (unplugged, capacitors given time to empty)", 12, "#212529", "m", 1)
+        sc.r(ix + 30, iy + 30, 300, 150, "#2b8a3e", "#1d5435", 2, 6)
+        for j, (cx, cy, lab, keep) in enumerate(((ix + 60, iy + 60, "ground", False), (ix + 300, iy + 60, "ground", False),
+                                                 (ix + 60, iy + 150, "mains earth", True))):
+            sc.c(cx, cy, 11, "#fab005" if not keep else "#adb5bd", "#e67700" if not keep else "#495057", 2)
+            sc.x(cx + (16 if cx < ix + 200 else -16), cy + 4, lab + (": keep" if keep else ": nylon"), 10, "#ffffff", "s" if cx < ix + 200 else "e", 1)
+        sc.x(ix + 180, iy + 110, "the standoffs that join the output", 11, "#ffffff", "m")
+        sc.x(ix + 180, iy + 126, "ground to the case: swap for nylon", 11, "#ffffff", "m")
+        notes = (("HP DPS-1200FB: two standoffs join the output ground", "to the case - swap them for nylon (2 mm of",
+                  "insulation); the third, mains earth, stays.") if kind == "server" else
+                 ("PC supplies differ: find every screw, standoff or wire", "joining the black (ground) side of the board to the",
+                  "case and isolate it with nylon - the green-yellow", "mains earth on the case stays."))
+        for j, s_ in enumerate(notes):
+            sc.x(ix, iy + 236 + j * 18, s_, 11, "#495057")
+        checks = ("Before joining the two: a meter between supply 1's ground (black / GND) and its case must read open (OL).",
+                  "Never lift the mains earth instead. Keep the two cases from touching (rubber feet, no shared metal plate).",
+                  "Switch each on with its own " + ("breakout board's switch" if kind == "server" else
+                                                   "switch, pin 16 to pin 15 of its own 24-pin plug - never to the other supply's ground") + ".",
+                  "A bypass diode across each (its + to the supply's +12 V): if one supply stops, the current goes round it instead of "
+                  "through it backwards.")
+        for j, s_ in enumerate(checks):
+            sc.x(60, 760 + j * 22, s_, 12, "#212529" if j == 0 else "#495057", "s", 1 if j == 0 else 0)
+        H = 760 + len(checks) * 22 + 60
+    else:
+        u = units[0]
+        sc.l([u["+"], (xo + 300, u["+"][1])], EW["pos"], 5)
+        sc.l([u["-"], (xo + 300, u["-"][1])], EW["neg"], 5)
+        sc.x(xo + 310, u["+"][1] + 5, "+12 V: to the diode, the relay and the + bus", 13, "#c92a2a", "s", 1)
+        sc.x(xo + 310, u["-"][1] + 5, "0 V: to the - bus", 13, "#212529", "s", 1)
+        notes = (("A breakout board for the HP common-slot supplies (sold for mining rigs) has the 12 V studs and the switch that",
+                  "joins its start pins. 75 A on 120 V mains, 100 A on 230 V."),) if kind == "server" else (
+                 ("Use only this supply's own modular cables: other makes' cables have other pin-outs and can destroy it.",
+                  "Cut the GPU / CPU plugs off: all yellow wires together to +, all black to - (crimped ring terminals).",
+                  "One supply cannot give 24 V: all its 12 V outputs share one ground. +12 V to the -12 V pin is 24 V, but only about",
+                  "half an amp - nothing for a motor. For 24 V: two supplies in series (choose 24 V in Power)."),)
+        for j, s_ in enumerate(notes[0]):
+            sc.x(60, 470 + j * 22, s_, 12, "#495057")
+        H = 470 + len(notes[0]) * 22 + 60
+    sc.h = H
+    _legend(sc, 40, H - 30, ("pos", "neg", "ctl", "L", "N", "PE"))
+    return sc.done("The supplies", "Opening a supply: unplug it and wait - its capacitors hold mains voltage for minutes. "
+                                   "If that is new to you, choose a 24 V supply made for it instead.")
+
+
+def elec_scene_estop(d, nm):
+    v = d["psu_volts"]
+    if d["estop"] == "ac":
+        sc = _ESc(1500, 520)
+        sc.x(30, 40, "Emergency stop in the mains", 22, "#212529", "s", 1)
+        sc.x(30, 64, "Simple: the button opens the supply's mains. The supply's own capacitors keep the motors alive for about "
+                     "a second - a relay on the motor side stops them at once.", 13, "#495057")
+        pa = _ic_psu(sc, 640, 110, 300, 170, "Power supply", f"{v:g} V")
+        pl = _ic_plug(sc, 60, 380, d["mains"])
+        es = _ic_estop(sc, 300, 110)
+        sc.l([pl["L"], (250, pl["L"][1]), (250, es["11"][1]), es["11"]], EW["L"], 3)
+        sc.l([es["12"], (520, es["12"][1]), (520, 330), (pa["L"][0], 330), pa["L"]], EW["L"], 3)
+        sc.l([pl["N"], (pa["N"][0], pl["N"][1]), pa["N"]], EW["N"], 3)
+        sc.l([pl["PE"], (pa["PE"][0], pl["PE"][1]), pa["PE"]], EW["PE"], 3)
+        sc.x(30, 88, "Mains wiring: in a closed box, by someone who knows how.", 12, "#c92a2a", "s", 1)
+        return sc.done("Emergency stop", "")
+    sc = _ESc(1500, 560)
+    sc.x(30, 40, "Emergency stop with a relay" + (" - recommended, not in your design yet" if d["estop"] == "none" else ""),
+         22, "#c92a2a" if d["estop"] == "none" else "#212529", "s", 1)
+    sc.x(30, 64, "The button (normally closed) feeds the relay's coil. Hit it: the coil drops, the relay opens the motor "
+                 "supply at once; the board and the sensors stay on.", 13, "#495057")
+    rl = _ic_relay(sc, 560, 250)
+    es = _ic_estop(sc, 230, 110)
+    yl = rl["30"][1]
+    sc.l([(60, yl), rl["30"]], EW["pos"], 5)
+    sc.x(60, yl + 24, "from the supply + (after the diode)", 12, "#c92a2a", "s", 1)
+    sc.l([rl["87"], (1000, yl)], EW["pos"], 5)
+    sc.x(1010, yl + 4, "87: to the + bus and the fuses", 13, "#c92a2a", "s", 1)
+    tap = (es["11"][0], yl)
+    sc.dot(*tap, EW["pos"])
+    sc.l([tap, es["11"]], EW["coil"], 3)
+    sc.l([es["12"], (rl["86"][0], es["12"][1]), rl["86"]], EW["coil"], 3)
+    sc.l([rl["85"], (rl["85"][0], 150)], EW["coil"], 3)
+    sc.tag(rl["85"][0] + 6, 144, "85: to the supply -", EW["coil"], "#ffffff", 11, "s")
+    dy = 214
+    dx = (rl["86"][0] + rl["85"][0]) / 2.0
+    sc.l([(rl["86"][0], dy), (dx - 10, dy)], "#868e96", 2); sc.l([(dx + 10, dy), (rl["85"][0], dy)], "#868e96", 2)
+    sc.p([(dx + 9, dy - 8), (dx + 9, dy + 8), (dx - 7, dy)], "#212529"); sc.l([(dx - 9, dy - 9), (dx - 9, dy + 9)], "#212529", 2.5)
+    sc.dot(rl["86"][0], dy, EW["coil"], 4); sc.dot(rl["85"][0], dy, EW["coil"], 4)
+    sc.x(dx, dy - 14, "1N4007: stripe to 86", 11, "#495057", "m", 1)
+    coil = 12 if v < 15 else 24
+    notes = (f"Relay: {coil} V coil, contacts {nm['relay_a']} A at {coil} V DC - a truck relay for 24 V (a car relay is rated 12 V).",
+             (f"A {coil} V coil pulls in from about {coil * 0.7:.0f} V: on {v:g} V check that it clicks." if 0.7 * coil <= v < coil * 0.95
+              else f"A {coil} V coil on a {v:g} V supply."),
+             "Button: latching mushroom with normally closed (NC) contacts, within reach of the seat.",
+             "Coil wires can be thin (0.5 mm2 / 20 AWG); 30 to 87 carries all the motor current.")
+    for i, s_ in enumerate(notes):
+        sc.x(60, 440 + i * 24, s_, 13, "#212529")
+    return sc.done("Emergency stop", "")
+
+
+# ---------------------------------------------------------------------------------------------------- the whole rig
+def _ic_pc(sc, x, y):
+    sc.r(x, y, 150, 96, "#212529", "#000000", 2, 8)
+    sc.r(x + 8, y + 8, 134, 72, "#1c7ed6", "", 0, 4)
+    for i in range(3):
+        sc.l([(x + 20, y + 26 + i * 16), (x + 20 + 90 - i * 25, y + 26 + i * 16)], "#a5d8ff", 3)
+    sc.r(x + 60, y + 96, 30, 18, "#495057", "", 0, 2); sc.r(x + 40, y + 112, 70, 8, "#495057", "", 0, 3)
+    sc.x(x + 75, y - 10, "PC: SimHub + the game", 12, "#212529", "m", 1)
+    return {"r": (x + 150, y + 48)}
+
+
+def _ic_nas(sc, x, y):
+    sc.r(x, y, 150, 86, "#343a40", "#212529", 2, 8)
+    for i in range(4):
+        sc.r(x + 12 + i * 34, y + 14, 26, 58, "#495057", "#212529", 1, 3)
+        sc.c(x + 25 + i * 34, y + 62, 3, "#51cf66", "", 0)
+    sc.x(x + 75, y - 10, "This page (NAS or PC, Docker)", 12, "#212529", "m", 1)
+    sc.x(x + 75, y + 104, "one copy of the page per board", 10, "#495057", "m")
+    return {"r": (x + 150, y + 43)}
+
+
+def _ic_board_small(sc, x, y, k, sub):
+    sc.r(x, y, 190, 150, "#00878f", "#005c63", 2.5, 12)
+    sc.r(x + 78, y - 10, 34, 18, "#ced4da", "#868e96", 1.5, 4)
+    for i in range(12):
+        for j in range(8):
+            sc.c(x + 40 + i * 10, y + 40 + j * 9, 2, "#ff6b6b" if (i * 3 + j) % 7 == 0 else "#ffc9c9", "", 0)
+    sc.x(x + 95, y + 124, f"Board {k}: UNO R4 WiFi", 12, "#ffffff", "m", 1)
+    sc.x(x + 95, y + 144, sub, 10, "#c3fae8", "m")
+    return {"l": (x, y + 60), "lt": (x, y + 30), "r": (x + 190, y + 75), "b": (x + 95, y + 150)}
+
+
+def _ic_box_small(sc, x, y, title, sub, f="#2b3a55", s="#1b263b", w=210, h=70):
+    sc.r(x, y, w, h, f, s, 2, 8)
+    for i in range(6):
+        sc.r(x + 110 + i * 14, y + 10, 8, h - 20, "#ced4da", "#adb5bd", 1, 2)
+    sc.x(x + 10, y + 26, title, 13, "#ffffff", "s", 1)
+    sc.x(x + 10, y + 46, sub, 10, "#c5d3e8", "s")
+    return {"l": (x, y + h / 2), "r": (x + w, y + h / 2), "t": (x + 30, y), "b": (x + 30, y + h)}
+
+
+def _ic_motor_small(sc, x, y, n):
+    sc.r(x, y + 10, 90, 40, "#adb5bd", "#868e96", 2, 8)
+    for i in range(4):
+        sc.l([(x + 14 + i * 18, y + 14), (x + 14 + i * 18, y + 46)], "#ced4da", 1.5)
+    sc.r(x + 86, y, 40, 60, "#495057", "#343a40", 2, 6)
+    sc.c(x + 106, y + 30, 9, "#868e96", "#343a40", 2)
+    sc.l([(x + 106, y + 30), (x + 140, y + 6)], "#868e96", 6)
+    sc.x(x + 44, y + 36, f"M{n}", 13, "#212529", "m", 1)
+    return {"l": (x, y + 30)}
+
+
+def elec_scene_overview(d, dr, r, servo=False):
+    """Everything at once: the PC and the page, every board, every driver or drive, every motor, and the power."""
+    n = d["motors"]
+    boards = int(math.ceil(n / 3.0))
+    rows = [186 + i * 104 + (i // 3) * 60 for i in range(n)]               # 2.9.5: room for the boards' adapters
+    sc = _ESc(1500, 100)
+    sc.x(30, 40, "The whole rig", 22, "#212529", "s", 1)
+    sc.x(30, 64, (f"{n} actuator{'s' if n > 1 else ''} with servo drives" if servo else
+                  f"{n} motor{'s' if n > 1 else ''} with {_drv_short(dr)} driver{'s' if n > 1 else ''}") +
+         f", {boards} board{'s' if boards > 1 else ''}: three motors per board. The other pictures show each part pin by pin.", 13, "#495057")
+    pc = _ic_pc(sc, 50, rows[0])
+    nas = _ic_nas(sc, 50, rows[0] + 220)
+    xb, xd, xm = 470.0, 790.0, 1110.0
+    bpins = []
+    for k in range(boards):
+        ms = list(range(k * 3, min(n, k * 3 + 3)))
+        yc = (rows[ms[0]] + rows[ms[-1]] + 70) / 2.0
+        bp = _ic_board_small(sc, xb, yc - 75, k + 1, (f"motors {ms[0] + 1}-{ms[-1] + 1}" if len(ms) > 1 else f"motor {ms[0] + 1}")
+                             + f" - SMC3 device {k + 1}")
+        bpins.append(bp)
+        top = yc - 75                                                       # 2.9.5: the board's own 12 V adapter
+        sc.r(xb + 14, top - 10, 30, 18, "#212529", "#000000", 1.2, 3)
+        sc.r(xb + 4, top - 62, 150, 32, "#343a40", "#0b0d10", 1.5, 6)
+        for dx in (10, 16):
+            sc.l([(xb + 4 + dx, top - 51), (xb + 4 + dx, top - 41)], "#ced4da", 2.5)
+        sc.x(xb + 28, top - 41, "12 V adapter", 11, "#ffffff", "s", 1)
+        sc.l([(xb + 29, top - 30), (xb + 29, top - 10)], EW["vin"], 3)
+        # the PC's USB cable and the page's WiFi link
+        lx = 380 + k * 16
+        sc.l([pc["r"], (lx, pc["r"][1]), (lx, bp["lt"][1]), bp["lt"]], EW["usb"], 4)
+        wx = 412 + k * 16
+        sc.l([nas["r"], (wx, nas["r"][1]), (wx, bp["l"][1] + 30), (bp["l"][0], bp["l"][1] + 30)], EW["wifi"], 2.5, 1)
+    sc.tag(288, pc["r"][1] - 14, "USB: one cable per board", EW["usb"], "#ffffff", 9.5, "m")
+    sc.tag(300, nas["r"][1] - 14, "WiFi", EW["wifi"], "#ffffff", 9.5, "m")
+    if d.get("imu"):                                 # 2.9.5: the motion sensor on the seat, into board 1's left side
+        bp0 = bpins[0]
+        y_e = bp0["l"][1]                            # between the USB (above) and the WiFi (below) entries
+        iy = y_e - 32
+        if iy <= pc["r"][1] + 12:                    # keep clear of the USB cable
+            iy = pc["r"][1] + 14
+        sc.r(214, iy, 150, 64, "#343a40", "#0b0d10", 2, 10)
+        sc.x(289, iy + 26, "WT901C-232", 12, "#ffffff", "m", 1)
+        sc.x(289, iy + 44, "motion sensor, on the seat", 9.5, "#ced4da", "m")
+        yi = iy + 32
+        cross = []
+        for k in range(boards):                      # the USB and WiFi lanes this line passes
+            ys_u = sorted((pc["r"][1], bpins[k]["lt"][1])); ys_w = sorted((nas["r"][1], bpins[k]["l"][1] + 30))
+            if ys_u[0] < yi < ys_u[1]:
+                cross.append(380 + k * 16)
+            if ys_w[0] < yi < ys_w[1]:
+                cross.append(412 + k * 16)
+        pts = _hop_h(364, 452, yi, cross)
+        wy = bp0["l"][1] + 30                         # board 1's WiFi entry, crossed going up
+        if yi > wy + 12 and y_e < wy - 12:
+            pts += [(452, wy + 11), (462, wy + 7), (462, wy - 7), (452, wy - 11)]
+        sc.l(pts + [(452, y_e), (bp0["l"][0], y_e)], EW["imu"], 3)
+        sc.x(289, iy + 82, "D0 / D1 of board 1, through a MAX3232", 9.5, "#e67700", "m", 1)
+    unit_pt = {}
+    if not servo and dr["ch"] == 2:                   # 2.9.5: one box per two-channel board, its two motors beside it
+        for u in range(int(math.ceil(n / 2.0))):
+            a, b = 2 * u, min(n - 1, 2 * u + 1)
+            _ic_box_small(sc, xd, rows[a], f"Driver {u + 1}", _drv_short(dr), h=rows[b] - rows[a] + 70)
+            sc.x(xd + 10, rows[a] + 64, f"motors {a + 1} + {b + 1}" if b > a else f"motor {a + 1}", 10, "#c5d3e8", "s")
+            for m in range(a, b + 1):
+                unit_pt[m] = {"l": (xd, rows[m] + 35), "r": (xd + 210, rows[m] + 35)}
+    for k in range(boards):
+        ms = list(range(k * 3, min(n, k * 3 + 3)))
+        bp = bpins[k]
+        for m in ms:
+            y = rows[m]
+            if servo:
+                db = _ic_box_small(sc, xd, y, f"Drive {m + 1}", "AASD-15A", "#343a40", "#212529")
+            elif m in unit_pt:
+                db = unit_pt[m]
+            else:
+                db = _ic_box_small(sc, xd, y, f"Driver {m + 1}", _drv_short(dr))
+            sy = bp["r"][1] - 20 + (m - ms[0]) * 20
+            sc.l([(bp["r"][0], sy), (bp["r"][0] + 40 + (m - ms[0]) * 12, sy), (bp["r"][0] + 40 + (m - ms[0]) * 12, db["l"][1]), db["l"]],
+                 EW["sig"], 3)
+            if servo:
+                ap = _ic_actuator_small(sc, xm + 20, y - 8, m + 1, h=88)
+                sc.l([db["r"], (xm, db["r"][1]), (xm, ap["left"][1]), ap["left"]], EW["ma"], 3)
+                sc.x(xm + 96, y + 30, f"actuator {m + 1}", 12, "#212529", "s", 1)
+                sc.x(xm + 96, y + 47, "motor (U V W) + encoder cable", 10, "#495057", "s")
+            else:
+                mo = _ic_motor_small(sc, xm, y + 5, m + 1)
+                sc.l([db["r"], mo["l"]], EW["ma"], 4)
+                sc.l([(xm + 45, y + 66), (xm + 45, y + 84), (xm + 160, y + 84)], EW["sens"], 2, 1)
+                sc.x(xm + 166, y + 88, f"sensor {m + 1} to board {k + 1}, A{m % 3}", 10, EW["sens"], "s", 1)
+    sig = "pulse, direction, servo-on - through two ULN2803A" if servo else {
+        "ibt2": "RPWM, LPWM, enables", "pwmdir": "PWM + direction", "inab": "PWM, INA, INB", "none": "-"}[dr["wire"]]
+    sc.x(xb + 200, rows[0] - 30, sig, 11, EW["pwm"], "s", 1)
+    y_end = rows[-1] + 90
+    # power along the bottom, a bus up to every driver / drive - below the page's box (2.9.5)
+    yp = max(y_end + 60, rows[0] + 360)
+    bx = xd - 40
+    if servo:
+        pl = _ic_plug(sc, 50, yp, d["mains"])
+        sc.l([pl["N"], (bx, pl["N"][1]), (bx, rows[0] + 20)], EW["mains"], 5)
+        for m in range(n):
+            sc.l([(bx, rows[m] + 20), (xd, rows[m] + 20)], EW["mains"], 4); sc.dot(bx, rows[m] + 20, EW["mains"], 5)
+        sc.tag(170, yp + 20, f"breaker {16 if d['mains'] == 230 else 20} A, earth to every drive and motor", "#8d5524", "#ffffff", 10, "s")
+        sc.tag(170, yp + 48, "24 V supply: servo-on, through the emergency stop", EW["coil"], "#ffffff", 10, "s")
+        sc.tag(170, yp + 76, f"emergency stop: cuts servo-on, tells {'each board' if boards > 1 else 'the board'} (A3)", "#c92a2a", "#ffffff", 10, "s")
+    else:
+        v = d["psu_volts"]
+        nm_ = (r or {}).get("numbers") or {}
+        g, ser = nm_.get("groups", 1), nm_.get("series", 1)
+        units = nm_.get("psu_units", g * ser)
+        word = {"server": "server supplies", "pc": "PC supplies", "battery": "batteries"}.get(d["psu"], "supplies")
+        if g > 1:                                    # 2.9.5: one supply (pair) per motor - stacked, a + of its own each
+            title = f"{units} {word}" + (f": {g} pairs" if ser == 2 else "")
+            sub = f"{v:g} V, one {'pair' if ser == 2 else 'supply'} per motor"
+            for j in range(min(g, 3) - 1, 0, -1):
+                sc.r(50 + j * 10, yp - j * 10, 260, 150, "#e9ecef", "#adb5bd", 2, 6)
+        elif ser == 2:
+            title, sub = f"2 {word} in series", f"{v:g} V (12 V + 12 V)"
+        else:
+            title, sub = _psu_title(d), f"{v:g} V" + (f", {d['psu_amps']:g} A" if d["psu"] != "battery" else "")
+        if g > 1:
+            sub = sub.replace("per motor", "per driver board") if dr["ch"] == 2 else sub
+        sp = _ic_psu(sc, 50, yp, 260, 150, title, sub)
+        feeds = list(range(0, n, 2)) if dr["ch"] == 2 else list(range(n))   # 2.9.5: a two-channel board has one input
+        nf = len(feeds)
+        if g > 1:
+            for j, m in enumerate(feeds):            # output j leaves at its own height, rises in its own lane
+                lane = bx - 14 * (nf - 1 - j)
+                yo = yp + 16 + 10 * j
+                sc.l([(310, yo), (lane, yo), (lane, rows[m] + 20), (xd, rows[m] + 20)], EW["pos"], 3)
+            sc.l([sp["-V"], (sp["-V"][0], yp + 186), (bx + 14, yp + 186), (bx + 14, rows[0] + 50)], EW["neg"], 5)
+            for m in feeds:
+                sc.l([(bx + 14, rows[m] + 50), (xd, rows[m] + 50)], EW["neg"], 3); sc.dot(bx + 14, rows[m] + 50, EW["neg"])
+            sc.tag(340, yp - 26, "a + of its own to each driver, the - sides joined", "#c92a2a", "#ffffff", 10, "s")
+        else:
+            sc.l([sp["+V"], (sp["+V"][0], yp + 170), (bx, yp + 170), (bx, rows[0] + 20)], EW["pos"], 5)
+            sc.l([sp["-V"], (sp["-V"][0], yp + 186), (bx + 14, yp + 186), (bx + 14, rows[0] + 50)], EW["neg"], 5)
+            for m in feeds:
+                sc.l([(bx, rows[m] + 20), (xd, rows[m] + 20)], EW["pos"], 3); sc.dot(bx, rows[m] + 20, EW["pos"])
+                sc.l([(bx + 14, rows[m] + 50), (xd, rows[m] + 50)], EW["neg"], 3); sc.dot(bx + 14, rows[m] + 50, EW["neg"])
+        sc.tag(340, yp + 30, "a fuse per driver board" if dr["ch"] == 2 else "a fuse per driver", "#c92a2a", "#ffffff", 10, "s")
+        if d.get("regen") == "diode_cap" and d.get("psu") != "battery":
+            sc.tag(340, yp + 58, "diode + capacitors: Braking energy", "#ae3ec9", "#ffffff", 10, "s")
+        sc.tag(340, yp + 86, {"relay": "e-stop relay in the +: Emergency stop", "ac": "e-stop in the mains",
+                              "none": "no emergency stop yet!"}[d["estop"]], "#c92a2a", "#ffffff", 10, "s")
+        yp += 40
+    keys = (("mains", "sig", "mcab", "usb", "wifi") if servo else ("pos", "neg", "sig", "ma", "sens", "usb", "wifi")) + (("imu",) if d.get("imu") else ()) + ("vin",)
+    sc.h = yp + 190 + (26 if len(keys) > 7 else 0)
+    _legend(sc, 40, sc.h - (56 if len(keys) > 7 else 30), keys, 7)
+    return sc.done("The whole rig", "Each board is its own SMC3 device in SimHub and has its own copy of this page; they "
+                                    "share the supply and the emergency stop." if boards > 1 else "")
+
+
+def _stack_scenes(scenes, title):
+    """Several pictures one under the other, as one (the signal wiring of every board at once)."""
+    w = max(s_["w"] for s_ in scenes)
+    sc = _ESc(w, 0)
+    sc.x(30, 40, title, 24, "#212529", "s", 1)
+    y = 70.0
+    for s_ in scenes:
+        sc.r(16, y, w - 32, s_["h"] + 8, "#ffffff", "#ced4da", 2, 10)
+        for it in s_["items"]:
+            it2 = dict(it)
+            if "y" in it2:
+                it2["y"] = round(it2["y"] + y, 1)
+            if "p" in it2:
+                it2["p"] = [[a, round(b + y, 1)] for a, b in it2["p"]]
+            sc.it.append(it2)
+        y += s_["h"] + 30
+    sc.h = y
+    return sc.done(title, scenes[0].get("note", ""))
+
+
+def elec_scenes(d, dr, nm):
+    """All the pictures for a design, in the order the Build step shows them."""
+    khz = d.get("pwm_khz") or 25
+    out = {"overview": elec_scene_overview(d, dr, {"numbers": nm}), "power": elec_scene_power(d, dr, nm)}
+    boards = int(math.ceil(d["motors"] / 3.0))
+    out["signals"] = [elec_scene_signals(d, dr, b + 1, khz) for b in range(boards)]
+    out["sigall"] = _stack_scenes(out["signals"], "Signal wiring, all boards") if boards > 1 else None
+    out["braking"] = elec_scene_braking(d, nm)
+    out["estop"] = elec_scene_estop(d, nm)
+    if d["psu"] in ("server", "pc"):                    # 2.9.5: the server / PC supplies in detail
+        out["supplies"] = elec_scene_supplies(d, nm)
+    return out
+
+
+def _hex_rgb(h):
+    h = h.lstrip("#")
+    return tuple(int(h[i:i + 2], 16) / 255.0 for i in (0, 2, 4))
+
+
+def elec_pdf_scene(p, sc, max_h=520.0, scale=None, at=None, frame=True):
+    """Draw a scene on a FramePdf page, as large as the page width allows - or at a fixed scale (points per scene unit:
+    72 / 25.4 draws a scene in millimetres at 1:1) with its top left corner at `at` (points from the page's top left)."""
+    avail = p.W - 2 * p.MARGIN
+    k = scale or min(avail / sc["w"], max_h / sc["h"])
+    hh = sc["h"] * k
+    if at is None:
+        p.need(hh + 10)
+        ox, top = p.MARGIN + (avail - sc["w"] * k) / 2.0, p.y - 4
+    else:
+        ox, top = at[0], p.H - at[1]
+
+    def X(v): return ox + v * k
+
+    def Y(v): return top - v * k
+
+    def col(h, stroke):
+        r, g, b = _hex_rgb(h)
+        p.ops.append(f"{r:.3f} {g:.3f} {b:.3f} {'RG' if stroke else 'rg'}")
+
+    def rpath(x, y, w, h, rx):
+        if rx <= 0.5:
+            return f"{x:.2f} {y:.2f} {w:.2f} {h:.2f} re"
+        rx = min(rx, w / 2, h / 2); c = rx * 0.4477
+        x2, y2 = x + w, y + h
+        return (f"{x + rx:.2f} {y:.2f} m {x2 - rx:.2f} {y:.2f} l {x2 - c:.2f} {y:.2f} {x2:.2f} {y + c:.2f} {x2:.2f} {y + rx:.2f} c "
+                f"{x2:.2f} {y2 - rx:.2f} l {x2:.2f} {y2 - c:.2f} {x2 - c:.2f} {y2:.2f} {x2 - rx:.2f} {y2:.2f} c "
+                f"{x + rx:.2f} {y2:.2f} l {x + c:.2f} {y2:.2f} {x:.2f} {y2 - c:.2f} {x:.2f} {y2 - rx:.2f} c "
+                f"{x:.2f} {y + rx:.2f} l {x:.2f} {y + c:.2f} {x + c:.2f} {y:.2f} {x + rx:.2f} {y:.2f} c h")
+    if frame:
+        p.ops.append("0.8 w")
+        col("#dee2e6", True)
+        p.ops.append(rpath(X(0), Y(sc["h"]), sc["w"] * k, sc["h"] * k, 6) + " S")
+    p.ops.append("1 J 1 j")
+    for it in sc["items"]:
+        t = it["t"]
+        if t == "r":
+            path = rpath(X(it["x"]), Y(it["y"] + it["h"]), it["w"] * k, it["h"] * k, it["rx"] * k)
+            if it["f"]:
+                col(it["f"], False); p.ops.append(path + " f")
+            if it["s"] and it["sw"]:
+                col(it["s"], True); p.ops.append(f"{max(0.3, it['sw'] * k):.2f} w " + path + " S")
+        elif t == "l":
+            col(it["c"], True)
+            pts = " ".join(f"{X(a):.2f} {Y(b):.2f} {'m' if i == 0 else 'l'}" for i, (a, b) in enumerate(it["p"]))
+            p.ops.append(f"{max(0.3 if not scale else 0.2, it['w'] * k):.2f} w " + ("[3 2] 0 d " if it["d"] else "") + pts + " S" + (" [] 0 d" if it["d"] else ""))
+        elif t == "c":
+            r_ = it["r"] * k; cx, cy = X(it["x"]), Y(it["y"]); c = 0.5523 * r_
+            path = (f"{cx + r_:.2f} {cy:.2f} m {cx + r_:.2f} {cy + c:.2f} {cx + c:.2f} {cy + r_:.2f} {cx:.2f} {cy + r_:.2f} c "
+                    f"{cx - c:.2f} {cy + r_:.2f} {cx - r_:.2f} {cy + c:.2f} {cx - r_:.2f} {cy:.2f} c "
+                    f"{cx - r_:.2f} {cy - c:.2f} {cx - c:.2f} {cy - r_:.2f} {cx:.2f} {cy - r_:.2f} c "
+                    f"{cx + c:.2f} {cy - r_:.2f} {cx + r_:.2f} {cy - c:.2f} {cx + r_:.2f} {cy:.2f} c h")
+            if it["f"]:
+                col(it["f"], False); p.ops.append(path + " f")
+            if it["s"] and it["sw"]:
+                col(it["s"], True); p.ops.append(f"{max(0.3, it['sw'] * k):.2f} w " + path + " S")
+        elif t == "p":
+            pts = " ".join(f"{X(a):.2f} {Y(b):.2f} {'m' if i == 0 else 'l'}" for i, (a, b) in enumerate(it["p"])) + " h"
+            if it["f"]:
+                col(it["f"], False); p.ops.append(pts + " f")
+            if it["s"] and it["sw"]:
+                col(it["s"], True); p.ops.append(f"{max(0.3, it['sw'] * k):.2f} w " + pts + " S")
+        elif t == "x":
+            z = it["z"] * k
+            if z < 2.2:
+                continue
+            z = round(z, 2)
+            s_ = it["s"]
+            w = p.width(s_, z, bool(it["b"]))
+            x0 = X(it["x"]) - (w if it["a"] == "e" else w / 2 if it["a"] == "m" else 0)
+            raw = s_.encode("cp1252", "replace").replace(b"\\", b"\\\\").replace(b"(", b"\\(").replace(b")", b"\\)")
+            col(it["c"], False)
+            p.ops.append(f"BT /F{2 if it['b'] else 1} {z:.2f} Tf {x0:.2f} {Y(it['y']):.2f} Td (".encode("latin-1") + raw + b") Tj ET")
+    p.ops.append("0 J 0 j")
+    if at is None:
+        p.y -= hh + 10
+
+
+# --------------------------------------------------------------------------------------------------------------
+# Electronics design (2.9.5): the wizard's sums - motor, driver, power supply, protection, wiring, parts
+# --------------------------------------------------------------------------------------------------------------
+# Rules of thumb here come from builds reported on xsimulator.net (wheelchair-motor rigs with SMC3): BTS7960 bridges
+# survive at 16-19 V and die at 24 V, supplies of 25-30 A for two 250 W motors, a diode and a capacitor bank where a
+# supply cuts out when the motors brake, a fuse per motor.  They size a first design; they are not a guarantee.
+
+ELEC_MOTORS = {   # id: (name, values, what to know, what to search for)
+    "jazzy_small": ("Pride Jazzy Select / Jet / 1103 class (smaller 2-pole motor)",
+                    {"volts": 24, "watts": 180, "rpm": 120, "i_noload": 3.0, "i_rated": 10.0, "i_stall": 60.0, "brake": 1},
+                    "The common used-chair motor. Labels read about 24 V, 180 to 250 W with a 28:1 or 32:1 right-angle gearbox: "
+                    "about 120 to 145 rpm at 24 V. Sold as a left and a right motor - buy the pair.",
+                    "Pride Jazzy Select motor pair"),
+    "jazzy_big": ("Pride Jazzy 600 / 1121 / Quantum class (larger 4-pole motor)",
+                  {"volts": 24, "watts": 350, "rpm": 140, "i_noload": 4.0, "i_rated": 19.0, "i_stall": 110.0, "brake": 1},
+                  "The heavy-duty chairs' motor: longer body, four brushes, far more torque when stalled - and far more current. "
+                  "It needs a driver of 60 A or more.",
+                  "Pride Jazzy 600 Quantum motor pair 4 pole"),
+    "wc250_75": ("New 24 V 250 W wheelchair motor, 75 rpm (MY1016Z type)",
+                 {"volts": 24, "watts": 250, "rpm": 75, "i_noload": 2.2, "i_rated": 13.7, "i_stall": 70.0, "brake": 0},
+                 "Sold new, no brake to remove. The slow 75 rpm gearbox gives strong, calm movement with a longer lever.",
+                 "MY1016Z 24V 250W 75RPM gear motor"),
+    "wc250_200": ("24 V 250 W wheelchair motor, about 200 rpm (23:1 to 25:1 gearbox)",
+                  {"volts": 24, "watts": 250, "rpm": 200, "i_noload": 3.5, "i_rated": 14.0, "i_stall": 75.0, "brake": 1},
+                  "A faster gearbox: quick but with less force at the lever - use a short lever (40 to 60 mm).",
+                  "24V 250W wheelchair motor gearbox"),
+    "ec350": ("22.5 V 350 W wheelchair motor (ElectroCraft and similar)",
+              {"volts": 22.5, "watts": 350, "rpm": 130, "i_noload": 3.5, "i_rated": 16.0, "i_stall": 100.0, "brake": 1},
+              "Rated 350 W all day and about 1250 W for a moment: treat it as a large motor when choosing the driver.",
+              "ElectroCraft wheelchair motor 24V"),
+    "worm200": ("Worm gear motor, 24 V 200 W, 180 rpm",
+                {"volts": 24, "watts": 200, "rpm": 180, "i_noload": 2.5, "i_rated": 11.0, "i_stall": 45.0, "brake": 0},
+                "The classic seat-mover motor. A worm gearbox does not turn backwards, so it brakes into the driver less.",
+                "24V 200W worm gear motor 180RPM"),
+    "wiper": ("Wiper motor, 12 V (light seat movers only)",
+              {"volts": 12, "watts": 60, "rpm": 45, "i_noload": 1.5, "i_rated": 6.0, "i_stall": 25.0, "brake": 0},
+              "Cheap and easy to find, but weak and soon hot: for a seat alone, not a whole cockpit.",
+              "12V wiper motor"),
+    "custom": ("My own motor (type the label's values)",
+               {}, "Type what the label says. Stall current: measure the resistance across the two motor wires and divide the "
+                   "motor's voltage by it (put the resistance in below and the page does it).", "24V gear motor"),
+}
+
+ELEC_DRIVERS = {  # id: name, volts min/max, supply it is known to survive (no fan / fan), A all day (no fan / fan), A peak,
+                  # wiring kind, motors per unit, USD, what to know, search
+    "ibt2": {"short": "IBT-2", "name": "IBT-2 (BTS7960), '43 A' bridge", "vmin": 6, "vmax": 27, "vsafe": 19, "vsafe_fan": 22, "icont": 15, "icont_fan": 25,
+             "ipeak": 43, "wire": "ibt2", "ch": 1, "usd": 10, "fmax": 25, "prot": "limit",
+             "note": "What most SMC3 rigs use and what the firmware drives as it comes. Its chips are rated 27.5 V at most, so a "
+                     "24 V supply leaves no room for the voltage a braking motor pushes back: builders report them lasting at "
+                     "16 to 19 V (22 V with a fan and heat sinks) and burning at 24 V. Its chips limit the current and switch "
+                     "off when too hot; R_IS / L_IS report the current.",
+             "q": "IBT-2 BTS7960 43A motor driver"},
+    "md30c": {"short": "MD30C", "name": "Cytron MD30C, 30 A", "vmin": 5, "vmax": 30, "vsafe": 26, "vsafe_fan": 26, "icont": 30, "icont_fan": 30,
+              "ipeak": 80, "wire": "pwmdir", "ch": 1, "usd": 45, "fmax": 20, "prot": "none",
+              "note": "30 A all day with no heat sink, 80 A for one second, and rated 30 V - room for 24 V. One PWM and one "
+                      "direction input, PWM up to 20 kHz. No current limit or over-temperature cut-out of its own: PWMmax and "
+                      "the fuse are its protection. Buy from Cytron or a listed dealer.",
+              "q": "Cytron MD30C motor driver"},
+    # 2.9.5: two-channel Cytron boards that are easy to buy (MDDS30, MDD10A); "pins" names each channel's inputs
+    "mdds30": {"short": "MDDS30", "name": "Cytron SmartDriveDuo-30 (MDDS30), 2 x 30 A", "vmin": 7, "vmax": 35, "vsafe": 28, "vsafe_fan": 28,
+               "icont": 30, "icont_fan": 30, "ipeak": 80, "wire": "pwmdir", "ch": 2, "usd": 70, "fmax": 0, "prot": "temp",
+               "pins": ({"PWM": "AN1", "DIR": "IN1", "M": "M1A / M1B"}, {"PWM": "AN2", "DIR": "IN2", "M": "M2A / M2B"}),
+               "note": "Two motors on one board, one supply input: 30 A each all day, 80 A for one second, rated 35 V - room "
+                       "for 24 V. A temperature sensor lowers the current as it heats up (80 A below 50 C, down to 30 A above "
+                       "100 C) and turns its fan on above 50 C. Its switches: 1 on, 2 off (PWM input), 3 and 4 on (both "
+                       "motors independent), 5 off (linear), 6 on (sign-magnitude). AN1 / AN2 take the PWM, IN1 / IN2 the "
+                       "direction; it smooths the PWM and switches the motors at its own 18 kHz.",
+               "q": "Cytron MDDS30 SmartDriveDuo 30A"},
+    "mdd10a": {"short": "MDD10A", "name": "Cytron MDD10A, 2 x 10 A (small motors)", "vmin": 5, "vmax": 30, "vsafe": 26, "vsafe_fan": 26,
+               "icont": 10, "icont_fan": 10, "ipeak": 30, "wire": "pwmdir", "ch": 2, "usd": 25, "fmax": 20, "prot": "none",
+               "pins": ({"PWM": "PWM1", "DIR": "DIR1", "M": "M1A / M1B"}, {"PWM": "PWM2", "DIR": "DIR2", "M": "M2A / M2B"}),
+               "note": "Two small motors on one board, one supply input: 10 A each all day, 30 A for ten seconds, PWM up to "
+                       "20 kHz, rated 30 V. No current limit or over-temperature cut-out is listed: PWMmax and the fuse are "
+                       "its protection. For wiper and small worm motors - not wheelchair motors.",
+               "q": "Cytron MDD10A dual channel motor driver"},
+    "mdds60": {"short": "MDDS60", "name": "Cytron SmartDriveDuo-60 (MDDS60), 2 x 60 A - hard to find", "vmin": 7, "vmax": 45, "vsafe": 36,
+               "vsafe_fan": 36, "icont": 60, "icont_fan": 60, "ipeak": 100, "wire": "pwmdir", "ch": 2, "usd": 150, "fmax": 0, "prot": "temp",
+               "pins": ({"PWM": "AN1", "DIR": "IN1", "M": "M1A / M1B"}, {"PWM": "AN2", "DIR": "IN2", "M": "M2A / M2B"}),
+               "note": "Two motors on one board: 60 A each, 100 A for one second, with its own fans and a temperature sensor "
+                       "that lowers the current when hot. Set its switches to PWM input, sign-magnitude, independent; it reads "
+                       "the PWM and switches the motor at its own 16 kHz. Few shops have it lately - the MDDS30 is the same "
+                       "idea at 30 A.", "q": "Cytron MDDS60 SmartDriveDuo-60"},
+    "hb100": {"short": "100 A bridge", "name": "100 A class H-bridge module (PWM + direction inputs)", "vmin": 12, "vmax": 48, "vsafe": 36, "vsafe_fan": 36,
+              "icont": 40, "icont_fan": 60, "ipeak": 100, "wire": "inab", "ch": 1, "usd": 45, "fmax": 20, "prot": "unknown",
+              "note": "The large MOSFET bridges several wheelchair-motor builders moved to after burning smaller ones. They vary: "
+                      "check that yours takes a PWM input with one or two direction inputs at 5 V, and count on about half the "
+                      "printed current. Most take PWM up to 20 kHz or less - check its listing.", "q": "100A H-bridge DC motor driver PWM 12V-48V"},
+    "md13s": {"short": "MD13S", "name": "Cytron MD13S, 13 A (small motors)", "vmin": 6, "vmax": 30, "vsafe": 26, "vsafe_fan": 26, "icont": 13,
+              "icont_fan": 13, "ipeak": 30, "wire": "pwmdir", "ch": 1, "usd": 15, "fmax": 20, "prot": "limit",
+              "note": "For wiper and small worm motors: 13 A all day, 30 A for ten seconds, limits its current at 30 A. One PWM "
+                      "and one direction input, PWM up to 20 kHz.", "q": "Cytron MD13S motor driver"},
+    "monster": {"short": "Monster Moto", "name": "Monster Moto shield (VNH2SP30), 12 V only", "vmin": 5.5, "vmax": 16, "vsafe": 14, "vsafe_fan": 14, "icont": 10,
+                "icont_fan": 14, "ipeak": 30, "wire": "inab", "ch": 2, "usd": 15, "fmax": 20, "prot": "limit",
+                "pins": ({"INA": "INA1", "INB": "INB1", "PWM": "PWM1", "M": "A1 / B1"}, {"INA": "INA2", "INB": "INB2", "PWM": "PWM2", "M": "A2 / B2"}),
+                "note": "The original SMC3 driver, for 12 V motors: it switches off above 16 V, takes PWM up to 20 kHz and "
+                        "needs a fan.",
+                "q": "Monster Moto shield VNH2SP30"},
+    "sabertooth32": {"short": "Sabertooth", "name": "Sabertooth 2x32", "vmin": 6, "vmax": 33.6, "vsafe": 30, "vsafe_fan": 30, "icont": 32, "icont_fan": 32,
+                     "ipeak": 64, "wire": "none", "ch": 2, "usd": 125, "fmax": 0, "prot": "limit",
+                     "note": "Well made and well liked on the forum, but it is commanded over a serial line by a different "
+                             "sketch (the SPS sketch on a classic Arduino). This project's firmware cannot drive it.",
+                     "q": "Sabertooth 2x32 motor driver"},
+    "sabertooth60": {"short": "Sabertooth", "name": "Sabertooth 2x60", "vmin": 6, "vmax": 33.6, "vsafe": 30, "vsafe_fan": 30, "icont": 60, "icont_fan": 60,
+                     "ipeak": 120, "wire": "none", "ch": 2, "usd": 190, "fmax": 0, "prot": "limit",
+                     "note": "As the 2x32 with twice the current - and it sends braking energy back to the supply, so it wants "
+                             "a battery. This project's firmware cannot drive it.", "q": "Sabertooth 2x60 motor driver"},
+    "custom": {"short": "your driver", "name": "Another driver (type its ratings)", "vmin": 5, "vmax": 30, "vsafe": 26, "vsafe_fan": 26, "icont": 30,
+               "icont_fan": 30, "ipeak": 60, "wire": "pwmdir", "ch": 1, "usd": 40, "fmax": 0, "prot": "unknown",
+               "note": "Type the voltage and currents from its data sheet and say which inputs it has.", "q": "DC motor driver H-bridge PWM"},
+}
+ELEC_WIRE = {"ibt2": "Two PWM inputs (IBT-2 / BTS7960)", "pwmdir": "PWM + one direction input",
+             "inab": "PWM + two direction inputs (INA / INB)", "none": "Serial or radio-control input only"}
+
+ELEC_PSUS = {     # id: name, what to know, search, USD = a + b * watts
+    "led": ("Enclosed switching supply, 24 V or 12 V (sold for LED strips)",
+            "Cheap and what most first builds run on. The voltage screw moves it about 10% only. Many cut out for a moment "
+            "when asked for more than their rating, or when the motors push voltage back.", "24V 30A 720W switching power supply",
+            (15.0, 0.05)),
+    "adj": ("Adjustable switching supply (voltage knob, 0 to 24 V or 0 to 48 V)",
+            "Lets you run 16 to 20 V, which is what keeps IBT-2 bridges alive on 24 V motors, and turn it up later.",
+            "adjustable switching power supply 0-24V 20A", (20.0, 0.06)),
+    "meanwell": ("Industrial supply (Mean Well SE / RSP / SDR and similar)",
+                 "Built for motors: the better ones give 150% for a few seconds and limit the current instead of cutting out.",
+                 "Mean Well 24V power supply SE-1000-24", (30.0, 0.16)),
+    "server": ("12 V server supplies: one for 12 V, two in series for 24 V (HP DPS-1200FB 1200 W and similar)",
+               "Used ones cost little. An HP DPS-1200FB gives 100 A at 12 V on 230 V mains and 75 A (900 W) on 120 V mains. "
+               "For 24 V the upper supply's output must first be separated from its metal case (two standoffs inside), and "
+               "each sits on a breakout board that switches it on.", "HP DPS-1200FB server power supply", (25.0, 0.0)),
+    # 2.9.5: PC (ATX) supplies. One gives 12 V only: every 12 V connector shares the same ground, so joining two of them
+    # gives more current, never 24 V; +12 V to the -12 V pin is 24 V but only about half an amp.
+    "pc": ("PC power supplies (ATX, 1000 W and up: EVGA SuperNOVA 1300 G2 and similar): one for 12 V, two in series for 24 V",
+           "One 1300 W supply gives about 108 A at 12 V from its PCIe and CPU cables. It cannot make 24 V on its own: all its "
+           "12 V connectors share one ground. Two in series give 24 V once the upper one's ground is separated from its case "
+           "inside - for builders who are at home inside a power supply.", "EVGA SuperNOVA 1300 G2 power supply", (40.0, 0.06)),
+    "battery": ("Two 12 V batteries in series, with a charger",
+                "Batteries give any current the motors ask for and swallow what they push back - nothing cuts out. They need a "
+                "main fuse right at the battery, and charging.", "12V 35Ah AGM deep cycle battery", (150.0, 0.0)),
+}
+
+ELEC_DEFAULTS = {
+    "motors": 2, "motor": "jazzy_small", "volts": 24.0, "watts": 180.0, "rpm": 120.0, "i_noload": 3.0, "i_rated": 10.0,
+    "i_stall": 60.0, "r_wind": 0.0, "brake": 1,
+    "driver": "ibt2", "drv_vmax": 30.0, "drv_icont": 30.0, "drv_ipeak": 60.0, "drv_wire": "pwmdir", "fan": 1,
+    "psu": "adj", "psu_volts": 18.0, "psu_amps": 30.0, "psu_share": "shared", "regen": "diode_cap", "mains": 120,
+    "pwm_max": 100.0, "pwm_khz": 25.0, "fuse": 0.0, "wire_len": 1.5, "wire_mm2": 0.0, "estop": "relay", "sensor": "hall", "sens_len": 1.5,
+    # 2.9.5: what moves the seat - "lever" (a gear motor and a lever, DC firmware) or "servo" (ball-screw actuators with
+    # AC servos, SFX-100 style: the servo build of the firmware)
+    "drive": "lever", "servo": "sfx750", "srv_watts": 750.0, "srv_torque": 2.4, "srv_peak": 7.2, "srv_rpm": 3000.0,
+    "stroke": 100.0, "lead": 5.0, "ppr": 500.0, "home": "bottom",
+    # 2.9.5: the WT901C motion sensor on the seat (board 1, D0 / D1 through a MAX3232); the lever and its push rod -
+    # between centres, swing either way from square, the motor's output shaft and key, the rod ends' thread
+    "imu": 1, "lever": 50.0, "swing": 45.0, "shaft_d": 19.05, "key_w": 4.76, "rod": "m10",
+    # 2.9.5: how hard the motors work on average while driving, % of their rated current - the supplies are sized
+    # from it (the Frame Design works it out; 100 = every motor at its rating all the time)
+    "load": 50.0,
+}
+# What one 12 V server or PC supply gives (2.9.5): HP DPS-1200FB label - 100-127 V 900 W / 75 A (800 W / 66.7 A at
+# 100 V), 200-240 V 1200 W / 100 A; EVGA SuperNOVA 1300 G2 - one +12 V rail, 108.3 A.
+ELEC_PSU_UNIT = {"server": {"name": "HP DPS-1200FB", "amps": {120: 75.0, 230: 100.0}, "watts": {120: 900, 230: 1200}},
+                 "pc": {"name": "EVGA SuperNOVA 1300 G2", "amps": {120: 108.0, 230: 108.0}, "watts": {120: 1300, 230: 1300}}}
+PCIE_CABLE_A = 12.5        # a PCIe 8-pin cable: 150 W by the PCIe spec = 12.5 A at 12 V
+ELEC_FUSES = (5, 7.5, 10, 15, 20, 25, 30, 40, 50, 60, 80, 100)
+ELEC_GAUGE = ((10, "18 AWG", 1.0), (15, "16 AWG", 1.5), (20, "14 AWG", 2.5), (30, "12 AWG", 4.0), (40, "10 AWG", 6.0),
+              (60, "8 AWG", 10.0), (80, "6 AWG", 16.0), (100, "4 AWG", 25.0))
+ELEC_PINS = ((2, 3, 9, "A0"), (4, 5, 10, "A1"), (6, 7, 11, "A2"))      # per motor: ENA, ENB, PWM, feedback
+
+
+def elec_inputs(raw):
+    raw = raw if isinstance(raw, dict) else {}
+    d = dict(ELEC_DEFAULTS)
+
+    def num(k, lo, hi):
+        try:
+            v = float(raw.get(k, d[k]))
+            if v != v:
+                raise ValueError
+        except (TypeError, ValueError):
+            v = float(ELEC_DEFAULTS[k])
+        d[k] = min(hi, max(lo, v))
+
+    def pick(k, allowed):
+        v = raw.get(k, d[k])
+        d[k] = v if v in allowed else ELEC_DEFAULTS[k]
+    pick("motor", ELEC_MOTORS)
+    if "motor" in raw and raw["motor"] in ELEC_MOTORS and "volts" not in raw:
+        d.update(ELEC_MOTORS[raw["motor"]][1])
+    pick("driver", ELEC_DRIVERS)
+    pick("drv_wire", ELEC_WIRE)
+    pick("psu", ELEC_PSUS)
+    pick("psu_share", ("shared", "each"))
+    pick("regen", ("none", "diode_cap", "battery"))
+    pick("estop", ("none", "ac", "relay"))
+    pick("sensor", ("pot", "hall"))
+    pick("drive", ("lever", "servo"))
+    pick("servo", ELEC_SERVOS)
+    pick("home", ("bottom", "switches"))
+    pick("rod", ("m8", "m10", "m12"))
+    if d["psu"] == "battery":
+        d["psu_share"] = "shared"                  # 2.9.5: one battery bank feeds every motor
+    _servo_inputs_fix(d, raw)
+    try:
+        d["motors"] = min(6, max(1, int(float(raw.get("motors", d["motors"])))))
+    except (TypeError, ValueError):
+        d["motors"] = 2
+    try:
+        d["mains"] = 230 if int(float(raw.get("mains", 120))) >= 200 else 120
+    except (TypeError, ValueError):
+        d["mains"] = 120
+    for k in ("brake", "fan", "imu"):
+        d[k] = 1 if raw.get(k, d[k]) in (1, True, "1", "true", 1.0) else 0
+    num("lever", 20, 200); num("swing", 10, 75); num("shaft_d", 6, 40); num("key_w", 0, 12)
+    num("volts", 6, 60); num("watts", 10, 2000); num("rpm", 5, 600); num("i_noload", 0, 30); num("i_rated", 0.5, 150)
+    num("i_stall", 1, 600); num("r_wind", 0, 20); num("drv_vmax", 6, 100); num("drv_icont", 1, 300); num("drv_ipeak", 1, 600)
+    num("psu_volts", 6, 60); num("psu_amps", 1, 400); num("pwm_max", 20, 100); num("pwm_khz", 1, 30); num("fuse", 0, 200); num("wire_len", 0.2, 15)
+    num("wire_mm2", 0, 50); num("sens_len", 0.2, 15); num("load", 20, 100)
+    num("srv_watts", 50, 3000); num("srv_torque", 0.1, 30); num("srv_peak", 0.1, 90); num("srv_rpm", 300, 6000)
+    num("stroke", 20, 400); num("lead", 1, 40); num("ppr", 50, 100000)
+    d["srv_peak"] = max(d["srv_peak"], d["srv_torque"])
+    if d["psu"] in ELEC_PSU_UNIT:                  # 2.9.5: a server / PC supply's own figures unless typed in
+        if "psu_amps" not in raw:
+            d["psu_amps"] = ELEC_PSU_UNIT[d["psu"]]["amps"][d["mains"]]
+        if "psu_volts" not in raw:
+            d["psu_volts"] = 12.0 if d["volts"] < 15 else 24.0
+    if d["r_wind"] > 0:
+        d["i_stall"] = round(min(600.0, d["volts"] / d["r_wind"]), 1)
+    d["i_stall"] = max(d["i_stall"], d["i_rated"])
+    return d
+
+
+def _elec_driver(d):
+    dr = dict(ELEC_DRIVERS[d["driver"]])
+    if d["driver"] == "custom":
+        dr.update(vmax=d["drv_vmax"], vsafe=d["drv_vmax"] * 0.87, vsafe_fan=d["drv_vmax"] * 0.87, icont=d["drv_icont"],
+                  icont_fan=d["drv_icont"], ipeak=max(d["drv_ipeak"], d["drv_icont"]), wire=d["drv_wire"])
+    dr["icont_now"] = dr["icont_fan"] if d["fan"] else dr["icont"]
+    dr["vsafe_now"] = dr["vsafe_fan"] if d["fan"] else dr["vsafe"]
+    dr["fw"] = {"ibt2": "ok", "pwmdir": "mode1", "inab": "mode1", "none": "no"}[dr["wire"]]
+    return dr
+
+
+def _elec_std(v, table):
+    for x in table:
+        if x >= v - 1e-9:
+            return x
+    return table[-1]
+
+
+def _elec_link(q):
+    qs = urllib.parse.quote_plus(q)
+    return {"q": q, "ebay": "https://www.ebay.com/sch/i.html?_nkw=" + qs, "amazon": "https://www.amazon.com/s?k=" + qs}
+
+
+def elec_design(raw):
+    """Everything the wizard shows, from its inputs."""
+    d = elec_inputs(raw)
+    if d["drive"] == "servo":                       # 2.9.5: ball-screw actuators with AC servos
+        return elec_servo_design(d)
+    n, v = d["motors"], d["psu_volts"]
+    dr = _elec_driver(d)
+    psu = ELEC_PSUS[d["psu"]]
+    boards = int(math.ceil(n / 3.0))
+    scale = v / d["volts"]
+    pwm = d["pwm_max"] / 100.0
+    rpm_v = d["rpm"] * scale * pwm
+    torque = 9.549 * d["watts"] / d["rpm"]
+    i_stall_v = d["i_stall"] * scale * pwm
+    i_peak = min(i_stall_v, dr["ipeak"])
+    torque_peak = torque * i_peak / d["i_rated"] * 0.85
+    sum_rated = n * d["i_rated"]
+    # 2.9.5: the supplies are sized for what the motors draw on average while driving, not for every motor at its
+    # rated current at once (a wheelchair climbing a hill all day). The rule for motion control
+    # supplies: the continuous rating covers the sum of the motors' average (RMS) current over the motion, with a quarter
+    # to spare so the supply runs cool; the short peaks of a hard move come from the capacitors and the supply's current
+    # limit, not from more supplies. "load" is that average as a % of the rated current.
+    lf = d["load"] / 100.0
+    i_avg = sum_rated * lf
+    need_min, need_good = i_avg, 1.25 * i_avg
+    # 2.9.5: supplies come in groups - one for all motors, or one per motor - and a group is one supply, or two 12 V
+    # ones (server, PC, batteries) in series for 24 V. The pictures and the parts list both count from these.
+    # 2.9.5: a two-channel driver board runs two motors from one supply input - "one per motor" is then one supply
+    # (or pair) per driver board, and each board gets one fuse, sized for both motors
+    ch = 2 if dr["ch"] == 2 else 1
+    units = int(math.ceil(n / float(ch)))                               # driver boards
+    groups = units if d["psu_share"] == "each" else 1
+    series = 2 if d["psu"] in ("server", "pc", "battery") and v > 15 else 1
+    psu_units = groups * series
+    psu_total = d["psu_amps"] * groups
+    psu_w = v * psu_total
+    grp_rated = sum_rated if groups == 1 else d["i_rated"] * min(n, ch)  # the busiest group's rated current (capacitors)
+    grp_need = grp_rated * lf * 1.25                                     # what its supply gives all day (diodes, relay, cables)
+
+    # fuse and wire, per motor
+    fuse_auto = _elec_std(1.5 * d["i_rated"], ELEC_FUSES)
+    while fuse_auto > dr["ipeak"] and fuse_auto > ELEC_FUSES[0]:
+        fuse_auto = ELEC_FUSES[ELEC_FUSES.index(fuse_auto) - 1]
+    fuse = d["fuse"] if d["fuse"] > 0 else fuse_auto
+    fuse_feed = fuse if ch == 1 else _elec_std(2 * fuse, ELEC_FUSES)   # one per driver board (2.9.5)
+    g_auto = next((g for g in ELEC_GAUGE if g[0] >= fuse_feed), ELEC_GAUGE[-1])
+    mm2 = d["wire_mm2"] if d["wire_mm2"] > 0 else g_auto[2]
+    gauge = next((g for g in ELEC_GAUGE if abs(g[2] - mm2) < 1e-6), None)
+    gname = f"{gauge[1]} ({mm2:g} mm2)" if gauge else f"{mm2:g} mm2"
+    drop = 2 * d["wire_len"] * d["i_rated"] * 0.0175 / mm2
+    drop_pct = 100.0 * drop / v
+    wire_amps = max((g[0] for g in ELEC_GAUGE if g[2] <= mm2 + 1e-6), default=5)
+
+    # braking energy: about 1000 uF per amp, in 10 000 uF capacitors, at each group's drivers; a KBPC5010 per 25 A
+    cap_k = max(1, int(math.ceil(grp_rated / 10.0 - 1e-9)))            # capacitors per group
+    cap_uf = cap_k * 10000                                              # uF per group
+    cap_v = next((x for x in (25, 35, 50, 63, 80, 100) if x >= 1.6 * v), 100)
+    n_diode_g = max(1, int(math.ceil(grp_need / 25.0 - 1e-9)))          # bridge rectifiers per group: the supply's current
+    n_diode = n_diode_g * groups
+
+    checks, fixes = [], []
+
+    def chk(level, title, text):
+        checks.append({"level": level, "title": title, "text": text})
+
+    def fix(level, title, text, patch):
+        fixes.append({"level": level, "title": title, "text": text, "patch": patch})
+
+    # 1. can the firmware drive it
+    if dr["fw"] == "ok":
+        chk("ok", "The board drives this driver as it comes",
+            "SMC3 R4 is built for IBT-2 bridges: nothing to change in the firmware.")
+    elif dr["fw"] == "mode1":
+        chk("info", "Set the board to 'PWM + direction'",
+            f"{dr['name']} takes {ELEC_WIRE[dr['wire']]}. With firmware 2.2.0b1 (the beta in All firmware) choose it in "
+            "Settings, Motor drivers - no recompiling. Firmware 2.1.1 and older: build the sketch with '#define MODE1' "
+            "instead of '#define MODE2'. The wiring list shows which pin goes where.")
+    else:
+        chk("bad", "This project's firmware cannot drive this driver",
+            f"{dr['name']} wants serial commands or a radio-control signal. Rigs that use it run a different sketch on a "
+            "different Arduino. Pick a driver with PWM inputs to use it with this board and this page.")
+        fix("bad", "Use a driver the board can drive", "A Cytron MD30C (30 A, one motor each) or SmartDriveDuo-30 (two motors "
+            "on one board).", {"driver": "mdds60" if d["i_rated"] > 25 else ("mdds30" if d["i_rated"] > 15 else "md30c")})
+
+    # 1b. PWM frequency against what the driver takes
+    if dr["fmax"] and d["pwm_khz"] > dr["fmax"] + 0.01:
+        chk("warn", f"{dr['name'].split(',')[0]} takes PWM up to {dr['fmax']:g} kHz",
+            f"The board runs {d['pwm_khz']:g} kHz (25 kHz unless changed). Above its rating the driver's switches heat more "
+            f"and may not follow. Set {dr['fmax']:g} kHz in Settings, Loop, PWM & smoothing (both fields) and Save to EEPROM - "
+            "Settings, Motor drivers does it for you. Most people cannot hear 20 kHz; a few hear a faint whine.")
+        fix("warn", f"Run PWM at {dr['fmax']:g} kHz", "Within what the driver takes.", {"pwm_khz": float(dr["fmax"])})
+    elif dr["fw"] != "no" and dr["fmax"]:
+        chk("ok", f"PWM at {d['pwm_khz']:g} kHz suits the driver", f"It takes up to {dr['fmax']:g} kHz.")
+
+    # 2. supply voltage against the driver
+    if v > dr["vmax"]:
+        chk("bad", f"{v:g} V is more than the driver can take",
+            f"{dr['name']} is rated {dr['vmax']:g} V at the very most. It will fail at once.")
+        fix("bad", f"Lower the supply to {min(dr['vsafe_now'], d['volts']):g} V", "Within what the driver survives.",
+            {"psu_volts": min(dr["vsafe_now"], d["volts"]), "psu": "adj" if d["psu"] == "led" else d["psu"]})
+    elif v > dr["vsafe_now"] + 0.05:
+        if d["driver"] == "ibt2":
+            chk("bad" if v > 22.05 else "warn", f"IBT-2 bridges burn at {v:g} V with motors like these",
+                f"The BTS7960 chips are rated 27 V at the very most. A braking motor pushes the supply up by several volts, "
+                f"and a hot chip gives up sooner. Builders on xsimulator.net report them working at 16 to 19 V"
+                f"{', up to 22 V with a fan on the heat sinks' if d['fan'] else ''} and dying on a plain 24 V supply. "
+                f"Lower the voltage (the rig gets slower in proportion, not weaker), or use a driver made for 24 V.")
+            fix("warn", f"Run the IBT-2 bridges at {dr['vsafe_now']:g} V", "An adjustable supply turned down: what the forum's "
+                "long-lived IBT-2 rigs do.", {"psu_volts": dr["vsafe_now"], "psu": "adj" if d["psu"] in ("led", "server", "pc", "battery") else d["psu"]})
+            fix("tip", "Or keep 24 V with a 24 V driver", "A Cytron MD30C or SmartDriveDuo-30 (Settings, Motor drivers: PWM + direction).",
+                {"driver": "mdds60" if d["i_rated"] > 25 else ("mdds30" if d["i_rated"] > 15 or d["i_stall"] > 80 else "md30c")})
+        else:
+            chk("warn", f"{v:g} V leaves this driver little room",
+                f"Rated {dr['vmax']:g} V at the most. A braking motor pushes the supply up by a few volts: keep to about "
+                f"{dr['vsafe_now']:.0f} V, or make sure the braking energy has somewhere to go (the Power step).")
+    else:
+        chk("ok", "Supply voltage suits the driver",
+            f"{v:g} V on a driver rated {dr['vmax']:g} V" + (" - inside what IBT-2 rigs are reported to survive." if d["driver"] == "ibt2" else "."))
+    if v < dr["vmin"]:
+        chk("bad", "The supply is below what the driver needs", f"{dr['name']} needs at least {dr['vmin']:g} V.")
+
+    # 3. supply voltage against the motor
+    if v > d["volts"] * 1.2:
+        chk("warn", "More voltage than the motor is made for",
+            f"A {d['volts']:g} V motor on {v:g} V runs {scale * 100 - 100:.0f}% faster and can draw {scale * 100 - 100:.0f}% more current "
+            "when stalled. Short bursts are fine; brushes and windings wear faster.")
+    elif v < d["volts"] * 0.6:
+        chk("warn", "The motor will be slow", f"On {v:g} V a {d['volts']:g} V motor turns about {rpm_v:.0f} rpm at most. Force is "
+            "set by current, not voltage, so it still pushes - it just takes longer to get there.")
+    elif scale < 0.95:
+        chk("info", f"Running a {d['volts']:g} V motor on {v:g} V",
+            f"Top speed drops to about {rpm_v:.0f} rpm ({scale * pwm * 100:.0f}%). Force at the lever stays: it is set by current. "
+            "A slightly shorter lever gets the liveliness back.")
+
+    # 4. driver current, all day
+    if d["i_rated"] > dr["icont_now"] * 1.5:
+        chk("bad", "The driver is too small for this motor",
+            f"The motor draws {d['i_rated']:.0f} A at its rated load; {dr['name']} carries about {dr['icont_now']:.0f} A all day"
+            + (" with a fan" if d["fan"] and dr["icont_fan"] != dr["icont"] else "") + ". It will overheat and switch off, then fail.")
+        if d["i_rated"] <= 30:                       # 2.9.5: the 30 A Cytron boards are easy to buy; the 60 A one isn't
+            fix("bad", "Choose a 30 A driver", "Cytron MD30C (one per motor) or SmartDriveDuo-30 (two motors per board).",
+                {"driver": "mdds30" if n > 1 else "md30c"})
+        else:
+            fix("bad", "Choose a larger driver", "60 A per motor: the SmartDriveDuo-60 (hard to find) or a 100 A class bridge.", {"driver": "mdds60"})
+    elif d["i_rated"] > dr["icont_now"]:
+        chk("warn", "The driver will run hot",
+            f"{d['i_rated']:.0f} A at the motor's rated load against about {dr['icont_now']:.0f} A all day for {dr['name']}. "
+            "It works while the rig is balanced and the moves are short; a held load (a heavy driver, a rig that is not "
+            "balanced) heats it until it switches off.")
+        if not d["fan"] and dr["icont_fan"] > dr["icont"]:
+            fix("warn", "Put a fan on the drivers", "An 80 mm fan blowing straight onto the heat sinks.", {"fan": 1})
+    else:
+        chk("ok", "The driver carries the motor's rated current",
+            f"{d['i_rated']:.0f} A rated against about {dr['icont_now']:.0f} A all day"
+            + (" (with the fan)" if d["fan"] and dr["icont_fan"] != dr["icont"] else "") + ".")
+
+    # 5. the worst moment: a stalled motor at full drive
+    if i_stall_v > dr["ipeak"] * 1.1:
+        lim = int(100.0 * dr["ipeak"] / (d["i_stall"] * scale))
+        bigger = dr["ipeak"] < 100 and dr["fw"] != "no"
+        txt = (f"Held against a stop at full drive this motor would draw about {i_stall_v:.0f} A; {dr['name']} is rated "
+               f"{dr['ipeak']:.0f} A at most. ")
+        if d["driver"] == "ibt2":
+            txt += "The BTS7960 limits the current itself, at the cost of heat - the usual way these die. "
+        elif dr["prot"] == "none":
+            txt += ("It has no current limit of its own: held there for more than a second it burns. ")
+        elif dr["prot"] == "unknown":
+            txt += "Check whether it limits its current; many don't. "
+        txt += ("PWMmax in Tuning limits how hard the board can drive: "
+                + (f"{lim}% keeps a stall within the driver." if lim >= 60 else "but so low a limit would leave little speed - a larger driver is the answer."))
+        chk("warn", "A stalled motor can ask for more than the driver gives", txt)
+        if lim >= 60 or not bigger:
+            if lim >= 30:
+                fix("warn", f"Limit PWMmax to {lim}%", f"Top speed drops to {d['rpm'] * scale * lim / 100:.0f} rpm; a stall stays within the driver.",
+                    {"pwm_max": float(lim)})
+            if bigger:
+                fix("tip", "Or use a 60 A driver", "Cytron SmartDriveDuo-60 (hard to find): 100 A for a moment, and it lowers its current "
+                    "when hot.", {"driver": "mdds60"})
+        else:
+            fix("warn", "Use a 60 A driver", "Cytron SmartDriveDuo-60 (hard to find): 60 A all day and 100 A for a moment, two motors "
+                "on one board (Settings, Motor drivers: PWM + direction).", {"driver": "mdds60"})
+            if lim >= 30:
+                fix("tip", f"Or limit PWMmax to {lim}%", f"Keeps this driver, at {d['rpm'] * scale * lim / 100:.0f} rpm top speed.", {"pwm_max": float(lim)})
+    elif dr["prot"] == "none" and i_stall_v > dr["icont_now"] * 1.05:
+        chk("info", "Nothing in the driver limits a held stall",
+            f"About {i_stall_v:.0f} A at the very worst - within its {dr['ipeak']:.0f} A for a moment, but {dr['name']} has no "
+            "current limit or over-temperature cut-out of its own. A motor held against a stop for several seconds heats it "
+            "with nothing to stop it: the page's cutoffs and end stops, PWMmax and the fuse are its protection.")
+    else:
+        chk("ok", "The driver survives a stalled motor",
+            f"About {i_stall_v:.0f} A at the very worst, " + (f"within the driver's {dr['ipeak']:.0f} A." if i_stall_v <= dr["ipeak"]
+                                                              else f"which the driver's own limit ({dr['ipeak']:.0f} A) holds for a moment."))
+
+    # 6. the supply
+    share = ("one pair for all" if series == 2 else "one supply for all") if d["psu_share"] == "shared" else \
+        f"{groups} {'pairs' if series == 2 else 'supplies'}, one per {'driver board' if ch == 2 else 'motor'}"
+    STD_A = (10, 15, 20, 25, 30, 40, 50, 60, 80, 100, 120, 150)
+    how = (f"{n} x {d['i_rated']:g} A rated at about {d['load']:.0f}% on average while driving = {i_avg:.0f} A"
+           if n > 1 else f"{d['i_rated']:g} A rated at about {d['load']:.0f}% on average while driving = {i_avg:.0f} A")
+    unit = ELEC_PSU_UNIT.get(d["psu"])
+    if d["psu"] == "battery":
+        chk("ok", "Batteries give whatever the motors ask for",
+            f"Count on about {i_avg:.0f} A while driving ({how}): a 35 Ah pair lasts about {35.0 * 0.8 / max(i_avg, 1):.1f} "
+            "hours of hard use. Put the main fuse within a hand's width of the battery - a shorted battery delivers hundreds "
+            "of amps.")
+    elif psu_total < need_min - 0.05:
+        chk("bad", "The power supply is too small",
+            f"{psu_total:.0f} A in all ({share}) against {how}. It would work at its limit all the time: the voltage sags "
+            "or the supply cuts out in the middle of a race.")
+        if unit and d["psu_share"] == "shared" and units > 1 and unit["amps"][d["mains"]] >= d["i_rated"] * ch * lf * 1.25 - 0.05:
+            fix("bad", f"One {'pair' if series == 2 else 'supply'} per driver board" if ch == 2 else f"One {'pair' if series == 2 else 'supply'} per motor",
+                f"{unit['amps'][d['mains']]:.0f} A for each {'board' if ch == 2 else 'motor'}.", {"psu_share": "each"})
+        elif not unit:
+            fix("bad", f"Use a {_elec_std(need_good if d['psu_share'] == 'shared' else grp_need, STD_A):.0f} A supply",
+                "Enough for what the motors draw on average, a quarter to spare.",
+                {"psu_amps": float(_elec_std(need_good if d["psu_share"] == "shared" else grp_need, STD_A))})
+    elif psu_total < need_good - 0.05:
+        chk("warn", "The power supply is on the small side",
+            f"{psu_total:.0f} A in all ({share}) against {how}; {need_good:.0f} A lets it run cool. It works, warm and near "
+            "its limit - a long hard race can make it cut out.")
+    else:
+        chk("ok", "The power supply is large enough",
+            f"{psu_total:.0f} A in all ({share}) for {need_good:.0f} A: {how}, and a quarter to spare so the supply runs cool.")
+    if d["psu"] != "battery":                      # 2.9.5: the peaks are not what the supply is sized for
+        chk("info", f"Short peaks: up to {n * i_peak:.0f} A for a moment",
+            "A hard move can ask for that for a fraction of a second. No supply here is sized for it, and none needs to be: "
+            "the capacitors give the first milliseconds, then the supply holds at its current limit and the voltage dips - "
+            "the motors slow for a moment. "
+            + ({"pc": "A PC supply's over-current protection usually switches it off until PS_ON is switched again, so "
+                      "keep its current well above what the motors draw on average - the quarter to spare above.",
+                "server": "Keep the quarter to spare above: the peaks come out of it."}.get(d["psu"],
+               "Check the overload line of its data sheet: a supply that limits its current (\"constant current\") rides "
+               "through the dip; one that switches off and tries again (\"hiccup\") makes the rig twitch - give that kind "
+               "half as much again.")))
+    if d["psu"] != "battery" and d["psu_share"] == "each" and units > 1 and d["psu_amps"] >= need_good - 0.05:
+        chk("info", f"{psu_units} supplies where {series} would do",
+            f"One of them gives {d['psu_amps']:.0f} A and all the motors draw about {i_avg:.0f} A on average ({need_good:.0f} A "
+            "with the quarter to spare). One per motor only helps when one supply cannot carry them all.")
+        fix("tip", f"One {'pair' if series == 2 else 'supply'} is enough for all {n} motors",
+            f"{d['psu_amps']:.0f} A against {need_good:.0f} A for all of them: {psu_units - series} supplies fewer.", {"psu_share": "shared"})
+    if d["psu"] == "led" and 13.5 < v < 21.5:
+        chk("warn", f"A fixed supply cannot be set to {v:g} V", "Its screw moves it about 10% around 12 V or 24 V. An adjustable "
+            "supply, or a 36 V / 48 V adjustable one turned down, reaches this.")
+        fix("warn", "Use an adjustable supply", "With a voltage knob.", {"psu": "adj"})
+    if unit:                                   # 2.9.5: server and PC supplies
+        kind_ = "Server" if d["psu"] == "server" else "PC"
+        if abs(v - 12) > 1.0 and abs(v - 24) > 1.6:
+            chk("warn", f"{kind_} supplies give 12 V each", "One gives 12 V (about 12.3 V), two in series 24 V. Other "
+                "voltages need another kind of supply.")
+            fix("warn", f"Use {12 if v < 18 else 24} V", "What one supply, or two in series, give.", {"psu_volts": 12.0 if v < 18 else 24.0})
+        rate = unit["amps"][d["mains"]]
+        if d["psu"] == "server" and d["psu_amps"] > rate + 0.5:
+            chk("warn", f"An HP DPS-1200FB gives {rate:.0f} A on {d['mains']} V mains",
+                f"Its label: 75 A (900 W) on 110-120 V mains, 100 A (1200 W) on 200-240 V. {d['psu_amps']:g} A was typed in.")
+            fix("warn", f"Count on {rate:.0f} A per supply", "What its label promises on your mains.", {"psu_amps": rate})
+        if d["psu"] == "pc":
+            cables = max(2, int(math.ceil(min(d["psu_amps"], grp_need) / PCIE_CABLE_A - 1e-9)))
+            chk("info", f"Take the 12 V from {cables} cables of each PC supply",
+                f"Each PCIe 8-pin cable carries 12.5 A by the PCIe spec (150 W); the CPU 8-pin cables count too. Cut the plugs "
+                "off the far ends: every yellow wire to the + bus, every black wire to the - bus. Use only the cables that came "
+                "with that supply - modular cables of another make have other pin-outs and can destroy it. It starts when "
+                "PS_ON (green, pin 16 of the 24-pin plug) is joined to ground (black, pin 15 or 17): a switch there. "
+                f"{'The EVGA SuperNOVA 1300 G2 gives 108 A on its one +12 V rail; ' if d['psu_amps'] <= 110 else ''}a supply "
+                "with several 12 V rails gives less on each - check the +12V line on its label.")
+        if v > 15:
+            serv = d["psu"] == "server"
+            chk("warn" if not serv else "info", f"Two {kind_.lower()} supplies in series: the upper one's ground off its case",
+                f"Inside a {kind_.lower()} supply the output's minus is joined to its metal case, which the mains plug earths. "
+                "In series the upper supply's minus sits at 12 V: joined to earth too, it shorts the lower supply. So the upper "
+                "supply (supply 1 in the pictures: its -V goes to the other's +V) has its ground separated from its case - "
+                + ("on the HP DPS-1200FB the two standoffs that join the output ground to the case are swapped for nylon "
+                   "ones; the third, mains earth, stays" if serv else
+                   "the screws or standoffs that join the circuit board's ground to the case swapped for nylon ones (or the wire "
+                   "from ground to the case cut); the green-yellow mains earth on the case stays") +
+                ". The lower supply stays as it is: its minus is the rig's 0 V, on earth like the board's USB ground through the "
+                "PC. Before joining them a meter must read open between the upper supply's -V and its case. Never lift the "
+                "mains earth instead, keep the two cases apart, and switch each on with its own "
+                + ("breakout board" if serv else "PS_ON switch, to its own ground") + ". A bypass diode across each supply "
+                "carries the current if one of them stops. Opening a supply: unplug it and wait - its capacitors hold mains "
+                "voltage for minutes.")
+            if need_good <= 150:                     # 2.9.5: one supply in place of the pair(s), for server supplies too
+                fewer = psu_units - 1
+                fix("tip", "Or one 24 V supply with nothing to open",
+                    f"An industrial 24 V supply of {_elec_std(need_good, STD_A):.0f} A for all motors: "
+                    + ("one supply fewer." if fewer == 1 else f"{fewer} supplies fewer."),
+                    {"psu": "meanwell", "psu_amps": float(_elec_std(need_good, STD_A)), "psu_share": "shared"})
+    if d["psu"] != "battery" and psu_w / 0.88 > (1440 if d["mains"] == 120 else 2900):
+        chk("info", "Check the wall socket", f"These supplies can draw {psu_w / 0.88:.0f} W at full load; a "
+            f"{'15 A, 120 V' if d['mains'] == 120 else '13 A, 230 V'} circuit gives about {1440 if d['mains'] == 120 else 2900} W all day. "
+            "The rig rarely asks for all of it, but share the socket with nothing else.")
+
+    # 7. braking energy
+    big = d["i_rated"] >= 8
+    if d["psu"] == "battery":
+        chk("ok", "The batteries take the braking energy", "A braking motor charges them for a moment. Nothing to add.")
+    elif d["regen"] == "none":
+        chk("warn" if big else "info", "Nothing takes the braking energy",
+            "When a motor is stopped or reversed quickly it works as a generator and pushes the supply voltage up. Switching "
+            "supplies answer by cutting out for a moment (the rig goes limp, the supply's light blinks) and drivers see more "
+            "volts than they are rated for. A diode after the supply and a capacitor bank at the drivers cure it.")
+        fix("warn" if big else "tip", "Add a diode and a capacitor bank", f"{cap_uf:,} uF at {cap_v} V across the drivers' supply, "
+            "after a 50 A diode.", {"regen": "diode_cap"})
+    elif d["regen"] == "diode_cap":
+        chk("ok", "A diode and capacitors take the braking energy",
+            f"{'A bridge rectifier' if n_diode_g == 1 else str(n_diode_g) + ' bridge rectifiers side by side'} (KBPC5010, 50 A) "
+            f"used as a diode after {'the supply' if groups == 1 else 'each supply'}, on a heat sink - it loses about a watt per "
+            f"amp - and {cap_k} x 10,000 uF capacitors ({cap_uf:,} uF) rated {cap_v} V or more across "
+            + ("the drivers' supply" if groups == 1 else "each driver's supply") + (f": {n_diode} diodes and {cap_k * groups} "
+            "capacitors in all" if groups > 1 else "") + ". The diode keeps the pushed-back voltage out of the supply; the "
+            "capacitors hold it and give it back on the next move.")
+    else:
+        float_v = 13.7 * (2 if v > 15 else 1)
+        if dr["vmax"] < float_v + 3:
+            chk("bad", "A buffer battery sits above what this driver takes", f"Lead-acid batteries across the supply float at about "
+                f"{float_v:.1f} V; {dr['name']} is rated {dr['vmax']:g} V at most.")
+            fix("bad", "Use a diode and capacitors instead", "No battery to keep charged.", {"regen": "diode_cap"})
+        else:
+            chk("warn", "A buffer battery across the supply", f"It swallows braking energy and covers peaks, but the supply must be "
+                f"set to the batteries' float voltage ({float_v:.1f} V) and limit its current, or it cuts out trying to charge them. "
+                "Fuse the battery at its terminal.")
+
+    # 8. fuse and wire
+    if d["fuse"] > 0 and fuse < d["i_rated"] * 1.1:
+        chk("warn", "The fuse will blow in normal use", f"{fuse:g} A against {d['i_rated']:.0f} A at the motor's rated load. About "
+            f"{fuse_auto:g} A lets the motor work and still protects the wiring.")
+        fix("warn", f"Use {fuse_auto:g} A fuses", "One per motor.", {"fuse": 0.0})
+    elif fuse_feed > wire_amps + 0.01:
+        chk("bad", "The wire is too thin for its fuse", f"A {fuse_feed:g} A fuse on {gname} wire: the wire is the fuse. Use "
+            f"{g_auto[1]} ({g_auto[2]:g} mm2) or thicker.")
+        fix("bad", f"Use {g_auto[1]} wire", "Sized for the fuse.", {"wire_mm2": 0.0})
+    else:
+        if ch == 2:                                   # 2.9.5: one supply input for both channels
+            chk("ok", f"A {fuse_feed:g} A fuse for each driver board and {gname} wire",
+                f"A two-channel board has one supply input for its two motors: one fuse in the positive wire to each board, "
+                f"sized for both ({fuse:g} A per motor), as close to the supply as it can be - a MAXI blade fuse (rated 32 V) in "
+                f"a holder. The wire is sized for that fuse, the motor wires too. Over {d['wire_len']:g} m it loses {drop:.2f} V "
+                f"({drop_pct:.1f}%) at a motor's rated current.")
+        else:
+            chk("ok", f"A {fuse:g} A fuse and {gname} wire for each motor",
+                f"One fuse in the positive wire to each driver, as close to the supply as it can be - a blade fuse (MAXI or "
+                f"ATO, rated 32 V) in a holder. Over {d['wire_len']:g} m the wire loses {drop:.2f} V ({drop_pct:.1f}%) at the rated current.")
+    if drop_pct > 4:
+        chk("warn", "The motor wires lose a lot", f"{drop:.1f} V ({drop_pct:.0f}%) over {d['wire_len']:g} m. Use thicker wire or "
+            "put the supply and the drivers nearer the motors.")
+
+    # 9. emergency stop
+    relay_a = _elec_std(need_good if groups == 1 else fuse_feed, (40, 80, 100, 150, 200))     # one relay per supply group (2.9.5: the supply's current)
+    if d["estop"] == "none":
+        chk("bad", "No emergency stop", "A rig that can lift a person needs a way to cut the motor power at once, within reach "
+            "of the seat. The page's Stop button and the firmware's cutoffs are not that: they need the board to be working.")
+        fix("bad", "Add an emergency stop with a relay", "A mushroom button that drops a relay in the motor supply.", {"estop": "relay"})
+    elif d["estop"] == "ac":
+        if d["psu"] == "battery":
+            chk("bad", "A mains switch cannot stop batteries", "The emergency stop has to open the battery circuit: a relay "
+                "or contactor in the positive wire.")
+            fix("bad", "Use a relay", "In the battery's positive wire.", {"estop": "relay"})
+        else:
+            chk("warn", "The emergency stop switches the mains", "Simple, but the supply's capacitors keep the motors alive for "
+                "about a second after the button is hit. A relay on the 24 V side stops them at once.")
+    else:
+        chk("ok", "Emergency stop with a relay",
+            f"A latching mushroom button (normally closed) feeds the coil of a {relay_a:.0f} A relay or contactor with a "
+            f"{12 if v < 15 else 24} V coil in the positive wire between "
+            + ("the supply and the fuses" if groups == 1 else f"each supply and its fuse ({groups} relays, their coils side by side "
+               "on the one button)") + ". Hit the button and the motors "
+            "lose power at once, while the board and the sensors stay on. Put a diode (1N4007) across "
+            + ("the coil." if groups == 1 else "each coil.")
+            + (" A 24 V coil pulls in from about 17 V: check that yours does on this supply." if 15 <= v < 20 else ""))
+
+    # 10. the rest
+    if d["brake"]:
+        chk("info", "Take the parking brake off the motor",
+            "Wheelchair motors carry an electric brake under the cap at the back: it holds the shaft until it gets 24 V. "
+            "Most builders unscrew it (two or three screws; the motor gets shorter too). The freewheel lever is not a "
+            "substitute: on many motors it works itself back.")
+    if boards > 1:
+        chk("info", f"{n} motors need {boards} boards", "One UNO R4 WiFi runs three motors. The second board is wired the same "
+            "way and has its own address in this page and its own output in SimHub.")
+    if d["sensor"] == "hall":
+        chk("ok", "Contactless Hall sensors", "Nothing wears and nothing loses contact. Feed each from the Arduino's 5 V and GND "
+            "pins, with shielded cable, the shield on GND at the Arduino end only." + (" Over this length, add the three-part filter "
+            "from Help at the Arduino." if d["sens_len"] > 2 else ""))
+    else:
+        chk("info", "Potentiometers wear", "A 10 k pot works and costs little; its wiper wears where the rig spends its time and "
+            "starts to jump. Fit the three-part filter from Help, and plan for Hall sensors later.")
+    chk("info", "One ground for the logic, kept apart from the motor current",
+        "Each driver's logic GND goes to an Arduino GND pin; the heavy supply wires go from the supply to each driver on "
+        "their own, never through the Arduino. Keep sensor cables away from motor cables.")
+
+    elec_imu_check(chk, d)                                # 2.9.5
+    order = {"bad": 3, "warn": 2, "ok": 1, "info": 0}
+    verdict = max((c["level"] for c in checks), key=lambda x: order[x])
+    verdict = verdict if verdict in ("bad", "warn") else "ok"
+
+    # ------------------------------------------------------------------ wiring list
+    kind = dr["wire"]
+    wiring = []
+    pins2 = dr.get("pins") if ch == 2 else None
+    for m in range(n if pins2 else min(n, 3)):           # 2.9.5: two-channel boards - every motor, its own channel's pins
+        ena, enb, pw, fb = ELEC_PINS[m % 3]
+        P = pins2[m % 2] if pins2 else {"PWM": "PWM", "DIR": "DIR", "INA": "INA (IN1)", "INB": "INB (IN2)", "M": "M+ and M-"}
+        uno = f" of board {m // 3 + 1}" if n > 3 and ch == 2 else ""
+        if kind == "ibt2":
+            rows = [("RPWM", f"D{ena}"), ("LPWM", f"D{pw}"), ("R_EN and L_EN, joined", f"D{enb}"), ("VCC", "5V"), ("GND", "GND"),
+                    ("R_IS, L_IS", "leave open")]
+        elif kind == "pwmdir":
+            rows = [(P["DIR"] + (" (direction)" if pins2 else ""), f"D{ena}{uno}"), (P["PWM"] + (" (speed, PWM)" if pins2 else ""), f"D{pw}{uno}"),
+                    ("GND", "GND")] + ([] if pins2 else [("5 V logic supply, if it has the pin", "5V")])
+        elif kind == "inab":
+            rows = [(P["INA"], f"D{ena}{uno}"), (P["INB"], f"D{enb}{uno}"), (P["PWM"], f"D{pw}{uno}"), ("GND", "GND"),
+                    ("5 V logic / enable, if it has the pin", "5V")]
+        else:
+            rows = [("-", "not driven by this board")]
+        if pins2:
+            mate = m + 1 if m % 2 == 0 else m - 1
+            rows += [("B+ (the board's one supply input)", f"supply + through its {fuse_feed:g} A fuse"
+                      + (f" - shared with motor {mate + 1}" if mate < n else "")), ("B-", "supply -"),
+                     (P["M"], f"motor {m + 1} (swap the two if it runs away from its target)")]
+        else:
+            rows += [("B+ / power +", f"supply + through the {fuse_feed:g} A fuse"), ("B- / power -", "supply -"),
+                     ("M+ and M-", f"motor {m + 1} (swap the two if it runs away from its target)")]
+        rows += [("sensor signal (wiper)", fb + uno), ("sensor + and -", "5V and GND, at the Arduino")]
+        w_ = {"motor": m + 1, "rows": [{"from": a_, "to": b_} for a_, b_ in rows]}
+        if pins2:
+            w_["title"] = f"Motor {m + 1}: driver {m // 2 + 1}, channel {m % 2 + 1}"
+        wiring.append(w_)
+
+    # ------------------------------------------------------------------ parts and cost
+    items = []
+
+    def add(group, what, qty, each, q, note=""):
+        if qty > 0:
+            it = {"group": group, "what": what, "qty": int(qty), "each": round(each, 2), "total": round(qty * each, 2), "note": note}
+            it.update(_elec_link(q))
+            items.append(it)
+    mp = ELEC_MOTORS[d["motor"]]
+    m_usd = {"jazzy_small": 50.0, "jazzy_big": 90.0, "wc250_75": 75.0, "wc250_200": 60.0, "ec350": 90.0, "worm200": 75.0, "wiper": 30.0}.get(
+        d["motor"], 30.0 + 0.2 * d["watts"])
+    add("Motors", f"{mp[0] if d['motor'] != 'custom' else f'{v_fmt(d)} gear motor'}", n, m_usd, mp[3],
+        "used, as pairs" if d["motor"].startswith("jazzy") or d["motor"] in ("wc250_200", "ec350") else "")
+    units = int(math.ceil(n / float(dr["ch"])))
+    add("Drivers", dr["name"] + (" (one runs two motors)" if dr["ch"] == 2 else ""), units, dr["usd"], dr["q"],
+        "buy a spare" if d["driver"] == "ibt2" else "")
+    if d["fan"]:
+        add("Drivers", f"80 mm fan, {12 if v < 15 else 24} V, blowing on the heat sinks", max(1, int(math.ceil(units / 2.0))), 8.0,
+            f"80mm {12 if v < 15 else 24}V fan")
+    w_each = v * d["psu_amps"]
+    pa, pb = psu[3]
+    per_ = "driver board" if ch == 2 else "motor"
+    each_note = (f"{groups} pairs: one per {per_}" if series == 2 else f"one per {per_}") if groups > 1 else (
+        "a pair in series" if series == 2 else "")
+    if d["psu"] == "server":                           # 2.9.5: the count the pictures show, the supply's real rating
+        unit = ELEC_PSU_UNIT["server"]
+        add("Power", f"12 V server supply HP DPS-1200FB, 1200 W ({unit['watts'][d['mains']]} W = {unit['amps'][d['mains']]:.0f} A "
+            f"on {d['mains']} V mains)", psu_units, 25.0, psu[2], ("used; " + each_note) if each_note else "used")
+        add("Power", "breakout board for it: 12 V terminals and an on switch", psu_units, 12.0, "HP DPS-1200FB breakout board")
+    elif d["psu"] == "pc":
+        add("Power", f"PC power supply, 1300 W class, one +12 V rail of about {d['psu_amps']:g} A (EVGA SuperNOVA 1300 G2 or "
+            "similar)", psu_units, pa + pb * 1300, psu[2], each_note)
+        add("Power", "switch for PS_ON: green (pin 16) to black (pin 15) on the 24-pin plug", psu_units, 6.0, "ATX 24 pin PSU on off switch")
+    elif d["psu"] == "battery":
+        add("Power", "12 V deep-cycle battery, about 35 Ah", psu_units, 75.0, psu[2], each_note)
+        add("Power", f"{12 if v < 15 else 24} V battery charger", 1, 45.0, f"{12 if v < 15 else 24}V AGM battery charger")
+        add("Power", "main fuse at the battery, with its holder", 1, 15.0, "ANL fuse holder 100A")
+    else:
+        add("Power", f"{psu[0].split(' (')[0].split(',')[0]}: {v:g} V, {d['psu_amps']:g} A ({w_each:.0f} W)", psu_units, pa + pb * w_each,
+            {"led": f"{24 if v > 15 else 12}V {d['psu_amps']:.0f}A switching power supply",
+             "adj": f"adjustable switching power supply 0-{24 if v <= 24 else 48}V {d['psu_amps']:.0f}A",
+             "meanwell": f"Mean Well {24 if v > 15 else 12}V {w_each:.0f}W power supply"}[d["psu"]], each_note)
+    if series == 2 and d["psu"] in ("server", "pc"):
+        add("Power", "nylon standoffs and washers (M3): the upper supply's ground off its case", groups, 6.0, "nylon standoff spacer M3 kit")
+        add("Protection", "bypass diode across each supply: KBPC5010 used as a diode", psu_units, 6.0, "KBPC5010 bridge rectifier 50A")
+    if d["regen"] == "diode_cap" and d["psu"] != "battery":
+        add("Protection", "bridge rectifier KBPC5010 (50 A), used as a diode, on a heat sink", n_diode, 6.0, "KBPC5010 bridge rectifier 50A",
+            f"{n_diode_g} per supply" if groups > 1 else "")
+        add("Protection", f"capacitor 10,000 uF {cap_v} V, 105 C, low ESR", cap_k * groups, 9.0, f"10000uF {cap_v}V electrolytic capacitor",
+            f"{cap_k} per supply" if groups > 1 else "")
+        add("Protection", "resistor 1 kohm 2 W: empties the capacitors", groups, 1.0, "1k ohm 2W resistor")
+    if d["regen"] == "battery" and d["psu"] != "battery":
+        add("Protection", "12 V battery as a buffer, with a fuse", (2 if v > 15 else 1) * groups, 45.0, "12V 9Ah AGM battery")
+    add("Protection", f"blade fuse holder with {fuse_feed:g} A fuses (and spares)" + (": one per driver board" if ch == 2 else ""), units, 7.0,
+        f"inline MAXI blade fuse holder {fuse_feed:g}A")
+    if d["estop"] != "none":
+        add("Protection", "emergency stop button, latching, normally closed", 1, 10.0, "emergency stop mushroom button NC")
+    if d["estop"] == "relay":
+        add("Protection", f"relay or contactor, {12 if v < 15 else 24} V coil, {relay_a:.0f} A, with a 1N4007 across the coil", groups,
+            14.0 if relay_a <= 100 else 30.0, f"{12 if v < 15 else 24}V {relay_a:.0f}A relay contactor", "one per supply" if groups > 1 else "")
+    elif d["estop"] == "ac" and groups > 1:
+        add("Protection", "power strip with a switch, for the supplies' mains (the button opens its feed)", 1, 15.0, "power strip")
+    add("Wiring", f"motor wire, {gname}, red and black, {math.ceil(d['wire_len'] * n * 2 + 2):.0f} m in all", 1,
+        4.0 + 1.2 * mm2 * (d["wire_len"] * n * 2 + 2) / 4.0, f"{(gauge[1] if gauge else g_auto[1]).replace(' AWG', '')} AWG silicone wire red black")
+    add("Wiring", "terminal strip or bus bars, ring terminals, heat-shrink", 1, 18.0, "bus bar terminal block 100A")
+    add("Sensors", "Hall angle sensor, 5 V, analog out (TT Electronics 6127: 1/4 in shaft, 3/8 in bushing - or similar)"
+        if d["sensor"] == "hall" else "potentiometer, 10 k linear, conductive plastic",
+        n, 30.0 if d["sensor"] == "hall" else 6.0, "TT Electronics 6127 hall rotary sensor" if d["sensor"] == "hall" else "10k linear potentiometer conductive plastic")
+    add("Sensors", f"shielded 3-core cable, {math.ceil(d['sens_len'] * n + 1):.0f} m", 1, 2.0 + 1.0 * (d["sens_len"] * n + 1), "shielded 3 core cable 22AWG")
+    elec_parts_imu(add, d)                                # 2.9.5: the motion sensor on the seat
+    lev = elec_lever(d, torque_peak)                      # 2.9.5: levers, push rods, sensor mounts
+    brk = elec_bracket(d, lev)                            # 2.9.5: the sensor's C bracket
+    elec_parts_mech(add, d, lev, brk)
+    add("Board", "Arduino UNO R4 WiFi", boards, 28.0, "Arduino UNO R4 WiFi")
+    add("Board", "12 V DC adapter for the board's barrel jack: 1 A or more, 5.5 x 2.1 mm plug, centre + (USB alone sags the 5 V)",
+        boards, 9.0, "12V 1A power adapter 5.5x2.1mm")                 # 2.9.5
+    add("Board", "jumper wires and a small 5 V / GND terminal strip", boards, 8.0, "dupont jumper wires screw terminal breakout Arduino")
+    total = sum(i_["total"] for i_ in items)
+    cgroups = []
+    for i_ in items:
+        if i_["group"] not in cgroups:
+            cgroups.append(i_["group"])
+    r10 = lambda x: int(round(x / 10.0) * 10)
+    cost = {"currency": "USD", "items": items, "total": r10(total), "low": r10(total * 0.75), "high": r10(total * 1.35),
+            "groups": [{"name": g_, "total": round(sum(i_["total"] for i_ in items if i_["group"] == g_))} for g_ in cgroups],
+            "note": "A ball-park in US dollars from what these parts usually sell for; the links open a search, so compare a "
+                    "few listings. Used wheelchair motors and server supplies swing the most."}
+
+    steps = [
+        ("Levers, push rods and sensor mounts", f"Print the Lever template at 100% and check its 100 mm bar; cut {n} lever"
+         f"{'s' if n > 1 else ''} from {lev['t_al']:g} mm aluminium (or {lev['t_st']:g} mm steel), and the sensor caps. Each lever "
+         "on its shaft with the key and the M8 clamp; a rod with a rod end at each end to the seat; the cap, coupling and "
+         "sensor bracket as the Sensor mount picture shows."),
+        ("Sensor brackets", f"The Sensor bracket template (in the same PDF): {n} strip{'s' if n > 1 else ''} of 3 x 25 mm "
+         f"aluminium, {brk['flat']:.0f} mm long. Drill the {brk['hole']:g} mm hole and the two slots, then bend into a C - both B "
+         "lines the same way (the arms), then both A lines the other way (the feet). Put the lever, cap, coupling and sensor on "
+         f"first and check the arm length ({brk['arm']:.0f} mm outside); mark the gearbox's screws through the slots."),
+        ("Motors on the bench", ("Take the brake off each motor. " if d["brake"] else "") + "Put a motor straight on the supply through "
+         "its fuse: it should turn smoothly both ways and draw about "
+         f"{d['i_noload'] * scale if d['i_noload'] else 3:.0f} A with nothing on the shaft. A motor that draws much more has a worn gearbox or brushes."),
+        ("Mount the power parts", "Supply, " + ("diode on its heat sink, " if d["regen"] == "diode_cap" and d["psu"] != "battery" else "")
+         + ("relay, " if d["estop"] == "relay" else "") + "fuse holders and drivers on one board, with the drivers' heat sinks in free air"
+         + (" and the fan blowing on them" if d["fan"] else "") + ". Keep the heavy wires short."),
+        ("Wire the power side, supply unplugged", f"Supply + to " + ("the diode, " if d["regen"] == "diode_cap" and d["psu"] != "battery" else "")
+         + ("the relay, " if d["estop"] == "relay" else "") + f"then one {fuse_feed:g} A fuse per driver" + (" board" if ch == 2 else "")
+         + ". Supply - straight to every driver. "
+         + (f"The capacitors go across + and - at the drivers, the right way round (the stripe is -). " if d["regen"] == "diode_cap" and d["psu"] != "battery" else "")
+         + f"Use {gname} wire and crimped terminals."),
+        ("Power for the board", "Each board gets its own 12 V adapter (1 A or more, 5.5 x 2.1 mm plug, centre +) in its "
+         "barrel jack, and keeps its USB cable for SimHub - both plugged in is fine. On USB alone the board gets about 4.7 V, "
+         "and less once the motors run: the Hall sensors want 5 V and read wrong below it. The barrel jack takes 6 to 24 V and "
+         "makes a steady 5 V. Not from the motor supply: its braking spikes and noise would reach the board."),
+        ("Sensors first", "Wire the sensors to 5V, GND and A0 to A2; plug the board's adapter and the USB cable in, the motor "
+         "supply off. In this page each position must move smoothly as you turn the lever by hand, with the middle of the travel "
+         "near the middle of the scale."),
+        ("Logic wires", "Driver inputs to the Arduino pins in the wiring list. Double-check 5V and GND before powering: a "
+         "swapped pair kills the driver's logic side."),
+    ] + ([("The motion sensor", IMU_STEP)] if d["imu"] else []) + [
+        ("First power, levers off", "Take the push rods off. In Tuning set PWMmax low (about a quarter) and Kp low. Switch "
+         "the motor supply on with a hand on the emergency stop. Run Settings, Diagnostics, Full check: it tells you which "
+         "way each motor goes and whether any wiring is swapped. A motor that runs away from its target has its two motor "
+         "wires swapped."),
+        ("Raise the power in steps", f"Rods on, nobody in the seat. Raise PWMmax a step at a time to {d['pwm_max']:.0f}%, feeling the "
+         "drivers and the wires for heat after each. Then run Auto-tune."),
+        ("Before sitting in it", "Hit the emergency stop while it moves: the rig must go limp at once. Check the mechanical "
+         "end stops, and that the page's Diagnostics shows no cutoffs or sensor glitches after ten minutes of running."),
+    ]
+    if dr["fw"] == "mode1":
+        steps.insert(4, ("Tell the board which driver", "Firmware 2.2.0b1: Settings, Motor drivers, 'PWM + direction', with the "
+                         "motors off" + (f", and {dr['fmax']:g} kHz PWM" if dr["fmax"] and dr["fmax"] < 25 else "") + ". "
+                         "(Firmware 2.1.1 and older: build the sketch with '#define MODE1'.)"))
+
+    out = {
+        "inputs": d, "verdict": verdict, "checks": checks, "fixes": fixes,
+        "motor_name": mp[0], "motor_note": mp[2], "driver": dict({k: dr[k] for k in ("name", "vmax", "icont_now", "ipeak", "fw", "wire", "note", "ch", "fmax", "prot")}, pins=dr.get("pins")),
+        "driver_units": units, "boards": boards, "psu_name": psu[0], "psu_note": psu[1],
+        "numbers": {"rpm": rpm_v, "torque": torque, "torque_peak": torque_peak, "i_rated": d["i_rated"], "i_stall": i_stall_v,
+                    "i_peak": i_peak, "need_min": need_min, "need_good": need_good, "psu_total": psu_total, "psu_w": psu_w,
+                    "fuse": fuse, "fuse_auto": fuse_auto, "wire": gname, "mm2": mm2, "drop": drop, "drop_pct": drop_pct,
+                    "fuse_feed": fuse_feed, "ch": ch, "units": units,
+                    "cap_uf": cap_uf, "cap_v": cap_v, "n_diode": n_diode, "relay_a": int(relay_a),
+                    # 2.9.5: how the supplies are counted (the pictures and the parts list use these)
+                    "groups": groups, "series": series, "psu_units": psu_units, "n_diode_g": n_diode_g, "cap_k": cap_k,
+                    "grp_rated": grp_rated,
+                    # 2.9.5: the supplies sized for the average current while driving
+                    "load": d["load"], "i_avg": i_avg, "grp_need": grp_need, "i_burst": n * i_peak},
+        "lever": lev, "bracket": brk,
+        "wiring": wiring, "wire_kind": ELEC_WIRE[kind], "cost": cost,
+        "steps": [{"title": a, "text": b} for a, b in steps],
+    }
+    out["scenes"] = elec_scenes(d, dr, out["numbers"])
+    out["scenes"].update(lever=elec_scene_lever(d, lev), linkage=elec_scene_linkage(d, lev),     # 2.9.5
+                         sensormount=elec_scene_sensor_mount(d, lev, brk),
+                         bracket=elec_scene_bracket(d, lev, brk))                                  # 2.9.5
+    out["imu_wiring"] = elec_imu_rows() if d["imu"] else None
+    out["firmware"] = elec_firmware_public(d)             # 2.9.5: the sketch for this build, ready to download
+    return out
+
+
+def v_fmt(d):
+    return f"{d['volts']:g} V {d['watts']:.0f} W {d['rpm']:.0f} rpm"
+
+
+class ElecPdf(FramePdf):
+    """FramePdf with landscape pages for the wiring pictures."""
+
+    def __init__(self, title):
+        self.sizes, self.cur = [], (612.0, 792.0)
+        FramePdf.__init__(self, title)
+
+    def new_page(self, landscape=None):
+        if self.ops:
+            self.pages.append(self.ops); self.sizes.append(self.cur)
+        if landscape is not None:
+            self.cur = (792.0, 612.0) if landscape else (612.0, 792.0)
+            self.W, self.H = self.cur
+        self.ops, self.y = [], self.H - self.MARGIN
+
+    def bytes(self):
+        if self.ops:
+            self.pages.append(self.ops); self.sizes.append(self.cur); self.ops = []
+        objs = [b"<< /Type /Catalog /Pages 2 0 R >>", None,
+                b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+                b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>"]
+        kids = []
+        for i, (ops, (w, h)) in enumerate(zip(self.pages, self.sizes)):
+            foot = f"{self.title}  -  page {i + 1} of {len(self.pages)}"
+            r, g, b = _PDF_COL["dim"]
+            ops = ops + [f"{r:.3f} {g:.3f} {b:.3f} rg", f"BT /F1 8 Tf {self.MARGIN:.2f} 30 Td ({foot}) Tj ET"]
+            body = b"\n".join(o if isinstance(o, bytes) else o.encode("latin-1") for o in ops)
+            objs.append(b"<< /Length " + str(len(body)).encode() + b" >>\nstream\n" + body + b"\nendstream")
+            content = len(objs)
+            objs.append(f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {w:.0f} {h:.0f}] /Contents {content} 0 R "
+                        f"/Resources << /Font << /F1 3 0 R /F2 4 0 R >> >> >>".encode())
+            kids.append(len(objs))
+        objs[1] = ("<< /Type /Pages /Kids [" + " ".join(f"{k} 0 R" for k in kids) + f"] /Count {len(kids)} >>").encode()
+        out, offs = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n"), []
+        for i, o in enumerate(objs):
+            offs.append(len(out))
+            out += f"{i + 1} 0 obj\n".encode() + o + b"\nendobj\n"
+        xref = len(out)
+        out += f"xref\n0 {len(objs) + 1}\n0000000000 65535 f \n".encode()
+        for o in offs:
+            out += f"{o:010d} 00000 n \n".encode()
+        out += f"trailer\n<< /Size {len(objs) + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode()
+        return bytes(out)
+
+
+def elec_pdf(raw, version=""):
+    r = elec_design(raw)
+    if r["inputs"]["drive"] == "servo":
+        return elec_servo_pdf(r, version), r
+    d, nm = r["inputs"], r["numbers"]
+    p = ElecPdf("Motion rig electronics design")
+    p.para("Motion rig electronics design", 20, True, gap=2)
+    p.para(f"{d['motors']} x {r['motor_name']}", 12, False, "dim", gap=2)
+    p.para(f"Made {time.strftime('%Y-%m-%d %H:%M')} with SMC3 R4" + (f" page {version}" if version else ""), 8.5, False, "dim", gap=8)
+    word = {"ok": ("Looks buildable", "ok"), "warn": ("Buildable, with points to look at", "warn"),
+            "bad": ("Change the design before buying parts", "bad")}[r["verdict"]]
+    p.para(word[0], 13, True, word[1], gap=6)
+    p.heading("The design")
+    p.table([("", 200, "start"), ("", 316, "start")], [
+        ["Motor", f"{d['volts']:g} V, {d['watts']:.0f} W, {d['rpm']:.0f} rpm; {d['i_rated']:.0f} A rated, {d['i_stall']:.0f} A stalled"],
+        ["On this supply", f"{nm['rpm']:.0f} rpm at most, about {nm['torque']:.0f} Nm all day and {nm['torque_peak']:.0f} Nm for a moment"],
+        ["Driver", f"{r['driver_units']} x {r['driver']['name']} ({r['wire_kind']})"],
+        ["Supply", f"{r['psu_name']}: {d['psu_volts']:g} V, {nm['psu_total']:.0f} A in all"],
+        ["Motors draw", f"about {nm['i_avg']:.0f} A on average while driving ({d['load']:.0f}% of rated), {nm['need_good']:.0f} A with a quarter to spare, up to {d['motors'] * nm['i_peak']:.0f} A for a moment"],
+        ["Each driver board" if nm.get("ch") == 2 else "Each motor", f"{nm.get('fuse_feed', nm['fuse']):g} A fuse, {nm['wire']} wire"],
+        ["PWMmax, PWM frequency", f"{d['pwm_max']:.0f}%, {d['pwm_khz']:g} kHz"],
+        ["Boards", f"{r['boards']} x Arduino UNO R4 WiFi, each with a 12 V adapter in its barrel jack"]])
+    p.heading("Checks")
+    mark = {"ok": "OK", "warn": "LOOK", "bad": "CHANGE", "info": "NOTE"}
+    for c in r["checks"]:
+        p.need(34)
+        p.para(f"{mark[c['level']]}: {c['title']}", 10, True, c["level"], gap=0)
+        p.para(c["text"], 9.5, indent=12, gap=5)
+    sc = r["scenes"]
+    for scn in ([sc["overview"], sc["power"]] + ([sc["supplies"]] if sc.get("supplies") else []) + sc["signals"]
+                + [sc["braking"], sc["estop"], sc["linkage"], sc["sensormount"]]):
+        p.new_page(landscape=True)
+        elec_pdf_scene(p, scn, p.H - 2 * p.MARGIN - 64)
+        if scn.get("note"):
+            p.para(scn["note"], 9, False, "dim")
+    elec_pdf_lever_pages(p, d, r["lever"])                # 2.9.5: the lever template, 1:1
+    p.new_page(landscape=False)
+    p.heading("Wiring list")
+    p.para(f"Driver inputs: {r['wire_kind']}. The same list for each motor, with its own pins.", 9.5)
+    for w in r["wiring"]:
+        p.need(120)
+        p.table([(w.get("title") or f"Motor {w['motor']}: driver terminal", 230, "start"), ("goes to", 286, "start")],
+                [[x["from"], x["to"]] for x in w["rows"]], 9)
+    if d["motors"] > 3 and not r["driver"].get("pins"):
+        p.para(f"Motors 4 to {d['motors']} go on a second board, on the same pins.", 9.5)
+    _elec_pdf_imu(p, r)
+    p.heading("Parts, and what to search for")
+    c = r["cost"]
+    p.para(f"About {c['low']:,} to {c['high']:,} US dollars; the lines below come to {c['total']:,}.", 10.5, True)
+    p.table([("What", 236, "start"), ("How many", 46, "end"), ("About", 60, "end"), ("Search eBay or Amazon for", 174, "start")],
+            [[f"{i_['group']}: {i_['what']}", str(i_["qty"]), f"{i_['total']:,.0f} USD", i_["q"]] for i_ in c["items"]]
+            + [["Total of the lines above", "", f"{c['total']:,} USD", ""]], 8.5)
+    p.para(c["note"], 9, False, "dim")
+    p.heading("Step by step")
+    for i, s_ in enumerate(r["steps"]):
+        p.need(40)
+        p.para(f"{i + 1}. {s_['title']}", 10.5, True, gap=0)
+        p.para(s_["text"], 9.5, indent=14, gap=5)
+    _elec_pdf_fw_table(p, r.get("firmware"))
+    p.heading("Read this before building")
+    p.para("These numbers are rules of thumb from motion rigs that people have built and reported on, with the values "
+           "you typed in: they size a first design and are only as good as the motor's label. Mains wiring can kill and a "
+           "shorted battery or supply starts fires: fuse every positive wire, keep mains under covers, and ask an "
+           "electrician if you are unsure. Test with nobody in the seat and the emergency stop in your hand.", 9.5)
+    return p.bytes(), r
+
+
+def _elec_pdf_imu(p, r):
+    if r.get("imu_wiring"):                             # 2.9.5: the motion sensor
+        p.need(120)
+        p.table([("Motion sensor (board 1)", 230, "start"), ("goes to", 286, "start")],
+                [[x["from"], x["to"]] for x in r["imu_wiring"]], 9)
+
+
+def _elec_pdf_fw_table(p, fw=None):
+    if fw is not None:                                  # 2.9.5: the sketch made for this design
+        p.heading("The firmware for this build")
+        if not fw["supported"]:
+            p.para(fw["why"], 9.5)
+        for k in ("beta", "release"):
+            x = fw.get(k)
+            if not x:
+                continue
+            p.need(60)
+            p.para(f"{x['file']}  -  SMC3_R4 {x['ver']}" + (" (BETA, not tested on a real rig yet)" if x["beta"] else " (release)"),
+                   10, True, "bad" if x["beta"] else "ok", gap=0)
+            p.para("Set up for: " + "; ".join(x["what"]) + ".", 9, indent=12, gap=0)
+            p.para("Download it from the page: Electronics, the result panel's firmware box (Download). Put your WiFi name "
+                   "and password in, then upload it with the Arduino IDE. " + x["saved"], 9, False, "dim", indent=12, gap=5)
+    p.heading("Which firmware for which set-up")
+    p.table([("Your set-up", 200, "start"), ("Firmware", 120, "start"), ("How", 196, "start")],
+            [[a, b, c] for a, b, c in FIRMWARE_TABLE], 8.5)
+
+
+def elec_servo_pdf(r, version=""):
+    d, nm = r["inputs"], r["numbers"]
+    p = ElecPdf("Motion rig electronics design")
+    p.para("Motion rig electronics design", 20, True, gap=2)
+    p.para(f"{d['motors']} ball-screw actuators with {r['servo']['short']} servos (SFX-100 style)", 12, False, "dim", gap=2)
+    p.para(f"Made {time.strftime('%Y-%m-%d %H:%M')} with SMC3 R4" + (f" page {version}" if version else ""), 8.5, False, "dim", gap=8)
+    p.para("BETA FIRMWARE: SMC3_R4_Servo 2.2.0b1 has not been tested on a real rig yet. It was written for the SMC3 R4 "
+           "dashboard and checked against a model of the board; it should work with it. First runs: actuators off the rig, "
+           "then nobody in the seat, the emergency stop in your hand.", 10, True, "bad", gap=8)
+    word = {"ok": ("Looks buildable", "ok"), "warn": ("Buildable, with points to look at", "warn"),
+            "bad": ("Change the design before buying parts", "bad")}[r["verdict"]]
+    p.para(word[0], 13, True, word[1], gap=6)
+    p.heading("The design")
+    p.table([("", 200, "start"), ("", 316, "start")], [
+        ["Actuators", f"{d['motors']} x ball screw, {d['lead']:g} mm a turn, {d['stroke']:g} mm stroke"],
+        ["Servo", f"{r['servo']['name']}: {d['srv_watts']:.0f} W, {d['srv_torque']:g} Nm ({d['srv_peak']:g} Nm peak), {d['srv_rpm']:.0f} rpm"],
+        ["Pulses", f"{int(d['ppr'])} a turn, {nm['travel']} for the stroke, {nm['res']:.3f} mm each"],
+        ["Each actuator", f"about {nm['f_rated']:.0f} N all day, {nm['f_peak']:.0f} N for a moment; top speed about {nm['v_top']:.0f} mm/s"],
+        ["Homing", "at the bottom (released 4 s)" if d["home"] == "bottom" else "home switches on A0-A2"],
+        ["Mains", f"{d['mains']} V, about {nm['amps_rated']:.0f} A with every servo flat out"],
+        ["Boards", f"{r['boards']} x Arduino UNO R4 WiFi, 2 x ULN2803A and a 12 V adapter each"]])
+    p.heading("Checks")
+    mark = {"ok": "OK", "warn": "LOOK", "bad": "CHANGE", "info": "NOTE"}
+    for c in r["checks"]:
+        p.need(34)
+        p.para(f"{mark[c['level']]}: {c['title']}", 10, True, c["level"], gap=0)
+        p.para(c["text"], 9.5, indent=12, gap=5)
+    sc = r["scenes"]
+    for scn in [sc["overview"], sc["actuator"], sc["power"]] + sc["signals"] + [sc["estop"]]:
+        p.new_page(landscape=True)
+        elec_pdf_scene(p, scn, p.H - 2 * p.MARGIN - 64)
+        if scn.get("note"):
+            p.para(scn["note"], 9, False, "dim")
+    p.new_page(landscape=False)
+    p.heading("Drive settings (each drive, on the bench)")
+    p.table([("Parameter", 90, "start"), ("Value", 90, "start"), ("What it does", 336, "start")],
+            [[x["p"], x["v"], x["what"]] for x in r["params"]], 9)
+    p.heading("Wiring list")
+    for w in r["wiring"]:
+        p.need(150)
+        p.table([(f"Actuator {w['motor']}" + (f" (board {w['board']})" if r["boards"] > 1 else "") + ": drive", 200, "start"),
+                 ("goes to", 316, "start")], [[x["from"], x["to"]] for x in w["rows"]], 8.5)
+    _elec_pdf_imu(p, r)
+    p.heading("Printed parts and the actuator kit")
+    p.para(r["print"], 9.5)
+    for l_ in r["links"]:
+        p.need(30)
+        p.para(l_["title"], 9.5, True, gap=0)
+        p.para(l_["url"], 8.5, False, "dim", indent=12, gap=0)
+        p.para(l_["note"], 9, indent=12, gap=4)
+    p.heading("Parts, and what to search for")
+    c = r["cost"]
+    p.para(f"About {c['low']:,} to {c['high']:,} US dollars; the lines below come to {c['total']:,}.", 10.5, True)
+    p.table([("What", 236, "start"), ("How many", 46, "end"), ("About", 60, "end"), ("Search eBay or Amazon for", 174, "start")],
+            [[f"{i_['group']}: {i_['what']}", str(i_["qty"]), f"{i_['total']:,.0f} USD", i_["q"]] for i_ in c["items"]]
+            + [["Total of the lines above", "", f"{c['total']:,} USD", ""]], 8.5)
+    p.para(c["note"], 9, False, "dim")
+    p.heading("Step by step")
+    for i, s_ in enumerate(r["steps"]):
+        p.need(40)
+        p.para(f"{i + 1}. {s_['title']}", 10.5, True, gap=0)
+        p.para(s_["text"], 9.5, indent=14, gap=5)
+    _elec_pdf_fw_table(p, r.get("firmware"))
+    p.heading("Read this before building")
+    p.para("Servo drives run on mains voltage and keep it in their capacitors after switch-off: wire them in a closed box, "
+           "earth every drive and motor, and wait before touching terminals. A servo actuator pushes with hundreds of kilos: "
+           "test with nobody in or under the seat and the emergency stop in your hand. The numbers here come from the "
+           "SFX-100 project's published parts and settings and the drive's manual; check them against your own parts.", 9.5)
+    return p.bytes()
+
+
+class ElecStore:
+    """The electronics design's inputs, kept in the data folder so the wizard opens where it was left."""
+
+    def __init__(self, data_dir):
+        self.path = os.path.join(data_dir, "electronics.json")
+        self.lock = threading.Lock()
+        self.inputs = None
+        try:
+            with open(self.path) as fh:
+                self.inputs = elec_inputs(json.load(fh))
+        except (OSError, ValueError):
+            pass
+
+    def load(self):
+        with self.lock:
+            return dict(self.inputs) if self.inputs else elec_inputs({})
+
+    def save(self, inputs):
+        with self.lock:
+            if inputs == self.inputs:
+                return
+            self.inputs = dict(inputs)
+            try:
+                tmp = self.path + ".tmp"
+                with open(tmp, "w") as fh:
+                    json.dump(self.inputs, fh)
+                os.replace(tmp, self.path)
+            except OSError:
+                pass
+
+    @staticmethod
+    def meta(frame_inputs_=None):
+        fr = None
+        f = frame_inputs_
+        if f and f.get("drive") == "rotary":
+            i_rated = f["motor_w"] / (f["volts"] * 0.75)
+            fr = {"drive": "lever", "motors": min(6, int(f["motors"])), "motor": "custom", "volts": f["volts"], "watts": f["motor_w"],
+                  "rpm": round(f["rpm"] / max(f.get("ratio", 1) or 1, 0.01), 1), "i_rated": round(i_rated, 1),
+                  "i_stall": round(i_rated * f["torque_peak"] / max(f["torque"], 0.1), 1), "r_wind": 0.0,
+                  "lever": float(f.get("ctc") or 50.0), "swing": float(f.get("swing") or 45.0)}     # 2.9.5
+            try:                                             # 2.9.5: how hard its motors work on average
+                fr["load"] = float(frame_design(f)["actuator"]["load"])
+            except Exception:
+                pass
+        elif f and f.get("drive") == "linear":               # 2.9.5: the frame's screw actuators -> servo actuators
+            t = float(f.get("servo_torque") or 2.4)
+            pre = "sfx750" if abs(t - 2.4) < 0.05 else ("sfx400" if abs(t - 1.27) < 0.05 else "custom")
+            fr = {"drive": "servo", "motors": min(6, int(f["motors"])), "servo": pre, "srv_torque": t,
+                  "srv_peak": float(f.get("servo_peak") or t * 3), "srv_rpm": float(f.get("servo_rpm") or 3000),
+                  "srv_watts": ELEC_SERVOS[pre]["watts"] if pre != "custom" else round(t * float(f.get("servo_rpm") or 3000) / 9.549),
+                  "stroke": float(f.get("travel") or 100), "lead": float(f.get("lead") or 5)}
+        return {"motors": [{"id": k, "name": v[0], "values": v[1], "note": v[2]} for k, v in ELEC_MOTORS.items()],
+                "drivers": [{"id": k, "name": v["name"], "note": v["note"], "vmax": v["vmax"], "icont": v["icont_fan"], "ipeak": v["ipeak"],
+                             "fmax": v["fmax"], "prot": v["prot"], "ch": v["ch"],
+                             "fw": {"ibt2": "ok", "pwmdir": "mode1", "inab": "mode1", "none": "no"}[v["wire"]]} for k, v in ELEC_DRIVERS.items()],
+                "psus": [{"id": k, "name": v[0], "note": v[1], "unit": ELEC_PSU_UNIT.get(k)} for k, v in ELEC_PSUS.items()],
+                "wire": [{"id": k, "name": v} for k, v in ELEC_WIRE.items()],
+                "gauges": [{"mm2": g[2], "name": f"{g[1]} ({g[2]:g} mm2)", "amps": g[0]} for g in ELEC_GAUGE],
+                "fuses": list(ELEC_FUSES), "frame": fr,
+                "servos": [{"id": k, "name": v["name"], "note": v["note"], "watts": v["watts"], "torque": v["torque"],
+                            "peak": v["peak"], "rpm": v["rpm"]} for k, v in ELEC_SERVOS.items()],
+                "firmware": [{"setup": a, "fw": b, "how": c} for a, b, c in FIRMWARE_TABLE]}
+
+
+# --------------------------------------------------------------------------------------------------------------
+# Electronics design (2.9.5): ball-screw actuators with AC servos (SFX-100 style), driven by the servo build of
+# the firmware (SMC3_R4_Servo 2.2.0b1, BETA): pulse + direction through ULN2803A buffers
+# --------------------------------------------------------------------------------------------------------------
+# Facts used here, and where they come from:
+#   SFX-100 parts and quantities: the SimFeedback-AC-Servo wiki, Shopping List (K50 profile 250 mm, SFU1605 250 mm, FK12,
+#     LMEK30UU, 30 mm hollow shaft 270 mm, 30L40 coupling 10-16 mm, 90ST-M02430 220 V 750 W, DB25 cables and breakouts,
+#     O-rings 23.5 x 30.5 x 3.5, bolts DIN 912 M8x40 / M6x85 / M6x25 / M4x25 / DIN 6912 M5x20).
+#   Drive settings: the same wiki, AC Servo Settings (P8 300, P9 -300, P51 1200 -> 3000, P98 20, P109 1, P110 30, P113 20,
+#     P114 10, P115 100; P97 direction).
+#   AASD-15A CN2 (DB25): pin 3 / 14 pulse + / -, 4 / 5 direction + / -, 6 SigIn1 (servo-on by default), 9 / 10 the 12-24 V
+#     input supply and its common; differential pulses up to 500 kHz, open collector up to 200 kHz; main power L1 L2 L3
+#     220 V; Pn003 0 = servo-on from SigIn1, Pn096 0 = pulse + direction, Pn097 direction, Pn098 / Pn102 electronic gear.
+#   SFX-100 controller wiring (opensfx.com): STEP to pin 3, DIR to 4, ENA to 6, 5V to 9, GND to 5, 10, 14.
+#   UNO R4 pins: 8 mA each - less than a drive's optocoupler inputs want; hence the ULN2803A here.
+#   Print settings (rowanhick.com SFX-100 build guide): PLA, 0.25 mm layers, 8 perimeters, 12 top and bottom layers,
+#     20 % infill, about 180 hours for the set; the STL files are CC BY-NC-SA 4.0 (opensfx.com downloads).
+
+ELEC_SERVOS = {
+    "sfx750": {"name": "AASD-15A drive + 90ST-M02430 servo motor, 750 W (the SFX-100's)", "short": "AASD-15A, 750 W",
+               "watts": 750.0, "torque": 2.4, "peak": 7.2, "rpm": 3000.0, "shaft": 16, "usd": 230.0, "motor": "90ST-M02430",
+               "q": "90ST-M02430 AASD-15A 750W servo motor driver kit",
+               "note": "What the SFX-100 uses: 2.4 Nm all day, 7.2 Nm for a moment, 3000 rpm, a 2500-line encoder (10 000 "
+                       "counts a turn). Sold as a set with the drive and the motor and encoder cables. 220 V: ask the "
+                       "seller for the 110 V version if your mains is 120 V."},
+    "sfx400": {"name": "AASD-15A drive + 60ST-M01330 servo motor, 400 W", "short": "AASD-15A, 400 W",
+               "watts": 400.0, "torque": 1.27, "peak": 3.8, "rpm": 3000.0, "shaft": 14, "usd": 170.0, "motor": "60ST-M01330",
+               "q": "60ST-M01330 AASD-15A 400W servo motor driver kit",
+               "note": "Half the force of the 750 W set, same drive and wiring: seat movers and light cockpits."},
+    "custom": {"name": "Another pulse + direction servo (type its ratings)", "short": "servo drive",
+               "watts": 750.0, "torque": 2.4, "peak": 7.2, "rpm": 3000.0, "shaft": 16, "usd": 230.0, "motor": "servo motor",
+               "q": "AC servo motor driver kit pulse direction 220V",
+               "note": "Any drive in position mode that takes pulse + direction at 5 V and has a servo-on input. Check "
+                       "its manual against the wiring list; the pictures use the AASD-15A's DB25 pins."},
+}
+
+SFX_LINKS = (
+    ("STL files of the SFX-100 actuator (SimFeedback on GitHub)", "https://github.com/SimFeedback/SimFeedback-AC-Servo/tree/master/STL",
+     "The printed parts: motor mount, bearing holders, slider, bottom cap. CC BY-NC-SA 4.0: free for your own rig, not for sale."),
+    ("opensfx.com downloads", "https://opensfx.com/downloads/", "The same STL files, SimFeedback, and the licence terms."),
+    ("SFX-100 shopping list", "https://github.com/SimFeedback/SimFeedback-AC-Servo/wiki/Shopping-List",
+     "Every part and bolt of the actuator, with quantities for four."),
+    ("SFX-100 drive settings", "https://github.com/SimFeedback/SimFeedback-AC-Servo/wiki/AC-Servo-Settings",
+     "The servo parameters the SFX-100 builds use (the list below)."),
+    ("SFX-100 controller wiring (for comparison)", "https://opensfx.com/build-process-controller-wiring/",
+     "Their own wiring to an Arduino Leonardo; this page's wiring differs (buffered, servo-on at 24 V)."),
+    ("No printer? An assembled actuator kit (RobotDigg)", "https://www.robotdigg.com/product/2260/SFX-100-or-SFX-150-actuator-kit-assembled",
+     "SFX-100 / SFX-150 actuators with machined parts instead of printed ones, servo and drive included."),
+    ("Ball-screw kit for SFX-100 / SFX-150 (RobotDigg)", "https://www.robotdigg.com/product/1926/1605-Ball-Screw-kit-for-SFX-100-or-SFX-150-Actuator",
+     "SFU1605 with the ends machined, and the FK12."),
+)
+
+SFX_PRINT = ("PLA (PETG works too). 0.25 mm layers, 8 perimeters, 12 top and 12 bottom layers, 20 % infill - the SFX-100 "
+             "builders' settings for rigid parts. A set for four actuators takes about two weeks of printing (about 180 hours) "
+             "and about 3 kg of filament: start while the other parts are on their way. No printer: a makerspace or an "
+             "online print service can print them for your own use (the files are non-commercial), or buy an actuator kit "
+             "with machined parts.")
+
+SFX_PARAMS = (     # (parameter, value, what it does)
+    ("Pn003", "0", "servo on from SigIn1 (DB25 pin 6) - the default; the board switches the servo on and off"),
+    ("Pn096", "0", "pulse + direction input - the default"),
+    ("Pn098", "20", "electronic gear: 20 encoder counts a pulse = 500 pulses a turn (Pn102 = 1)"),
+    ("Pn051", "1200, later 3000", "top speed, rpm: start slowly, as the SFX-100 build does"),
+    ("Pn008 / Pn009", "300 / -300", "torque limits, as the SFX-100 sets them"),
+    ("Pn109 / Pn110", "1 / 30", "position smoothing on, 30 ms (SFX-100 values)"),
+    ("Pn113 / Pn114", "20 / 10", "speed feed-forward 20 %, its filter 10 ms (SFX-100 values)"),
+    ("Pn115", "100", "gain, % (SFX-100 value)"),
+    ("Pn097", "0 or 1", "motor direction: set it so more pulses lift the actuator (or tick Reverse on the page)"),
+)
+
+FIRMWARE_TABLE = (   # (your set-up, firmware, how)
+    ("Gear motor + lever, IBT-2 / BTS7960 bridges", "SMC3_R4 2.1.1 (release) or 2.2.0b1",
+     "As it comes: two PWM inputs per bridge, a pot or Hall sensor per motor."),
+    ("Gear motor + lever, Cytron MD30C / MD13S / MDD10A / SmartDriveDuo, VNH or 100 A bridges", "SMC3_R4 2.2.0b1",
+     "Settings, Motor drivers: PWM + direction - no recompiling. Cytrons: PWM 20 kHz."),
+    ("Ball-screw actuator turned by a DC motor, with a pot or Hall sensor", "as the gear motor above",
+     "To the board it is a DC motor with a position sensor - choose 'Gear motor' here and its driver."),
+    ("Ball-screw actuator with an AC servo (SFX-100 style: AASD-15A and similar), pulse + direction",
+     "SMC3_R4_Servo 2.2.0b1 - BETA", "Its own build (SERVO_STEPDIR 1): pulses, direction and servo-on, homing, no PID. "
+     "Three actuators per board: four take two boards."),
+    ("Sabertooth (serial or RC), servos only reachable over Modbus", "not supported", "They need a different controller."),
+)
+
+
+def _servo_inputs_fix(d, raw):
+    """Fill the servo fields from the chosen preset (when the preset was just picked)."""
+    if "servo" in raw and raw.get("servo") in ELEC_SERVOS and raw.get("servo") != "custom" and "srv_torque" not in raw:
+        sv = ELEC_SERVOS[raw["servo"]]
+        d.update(srv_watts=sv["watts"], srv_torque=sv["torque"], srv_peak=sv["peak"], srv_rpm=sv["rpm"])
+
+
+def elec_servo_design(d):
+    """The wizard's answer for ball-screw servo actuators (d: elec_inputs())."""
+    n = d["motors"]
+    boards = int(math.ceil(n / 3.0))
+    sv = dict(ELEC_SERVOS[d["servo"]])
+    lead, ppr, stroke = d["lead"], int(round(d["ppr"])), d["stroke"]
+    travel = int(round(stroke / lead * ppr))
+    eff = 0.9                                                    # ball screw
+    f_rated = 2 * math.pi * d["srv_torque"] * eff / (lead / 1000.0)
+    f_peak = 2 * math.pi * d["srv_peak"] * eff / (lead / 1000.0)
+    v_motor = d["srv_rpm"] / 60.0 * lead                         # mm/s at the motor's top speed
+    v_fw = 20000.0 / ppr * lead                                   # mm/s at the firmware's 20 kHz
+    v_top = min(v_motor, v_fw)
+    rpm_fw = 20000.0 / ppr * 60.0
+    res = lead / ppr
+    accel_k = int(round(5.0 * ppr / lead))                        # 5 m/s^2 -> 1000 pulses/s^2
+    mains = d["mains"]
+    w_all = n * d["srv_watts"]
+    amps_rated = w_all / (mains * 0.9)
+    checks, fixes = [], []
+
+    def chk(level, title, text):
+        checks.append({"level": level, "title": title, "text": text})
+
+    def fix(level, title, text, patch):
+        fixes.append({"level": level, "title": title, "text": text, "patch": patch})
+
+    # 1. firmware
+    chk("info", "Firmware: SMC3_R4_Servo 2.2.0b1 - a BETA",
+        "The servo build of the firmware (the result panel's Download button gives it set up for this design; also in "
+        "the package: firmware/SMC3_R4_Servo_v2.2.0b1). It sends pulse + direction "
+        "to each drive, switches the servos on and off, homes the actuators and plans each move within an acceleration "
+        "limit; SimHub talks SMC3 to it as before. It has not been tested on a real rig yet: it was checked on the PC "
+        "against a model of the board and works with this dashboard's simulator. First runs: actuators off the rig, "
+        "then nobody in the seat, the emergency stop in your hand.")
+    # 2. mains against the drives
+    if mains == 120:
+        chk("warn", "The SFX-100's servo sets are 220 V",
+            "On 120 V mains buy the 110 V version of the drive (ask the seller - the SFX-100 shopping list says the same), "
+            "or feed 220 V drives from a step-up transformer sized for all of them. A 220 V drive on 120 V lacks top speed "
+            "and may report under-voltage.")
+    else:
+        chk("ok", "220 V drives on 230 V mains", "Single phase on L1 and L2 (the drive's manual has the terminal names); "
+            "earth on the drive's PE terminal and on the motor.")
+    chk("info" if amps_rated < (13 if mains == 230 else 15) else "warn",
+        f"About {amps_rated:.0f} A from the wall if every servo ran flat out",
+        f"{n} x {d['srv_watts']:.0f} W. A motion rig works in short bursts and draws far less on average - SFX-100 builders "
+        "run four 750 W servos from an ordinary socket - but give the drives a circuit of their own if you can, behind a "
+        f"2-pole switch or breaker ({16 if mains == 230 else 20} A) and an RCD / GFCI.")
+    # 3. pulses
+    if travel > 32000:
+        chk("bad", "Too many pulses for the stroke", f"{stroke:g} mm at {ppr} pulses a turn and {lead:g} mm a turn is {travel} "
+            "pulses; the firmware counts up to 32 000. Set the drive to fewer pulses a turn (a larger electronic gear).")
+        fix("bad", "500 pulses a turn", "Pn098 = 20 on a 10 000-count encoder.", {"ppr": 500.0})
+    elif travel < 200:
+        chk("bad", "Too few pulses for the stroke", f"{travel} pulses; at least 200 give a usable resolution.")
+        fix("bad", "500 pulses a turn", "Pn098 = 20 on a 10 000-count encoder.", {"ppr": 500.0})
+    else:
+        chk("ok", f"{travel} pulses for {stroke:g} mm", f"{res:.3f} mm a pulse. SimHub's 0-1023 spans the stroke; the SMC3 Clip "
+            "window (100 by default) keeps its targets about 10 % from each end, so the nut never runs into the ends "
+            "in normal driving.")
+    if v_fw < v_motor * 0.6:
+        chk("info", f"The firmware's 20 kHz limits the speed to {v_fw:.0f} mm/s",
+            f"At {ppr} pulses a turn 20 000 pulses/s turn the motor at {rpm_fw:.0f} rpm, below its {d['srv_rpm']:.0f}. "
+            f"Fewer pulses a turn give more speed and coarser steps ({lead / max(1, ppr // 2):.3f} mm at half as many).")
+    elif rpm_fw > d["srv_rpm"] * 1.02:
+        lim = int(255 * d["srv_rpm"] / rpm_fw)
+        chk("warn", "PWMmax can ask for more than the motor's top speed",
+            f"PWMmax 255 = 20 000 pulses/s = {rpm_fw:.0f} rpm here; the motor is rated {d['srv_rpm']:.0f}. Keep PWMmax at "
+            f"{lim} or below (Tuning), or use more pulses a turn.")
+    else:
+        chk("ok", f"Top speed about {v_top:.0f} mm/s", f"PWMmax 255 = 20 000 pulses/s = {rpm_fw:.0f} rpm; PWMmax sets each "
+            "actuator's top speed, the acceleration limit (Settings, Servo actuators) how fast it gets there.")
+    # 4. force
+    chk("info", f"Each actuator pushes about {f_rated:.0f} N all day, {f_peak:.0f} N for a moment",
+        f"{d['srv_torque']:g} Nm through a {lead:g} mm lead (90 % efficient): about {f_rated / 9.81:.0f} kg each, "
+        f"{n * f_rated / 9.81:.0f} kg for all {n} - the Frame Design wizard checks it against your rig's weight.")
+    # 5. the board's pins
+    chk("info", "Through two ULN2803A per board",
+        "The UNO R4's pins give 8 mA, less than a drive's optocoupler inputs take, and the AASD-15A's servo-on input runs "
+        "on 12-24 V. A ULN2803A (8 switches to GND, about a dollar) between the board and the drives fixes both: the "
+        "drive's pulse + and direction + get the board's 5V, the ULN pulls the - side; servo-on (pin 6) is pulled to "
+        "0 V while pin 9 gets 24 V. A board that is off or restarting leaves the ULN off: the servos let go.")
+    # 6. homing
+    if d["home"] == "bottom":
+        chk("warn", "Homing at the bottom: keep clear for the first 4 s",
+            "After power-up (and Home again) the board releases the servos for 4 s: the seat sinks onto the actuators' "
+            "bottom ends, and that counts as zero - what SimFeedback does. It needs the servo-on wire (the board must be "
+            "able to let go) and actuators that sink by themselves (a ball screw does under the seat's weight). Nothing may "
+            "be under the seat then.")
+    else:
+        chk("ok", "Home switches", "A normally closed micro switch at the bottom of each actuator, between A0 / A1 / A2 and "
+            "GND: the actuator drives down until it opens. A switch that never opens (a broken wire) is noticed: homing "
+            "stops and that actuator stays off.")
+    # 7. emergency stop
+    if d["estop"] == "none":
+        chk("bad", "No emergency stop", "A rig that lifts a person needs a button within reach that stops it whatever the "
+            "board does.")
+        fix("bad", "Add the emergency stop", "Its first contact cuts the servo-on supply, the second tells the board.",
+            {"estop": "relay"})
+    else:
+        chk("ok", "Emergency stop: servo-on cut, and the board told",
+            f"A latching button with {1 + boards} normally closed contacts: the first is in the +24 V wire to every drive's "
+            "pin 9 - the servos let go at once, whatever the board does; the next one opens A3 to GND on "
+            + ("each board" if boards > 1 else "the board") + " - it stops, releases the servos and counts the positions as "
+            "lost. Afterwards: release the button, Enable Motors, and the board homes first."
+            + (" The mains contactor also cuts the drives' power." if d["estop"] == "ac" else ""))
+    # 8. boards
+    if boards > 1:
+        chk("info", f"{n} actuators need {boards} boards", "One board drives three actuators (SimHub's SMC3 device has three "
+            "channels). The second board is wired the same way, is a second SMC3 device in SimHub and needs its own copy "
+            "of this page. Split four actuators 3 + 1, or 2 + 2.")
+    chk("info", "Set the drives up first (on the bench)",
+        "Before the board drives anything, set each drive: " + "; ".join(f"{p} = {v}" for p, v, _w in SFX_PARAMS[:4]) +
+        ". The full list is in the Build step.")
+    chk("info", "Cables", "DB25 cables with the shield joined to the drive's metal case only, not at the board. Motor and "
+        "encoder cables as they come with the set, kept apart from the DB25 cables.")
+    elec_imu_check(chk, d)                                # 2.9.5
+
+    order = {"bad": 3, "warn": 2, "ok": 1, "info": 0}
+    verdict = max((c["level"] for c in checks), key=lambda x: order[x])
+    verdict = verdict if verdict in ("bad", "warn") else "ok"
+
+    # ------------------------------------------------------------------ wiring list
+    wiring = []
+    for m in range(n):
+        j = m % 3
+        b = m // 3 + 1
+        u1 = f"ULN2803A no. 1 of board {b}" if boards > 1 else "ULN2803A no. 1"
+        u2 = f"ULN2803A no. 2 of board {b}" if boards > 1 else "ULN2803A no. 2"
+        rows = [("DB25 pin 3 (PULS+)", "the board's 5V"),
+                ("DB25 pin 14 (PULS-)", f"{u1}, pin {18 - 2 * j} (its input, pin {1 + 2 * j}: D{2 + 2 * j})"),
+                ("DB25 pin 4 (SIGN+)", "the board's 5V"),
+                ("DB25 pin 5 (SIGN-)", f"{u1}, pin {17 - 2 * j} (its input, pin {2 + 2 * j}: D{3 + 2 * j})"),
+                ("DB25 pin 6 (SigIn1 = servo-on)", f"{u2}, pin {18 - j} (its input, pin {1 + j}: D{9 + j})"),
+                ("DB25 pin 9 (COM+, 12-24 V)", "+24 V, through the emergency stop's first contact"),
+                ("DB25 pin 10 (COM)", "0 V of the 24 V supply = the board's GND = the ULN2803A's pin 9")]
+        if d["home"] == "switches":
+            rows.append(("home switch (NC, at the bottom)", f"A{j} and GND"))
+        rows += [("L1, L2 and PE", "mains, through the breaker" + (" and the contactor" if d["estop"] == "ac" else "")),
+                 ("U, V, W and PE", f"servo motor {m + 1} (its power cable)"),
+                 ("encoder socket", f"servo motor {m + 1}'s encoder cable")]
+        wiring.append({"motor": m + 1, "board": b, "rows": [{"from": a, "to": c} for a, c in rows]})
+
+    # ------------------------------------------------------------------ parts and cost
+    items = []
+
+    def add(group, what, qty, each, q, note=""):
+        if qty > 0:
+            it = {"group": group, "what": what, "qty": int(qty), "each": round(each, 2), "total": round(qty * each, 2), "note": note}
+            it.update(_elec_link(q))
+            items.append(it)
+    add("Actuators", sv["name"].split(" (")[0] if d["servo"] != "custom" else "pulse + direction servo motor and drive",
+        n, sv["usd"], sv["q"], "with motor and encoder cables")
+    add("Actuators", "aluminium profile 100 x 100 (K50 system), 250 mm", n, 35.0, "100x100 aluminium profile 250mm")
+    add("Actuators", "SFU1605 ball screw 250 mm, ends machined for FK12, with its nut", n, 30.0, "SFU1605 ball screw 250mm FK12 end machining")
+    add("Actuators", "FK12 fixed bearing block", n, 15.0, "FK12 fixed bearing support")
+    add("Actuators", "LMEK30UU flanged linear bearing", n, 14.0, "LMEK30UU linear bearing")
+    add("Actuators", "hollow shaft 30 mm, 270 mm long, chamfered", n, 25.0, "30mm hollow linear shaft 270mm")
+    add("Actuators", f"shaft coupling D30 L40, 10 x {sv['shaft']} mm", n, 8.0, f"D30 L40 shaft coupling 10mm {sv['shaft']}mm")
+    add("Actuators", "bolts: DIN 912 M8x40, M6x85, M6x25, M4x25, DIN 6912 M5x20, washers", 1, 15.0 + 7.0 * n,
+        "DIN 912 socket head cap screw assortment M4 M5 M6 M8", f"{8 * n} M8x40, {4 * n} M6x85, {4 * n} M6x25, {4 * n} M4x25, {6 * n} M5x20")
+    add("Actuators", "O-ring 23.5 x 30.5 x 3.5 mm (the bumper) and rubber feet", 1, 12.0, "O-ring 23.5x30.5x3.5")
+    add("Actuators", "PLA filament, 1 kg (for the printed parts)", int(math.ceil(0.75 * n)), 20.0, "PLA filament 1kg 1.75mm")
+    add("Wiring", "DB25 cable, male to male, shielded", n, 9.0, "DB25 cable male male shielded 2m")
+    add("Wiring", "DB25 male breakout board with screw terminals", n, 10.0, "DB25 breakout board screw terminal")
+    add("Board", "ULN2803A (8 open-collector switches, DIP-18) and sockets", 2 * boards, 2.0, "ULN2803A DIP-18")
+    add("Board", "perfboard, screw terminals, jumper wires", boards, 12.0, "perfboard screw terminal block 5mm")
+    add("Power", "24 V supply, 1 A (servo-on and the drives' inputs)", 1, 14.0, "24V 1A DIN rail power supply")
+    add("Power", f"2-pole switch or circuit breaker, {16 if mains == 230 else 20} A, in a box", 1, 25.0, "2 pole circuit breaker enclosure")
+    add("Power", "mains wire 1.5 mm2 (14 AWG), ferrules, earth wire", 1, 20.0, "1.5mm2 3 core cable")
+    add("Protection", f"emergency stop button, latching, with {1 + boards} NC contact blocks", 1, 18.0, "emergency stop mushroom button NC contact block")
+    if d["estop"] == "ac":
+        add("Protection", f"contactor for the drives' mains, {mains} V coil, 25 A", 1, 25.0, f"contactor 25A {mains}V coil")
+    if d["home"] == "switches":
+        add("Sensors", "micro switch with lever, NC contact (home switch)", n, 4.0, "micro limit switch lever NC")
+        add("Sensors", "2-core cable for the switches", 1, 8.0, "2 core cable 0.25mm2")
+    add("Board", "Arduino UNO R4 WiFi", boards, 28.0, "Arduino UNO R4 WiFi")
+    add("Board", "12 V DC adapter for the board's barrel jack: 1 A or more, 5.5 x 2.1 mm plug, centre + (USB alone sags the 5 V)",
+        boards, 9.0, "12V 1A power adapter 5.5x2.1mm")                 # 2.9.5
+    elec_parts_imu(add, d)                                # 2.9.5: the motion sensor on the seat
+    total = sum(i_["total"] for i_ in items)
+    groups = []
+    for i_ in items:
+        if i_["group"] not in groups:
+            groups.append(i_["group"])
+    r10 = lambda x: int(round(x / 10.0) * 10)
+    cost = {"currency": "USD", "items": items, "total": r10(total), "low": r10(total * 0.8), "high": r10(total * 1.3),
+            "groups": [{"name": g_, "total": round(sum(i_["total"] for i_ in items if i_["group"] == g_))} for g_ in groups],
+            "note": "A ball-park in US dollars; the links open a search, so compare a few listings. The servo sets are most "
+                    "of it; an assembled actuator kit replaces the Actuators lines but the servo set."}
+
+    steps = [
+        ("Print the parts", SFX_PRINT),
+        ("Build the actuators", "Follow the SFX-100 build (the STL folder and the shopping list are linked below): FK12 and "
+         "ball screw in the profile, the nut in the printed slider on the hollow shaft, the LMEK30UU in the bottom cap, "
+         "the coupling to the motor. Turn the screw by hand from end to end: it must run freely."),
+        ("Set each drive up on the bench", "Drive on the mains alone, its motor connected, nothing else: "
+         + "; ".join(f"{p} {v}" for p, v, _w in SFX_PARAMS) + ". Its own jog mode (see its manual) turns the motor to check it."),
+        ("Wire the interface, everything unplugged", "Two ULN2803A per board on a perfboard, the 24 V supply, the DB25 "
+         "breakouts and the emergency stop as the Signal wiring and Emergency stop pictures show. Check 5V, 24 V and 0 V "
+         "with a meter before plugging the DB25 cables in. Each board gets its own 12 V adapter (1 A or more, 5.5 x 2.1 mm, "
+         "centre +) in its barrel jack and keeps its USB cable: on USB alone its 5V sags to about 4.7 V."),
+        ("Load the firmware", "Download it from the result panel (it is set up for this design: stroke, homing, the e-stop "
+         "contact), unzip, open it in the Arduino IDE, your WiFi name and password at the top, board 'Arduino UNO R4 WiFi', "
+         "Upload. The matrix's corner LED and the L LED blink: beta firmware."),
+        ("First power-up, actuators off the rig", "Settings, Servo actuators: stroke, lead, pulses a turn, homing, "
+         "servo-on HIGH, the e-stop contact - Save. Watch them home. Move one with its motor card's knob a little: up must "
+         "be up (else tick Reverse or set Pn097). Press the emergency stop: all must go limp and the page must say so."),
+        ("On the rig", "Mount them, nobody in the seat: Seat setup, then SimHub (one SMC3 device per board) with low "
+         "intensity first. Raise PWMmax and the acceleration limit step by step."),
+    ]
+    if d["imu"]:
+        steps.insert(len(steps) - 1, ("The motion sensor", IMU_STEP))
+    out = {
+        "inputs": d, "verdict": verdict, "checks": checks, "fixes": fixes, "servo": sv,
+        "boards": boards, "driver_units": n,
+        "numbers": {"travel": travel, "res": res, "f_rated": f_rated, "f_peak": f_peak, "v_top": v_top, "v_fw": v_fw,
+                    "v_motor": v_motor, "rpm_fw": rpm_fw, "accel_k": accel_k, "amps_rated": amps_rated, "w_all": w_all},
+        "wiring": wiring, "wire_kind": "pulse + direction, servo-on (ULN2803A)", "cost": cost,
+        "steps": [{"title": a, "text": b} for a, b in steps],
+        "links": [{"title": a, "url": u, "note": c} for a, u, c in SFX_LINKS], "print": SFX_PRINT,
+        "params": [{"p": a, "v": b, "what": c} for a, b, c in SFX_PARAMS],
+    }
+    out["scenes"] = elec_servo_scenes(d, out)
+    out["firmware"] = elec_firmware_public(d)             # 2.9.5: the sketch for this build, ready to download
+    out["imu_wiring"] = elec_imu_rows() if d["imu"] else None
+    return out
+
+
+# ---------------------------------------------------------------------------------------------------- pictures
+def _ic_uln(sc, x, y, title, used):
+    """A ULN2803A from above: inputs 1-8 down the left (pins 1-8), outputs 1-8 down the right (pins 18-11), GND (9)
+    and COM (10) at the bottom.  used: input number -> (label, colour)."""
+    w, pitch = 150, 26.0
+    h = 8 * pitch + 60
+    sc.r(x, y, w, h, "#212529", "#000000", 2, 6)
+    sc.c(x + w / 2, y + 4, 9, "#ffffff", "", 0)                       # the notch
+    sc.x(x + w / 2, y + h - 24, "ULN2803A", 13, "#ffffff", "m", 1)
+    sc.x(x + w / 2, y + h - 8, title, 10, "#adb5bd", "m")
+    ins, outs = {}, {}
+    for i in range(8):
+        py = y + 30 + i * pitch
+        on = (i + 1) in used
+        for side, px in ((0, x - 8), (1, x + w)):
+            sc.r(px, py - 5, 8, 10, "#ced4da" if on else "#6c757d", "#868e96", 1, 1)
+        sc.x(x + 12, py + 4, f"{i + 1}", 10, "#ffffff" if on else "#868e96", "s", 1)
+        sc.x(x + w - 12, py + 4, f"{18 - i}", 10, "#ffffff" if on else "#868e96", "e", 1)
+        if on:
+            lab, _col = used[i + 1]
+            sc.x(x + w / 2, py + 4, lab, 10, "#ffd43b", "m", 1)
+        ins[i + 1] = (x - 8, py)
+        outs[i + 1] = (x + w + 8, py)
+    gnd = (x + 40, y + h + 10)
+    com = (x + w - 40, y + h + 10)
+    sc.r(gnd[0] - 5, y + h, 10, 10, "#ced4da", "#868e96", 1, 1); sc.r(com[0] - 5, y + h, 10, 10, "#6c757d", "#868e96", 1, 1)
+    sc.x(gnd[0] + 8, y + h + 24, "pin 9 GND", 10, "#212529", "s", 1); sc.x(com[0] - 4, y + h + 24, "10 COM: open", 10, "#868e96", "s", 1)
+    return ins, outs, gnd, h
+
+
+def _ic_db25(sc, x, y, n, rows):
+    """A DB25 breakout board with the used terminals: rows = [(pin, label, colour key)]."""
+    pitch = 22.0
+    h = len(rows) * pitch + 44
+    w = 230
+    sc.r(x, y, w, h, "#2b8a3e", "#1e6b30", 2, 6)
+    sc.r(x + w - 40, y + 16, 30, h - 32, "#868e96", "#495057", 2, 6)          # the D-sub on the board
+    sc.x(x + 10, y + 18, f"Drive {n}: DB25 (CN2)", 12, "#ffffff", "s", 1)
+    pins = {}
+    for i, (pn, lab, ck) in enumerate(rows):
+        py = y + 38 + i * pitch
+        sc.r(x - 6, py - 7, 14, 14, "#ced4da", "#495057", 1, 2)
+        sc.x(x + 14, py + 4, f"{pn}", 11, "#ffffff", "s", 1)
+        sc.x(x + 38, py + 4, lab, 10.5, "#e6fcf5", "s", 0)
+        pins[pn] = (x - 6, py, ck)
+    sc.x(x + w / 2, y + h + 16, "cable to the drive's CN2", 10, "#495057", "m")
+    return pins, h
+
+
+def _ic_drive(sc, x, y, n, name, w=180, h=150):
+    """A servo drive from the front: display and keys, mains in on top (L1 L2 L3, earth), motor out at the bottom
+    (U V W, earth), CN2 (the DB25) on the right."""
+    sc.r(x, y, w, h, "#343a40", "#212529", 2, 8)
+    sc.r(x + 12, y + 30, 70, 26, "#0b7285", "#063f48", 1.5, 3)
+    sc.x(x + 47, y + 49, "88888", 13, "#c3fae8", "m", 1)
+    for i in range(4):
+        sc.c(x + 100 + i * 20, y + 43, 7, "#495057", "#868e96", 1)
+    sc.x(x + 10, y + 18, f"Servo drive {n}", 12, "#ffffff", "s", 1)
+    if name:
+        sc.x(x + w - 8, y + 18, name, 9.5, "#ced4da", "e")
+    sc.r(x + w - 34, y + 66, 26, 50, "#868e96", "#495057", 1.5, 4)
+    sc.x(x + w - 21, y + 128, "CN2", 9, "#ced4da", "m", 1)
+    pins = {}
+    for i, (k, f) in enumerate((("L1", "#adb5bd"), ("L2", "#adb5bd"), ("L3", "#6c757d"), ("PE", "#69db7c"))):
+        px = x + 20 + i * 32
+        sc.r(px - 9, y - 10, 18, 12, f, "#495057", 1, 2)
+        sc.x(px, y + 76, k, 10, "#ced4da" if k != "L3" else "#868e96", "m", 1)
+        pins[k if k != "PE" else "PEin"] = (px, y - 10)
+    for i, k in enumerate(("U", "V", "W", "PE")):
+        px = x + 20 + i * 30
+        sc.r(px - 9, y + h - 2, 18, 12, "#adb5bd" if k != "PE" else "#69db7c", "#495057", 1, 2)
+        sc.x(px, y + h - 12, k, 10, "#ced4da", "m", 1)
+        pins[k] = (px, y + h + 10)
+    pins["CN2"] = (x + w, y + 91)
+    pins["ENC"] = (x + w - 21, y + h)
+    return pins
+
+
+def _ic_servo_motor(sc, x, y, n, vertical=True):
+    """A servo motor end-on to its actuator: square flange, body, cable glands."""
+    if vertical:
+        sc.r(x, y, 90, 26, "#ced4da", "#868e96", 2, 4)                          # flange
+        sc.r(x + 8, y - 120, 74, 122, "#212529", "#000000", 2, 8)                # body
+        sc.r(x + 8, y - 120, 74, 18, "#495057", "", 0, 6)
+        sc.c(x + 26, y - 110, 6, "#868e96", "", 0); sc.c(x + 64, y - 110, 6, "#868e96", "", 0)
+        sc.x(x + 45, y - 50, f"M{n}", 15, "#ffffff", "m", 1)
+        return {"pow": (x + 26, y - 120), "enc": (x + 64, y - 120)}
+    sc.r(x, y, 26, 90, "#ced4da", "#868e96", 2, 4)
+    sc.r(x + 24, y + 8, 122, 74, "#212529", "#000000", 2, 8)
+    sc.x(x + 90, y + 52, f"M{n}", 15, "#ffffff", "m", 1)
+    return {"pow": (x + 146, y + 26), "enc": (x + 146, y + 64)}
+
+
+def _ic_actuator_small(sc, x, y, n, h=150):
+    """A ball-screw actuator standing up: motor on top, the profile, the rod down."""
+    sc.r(x + 10, y, 44, 36, "#212529", "#000000", 2, 6)
+    sc.r(x + 4, y + 34, 56, 10, "#ced4da", "#868e96", 1.5, 2)
+    sc.r(x + 8, y + 44, 48, h - 70, "#ced4da", "#868e96", 2, 4)
+    for i in range(3):
+        sc.l([(x + 16 + i * 16, y + 50), (x + 16 + i * 16, y + h - 32)], "#adb5bd", 1.5)
+    sc.r(x + 24, y + h - 26, 16, 22, "#adb5bd", "#868e96", 1.5, 2)
+    sc.r(x + 18, y + h - 6, 28, 8, "#495057", "", 0, 3)
+    sc.x(x + 32, y + 24, f"{n}", 12, "#ffffff", "m", 1)
+    return {"top": (x + 32, y), "left": (x + 10, y + 18)}
+
+
+def _ic_breaker(sc, x, y, label):
+    sc.r(x, y, 70, 96, "#f1f3f5", "#868e96", 2, 6)
+    for i in range(2):
+        sc.r(x + 12 + i * 26, y + 30, 20, 34, "#495057", "", 0, 3)
+        sc.r(x + 16 + i * 26, y + 34, 12, 14, "#ced4da", "", 0, 2)
+    sc.x(x + 35, y + 86, "2-pole", 10, "#495057", "m", 1)
+    sc.x(x + 35, y - 8, label, 11, "#212529", "m", 1)
+    return {"inL": (x + 22, y), "inN": (x + 48, y), "outL": (x + 22, y + 96), "outN": (x + 48, y + 96)}
+
+
+def _ic_psu24(sc, x, y, title="24 V supply, 1 A"):
+    sc.r(x, y, 150, 86, "#dee2e6", "#868e96", 2, 6)
+    for i in range(6):
+        sc.c(x + 20 + i * 22, y + 18, 3, "#adb5bd", "", 0)
+    sc.x(x + 75, y + 46, title, 12, "#212529", "m", 1)
+    pins = {}
+    for i, (k, col) in enumerate((("L", "L"), ("N", "N"), ("PE", "PE"), ("0V", "neg"), ("+24V", "pos"))):
+        px = x + 15 + i * 30
+        sc.c(px, y + 72, 6, "#ced4da", "#868e96", 1.5)
+        sc.x(px, y + 62, k, 9, "#212529", "m", 1)
+        pins[k] = (px, y + 86)
+    return pins
+
+
+def _contact(sc, x, y, label, vertical=False):
+    """A normally closed contact block: two terminals and the bridge."""
+    if vertical:
+        sc.r(x - 14, y, 28, 56, "#fff3bf", "#e67700", 1.5, 4)
+        sc.c(x, y + 12, 4, "#495057", "", 0); sc.c(x, y + 44, 4, "#495057", "", 0)
+        sc.l([(x - 6, y + 14), (x - 6, y + 42)], "#212529", 3)
+        sc.x(x + 20, y + 32, label, 10, "#212529", "s", 1)
+        return {"a": (x, y), "b": (x, y + 56)}
+    sc.r(x, y - 14, 56, 28, "#fff3bf", "#e67700", 1.5, 4)
+    sc.c(x + 12, y, 4, "#495057", "", 0); sc.c(x + 44, y, 4, "#495057", "", 0)
+    sc.l([(x + 14, y - 6), (x + 42, y - 6)], "#212529", 3)
+    sc.x(x + 28, y - 20, label, 10, "#212529", "m", 1)
+    return {"a": (x, y), "b": (x + 56, y)}
+
+
+def elec_servo_power(d, r):
+    n = d["motors"]
+    mains = d["mains"]
+    ac = d["estop"] == "ac"
+    sc = _ESc(1500, 100)
+    sc.x(30, 40, "Power wiring: mains to the servo drives", 22, "#212529", "s", 1)
+    sc.x(30, 64, f"{n} drive{'s' if n > 1 else ''} on {mains} V single phase (L1 and L2; L3 stays free), each with its motor. "
+                 "The motor and encoder cables come with the servo sets.", 13, "#495057")
+    sc.x(30, 86, "Mains wiring: in a closed box, by someone who knows how. The drives keep a charge after switch-off.", 12, "#c92a2a", "s", 1)
+    plug = _ic_plug(sc, 40, 140, mains)
+    br = _ic_breaker(sc, 240, 150, "")
+    sc.x(320, 190, f"2-pole {16 if mains == 230 else 20} A", 11, "#212529", "s", 1)
+    sc.x(320, 206, "+ RCD / GFCI", 10, "#495057", "s")
+    sc.l([plug["L"], (196, plug["L"][1]), (196, 128), (br["inL"][0], 128), br["inL"]], EW["L"], 3)
+    sc.l([plug["N"], (206, plug["N"][1]), (206, 136), (br["inN"][0], 136), br["inN"]], EW["N"], 3)
+    yL, yN, yPE = 330.0, 352.0, 374.0
+    if ac:                                                              # the contactor right under the breaker
+        sc.r(232, 262, 86, 48, "#495057", "#212529", 2, 6)
+        sc.x(275, 291, "K1", 12, "#ffffff", "m", 1)
+        sc.x(326, 282, "contactor", 11, "#212529", "s", 1)
+        sc.x(326, 298, "coil: Emergency stop", 10, "#495057", "s")
+        sc.l([br["outL"], (br["outL"][0], 262)], EW["L"], 3); sc.l([br["outN"], (br["outN"][0], 262)], EW["N"], 3)
+        sc.l([(br["outL"][0], 310), (br["outL"][0], yL), (500, yL)], EW["L"], 3)
+        sc.l([(br["outN"][0], 310), (br["outN"][0], yN), (500, yN)], EW["N"], 3)
+    else:
+        sc.l([br["outL"], (br["outL"][0], yL), (500, yL)], EW["L"], 3)
+        sc.l([br["outN"], (br["outN"][0], yN), (500, yN)], EW["N"], 3)
+    sc.l([plug["PE"], (130, plug["PE"][1]), (130, yPE), (500, yPE)], EW["PE"], 3)
+    xs = [530 + i * 205 for i in range(n)]
+    end = xs[-1] + 150
+    sc.l([(500, yL), (end, yL)], EW["L"], 4); sc.l([(500, yN), (end, yN)], EW["N"], 4); sc.l([(500, yPE), (end, yPE)], EW["PE"], 4)
+    sc.x(506, yL - 8, "L", 11, EW["L"], "s", 1); sc.x(506, yN - 8, "N", 11, EW["N"], "s", 1); sc.x(506, yPE + 16, "earth", 11, EW["PE"], "s", 1)
+    yd = 440.0
+    for i in range(n):
+        x = xs[i]
+        dp = _ic_drive(sc, x, yd, i + 1, "")
+        sc.l([(dp["L1"][0], yL), dp["L1"]], EW["L"], 3); sc.dot(dp["L1"][0], yL, EW["L"])
+        sc.l(_hop_v(dp["L2"][0], yN, dp["L2"][1], []), EW["N"], 3); sc.dot(dp["L2"][0], yN, EW["N"])
+        sc.l([(dp["PEin"][0], yPE), dp["PEin"]], EW["PE"], 3); sc.dot(dp["PEin"][0], yPE, EW["PE"])
+        mo = _ic_servo_motor(sc, x + 45, 830, i + 1)
+        for k, dy in (("U", 0), ("V", 8), ("W", 16)):
+            sc.l([dp[k], (dp[k][0], 640 + dy), (mo["pow"][0] - 8 + dy, 640 + dy), (mo["pow"][0] - 8 + dy, mo["pow"][1])], EW["mcab"], 2.5)
+        sc.l([dp["PE"], (dp["PE"][0], 668), (mo["pow"][0] + 18, 668), (mo["pow"][0] + 18, mo["pow"][1])], EW["PE"], 2.5)
+        sc.l([dp["ENC"], (dp["ENC"][0], 676), (mo["enc"][0] + 4, 676), (mo["enc"][0] + 4, mo["enc"][1])], "#868e96", 2.5, 1)
+        sc.x(x + 90, 880, f"servo motor {i + 1}", 11, "#212529", "m", 1)
+    sc.x(xs[0], 912, "Each motor: its power cable (U V W + earth) and its encoder cable (dashed) to its own drive.", 12, "#212529")
+    # the 24 V supply, fed after the breaker
+    p24 = _ic_psu24(sc, 70, 540)
+    for k_ in ("L", "N", "PE"):
+        sc.l([(p24[k_][0], 540), (p24[k_][0], 516)], EW[k_], 2)
+    sc.x(70, 506, "fed from L and N after the breaker, and earth", 10.5, "#495057", "s", 1)
+    sc.l([p24["+24V"], (p24["+24V"][0], p24["+24V"][1] + 26), (p24["+24V"][0] + 16, p24["+24V"][1] + 26)], EW["p24"], 2.5)
+    sc.tag(p24["+24V"][0] + 20, p24["+24V"][1] + 26, "+24 V: through the e-stop to pin 9", EW["p24"], "#ffffff", 9.5, "s")
+    sc.l([p24["0V"], (p24["0V"][0], p24["0V"][1] + 56), (p24["0V"][0] + 16, p24["0V"][1] + 56)], EW["gnd"], 2.5)
+    sc.tag(p24["0V"][0] + 20, p24["0V"][1] + 56, "0 V: to the board's GND", EW["gnd"], "#ffffff", 9.5, "s")
+    sc.x(70, 730, "See Signal wiring and", 11, "#495057", "s")
+    sc.x(70, 746, "Emergency stop.", 11, "#495057", "s")
+    sc.h = 990
+    sc.w = max(1500.0, end + 60)
+    _legend(sc, 40, sc.h - 30, ("L", "N", "PE", "mcab", "p24", "gnd"))
+    return sc.done("Power wiring", "Single-phase mains to L1 and L2 of each drive (check its manual's terminal names); "
+                                   "every drive and motor earthed.")
+
+
+def elec_servo_signals(d, board):
+    n = d["motors"]
+    first = (board - 1) * 3
+    motors = list(range(first, min(n, first + 3)))
+    sw = d["home"] == "switches"
+    es = d["estop"] != "none"
+    boards = int(math.ceil(n / 3.0))
+    sc = _ESc(1500, 1000)
+    sc.x(30, 40, f"Signal wiring{f', board {board}' if boards > 1 else ''}: actuators {motors[0] + 1}-{motors[-1] + 1}"
+         if len(motors) > 1 else f"Signal wiring{f', board {board}' if boards > 1 else ''}: actuator {motors[0] + 1}", 22, "#212529", "s", 1)
+    sc.x(30, 64, "Pulse, direction and servo-on through two ULN2803A: the board's pins switch them, they pull the drives' "
+                 "inputs to 0 V. Pulse + and direction + get the board's 5V; pin 9 gets 24 V through the emergency stop.",
+         13, "#495057")
+    used = {"5V": EW["v5"], "GND": EW["gnd"]}
+    w1, w2 = {}, {}
+    for j, m in enumerate(motors):
+        used[f"D{2 + 2 * j}"] = EW["step"]; used[f"D{3 + 2 * j}"] = EW["sdir"]; used[f"D{9 + j}"] = EW["son"]
+        w1[1 + 2 * j] = (f"STEP {m + 1}", "step"); w1[2 + 2 * j] = (f"DIR {m + 1}", "sdir"); w2[1 + j] = (f"SON {m + 1}", "son")
+        if sw:
+            used[f"A{j}"] = EW["sens"]
+    if es:
+        used["A3"] = EW["coil"]
+    if d.get("imu") and board == 1:
+        used["D0"], used["D1"] = EW["imutx"], EW["imurx"]
+    ux, uy = 200.0, 120.0
+    up, _box = _ic_uno(sc, ux, uy, used, "Arduino UNO R4 WiFi", "SMC3_R4_Servo firmware (beta)")
+    elec_board_power(sc, ux, uy, 20, 74)                          # 2.9.5: the board's own 12 V adapter
+    u1x, u1y = 700.0, 110.0
+    in1, out1, g1, h1 = _ic_uln(sc, u1x, u1y, "no. 1: pulse, direction", w1)
+    u2y = u1y + h1 + 70
+    in2, out2, g2, h2 = _ic_uln(sc, u1x, u2y, "no. 2: servo-on", w2)
+    # board pins -> ULN inputs, each in its own lane
+    links = []
+    for j, m in enumerate(motors):
+        links += [(f"D{2 + 2 * j}", in1[1 + 2 * j], "step"), (f"D{3 + 2 * j}", in1[2 + 2 * j], "sdir"), (f"D{9 + j}", in2[1 + j], "son")]
+    links.sort(key=lambda t: up[t[0]][1])
+    for i, (bp, (tx, ty), col) in enumerate(links):
+        sx, sy = up[bp]
+        lx = 540 + i * 15
+        sc.l([(sx, sy), (lx, sy), (lx, ty), (tx, ty)], EW[col], 3)
+    # GND of both ULNs
+    for g in (g1, g2):
+        sc.l([g, (g[0], g[1] + 6)], EW["gnd"], 3)
+        sc.tag(g[0] - 4, g[1] + 46, "GND", EW["gnd"], "#ffffff", 10, "e")
+        sc.l([(g[0], g[1] + 6), (g[0], g[1] + 46), (g[0] - 4, g[1] + 46)], EW["gnd"], 3)
+    # drives' breakouts on the right
+    bx, by = 1130.0, 100.0
+    bpins = []
+    for j, m in enumerate(motors):
+        rows = [(3, "PULS+  <- 5V", "v5"), (14, "PULS-  <- ULN 1", "step"), (4, "SIGN+  <- 5V", "v5"), (5, "SIGN-  <- ULN 1", "sdir"),
+                (6, "SigIn1 = servo-on  <- ULN 2", "son"), (9, "COM+ 12-24 V  <- +24 V", "p24"), (10, "COM  <- 0 V / GND", "gnd")]
+        pins, h = _ic_db25(sc, bx, by, m + 1, rows)
+        bpins.append(pins)
+        by += h + 44
+    # ULN outputs -> drive pins
+    outs = []
+    for j, m in enumerate(motors):
+        outs += [(out1[1 + 2 * j], bpins[j][14], "step"), (out1[2 + 2 * j], bpins[j][5], "sdir"), (out2[1 + j], bpins[j][6], "son")]
+    outs.sort(key=lambda t: t[0][1])
+    for i, ((sx, sy), (tx, ty, _k), col) in enumerate(outs):
+        lx = 890 + i * 16
+        sc.l([(sx, sy), (lx, sy), (lx, ty), (tx, ty)], EW[col], 3)
+    # 5V / +24 V / 0 V by flags
+    for j in range(len(motors)):
+        for pn, lab, col in ((3, "5V", "v5"), (4, "5V", "v5"), (9, "+24 V", "p24"), (10, "0 V", "gnd")):
+            tx, ty, _k = bpins[j][pn]
+            sc.l([(tx, ty), (tx - 16, ty)], EW[col], 3)
+            sc.tag(tx - 20, ty, lab, EW[col], "#ffffff", 9.5, "e")
+    for key, lab, col in (("L5V", "5V strip", "v5"), ("LGND", "GND strip = 0 V", "gnd")):
+        px_, py_ = up[key]
+        sc.l([(px_, py_), (px_ - 20, py_)], EW[col], 3)
+        sc.tag(px_ - 24, py_, lab, EW[col], "#ffffff", 9.5, "e")
+    yb = uy + 600
+    # home switches and the e-stop contact on the analog side
+    if sw:
+        for j, m in enumerate(motors):
+            ap = up[f"LA{j}"]
+            sc.l([ap, (ap[0] - 22, ap[1])], EW["sens"], 3)
+            sc.tag(ap[0] - 26, ap[1], f"home switch {m + 1} (NC) to GND", EW["sens"], "#ffffff", 9.5, "e")
+    if es:
+        ap = up["LA3"]
+        sc.l([ap, (ap[0] - 22, ap[1])], EW["coil"], 3)
+        sc.tag(ap[0] - 26, ap[1], "e-stop contact (NC) to GND", EW["coil"], "#ffffff", 9.5, "e")
+    y_end = max(by, u2y + h2 + 80, yb)
+    sc.r(ux, y_end - 40, 306, 70, "#fff9db", "#fab005", 1.5, 8)
+    sc.x(ux + 153, y_end - 16, "5V strip: the board's 5V + every 5V flag", 11, "#212529", "m", 1)
+    sc.x(ux + 153, y_end + 4, "GND strip: the board's GND, both ULN GNDs,", 11, "#212529", "m", 1)
+    sc.x(ux + 153, y_end + 20, "the 24 V supply's 0 V, every drive's pin 10", 11, "#212529", "m", 1)
+    imu = d.get("imu") and board == 1                 # 2.9.5: the motion sensor, board 1's D0 / D1
+    if imu:
+        y_end = elec_imu_signal(sc, up, 70, y_end + 64, 518, 529) - 30
+    sc.h = H = y_end + 140
+    sc.x(60, H - 84, BOARD_POWER_NOTE.replace(" - too little for the Hall sensors", ""), 12, EW["vin"], "s", 1)
+    sc.x(60, H - 64, "Shielded DB25 cables, the shield on the drive's case only. Keep them away from the mains and motor cables.", 12, "#495057")
+    _legend(sc, 60, H - 36, ("step", "sdir", "son", "v5", "gnd", "p24", "coil", "vin") + (("sens",) if sw else ())
+            + (("imutx", "imurx") if imu else ()), 7)
+    return sc.done(f"Signal wiring{f', board {board}' if boards > 1 else ''}",
+                   "ULN2803A: pin 1-8 in, pin 18-11 out, 9 GND, 10 COM left open. Servo-on is active HIGH with this wiring "
+                   "(Settings, Servo actuators: On when HIGH, the default).")
+
+
+def elec_servo_estop(d):
+    n = d["motors"]
+    boards = int(math.ceil(n / 3.0))
+    ac = d["estop"] == "ac"
+    sc = _ESc(1500, 640 + (130 if ac else 0))
+    sc.x(30, 40, "Emergency stop" + (" - recommended, not in your design yet" if d["estop"] == "none" else ""), 22,
+         "#c92a2a" if d["estop"] == "none" else "#212529", "s", 1)
+    sc.x(30, 64, f"One latching button, {1 + boards + (1 if ac else 0)} normally closed contact blocks. The first stops the "
+                 "servos without the board; the others tell the board" + (" and drop the mains contactor." if ac else "."),
+         13, "#495057")
+    es = _ic_estop(sc, 640, 120)
+    # contact 1: +24 V -> pin 9 of every drive
+    c1 = _contact(sc, 300, 330, "contact 1")
+    sc.l([(80, 330), c1["a"]], EW["pos"], 3)
+    sc.x(80, 318, "+24 V from the 24 V supply", 11, EW["pos"], "s", 1)
+    sc.l([c1["b"], (1100, 330)], EW["pos"], 3)
+    sc.x(1110, 334, f"pin 9 (COM+) of every drive", 12, "#212529", "s", 1)
+    sc.x(1110, 352, "opened: no servo-on - they let go at once", 11, "#495057", "s")
+    sc.l([(es["11"][0] + 45, es["11"][1] + 20), (c1["a"][0] + 28, 316)], "#adb5bd", 1.5, 1)
+    yk = 430
+    for b in range(boards):
+        cb = _contact(sc, 300, yk + b * 80, f"contact {2 + b}")
+        sc.l([(80, yk + b * 80), cb["a"]], EW["coil"], 3)
+        sc.x(80, yk + b * 80 - 12, f"board {b + 1}: A3" if boards > 1 else "the board's A3", 11, EW["coil"], "s", 1)
+        sc.l([cb["b"], (700, yk + b * 80)], EW["gnd"], 3)
+        sc.x(710, yk + b * 80 + 4, f"board {b + 1}: GND" if boards > 1 else "the board's GND", 12, "#212529", "s", 1)
+        sc.l([(es["11"][0] + 45, es["11"][1] + 20), (cb["a"][0] + 28, yk + b * 80 - 14)], "#adb5bd", 1.5, 1)
+    y = yk + boards * 80 + 10
+    if ac:
+        cc = _contact(sc, 300, y + 30, f"contact {2 + boards}")
+        sc.l([(80, y + 30), cc["a"]], EW["L"], 3)
+        sc.x(80, y + 18, "mains L (after the breaker)", 11, EW["L"], "s", 1)
+        sc.l([cc["b"], (700, y + 30)], EW["L"], 3)
+        sc.x(710, y + 34, "the contactor's coil (A1); A2 to N", 12, "#212529", "s", 1)
+        sc.x(710, y + 52, "contact blocks rated for mains (most are: 400 V+)", 11, "#495057", "s")
+        sc.l([(es["11"][0] + 45, es["11"][1] + 20), (cc["a"][0] + 28, y + 16)], "#adb5bd", 1.5, 1)
+        y += 110
+    notes = ("Pressed: the servos let go and the seat sinks onto the actuators' bottom ends; the board sees A3 open, switches "
+             "every motor off and forgets the positions.",
+             "Afterwards: release the button (it latches - twist or pull), then Enable Motors in the page: the board homes "
+             "first, then the actuators creep up.",
+             "Settings, Servo actuators: tick 'NC contact A3 to GND'. A broken wire counts as pressed - it fails safe.",
+             "Without contact 1 the stop would depend on the board; without contact 2 the board would carry on counting "
+             "from where it was - keep both.")
+    for i, s_ in enumerate(notes):
+        sc.x(60, y + 40 + i * 24, s_, 12.5, "#212529")
+    sc.h = y + 150
+    return sc.done("Emergency stop", "")
+
+
+def elec_actuator(d, r):
+    """An SFX-100 style actuator, cut open, every part named."""
+    sc = _ESc(1500, 1000)
+    sc.x(30, 40, "The actuator (SFX-100 style), cut open", 22, "#212529", "s", 1)
+    nm = r["numbers"]
+    sc.x(30, 64, f"{d['stroke']:g} mm usable stroke, {d['lead']:g} mm a turn, {int(d['ppr'])} pulses a turn: {nm['travel']} pulses "
+                 f"for the stroke, {nm['res']:.3f} mm a pulse. Orange = printed (PLA).", 13, "#495057")
+    pla, alu, steel = "#fd7e14", "#ced4da", "#868e96"
+    cx = 520.0
+    # motor
+    sc.r(cx - 60, 110, 120, 150, "#212529", "#000000", 2, 10)
+    sc.r(cx - 60, 110, 120, 22, "#495057", "", 0, 8)
+    sc.x(cx, 200, "SERVO", 13, "#ffffff", "m", 1)
+    sc.r(cx - 66, 258, 132, 16, steel, "#495057", 1.5, 2)                       # flange
+    # motor mount (printed) with the coupling
+    sc.r(cx - 70, 274, 140, 70, pla, "#d9480f", 2, 6)
+    sc.r(cx - 20, 284, 40, 50, "#adb5bd", "#495057", 1.5, 6)                     # coupling
+    for dx in (-44, 44):
+        sc.l([(cx + dx, 262), (cx + dx, 360)], "#343a40", 2.5)                  # M6 x 85 bolts
+    # FK12 in its printed holder
+    sc.r(cx - 70, 344, 140, 44, pla, "#d9480f", 2, 4)
+    sc.r(cx - 34, 350, 68, 32, "#495057", "#212529", 1.5, 3)
+    sc.x(cx, 371, "FK12", 11, "#ffffff", "m", 1)
+    # the profile, cut open
+    top, bot = 388.0, 820.0
+    sc.r(cx - 70, top, 16, bot - top, alu, steel, 1.5, 2); sc.r(cx + 54, top, 16, bot - top, alu, steel, 1.5, 2)
+    for yy in range(int(top) + 20, int(bot) - 10, 40):
+        sc.l([(cx - 70, yy), (cx - 54, yy + 8)], "#adb5bd", 1); sc.l([(cx + 54, yy), (cx + 70, yy + 8)], "#adb5bd", 1)
+    # the ball screw
+    sc.r(cx - 8, 380, 16, 330, "#adb5bd", "#495057", 1.5, 3)
+    for yy in range(386, 706, 8):
+        sc.l([(cx - 8, yy), (cx + 8, yy + 5)], "#868e96", 1)
+    # the nut in the printed slider
+    sy = 560.0
+    sc.r(cx - 52, sy, 104, 70, pla, "#d9480f", 2, 6)
+    sc.r(cx - 24, sy + 10, 48, 50, "#495057", "#212529", 1.5, 4)
+    sc.x(cx, sy + 40, "nut", 10, "#ffffff", "m", 1)
+    # the hollow shaft below the slider, out through the bottom cap
+    sc.r(cx - 20, sy + 70, 40, 360, "#e9ecef", steel, 2, 3)
+    sc.r(cx - 74, bot, 148, 40, pla, "#d9480f", 2, 6)                           # bottom cap
+    sc.r(cx - 40, bot + 6, 80, 28, "#495057", "#212529", 1.5, 4)                 # LMEK30UU
+    sc.x(cx, bot + 25, "LMEK30UU", 9.5, "#ffffff", "m", 1)
+    sc.r(cx - 24, bot + 44, 48, 8, "#212529", "", 0, 4)                          # the O-ring bumper
+    sc.r(cx - 30, sy + 430, 60, 16, "#495057", "#212529", 1.5, 6)                # the foot
+    # the stroke
+    sc.l([(cx + 110, sy), (cx + 110, sy + 120)], "#e03131", 2.5)
+    sc.p([(cx + 104, sy + 10), (cx + 116, sy + 10), (cx + 110, sy)], "#e03131")
+    sc.p([(cx + 104, sy + 110), (cx + 116, sy + 110), (cx + 110, sy + 120)], "#e03131")
+    sc.x(cx + 120, sy + 64, f"stroke {d['stroke']:g} mm", 12, "#c92a2a", "s", 1)
+    labels = (    # (label y, the part's y, title, detail)
+        (150, 190, "Servo motor", f"{r['servo']['motor']}, {d['srv_torque']:g} Nm, {d['srv_rpm']:.0f} rpm"),
+        (300, 305, "Motor mount (printed) and coupling", f"D30 L40 coupling: the screw's 10 mm end to the motor's {r['servo']['shaft']} mm shaft; 4 x M6 x 85"),
+        (366, 366, "FK12 fixed bearing (printed holder)", "holds the screw: all the force goes through it; 4 x M4 x 25"),
+        (470, 466, "Profile 100 x 100, 250 mm", "K50 system; thread inserts + M8 x 40 hold the parts"),
+        (520, 516, f"Ball screw SFU16{int(d['lead']):02d}, 250 mm" if d["lead"] in (5, 10) else "Ball screw, 250 mm",
+         "ends machined for the FK12; turns, the nut doesn't"),
+        (595, 595, "Slider (printed) with the nut", "slides in the profile; 6 x M5 x 20 to the nut"),
+        (700, 700, "Hollow shaft 30 mm, 270 mm", "goes up and down with the slider"),
+        (830, 836, "Bottom cap (printed), LMEK30UU", "guides the shaft; 4 x M6 x 25"),
+        (900, 868, "O-ring 23.5 x 30.5 x 3.5", "the bumper at the bottom end"),
+        (1000, 998, "Foot", "rubber foot or ball joint, to the floor / the base frame"),
+    )
+    for ly, py, t1, t2 in labels:
+        tx = 760.0
+        sc.l([(cx + 76, py), (tx - 30, py), (tx - 10, ly - 4)], "#868e96", 1.2)
+        sc.c(cx + 76, py, 3, "#868e96", "", 0)
+        sc.x(tx, ly, t1, 13, "#212529", "s", 1)
+        sc.x(tx, ly + 17, t2, 11.5, "#495057", "s")
+    sc.x(60, 160, "Hangs from the rig,", 12, "#495057", "s", 1)
+    sc.x(60, 178, "motor up, shaft down", 12, "#495057", "s")
+    sc.x(60, 220, "STL files and the full", 12, "#495057", "s")
+    sc.x(60, 238, "parts list: Build step,", 12, "#495057", "s")
+    sc.x(60, 256, "'Printed parts'.", 12, "#495057", "s")
+    sc.h = 1050
+    return sc.done("The actuator", "Shown for the SFX-100 parts list; other kits differ in the details. Printed parts in "
+                                   "orange, from the SFX-100 STL files.")
+
+
+def elec_servo_scenes(d, r):
+    out = {"overview": elec_scene_overview(d, None, r, servo=True), "power": elec_servo_power(d, r)}
+    boards = int(math.ceil(d["motors"] / 3.0))
+    out["signals"] = [elec_servo_signals(d, b + 1) for b in range(boards)]
+    out["sigall"] = _stack_scenes(out["signals"], "Signal wiring, all boards") if boards > 1 else None
+    out["actuator"] = elec_actuator(d, r)
+    out["estop"] = elec_servo_estop(d)
+    return out
+
+
+# --------------------------------------------------------------------------------------------------------------
+# Electronics design (2.9.5): the firmware for the design, ready to flash - a sketch folder in a .zip, named after
+# the build, with the build's starting values set (driver type, PWM frequency; for servos the stroke in pulses, the
+# acceleration, homing and the e-stop contact).  Made from the firmware sources built into this page server
+# (FIRMWARE_SRC: SMC3_R4 2.2.0b1 and the 2.1.1 release); only #define / starting-value lines change, and a header
+# says which.
+# --------------------------------------------------------------------------------------------------------------
+
+FW_BETA_VER = "2.2.0b1"
+FW_RELEASE_VER = "2.1.1"
+_FW_SLUG = {"ibt2": "IBT-2", "md30c": "MD30C", "mdds30": "MDDS30", "mdd10a": "MDD10A", "mdds60": "MDDS60", "hb100": "100A-bridge", "md13s": "MD13S",
+            "monster": "Monster-Moto"}
+_FW_CUSTOM_SLUG = {"ibt2": "two-PWM", "pwmdir": "PWM-DIR", "inab": "PWM-INA-INB"}
+_FW_SERVO_SLUG = {"sfx750": "AASD-15A-750W", "sfx400": "AASD-15A-400W", "custom": "servo"}
+# 2.9.5: every build listens for the WT901C on D0 / D1 (IMU_PORT 1 - the same sensor code as the 2.1.1 release); with the
+# motion sensor in the design the download also switches it on from the start ("Use the sensor"), so a new board keeps
+# looking for it until it is found.  A board that saved its settings keeps its own.
+_FW_IMU_OLD = "uint8_t       SensorFlags  = 0;"
+_FW_IMU_NEW = "uint8_t       SensorFlags  = 1;"
+
+
+def _fw_imu(d):
+    """The motion sensor's line in what / changes, for a design with or without it."""
+    if d.get("imu"):
+        return ("motion sensor WT901C-232 on D0 (RX) / D1 (TX) through a MAX3232: found at any baud rate, switched on from the start",
+                [(_FW_IMU_OLD, _FW_IMU_NEW, "motion sensor switched on (Settings, Motion sensor: Use the sensor)")])
+    return ("motion sensor: none in the design - the board still looks for one on D0 / D1 for a minute after power-up", [])
+
+
+def _fw_source(name):
+    src = globals().get("FIRMWARE_SRC") or {}
+    raw = src.get(name)
+    return gzip.decompress(raw).decode("utf-8") if raw else None
+
+
+def _fw_safe(name):
+    """Arduino IDE sketch names: letters, digits, '_', '-', '.', up to 63 characters, starting with a letter or digit."""
+    s = re.sub(r"[^A-Za-z0-9_.-]+", "-", name).strip("-_.")
+    return s[:63].rstrip("-_.")
+
+
+def _fw_driver(d):
+    dr = dict(ELEC_DRIVERS[d["driver"]])
+    if d["driver"] == "custom":
+        dr["wire"] = d["drv_wire"]
+    return dr
+
+
+def elec_firmware_plan(d):
+    """What firmware this design needs: {"supported", "beta": {...}, "release": {...} or None, "why"} - each with the
+    sketch name, what it is set up for, and the lines to change."""
+    if d.get("drive") == "servo":
+        sv = d["servo"]
+        travel = int(round(d["stroke"] / d["lead"] * d["ppr"]))
+        accel_k = int(round(5.0 * d["ppr"] / d["lead"]))
+        travel = max(200, min(32000, travel))
+        accel_k = max(10, min(5000, accel_k))
+        flags = (1 if d["home"] == "switches" else 0) | (32 if d["estop"] != "none" else 0)
+        name = _fw_safe(f"SMC3_R4_Servo_v{FW_BETA_VER}_{_FW_SERVO_SLUG.get(sv, 'servo')}_{d['stroke']:g}mm_"
+                        f"{'switches' if d['home'] == 'switches' else 'bottom'}{'_estop' if flags & 32 else ''}")
+        what = [f"servo actuators (pulse + direction), {ELEC_SERVOS[sv]['short']}",
+                f"{d['stroke']:g} mm stroke, {d['lead']:g} mm lead, {int(d['ppr'])} pulses a turn = {travel} pulses",
+                "acceleration limit 5 m/s2 (" + str(accel_k) + " x 1000 pulses/s2)",
+                "homing " + ("on switches (NC to GND on A0-A2)" if flags & 1 else "at the bottom (released 4 s)"),
+                "emergency-stop contact on A3 (NC to GND)" if flags & 32 else "no emergency-stop contact",
+                "servo-on active HIGH (through the ULN2803A)", _fw_imu(d)[0]]
+        changes = [("#define SERVO_STEPDIR  0", "#define SERVO_STEPDIR  1",
+                    "the servo build"),
+                   ("uint16_t          TravelPulses = 10000;", f"uint16_t          TravelPulses = {travel};",
+                    f"{travel} pulses for the stroke"),
+                   ("uint16_t          AccelK = 500;", f"uint16_t          AccelK = {accel_k};",
+                    f"acceleration {accel_k}"),
+                   ("uint8_t           ServoFlags = 0;", f"uint8_t           ServoFlags = {flags};",
+                    f"flags {flags}: " + (", ".join(x for x in ("home switches" if flags & 1 else "",
+                                                                 "e-stop contact" if flags & 32 else "") if x) or "none"))]
+        changes += _fw_imu(d)[1]
+        beta = {"name": name, "ver": FW_BETA_VER, "src": "SMC3_R4_v2.2.0b1.ino", "what": what, "changes": changes,
+                "saved": "Settings, Servo actuators shows these and saves changes on the board; a board that ran the "
+                         "servo firmware before keeps what it saved."}
+        return {"supported": True, "beta": beta, "release": None, "why": ""}
+    dr = _fw_driver(d)
+    if dr["wire"] == "none":
+        return {"supported": False, "beta": None, "release": None,
+                "why": f"{dr['name']} takes serial or RC commands, not PWM: no SMC3 firmware drives it."}
+    slug = _FW_SLUG.get(d["driver"]) or _FW_CUSTOM_SLUG.get(dr["wire"], "driver")
+    khz = int(round(d.get("pwm_khz") or 25))
+    khz = max(1, min(30, khz))
+    pwmdir = dr["wire"] in ("pwmdir", "inab")
+    changes = []
+    if pwmdir:
+        changes.append(("#define MODE2", "#define MODE1", "PWM + direction from the start (Settings, Motor drivers)"))
+    if khz != 25:
+        changes.append(("#define DEFAULT_TIMER1_KHZ 25", f"#define DEFAULT_TIMER1_KHZ {khz}", f"PWM {khz} kHz, motors 1 and 2"))
+        changes.append(("#define DEFAULT_TIMER2_KHZ 25", f"#define DEFAULT_TIMER2_KHZ {khz}", f"PWM {khz} kHz, motor 3"))
+    name = _fw_safe(f"SMC3_R4_v{FW_BETA_VER}_{slug}" + (f"_{khz}kHz" if (pwmdir or khz != 25) else ""))
+    what = [f"{dr['name']}: " + ("PWM + direction (" + ("INA / INB" if dr["wire"] == "inab" else "DIR") + " on D2/D4/D6, "
+                                  "PWM on D9/D10/D11)" if pwmdir else "two PWM inputs (RPWM D2/D4/D6, LPWM D9/D10/D11)"),
+            f"PWM {khz} kHz", _fw_imu(d)[0]]
+    changes += _fw_imu(d)[1]
+    saved = ("A board that ran SMC3 before keeps its saved PWM frequency" + (", driver type" if pwmdir else "") +
+             " and motion sensor settings: check Settings, Motor drivers and Motion sensor after flashing.")
+    beta = {"name": name, "ver": FW_BETA_VER, "src": "SMC3_R4_v2.2.0b1.ino", "what": what, "changes": changes, "saved": saved}
+    release = None
+    if not pwmdir:
+        rch = ([] if khz == 25 else [c for c in changes if c[0].startswith("#define DEFAULT_TIMER")]) + _fw_imu(d)[1]
+        release = {"name": _fw_safe(f"SMC3_R4_v{FW_RELEASE_VER}_{slug}" + (f"_{khz}kHz" if khz != 25 else "")),
+                   "ver": FW_RELEASE_VER, "src": "SMC3_R4_v2.1.1.ino", "what": what, "changes": rch, "saved": saved}
+    return {"supported": True, "beta": beta, "release": release, "why": ""}
+
+
+def elec_firmware_public(d):
+    """The plan for the page and the PDF (no source lines)."""
+    p = elec_firmware_plan(d)
+    out = {"supported": p["supported"], "why": p["why"]}
+    for k in ("beta", "release"):
+        x = p.get(k)
+        out[k] = None if not x else {"name": x["name"], "file": x["name"] + ".zip", "ver": x["ver"], "what": x["what"],
+                                    "changes": [c[2] for c in x["changes"]], "saved": x["saved"], "beta": k == "beta"}
+    return out
+
+
+def elec_firmware(raw, which="beta", page_version=""):
+    """(file name, .zip bytes) - the sketch folder, or (None, error text)."""
+    d = elec_inputs(raw)
+    p = elec_firmware_plan(d)
+    if not p["supported"]:
+        return None, p["why"]
+    x = p.get("release" if which == "release" else "beta")
+    if not x:
+        return None, "There is no release firmware for this build - it needs the beta."
+    return _fw_zip(x, page_version)
+
+
+def _fw_zip(x, page_version="", plain=False):
+    """(file name, .zip bytes) for a plan entry x (name, ver, src, what, changes, saved) - or (None, why).  plain: a
+    published sketch (2.9.5), its header says so."""
+    src = _fw_source(x["src"])
+    if not src:
+        return None, "This page server was built without the firmware sources."
+    for old, new, _why in x["changes"]:
+        pat = re.compile(r"^" + re.escape(old) + r"(?=\s|$)", re.M)
+        if len(pat.findall(src)) != 1:
+            return None, f"The firmware source has changed: '{old}' not found once - nothing was made."
+        src = pat.sub(new.replace("\\", "\\\\"), src, count=1)
+    beta = x["ver"] != FW_RELEASE_VER
+    head = ["// " + "=" * 110,
+            f"// {x['name']}.ino",
+            f"// SMC3_R4 firmware {x['ver']}" + (" - BETA: NOT TESTED ON A REAL RIG YET. It was written for the SMC3 R4 motion "
+                                                "control dashboard and checked" if beta else " (release)"),
+            *(["//   against a model of the board; it should work with the dashboard. First runs: motors / actuators off the",
+               "//   rig, then nobody in the seat, a hand on the emergency stop. While it runs the board's L LED and the",
+               "//   top-right LED of its LED matrix blink."] if beta else []),
+            (f"// As published, from the SMC3 R4 dashboard" + (f" (page {page_version})" if page_version else "")
+             + f" on {time.strftime('%Y-%m-%d')}:") if plain else
+            (f"// Set up by the Electronics wizard of the SMC3 R4 dashboard" + (f" (page {page_version})" if page_version else "")
+             + f" on {time.strftime('%Y-%m-%d')} for:")]
+    head += [f"//   - {w}" for w in x["what"]]
+    if x["changes"]:
+        head.append(f"// Changed from SMC3_R4 {x['ver']} as published (starting values only, the code is the same):")
+        head += [f"//   {new:<58} ({why})" for _old, new, why in x["changes"]]
+    head += ["// Before uploading: your WiFi name and password in WIFI_SSID and WIFI_PASS below (2.4 GHz network).",
+             "// Arduino IDE: unzip, open this file, board 'Arduino UNO R4 WiFi', Upload.",
+             f"// {x['saved']}",
+             "// " + "=" * 110, ""]
+    sketch = "\n".join(head) + src
+    bio = io.BytesIO()
+    with zipfile.ZipFile(bio, "w", zipfile.ZIP_DEFLATED) as z:
+        info = zipfile.ZipInfo(f"{x['name']}/{x['name']}.ino", date_time=time.localtime()[:6])
+        info.compress_type = zipfile.ZIP_DEFLATED
+        info.external_attr = 0o644 << 16
+        z.writestr(info, sketch.replace("\r\n", "\n"))
+    return x["name"] + ".zip", bio.getvalue()
+
+
+
+# --------------------------------------------------------------------------------------------------------------
+# 2.9.5: every firmware this page hands out, as one table - the published sketches and the ready-made set-ups for
+# each driver and servo drive - with what each drives, how, and how it differs; the design's own pick on top.
+# --------------------------------------------------------------------------------------------------------------
+_FW_PUB = {
+    "pub:2.1.1": {"name": "SMC3_R4_v2.1.1", "ver": FW_RELEASE_VER, "src": "SMC3_R4_v2.1.1.ino", "build": "DC motors",
+                  "hw": "IBT-2 / BTS7960 bridges as it comes; PWM + direction drivers only rebuilt with #define MODE1",
+                  "inputs": "two PWM (RPWM / LPWM)", "pwm": "25 kHz (Settings, Loop)",
+                  "summary": "The release, as on GitHub. Park, recover from an end stop, the motion sensor check and every "
+                             "fix up to 2.1.1. No driver-type setting, no beta LED.", "changes": []},
+    "pub:2.2.0b1": {"name": "SMC3_R4_v2.2.0b1", "ver": FW_BETA_VER, "src": "SMC3_R4_v2.2.0b1.ino", "build": "DC motors",
+                    "hw": "IBT-2 and every PWM + direction driver (Cytron, VNH, 100 A bridges)",
+                    "inputs": "two PWM, or PWM + direction - chosen in Settings, Motor drivers", "pwm": "25 kHz (Settings, Loop)",
+                    "summary": "Beta, not tested on a real rig yet. 2.1.1 plus the driver type as a setting (no rebuilding "
+                               "for PWM + direction drivers) and the blinking beta LED.", "changes": []},
+    "pub:servo": {"name": "SMC3_R4_Servo_v2.2.0b1", "ver": FW_BETA_VER, "src": "SMC3_R4_v2.2.0b1.ino", "build": "Servo actuators",
+                  "hw": "servo drives with pulse + direction inputs (AASD-15A and similar), ball-screw actuators",
+                  "inputs": "pulse, direction, servo-on (two ULN2803A)", "pwm": "pulses up to 20 kHz",
+                  "summary": "Beta, not tested on a real rig yet. The servo build of 2.2.0b1: open loop, no pots or PID, "
+                             "homing at the bottom or on switches, e-stop contact on A3. Set it up in Settings, Servo actuators.",
+                  "changes": [("#define SERVO_STEPDIR  0", "#define SERVO_STEPDIR  1", "the servo build")]},
+}
+_FW_IMU_PLAIN = "listens on D0 / D1 for a minute after power-up; Settings, Motion sensor: Use the sensor keeps it"
+
+
+def _fw_rec_khz(dr):
+    f = dr.get("fmax") or 0
+    return int(f) if 0 < f < 25 else 25
+
+
+def _fw_cat_inputs(rid, d):
+    """The wizard inputs behind a ready-made row's id, with the design's motion sensor choice."""
+    imu = d.get("imu", 1)
+    if rid.startswith("srv:"):
+        return {"drive": "servo", "motors": 3, "servo": rid[4:], "imu": imu}
+    drv = rid.split(":")[1]
+    wire = "pwmdir"
+    if drv.startswith("custom."):
+        drv, wire = "custom", drv.split(".", 1)[1]
+    dr = dict(ELEC_DRIVERS[drv]); dr["wire"] = wire if drv == "custom" else dr["wire"]
+    return {"drive": "lever", "motors": 3, "driver": drv, "drv_wire": wire, "pwm_khz": _fw_rec_khz(dr), "imu": imu}
+
+
+def _fw_row(rid, x, group, build, hw, inputs, pwm, imu, summary, yours=False, ok=True, why=""):
+    return {"id": rid, "file": (x["name"] + ".zip") if x else "", "name": x["name"] if x else "", "ver": x["ver"] if x else "",
+            "beta": bool(x) and x["ver"] != FW_RELEASE_VER, "group": group, "build": build, "hw": hw, "inputs": inputs,
+            "pwm": pwm, "imu": imu, "summary": summary, "changes": [c[2] for c in (x or {}).get("changes", [])],
+            "yours": yours, "ok": ok, "why": why}
+
+
+def _fw_plan_row(rid, inp, which, group, yours=False):
+    d2 = elec_inputs(inp)
+    p = elec_firmware_plan(d2)
+    servo = d2.get("drive") == "servo"
+    if servo:
+        hw = ELEC_SERVOS[d2["servo"]]["name"]
+        inputs, pwm = _FW_PUB["pub:servo"]["inputs"], "pulses up to 20 kHz"
+    else:
+        dr = _fw_driver(d2)
+        hw = dr["name"] if d2["driver"] != "custom" else f"your own driver - {ELEC_WIRE[dr['wire']]}"
+        inputs = ELEC_WIRE[dr["wire"]]
+        pwm = f"{int(round(d2['pwm_khz']))} kHz"
+    if not p["supported"]:
+        return _fw_row(rid, None, group, "DC motors", hw, inputs, "-", "-", p["why"], yours, False, p["why"])
+    x = p.get(which)
+    if not x:
+        return None
+    base = "SMC3_R4_Servo " + x["ver"] if servo else "SMC3_R4 " + x["ver"]
+    ch = [c[2] for c in x["changes"]]
+    summary = (f"{base} {'(beta)' if x['ver'] != FW_RELEASE_VER else '(release)'} with its starting values set: "
+               + ("; ".join(ch) if ch else "nothing changed") + ".")
+    imu = ("on from the start" if d2.get("imu") else "listens on D0 / D1 for a minute after power-up")
+    return _fw_row(rid, x, group, "Servo actuators" if servo else "DC motors", hw, inputs, pwm, imu, summary, yours)
+
+
+def elec_firmware_catalog(raw):
+    """Every firmware file this page can make: {"rows": [...], "pick": [names], "imu": bool}.  The design's own pick
+    (what the Electronics wizard hands out for it) first, then the published sketches, the ready-made set-up for each
+    driver and servo drive, and the drivers no SMC3 firmware drives."""
+    d = elec_inputs(raw)
+    rows, names = [], set()
+    for which in ("beta", "release"):                                   # the wizard's pick for this design
+        r_ = _fw_plan_row(f"design:{which}", d, which, "For your design (the wizard's pick)", yours=True)
+        if r_:
+            rows.append(r_)
+            names.add(r_["name"])
+    pick = [r_["file"] for r_ in rows if r_["ok"]]
+    for rid, x in _FW_PUB.items():
+        rows.append(_fw_row(rid, x, "Published sketches", x["build"], x["hw"], x["inputs"], x["pwm"], _FW_IMU_PLAIN, x["summary"]))
+    later = []
+    for drv, dr in ELEC_DRIVERS.items():
+        ids = [f"drv:custom.{w}" for w in ("ibt2", "pwmdir", "inab")] if drv == "custom" else [f"drv:{drv}"]
+        for base in ids:
+            for which in ("beta", "release"):
+                r_ = _fw_plan_row(f"{base}:{which}", _fw_cat_inputs(base, d), which, "Ready-made for a driver")
+                if not r_ or (r_["ok"] and r_["name"] in names):
+                    continue
+                if not r_["ok"]:
+                    if which == "beta":
+                        r_["group"] = "Not driven by SMC3"
+                        later.append(r_)
+                    continue
+                names.add(r_["name"])
+                rows.append(r_)
+    for sv in ELEC_SERVOS:
+        if sv == "custom":
+            continue
+        r_ = _fw_plan_row(f"srv:{sv}", _fw_cat_inputs(f"srv:{sv}", d), "beta", "Ready-made for servo actuators")
+        if r_ and r_["name"] not in names:
+            names.add(r_["name"])
+            rows.append(r_)
+    return {"rows": rows + later, "pick": pick, "imu": bool(d.get("imu"))}
+
+
+def elec_firmware_by_id(rid, raw, page_version=""):
+    """(file name, .zip bytes) for a row of the catalog - or (None, why)."""
+    rid = str(rid or "")
+    if rid.startswith("design:"):
+        return elec_firmware(raw, "release" if rid.endswith(":release") else "beta", page_version)
+    if rid in _FW_PUB:
+        x = dict(_FW_PUB[rid])
+        x["what"] = [x["hw"], x["inputs"], "motion sensor: " + _FW_IMU_PLAIN]
+        x["saved"] = "A board keeps the settings it saved (Settings): check them after flashing."
+        return _fw_zip(x, page_version, plain=True)
+    d = elec_inputs(raw)
+    m_ = re.match(r"^(drv:[a-z0-9.]+|srv:[a-z0-9]+)(?::(beta|release))?$", rid)
+    if not m_:
+        return None, "Unknown firmware."
+    base, which = m_.group(1), m_.group(2) or "beta"
+    name = base.split(":")[1].split(".")[0]
+    if (base.startswith("drv:") and name not in ELEC_DRIVERS) or (base.startswith("srv:") and name not in ELEC_SERVOS):
+        return None, "Unknown firmware."
+    return elec_firmware(_fw_cat_inputs(base, d), which, page_version)
+
+
+# --------------------------------------------------------------------------------------------------------------
+# Electronics design (2.9.5): the mechanical side of a lever drive, and the motion sensor
+#   - the lever: a 1:1 template to print, trace on a plate and cut out (a keyed bore with a clamp, the rod end's hole,
+#     two holes for the sensor cap), and the cap that turns the position sensor; plate thickness worked out from the
+#     motor's torque
+#   - the push rod with a ball joint (rod end) at each end, from the lever to the seat
+#   - how the position sensor reads the shaft: the cap, a stub, a flexible coupling, the sensor in a bracket on the
+#     motor's gearbox
+#   - the WT901C-232 motion sensor on the seat: parts and wiring (board 1, D0 / D1 through a MAX3232 module)
+# Drawings are scenes (elecdraw_part); the template is drawn in millimetres so the PDF prints it at 1:1.
+# --------------------------------------------------------------------------------------------------------------
+
+IMU_STEP = ("WT901C-232 flat on the seat frame, any direction (the page learns it). Its red wire to 5V, black / yellow / green "
+            "to the DB9 plug's pins 5 / 3 / 2, the plug into the MAX3232 module; the module's TXD to D0, RXD to D1, GND and VCC "
+            "to GND and 5V of board 1. Check it is the RS-232 kind first: powered alone, yellow to black reads negative (about "
+            "-5 to -9 V). Then Settings, Motion sensor: Use the sensor, Set up the sensor - and Seat setup.")
+ELEC_RODS = {"m8": (8.0, "M8", "PHS8 / SI8"), "m10": (10.0, "M10", "PHS10 / SI10"), "m12": (12.0, "M12", "PHS12 / SI12")}
+_PLATES = (6, 8, 10, 12, 15, 20, 25, 30)
+
+
+def _std_up(v, table):
+    return next((x for x in table if x >= v - 1e-9), table[-1])
+
+
+def elec_lever(d, torque_peak):
+    """The lever for this motor: its shape (mm, the bore at 0,0, the arm along +x) and what to make it of."""
+    sd, ctc = d["shaft_d"], d["lever"]
+    rb = sd / 2.0
+    rod_d, rod_name, rod_part = ELEC_RODS[d["rod"]]
+    r_hub = max(24.0, rb + 16.0)
+    r_end = rod_d / 2.0 + 10.0
+    x_bolt = -(rb + 9.5)                                  # the M8 pinch bolt across the tail
+    x_tail = -(rb + 21.5)
+    r_cap = rb + 9.0                                      # the sensor cap's two M5 holes
+    key = d["key_w"]
+    # torque: the clamp grips (an M8 8.8 bolt pulls about 12 kN; friction 0.15 on both jaws - counted at half), the key
+    # takes the rest and presses on the hub's keyway over the plate's thickness
+    t_peak = max(1.0, torque_peak)
+    t_clamp = 0.15 * 12000.0 * 2 * rb / 1000.0            # Nm
+    t_key = max(0.0, t_peak - 0.5 * t_clamp)
+    if key > 0:
+        f_key = t_key * 1000.0 / rb                       # N on the key
+        t_al = max(10.0, f_key / (key / 2.0 * 120.0))     # 6061-T6: 120 MPa on the keyway's face
+        t_st = max(6.0, f_key / (key / 2.0 * 160.0))
+    else:
+        f_key, t_al, t_st = 0.0, 12.0, 8.0
+    # the arm, bent by the push rod's force: section at the hub's edge
+    f_end = t_peak * 1000.0 / ctc
+    h_arm = max(2 * r_end, 2 * r_hub - (r_hub - r_end) * min(1.0, r_hub / ctc) * 2)
+    m_arm = f_end * max(0.0, ctc - r_hub)                 # N mm
+    t_need = t_al
+    t_al = _PLATES[-1]
+    for t_ in _PLATES:                                    # the thinnest standard plate that does both
+        if t_ >= t_need - 1e-9 and m_arm / (t_ * h_arm * h_arm / 6.0) <= 100.0:
+            t_al = t_
+            break
+    t_st = _std_up(t_st, _PLATES)
+    t_half = _std_up(t_al / 2.0, _PLATES)                 # two plates cut alike and bolted together
+    bolt_len = int(5 * math.ceil((2 * r_hub + 12) / 5.0))
+    rod_bolt = int(5 * math.ceil((t_al + rod_d * 1.3 + 12) / 5.0))
+    travel = 2 * ctc * math.sin(math.radians(d["swing"]))
+    return {"ctc": ctc, "shaft": sd, "rb": rb, "key": key, "r_hub": r_hub, "r_end": r_end, "x_bolt": x_bolt, "x_tail": x_tail,
+            "r_cap": r_cap, "rod_d": rod_d, "rod": rod_name, "rod_part": rod_part, "hole": rod_d + 0.5,
+            "t_peak": t_peak, "t_clamp": t_clamp, "f_key": f_key, "f_end": f_end, "t_al": t_al, "t_st": t_st, "t_half": t_half,
+            "bolt_len": bolt_len, "rod_bolt": rod_bolt, "travel": travel, "swing": d["swing"],
+            "length": ctc + r_end - x_tail, "width": 2 * r_hub}
+
+
+def _lever_outline(lv, steps=28):
+    """The lever's outline (mm, y up): the tail's square end, the hub, the tangents, the end round it."""
+    ctc, rh, re_, xt = lv["ctc"], lv["r_hub"], lv["r_end"], lv["x_tail"]
+    phi = math.acos(max(-1.0, min(1.0, (rh - re_) / ctc)))
+    pts = []
+
+    def arc(cx, cy, r, a0, a1, k=steps):
+        for i in range(k + 1):
+            a = a0 + (a1 - a0) * i / float(k)
+            pts.append((cx + r * math.cos(a), cy + r * math.sin(a)))
+    cr = 5.0
+    pts.append((xt + cr, rh))
+    arc(0.0, 0.0, rh, math.pi / 2, phi, 16)                                 # hub, top: 90 deg down to the tangent
+    arc(ctc, 0.0, re_, phi, -phi, 24)                                       # round the end
+    arc(0.0, 0.0, rh, -phi, -math.pi / 2, 16)                               # hub, bottom
+    pts.append((xt + cr, -rh))
+    arc(xt + cr, -rh + cr, cr, -math.pi / 2, -math.pi, 6)                  # tail corners
+    arc(xt + cr, rh - cr, cr, math.pi, math.pi / 2, 6)
+    return pts
+
+
+def _keyway(lv):
+    """The keyway's notch in the bore at 45 deg (mm, y up), as a polygon."""
+    rb, k = lv["rb"], lv["key"]
+    if k <= 0:
+        return None
+    a = math.radians(45.0)
+    ux, uy = math.cos(a), math.sin(a)
+    vx, vy = -uy, ux
+    depth = rb + k / 2.0 + 0.4
+    hw = k / 2.0 + 0.05
+    r0 = math.sqrt(max(0.0, rb * rb - hw * hw))
+    return [(ux * r0 + vx * hw, uy * r0 + vy * hw), (ux * depth + vx * hw, uy * depth + vy * hw),
+            (ux * depth - vx * hw, uy * depth - vy * hw), (ux * r0 - vx * hw, uy * r0 - vy * hw)]
+
+
+def _dim(sc, x1, y1, x2, y2, text, off=0.0, z=3.0, col="#1c7ed6"):
+    """A dimension line with arrow heads (scene units), text above its middle."""
+    L = math.hypot(x2 - x1, y2 - y1) or 1.0
+    ux, uy = (x2 - x1) / L, (y2 - y1) / L
+    nx, ny = -uy * off, ux * off
+    a, b = (x1 + nx, y1 + ny), (x2 + nx, y2 + ny)
+    sc.l([a, b], col, z * 0.08)
+    ah = z * 0.9
+    for (px, py), s in ((a, 1), (b, -1)):
+        sc.p([(px, py), (px + s * ux * ah - uy * ah * 0.35, py + s * uy * ah + ux * ah * 0.35),
+              (px + s * ux * ah + uy * ah * 0.35, py + s * uy * ah - ux * ah * 0.35)], col)
+    if off:
+        sc.l([(x1, y1), (a[0] + nx * 0.15, a[1] + ny * 0.15)], col, z * 0.05)
+        sc.l([(x2, y2), (b[0] + nx * 0.15, b[1] + ny * 0.15)], col, z * 0.05)
+    sc.x((a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0 - z * 0.5, text, z, col, "m", 1)
+
+
+def _cross(sc, x, y, r, col="#212529", w=0.25):
+    sc.l([(x - r, y), (x + r, y)], col, w); sc.l([(x, y - r), (x, y + r)], col, w)
+
+
+def elec_scene_lever(d, lv, page=False, part="both"):
+    """The lever template, 1:1 in millimetres (the scene's units are mm), with the sensor cap beside it.
+    page=True: a printable sheet (landscape: Letter and A4 both take 254 x 180 mm) with scale bars; part = "both",
+    "lever" (a long lever: the cap goes on a sheet of its own) or "cap"."""
+    W, H = 254.0, 180.0
+    t, s_ = lv, "#212529"
+    rc = t["r_cap"] + 7.0
+    ox = 12.0 - t["x_tail"]                                       # the bore's centre
+    oy = 36.0 + t["r_hub"]
+    ex, ey = ox + t["ctc"], oy
+    right = ex + t["r_end"]
+    fits = right + 16 + 2 * rc <= W - 4
+    if not page and not fits:
+        W = right + 16 + 2 * rc + 8
+    sc = _ESc(W, H)
+
+    def P(x, y):
+        return (ox + x, oy - y)
+
+    def note(px, py, tx, ty, lines, col="#212529", a="s"):
+        sc.l([(px, py), (tx, ty + (0 if ty > py else 2.4))], "#868e96", 0.15)
+        for i, ln in enumerate(lines):
+            sc.x(tx, ty + 1.2 + i * 3.6, ln, 2.8, col if i == 0 else "#495057", a, 1 if i == 0 else 0)
+
+    def bars(yb):
+        sc.r(4, yb, 100, 2.5, "#212529", "", 0, 0)
+        for i in range(11):
+            sc.l([(4 + i * 10, yb), (4 + i * 10, yb - (1.5 if i % 5 == 0 else 0.8))], "#212529", 0.25)
+        sc.x(4, yb + 6.5, "100 mm - measure it: the print must be at 100% (Actual size)", 2.8, s_, "s", 1)
+        sc.r(140, yb, 101.6, 2.5, "#495057", "", 0, 0)
+        for i in range(9):
+            sc.l([(140 + i * 12.7, yb), (140 + i * 12.7, yb - (1.5 if i % 2 == 0 else 0.8))], "#495057", 0.25)
+        sc.x(140, yb + 6.5, "4 inches", 2.8, s_, "s", 1)
+
+    def cap(cx0, cy0):
+        sc.c(cx0, cy0, rc, "#f1f3f5", "#212529", 0.45)
+        for sy in (1, -1):
+            sc.c(cx0, cy0 - sy * t["r_cap"], 2.75, "#ffffff", "#212529", 0.3)
+            _cross(sc, cx0, cy0 - sy * t["r_cap"], 3.4, "#212529", 0.15)
+        sc.c(cx0, cy0, 3.25, "#ffffff", "#212529", 0.3); _cross(sc, cx0, cy0, rc * 0.75, "#212529", 0.15)
+        sc.x(cx0, cy0 - rc - 6.4, "Sensor cap, 1:1", 3.2, s_, "m", 1)
+        sc.x(cx0, cy0 - rc - 2.6, "aluminium 4-5 mm", 2.6, "#495057", "m")
+        sc.x(cx0, cy0 + rc + 4.4, "2 holes 5.5 mm, centre 6.5 mm", 2.6, "#495057", "m")
+        sc.x(cx0, cy0 + rc + 8.0, "(the M6 stub)", 2.6, "#495057", "m")
+
+    if part == "cap":
+        sc.x(4, 7, f"Sensor cap template, 1:1 - for the {t['ctc']:g} mm lever", 4.6, s_, "s", 1)
+        sc.x(4, 12.5, "Drill the two 5.5 mm holes and the 6.5 mm centre from this sheet: they match the lever's M5 holes and bore.", 3.0, "#495057")
+        cap(60, 70)
+        bars(H - 14)
+        return sc.done("Sensor cap template", "")
+    sc.x(4, 7, f"Lever template, 1:1 - {t['ctc']:g} mm between centres, {t['shaft']:g} mm shaft"
+         + (f", {t['key']:g} mm key" if t["key"] > 0 else ", no key"), 4.6, s_, "s", 1)
+    sc.x(4, 12.5, f"Aluminium 6061-T6 {t['t_al']:g} mm thick (or two {t['t_half']:g} mm plates cut alike and bolted together), "
+         f"or steel {t['t_st']:g} mm.", 3.0, "#495057")
+    sc.p([P(x, y) for x, y in _lever_outline(t)], "#f1f3f5", "#212529", 0.45)
+    sc.c(ox, oy, t["rb"], "#ffffff", "#212529", 0.4)                  # bore and keyway
+    kw = _keyway(t)
+    if kw:
+        sc.p([P(x, y) for x, y in kw], "#ffffff", "#212529", 0.35)
+    _cross(sc, ox, oy, t["rb"] * 0.6)
+    sc.r(ox + t["x_tail"], oy - 1.0, -t["x_tail"] - t["rb"] + 0.3, 2.0, "#ffffff", "#212529", 0.3, 0)    # clamp slot
+    xb = ox + t["x_bolt"]                                              # pinch bolt, drilled from the edge (hidden)
+    for dx in (-4.25, 4.25):
+        sc.l([(xb + dx, oy - t["r_hub"]), (xb + dx, oy + t["r_hub"])], "#c92a2a", 0.3, 1)
+    sc.l([(xb, oy - t["r_hub"] - 2), (xb, oy + t["r_hub"] + 2)], "#c92a2a", 0.15)
+    for sy in (1, -1):                                                 # the sensor cap's M5 holes
+        cx, cy = P(0.0, sy * t["r_cap"])
+        sc.c(cx, cy, 2.1, "#ffffff", "#212529", 0.3); _cross(sc, cx, cy, 3.0, "#212529", 0.15)
+    sc.c(ex, ey, t["hole"] / 2.0, "#ffffff", "#212529", 0.4); _cross(sc, ex, ey, t["hole"] * 0.42)
+    sc.l([(ox + t["x_tail"] - 3, oy), (right + 3, oy)], "#868e96", 0.15, 1)
+    yd = oy + t["r_hub"] + 6
+    _dim(sc, ox, yd, ex, yd, f"{t['ctc']:g} mm between centres", 0, 3.0)
+    for x_ in (ox, ex):
+        sc.l([(x_, oy + 3), (x_, yd + 1)], "#1c7ed6", 0.12)
+    x0 = ox + t["x_tail"]
+    top1, top2 = oy - t["r_hub"] - 19, oy - t["r_hub"] - 9
+    note(xb, oy - t["r_hub"], x0, top1, ["pinch bolt: drill 8.5 mm from the edge, through", f"both jaws; M8 x {t['bolt_len']} and a nyloc nut"], "#c92a2a")
+    note(ex, ey - t["hole"] / 2, right, top2, [f"{t['hole']:g} mm hole: the rod end's bolt", f"{t['rod']} x {t['rod_bolt']}, washers, nyloc nut"], s_, "e")
+    b1, b2, b3 = oy + t["r_hub"] + 13, oy + t["r_hub"] + 22, oy + t["r_hub"] + 31
+    note(ox + t["rb"] * 0.4, oy + t["rb"] * 0.5, x0, b1,
+         [f"bore {t['shaft']:g} mm, a snug fit on the shaft" + (f"; keyway {t['key'] + 0.1:.1f} wide, {t['key'] / 2 + 0.4:.1f} deep" if t["key"] > 0 else ""),
+          "drill under size, then file or ream to the shaft" + ("; file the keyway square" if t["key"] > 0 else " - no key: the clamp alone")])
+    note(ox + t["x_tail"] + 3, oy + 1, x0, b2, ["clamp slot: saw about 2 mm wide, from the bore to the end", "(cut it last)"])
+    cx, cy = P(0.0, -t["r_cap"])
+    note(cx, cy + 2, x0, b3, ["2 x M5: drill 4.2 mm, tap M5 - the sensor cap's screws", "centre-punch every cross before drilling"])
+    if fits:
+        cap(right + 8 + rc + 6, oy)
+    for i, ln in enumerate((
+            "Cut: glue the sheet on the plate, centre-punch every cross, drill the holes, saw outside the line and file to it.",
+            "With the key in, the M8 pulls the slot shut and the lever grips the shaft with no play; the axle nut and washer keep it on.",
+            f"Worst moment: a stalled motor at the driver's peak - about {t['t_peak']:.0f} Nm, {t['f_end']:.0f} N "
+            f"({t['f_end'] / 9.81:.0f} kg) at the rod end. Two or more levers: cut them all from this sheet.")):
+        sc.x(4, H - 36 + i * 4.2, ln, 2.7, "#495057")
+    if page:
+        bars(H - 14)
+    else:
+        sc.x(4, H - 8, "Export PDF or the Lever template button prints it at 1:1, with bars to check the scale.", 3.0, "#1c7ed6", "s", 1)
+    return sc.done("Lever template", "Print the PDF at 100% (Actual size), check the 100 mm bar with a ruler, glue it on the plate "
+                                     "and cut along the line.")
+
+
+def _rod_end(sc, x, y, ang, k=1.0, label=True):
+    """A rod end (ball joint) seen from the side: the eye with its ball at (x, y), the threaded shank along ang (deg)."""
+    a = math.radians(ang)
+    ux, uy = math.cos(a), math.sin(a)
+    sc.c(x, y, 15 * k, "#ced4da", "#495057", 2)
+    sc.c(x, y, 9 * k, "#f8f9fa", "#495057", 1.5)
+    sc.c(x, y, 4 * k, "#495057", "", 0)
+    sx, sy = x + ux * 14 * k, y + uy * 14 * k
+    ex, ey = x + ux * 46 * k, y + uy * 46 * k
+    sc.l([(sx, sy), (ex, ey)], "#adb5bd", 12 * k)
+    sc.l([(x + ux * 46 * k, y + uy * 46 * k), (x + ux * 56 * k, y + uy * 56 * k)], "#495057", 16 * k)     # jam nut
+    return (x + ux * 56 * k, y + uy * 56 * k)
+
+
+# ---- 2.9.5: the position sensor's bracket - a C (a "hat") bent from 3 x 25 mm strip: two feet on the gearbox's
+# screws, two arms past the lever, the face across the shaft's axis with the sensor in its middle
+BRK_T, BRK_W, BRK_RI, BRK_F, BRK_G0 = 3.0, 25.0, 3.0, 35.0, 8.0     # strip, width, inside bend radius, foot, gearbox to lever
+BRK_K = 0.4                                                         # where the neutral line sits in the bend (aluminium)
+_BRK_CACHE = {}
+
+
+def _densify(pts, step):
+    out = []
+    for i in range(len(pts)):
+        (x0, y0), (x1, y1) = pts[i], pts[(i + 1) % len(pts)]
+        k = max(1, int(math.ceil(math.hypot(x1 - x0, y1 - y0) / step)))
+        out += [(x0 + (x1 - x0) * j / float(k), y0 + (y1 - y0) * j / float(k)) for j in range(k)]
+    return out
+
+
+def _brk_arms(ctc, r_hub, x_tail, r_end, r_cap, swing):
+    """Where the bracket's arms go (deg from the lever's mid position, the pair phi and phi + 180) and how far out (mm,
+    their inside faces), so that the lever - arm, hub and tail - over its whole swing, and the push rod going from its
+    end towards the seat, never touch them."""
+    key = (round(ctc, 1), round(r_hub, 2), round(x_tail, 2), round(r_end, 2), round(r_cap, 2), round(swing, 1))
+    if key in _BRK_CACHE:
+        return _BRK_CACHE[key]
+    lv = {"ctc": ctc, "r_hub": r_hub, "r_end": r_end, "x_tail": x_tail}
+    outline = _densify(_lever_outline(lv, 10), 3.0)
+    pts = []
+    sw = swing + 3.0
+    nth = max(2, int(math.ceil(2 * sw / 3.0)))
+    for i in range(nth + 1):
+        th = math.radians(-sw + 2 * sw * i / float(nth))
+        c, s_ = math.cos(th), math.sin(th)
+        pts += [(x * c - y * s_, x * s_ + y * c) for x, y in outline]
+        ex, ey = ctc * c, ctc * s_                                    # the rod end, the rod towards the seat (+y)
+        pts += [(ex + o, ey + 4.0 * j) for j in range(0, 60) for o in (-r_end, 0.0, r_end)]
+    polar = [(math.hypot(x, y), math.atan2(y, x)) for x, y in pts]
+    base = max(r_hub, r_cap + 7.0) + 4.0
+    hw = BRK_W / 2.0 + 3.0
+    best = None
+    for phi in range(0, 180, 3):
+        need = base
+        for ang in (phi, phi + 180):
+            a = math.radians(ang)
+            for r_, al in polar:
+                da = al - a
+                v = r_ * math.cos(da)
+                if v > 0 and abs(r_ * math.sin(da)) <= hw and v + 4.0 > need:
+                    need = v + 4.0
+        if best is None or need < best[0] - 0.05 or (abs(need - best[0]) <= 0.05 and abs(phi - 90) < abs(best[1] - 90)):
+            best = (need, phi)
+    out = (round(best[0] * 2) / 2.0, best[1])
+    if len(_BRK_CACHE) > 256:
+        _BRK_CACHE.clear()
+    _BRK_CACHE[key] = out
+    return out
+
+
+def elec_bracket(d, lv):
+    """The C bracket for the position sensor: outside sizes, the flat strip and where to bend it (mm)."""
+    t, ri = BRK_T, BRK_RI
+    r_in, phi = _brk_arms(lv["ctc"], lv["r_hub"], lv["x_tail"], lv["r_end"], lv["r_cap"], lv["swing"])
+    r_out = r_in + t
+    face = 2 * r_out                                                  # outside, arm to arm
+    inner = BRK_G0 + lv["t_al"] + 78.0                                # gearbox face to the face's inside: the stack
+    arm = inner + t                                                   # outside: the gearbox face to the face's outside
+    foot = BRK_F
+    ba = math.pi / 2.0 * (ri + BRK_K * t)                            # each 90 deg bend
+    bd = 2 * (ri + t) - ba
+    half = face / 2.0 + arm + foot - 2 * bd
+    hole = 10.0                                                       # a 3/8 in bushing (TT 6127, most pots)
+    return {"t": t, "w": BRK_W, "ri": ri, "r_in": r_in, "r_out": r_out, "phi": phi, "face": face, "arm": arm, "foot": foot,
+            "inner": inner, "g0": BRK_G0, "bd": bd, "half": half, "flat": 2 * half, "b2": face / 2.0 - bd / 2.0,
+            "b1": face / 2.0 + arm - 1.5 * bd, "hole": hole,
+            "slot": (5.0, max(11.0, foot - (ri + t) - 2 * t)), "slot_w": 6.5}
+
+
+def elec_scene_bracket(d, lv, br, page=False):
+    """The sensor bracket's template, 1:1 in millimetres: the flat strip with its holes and bend lines (half of it when the
+    whole is too long for the sheet - the other half is its mirror - and that half in two pieces when it is still too long),
+    and the bent C seen from the side."""
+    import textwrap
+    W, H = 254.0, 180.0
+    b, s_ = br, "#212529"
+    full = b["flat"] + 24 <= W - 8
+    sc = _ESc(W, H)
+    hall = d.get("sensor") == "hall"
+    if full:
+        rows = [(-b["half"], b["half"], W / 2.0)]                   # (from, to, where s = 0 sits on the sheet)
+    elif b["half"] + 26 <= W - 8:
+        rows = [(-10.0, b["half"], 16.0)]
+    else:                                                           # half of it in two pieces, 8 mm overlap
+        cut = round(b["half"] / 2.0)
+        rows = [(-10.0, cut + 4.0, 16.0), (cut - 4.0, b["half"], 16.0 - (cut - 14.0))]
+    spans = [(r_[0], r_[1]) for r_ in rows] if len(rows) == 1 else [(-10.0, rows[0][1] - 4.0), (rows[0][1] - 4.0 + 1e-3, b["half"])]
+    sc.x(4, 7, "Sensor bracket template, 1:1 - a C bent from aluminium strip 3 x 25 mm" + ("" if full else " (half of it)"), 4.6, s_, "s", 1)
+    sc.x(4, 12.5, ("The whole strip: " if full else "The strip's left half; the right half is the same, mirrored - ")
+         + f"{b['flat']:.0f} mm long. Drill first, then bend at the red lines."
+         + ("" if len(rows) == 1 else " Two pieces: tape them together on the join line."), 3.0, "#495057")
+    if len(rows) > 1:
+        sc.x(W - 4, 17.5, f"Flat, from the centre: face {b['b2']:.1f}, arm {b['b1'] - b['b2']:.1f}, foot {b['half'] - b['b1']:.1f} mm.", 2.8, "#1c7ed6", "e", 1)
+    sides = (-1, 1) if full else (1,)
+    a0, a1 = b["slot"]
+    for ri_, (s0, s1, xc) in enumerate(rows):
+        y0 = 26.0 + ri_ * 44.0                                      # this piece's top edge
+        ym = y0 + b["w"] / 2.0
+        X = lambda u, xc=xc: xc + u
+
+        def inside(u, lo=spans[ri_][0], hi=spans[ri_][1]):         # each mark on one piece only
+            return lo - 1e-6 <= u <= hi + 1e-6
+        sc.r(X(s0), y0, s1 - s0, b["w"], "#f1f3f5", "", 0, 0)
+        sc.l([(X(s0), y0), (X(s1), y0)], s_, 0.45); sc.l([(X(s0), y0 + b["w"]), (X(s1), y0 + b["w"])], s_, 0.45)
+        for u, real in ((s0, full and ri_ == 0 or abs(s0 + b["half"]) < 1e-6), (s1, abs(s1 - b["half"]) < 1e-6)):
+            if real:
+                sc.l([(X(u), y0), (X(u), y0 + b["w"])], s_, 0.45)
+            else:                                                   # broken off: the strip goes on
+                sc.l([(X(u) + (1.2 if i % 2 else -1.2), y0 + i * b["w"] / 6.0) for i in range(7)], "#868e96", 0.3)
+        if len(rows) > 1:                                           # where the two pieces meet
+            jx = X(rows[0][1] - 4.0)
+            sc.l([(jx, y0 - 3), (jx, y0 + b["w"] + 3)], "#7048e8", 0.3, 1)
+            sc.x(jx, y0 + b["w"] + 5.5, "join", 2.4, "#7048e8", "m", 1)
+        if inside(0.0):
+            sc.l([(X(0), y0 - 6), (X(0), y0 + b["w"] + 6)], "#1c7ed6", 0.25, 1)    # the centre
+            sc.c(X(0), ym, b["hole"] / 2.0, "#ffffff", s_, 0.35); _cross(sc, X(0), ym, b["hole"] * 0.6, s_, 0.15)
+            sc.x(X(0) + (2 if not full else 0), y0 - 8.6, "centre" + ("" if full else ": for the other half turn the sheet end for end and line it up here"),
+                 2.6, "#1c7ed6", "s" if not full else "m", 1)
+            sc.x(X(0) + 1.5, ym + b["hole"] / 2.0 + 3.8, f"{b['hole']:g} mm", 2.4, s_, "s", 1)
+        for sd in sides:
+            for name, pos, txt in (("B", b["b2"], "arm up 90"), ("A", b["b1"], "foot out 90")):
+                if inside(sd * pos):
+                    xx = X(sd * pos)
+                    sc.l([(xx, y0 - 3), (xx, y0 + b["w"] + 3)], "#e03131", 0.35, 1)
+                    sc.x(xx, y0 - 4.2, f"bend {name}: {txt}", 2.5, "#e03131", "m", 1)
+            if inside(sd * (b["half"] - a1)):
+                xa, xb = X(sd * (b["half"] - a0)), X(sd * (b["half"] - a1))  # the foot's slot
+                lo, hi = min(xa, xb), max(xa, xb)
+                r_ = b["slot_w"] / 2.0
+                sc.r(lo - r_, ym - r_, hi - lo + 2 * r_, 2 * r_, "#ffffff", s_, 0.3, r_)
+                _cross(sc, lo, ym, 2.5, s_, 0.12); _cross(sc, hi, ym, 2.5, s_, 0.12)
+                sc.x((lo + hi) / 2.0, ym - b["slot_w"] / 2.0 - 1.4, f"slot {b['slot_w']:g} mm", 2.4, s_, "m", 1)
+            for nm_, (u0, u1) in (("face", (0, b["b2"])), ("arm", (b["b2"], b["b1"])), ("foot", (b["b1"], b["half"]))):
+                um = sd * (u0 + u1) / 2.0
+                if inside(um):
+                    sc.x(X(um), y0 + b["w"] - 2.2, nm_, 2.6, "#868e96", "m")
+        # flat lengths along the strip, below it
+        yd = y0 + b["w"] + 7
+        marks = [u for u in (0.0, b["b2"], b["b1"], b["half"])]
+        for u0, u1 in zip(marks, marks[1:]):
+            if inside(u0) and inside(u1):
+                _dim(sc, X(u0), yd, X(u1), yd, f"{u1 - u0:.1f}", 0, 2.6)
+        for u in marks:
+            if inside(u):
+                sc.l([(X(u), y0 + b["w"] + 1), (X(u), yd + 1)], "#1c7ed6", 0.12)
+    # the bent C from the side, small
+    two = len(rows) > 1
+    k = min(0.5, 80.0 / (2 * (b["r_out"] + b["foot"]) + 8), (30.0 if two else 58.0) / b["arm"])
+    cx0 = 12.0 + (b["r_out"] + b["foot"]) * k
+    gy = 146.0                                                      # the gearbox face
+    t = max(0.6, b["t"] * k)
+    ro, fo, ar = b["r_out"] * k, b["foot"] * k, b["arm"] * k
+    sc.r(cx0 - ro - fo - 4, gy, 2 * (ro + fo) + 8, 6 * k + 1, "#adb5bd", "", 0, 1)
+    sc.x(cx0, gy + 9.5, "gearbox face", 2.6, "#495057", "m")
+    col = "#fab005"
+    for sd in (-1, 1):
+        sc.r(cx0 + (ro if sd > 0 else -ro - fo), gy - t, fo, t, col, "#e67700", 0.2, 0)                # foot
+        sc.r(cx0 + (ro - t if sd > 0 else -ro), gy - ar, t, ar, col, "#e67700", 0.2, 0)                # arm
+    sc.r(cx0 - ro, gy - ar, 2 * ro, t, col, "#e67700", 0.2, 0)                                           # face
+    sc.r(cx0 - 3, gy - ar - 6, 6, 6, "#212529", "", 0, 1)
+    sc.x(cx0, gy - ar - 8, "sensor", 2.4, s_, "m", 1)
+    sc.l([(cx0, gy), (cx0, gy - ar + 4)], "#868e96", 0.2, 1)
+    _dim(sc, cx0 - ro, gy - ar - 13, cx0 + ro, gy - ar - 13, f"{b['face']:.0f} outside", 0, 2.4)
+    _dim(sc, cx0 + ro + fo + 5, gy, cx0 + ro + fo + 5, gy - ar, f"{b['arm']:.0f}", 0, 2.4)
+    _dim(sc, cx0 + ro, gy - t - 3, cx0 + ro + fo, gy - t - 3, f"{b['foot']:.0f}", 0, 2.4)
+    sc.x(cx0, gy + 15, f"bent, {'half size' if abs(k - 0.5) < 1e-6 else 'small'} - outside sizes", 2.6, s_, "m", 1)
+    tx = max(cx0 + ro + fo + 14, 96.0)
+    paras = [
+        "Drill the " + (f"{b['hole']:g} mm hole (the sensor's 3/8 in bushing)" if hall else f"{b['hole']:g} mm hole (a 3/8 in bushing; 7.5 mm for an M7 one)")
+        + " and the slots, then bend: in a vise, the red line at the jaw's edge, over a 6 mm rod.",
+        "Bends B first (both arms the same way), then A (the feet out, the other way): a hat, the face across the shaft.",
+        "6063 or 5052 strip bends easily; 6061-T6 can crack - bend it over a 10 mm rod, or use 2 mm steel strip.",
+        f"The arms ({b['arm']:.0f} mm) are for a lever {b['g0']:g} mm off the gearbox and the parts of the Sensor mount picture: "
+        "put everything on the shaft first, measure from the gearbox face to the sensor's mounting face, add 3 mm, and move "
+        "both A lines by the difference.",
+        "The arms sit square to the lever's middle position" + (f" ({b['phi']} deg round from it)" if b["phi"] != 90 else "")
+        + f", {b['r_in']:.0f} mm off the axis: clear of the lever, its tail and the push rod over the whole swing.",
+        "Feet: hold it on the gearbox, the hole over the shaft's end, and mark the gearbox's screws in the slots; open the "
+        "slots or drill new holes to fit, and use longer screws of the same thread.",
+    ]
+    ny = 112.0 if two else 72.0
+    cols = int((W - tx - 4) / (2.6 * 0.5))
+    i = 0
+    for para in paras:
+        for ln in textwrap.wrap(para, cols):
+            sc.x(tx, ny + i * 4.1, ln, 2.6, "#495057")
+            i += 1
+        i += 0.35
+    if page:
+        sc.r(4, H - 14, 100, 2.5, "#212529", "", 0, 0)
+        for i in range(11):
+            sc.l([(4 + i * 10, H - 14), (4 + i * 10, H - 14 - (1.5 if i % 5 == 0 else 0.8))], "#212529", 0.25)
+        sc.x(4, H - 7.5, "100 mm - measure it: the print must be at 100% (Actual size)", 2.8, s_, "s", 1)
+        sc.r(140, H - 14, 101.6, 2.5, "#495057", "", 0, 0)
+        for i in range(9):
+            sc.l([(140 + i * 12.7, H - 14), (140 + i * 12.7, H - 14 - (1.5 if i % 2 == 0 else 0.8))], "#495057", 0.25)
+        sc.x(140, H - 7.5, "4 inches", 2.8, s_, "s", 1)
+    else:
+        sc.x(4, H - 6, "Export PDF or the Lever template button prints it at 1:1, with bars to check the scale.", 3.0, "#1c7ed6", "s", 1)
+    return sc.done("Sensor bracket template", "Print at 100% (Actual size), check the 100 mm bar, glue it on the strip, "
+                                              "centre-punch, drill, then bend at the red lines.")
+
+
+def elec_scene_linkage(d, lv):
+    """The push rod: lever, rod end, rod, rod end, the seat's bracket - side view, at mid travel and at both ends."""
+    sc = _ESc(1500, 940)
+    sc.x(30, 40, "Lever and push rod", 22, "#212529", "s", 1)
+    sc.x(30, 64, f"A rod with a ball joint (rod end) at each end links the lever to the seat. The lever is square to the rod at "
+                 f"mid travel and swings +/-{lv['swing']:g} deg: {lv['travel']:.0f} mm of travel at the seat.", 13, "#495057")
+    k = max(2.2, 220.0 / lv["ctc"])                          # px per mm: the lever at least 220 px long
+    L = lv["ctc"] * k
+    top_y = 250.0                                            # the seat's rod end at mid travel
+    ox, oy = 330.0, 610.0                                    # the motor's shaft
+    rod_x = ox + L
+    drop = L * math.sin(math.radians(lv["swing"]))
+    y_base = oy + max(drop, 90) + 50
+    # the motor seen from its output end, on a pedestal on the base
+    sc.r(ox - 190, y_base, 520, 14, "#868e96", "", 0, 3)
+    sc.x(ox + 330, y_base + 30, "the rig's base frame", 11, "#868e96", "e")
+    sc.r(ox - 130, oy + 60, 120, y_base - oy - 60, "#ced4da", "#adb5bd", 1.5, 2)
+    sc.r(ox - 190, oy - 70, 120, 140, "#adb5bd", "#868e96", 2, 12)
+    sc.r(ox - 80, oy - 80, 120, 160, "#495057", "#343a40", 2, 10)
+    sc.x(ox - 130, y_base - 10, "gear motor on its mount", 12, "#495057", "m", 1)
+    # ghosts at both ends of the swing
+    for sgn in (1, -1):
+        a = math.radians(sgn * lv["swing"])
+        lx, ly = ox + L * math.cos(a), oy - L * math.sin(a)
+        sc.l([(ox, oy), (lx, ly)], "#dee2e6", 26)
+        sc.c(lx, ly, 12, "#f1f3f5", "#ced4da", 2)
+    pts = [(ox + (L + 30) * math.cos(math.radians(t_)), oy - (L + 30) * math.sin(math.radians(t_)))
+           for t_ in range(-int(lv["swing"]), int(lv["swing"]) + 1, 3)]
+    sc.l(pts, "#1c7ed6", 2, 1)
+    sc.x(pts[-1][0] - 12, pts[-1][1] - 6, f"+{lv['swing']:g} deg", 12, "#1c7ed6", "e", 1)
+    sc.x(pts[0][0] - 12, pts[0][1] + 18, f"-{lv['swing']:g} deg", 12, "#1c7ed6", "e", 1)
+    # the lever at mid travel
+    sc.l([(ox, oy), (rod_x, oy)], "#868e96", 30)
+    sc.c(ox, oy, max(30.0, lv["r_hub"] * k * 0.5), "#868e96", "#495057", 2)
+    sc.c(ox, oy, 12, "#495057", "", 0)
+    sc.x(rod_x + 80, oy + 136, f"lever: {lv['ctc']:g} mm between centres", 13, "#212529", "s", 1)
+    sc.x(rod_x + 80, oy + 154, "clamped and keyed on the shaft: Lever template", 12, "#495057", "s")
+    # rod ends and the rod
+    e1 = _rod_end(sc, rod_x, oy, -90, 1.0)
+    e2 = _rod_end(sc, rod_x, top_y, 90, 1.0)
+    sc.l([e1, e2], "#adb5bd", 12)
+    sc.l([(rod_x - 6, e1[1] - 4), (rod_x - 6, e2[1] + 4)], "#ced4da", 2)
+    sc.l([(rod_x - 34, oy), (rod_x - 34, oy - 34), (rod_x, oy - 34)], "#2f9e44", 2)
+    sc.x(rod_x - 42, oy - 42, "90 deg at mid travel", 12, "#2f9e44", "e", 1)
+    # the seat's tab and frame
+    sc.r(rod_x - 210, top_y - 92, 420, 26, "#495057", "#343a40", 2, 4)
+    sc.x(rod_x, top_y - 104, "the seat's moving frame", 13, "#212529", "m", 1)
+    sc.p([(rod_x - 22, top_y - 66), (rod_x + 22, top_y - 66), (rod_x + 14, top_y + 10), (rod_x - 14, top_y + 10)], "#868e96", "#495057", 2)
+    sc.c(rod_x, top_y, 6, "#212529", "", 0)
+
+    def lab(x, y, lines, col="#212529"):
+        for i, s_ in enumerate(lines):
+            sc.x(x, y + i * 18, s_, 13 if i == 0 else 12, col if i == 0 else "#495057", "s", 1 if i == 0 else 0)
+    lab(rod_x + 80, oy - 6, [f"rod end ({lv['rod']}, {lv['rod_part']}): a ball joint",
+                             f"{lv['rod']} x {lv['rod_bolt']} bolt through the lever's end, a washer each side,",
+                             "nyloc nut - the ball must turn freely"])
+    lab(rod_x + 80, (oy + top_y) / 2 - 20, [f"push rod: {lv['rod']} threaded rod, or a tube with threaded ends",
+                                            "a jam nut at each rod end locks the length",
+                                            "or a turnbuckle (one end left-hand thread):",
+                                            "turn the rod to set its length on the rig"])
+    lab(rod_x + 80, top_y - 6, ["rod end at the seat: bolted to a tab on the frame,",
+                                "in the plane the lever swings in, the bolt square to it"])
+    lab(rod_x + 80, oy + 90, [f"travel at the seat: about {lv['travel']:.0f} mm (2 x lever x sin {lv['swing']:g} deg)"], "#1c7ed6")
+    yb = y_base + 70
+    sc.x(30, yb, "Why ball joints: as the seat tilts, the rod leans a little and its ends turn - a rigid joint would bend the rod or "
+                 "load the motor's shaft sideways.", 12, "#495057")
+    sc.x(30, yb + 20, f"Rod length: from the lever's end to the seat's tab at mid travel, set by your frame. Worst case it pushes about "
+                      f"{lv['f_end']:.0f} N ({lv['f_end'] / 9.81:.0f} kg): {lv['rod']} rod ends and rod take that with room to spare.", 12, "#495057")
+    sc.h = yb + 50
+    return sc.done("Lever and push rod", "Fit the rods with the seat level and the levers square to them; the page's Seat setup "
+                                         "then finds the limits.")
+
+
+def elec_scene_sensor_mount(d, lv, br=None):
+    """How the position sensor reads the shaft: a cap on the lever's hub turns a stub, a flexible coupling turns the
+    sensor; a C bracket on the gearbox holds the sensor still (2.9.5: a C - feet, arms past the lever, the face with the
+    sensor).  Side view along the shaft, and the view from the end."""
+    hall = d["sensor"] == "hall"
+    br = br or elec_bracket(d, lv)
+    sc = _ESc(1500, 900)
+    sc.x(30, 40, "Position sensor on the shaft", 22, "#212529", "s", 1)
+    sc.x(30, 64, "The sensor turns with the lever: a cap on the lever's hub turns a stub on the shaft's axis, a flexible coupling "
+                 "turns the sensor; a C bracket on the gearbox holds the sensor's body still.", 13, "#495057")
+    k = 3.2                                                   # px per mm
+    reach = br["r_out"] + br["foot"]
+    cy = 120.0 + (reach + 6) * k
+    gx = 110.0
+    yo = cy - reach * k                                       # the top foot's end
+
+    def lead(px, py, tx, ty, lines, col="#212529", a="s"):
+        sc.l([(px, py), (tx - 4, ty - 14 if ty > py else ty + 8 + 16 * (len(lines) - 1))], "#868e96", 1)
+        for i, s_ in enumerate(lines):
+            sc.x(tx, ty + i * 16, s_, 12 if i == 0 else 11, col if i == 0 else "#495057", a, 1 if i == 0 else 0)
+    # ---- side view: the gearbox on the left, the shaft along +x
+    gh = (reach + 6) * k
+    sc.r(gx, cy - gh, 150, 2 * gh, "#495057", "#343a40", 2, 12)
+    sc.x(gx + 75, cy + gh + 26, "gearbox", 13, "#495057", "m", 1)
+    sx0 = gx + 150
+    rb = lv["rb"] * k
+    sc.r(sx0, cy - rb, 30 * k, 2 * rb, "#adb5bd", "#868e96", 1.5, 2)                  # the output shaft
+    t = lv["t_al"] * k
+    lx0 = sx0 + br["g0"] * k
+    sc.r(lx0, cy - lv["r_hub"] * k, t, lv["r_hub"] * k * 2, "#ced4da", "#868e96", 2, 3)   # the lever, edge on (its hub)
+    nx0 = lx0 + t
+    sc.r(nx0, cy - rb * 1.3, 6 * k, rb * 2.6, "#868e96", "#495057", 1.5, 2)           # axle nut
+    sp_len = 22.0 * k
+    cap_x = nx0 + sp_len
+    for sy in (-1, 1):
+        yy = cy + sy * lv["r_cap"] * k
+        sc.r(nx0, yy - 3 * k, sp_len, 6 * k, "#e9ecef", "#868e96", 1.2, 2)
+    rcap = (lv["r_cap"] + 7) * k
+    sc.r(cap_x, cy - rcap, 5 * k, 2 * rcap, "#ced4da", "#495057", 2, 2)
+    stub_x0 = cap_x + 5 * k
+    sc.r(cap_x - 6 * k, cy - 3 * k, 6 * k, 6 * k, "#495057", "", 0, 1)               # the bolt's head, inside
+    sc.r(stub_x0, cy - 3 * k, 18 * k, 6 * k, "#868e96", "#495057", 1, 1)
+    sc.r(stub_x0, cy - 5 * k, 3 * k, 10 * k, "#495057", "", 0, 1)                    # its nut
+    cpx = stub_x0 + 12 * k
+    sc.r(cpx, cy - 9 * k, 25 * k, 18 * k, "#74c0fc", "#1c7ed6", 2, 6)
+    for i in range(4):
+        sc.l([(cpx + (6 + i * 4.5) * k, cy - 9 * k), (cpx + (6 + i * 4.5) * k, cy + 9 * k)], "#1c7ed6", 1.5)
+    shx = cpx + 25 * k
+    sc.r(cpx + 15 * k, cy - 3.2 * k, 16 * k, 6.4 * k, "#adb5bd", "#868e96", 1, 1)    # the sensor's shaft
+    brx = sx0 + br["inner"] * k                                                        # the face's inside
+    sc.r(shx + 4 * k, cy - 4.75 * k, 10 * k, 9.5 * k, "#adb5bd", "#868e96", 1, 1)    # its bushing
+    sc.r(brx - 2 * k, cy - 8 * k, 2 * k, 16 * k, "#495057", "", 0, 1)               # the panel nut
+    # the C bracket: feet on the gearbox face, arms past the lever, the face with the sensor
+    bt = br["t"] * k
+    ri, ro = br["r_in"] * k, br["r_out"] * k
+    col, edge = "#fab005", "#e67700"
+    for sy in (-1, 1):
+        y_arm = cy + sy * ri if sy > 0 else cy - ro
+        sc.r(sx0, y_arm, brx + bt - sx0, bt, col, edge, 1.2, 0)                       # arm
+        yf0, yf1 = (cy + ri, cy + reach * k) if sy > 0 else (cy - reach * k, cy - ri)
+        sc.r(sx0, yf0, bt, yf1 - yf0, col, edge, 1.2, 0)                               # foot, flat on the gearbox
+        ys = cy + sy * (br["r_out"] + br["foot"] * 0.55) * k
+        sc.r(sx0 + bt, ys - 5 * k, 3.5 * k, 10 * k, "#adb5bd", "#495057", 1, 1)      # a gearbox screw's head
+    sc.r(brx, cy - ro, bt, 2 * ro, col, edge, 1.2, 0)                                    # the face
+    sc.r(brx + bt, cy - 11 * k, 14 * k, 22 * k, "#212529", "#000000", 2, 4)          # the sensor's body
+    sc.x(sx0 + bt + 22, yo + 16, f"C bracket: aluminium strip 3 x 25 mm, {br['flat']:.0f} mm, four bends (Sensor bracket template)", 12, "#e67700", "s", 1)
+    room = ri - lv["r_hub"] * k >= 56                                                   # the lever's label fits inside the C
+    sc.x(sx0 + bt + 22, yo + 34, "feet on two of the gearbox's screws (longer, the same thread) - stiff, so the sensor's body cannot turn"
+         + ("" if room else "; the lever (edge on) swings between its arms"), 11, "#495057", "s")
+    # labels: above, and two rows below
+    if room:
+        lead(lx0 + t / 2, cy - lv["r_hub"] * k, sx0 + bt + 22, cy - ri + 22, ["lever (edge on) - it swings between the arms"])
+    lead(nx0 + sp_len / 2, cy - lv["r_cap"] * k - 3 * k, nx0 + sp_len / 2 - 10, cy - lv["r_cap"] * k - 30, ["2 spacers, M5 screws"])
+    lead(cpx + 12 * k, cy - 9 * k, cpx + 20, cy - ro - 38, ["flexible coupling",
+                                                                 "6 mm to 6.35 mm (1/4 in)" if hall else "6 mm to the pot's shaft"], "#1c7ed6")
+    r1, r2 = cy + gh + 70, cy + gh + 122
+    lead(sx0 + 4 * k, cy + rb, sx0 + 8, r1, ["output shaft"])
+    lead(cap_x + 2.5 * k, cy + rcap, cap_x - 40, r1, ["sensor cap (template)"])
+    lead(brx + 10 * k, cy + 11 * k, brx - 20, r1, ["TT 6127 Hall sensor" if hall else "10 k pot",
+                                                   "3/8 in bushing through the face's 10 mm hole, its nut" if hall else "its bushing nut on the face"])
+    lead(nx0 + 3 * k, cy + rb * 1.3, nx0 - 30, r2, ["axle nut and washer (the motor's own)"])
+    lead(stub_x0 + 9 * k, cy + 3 * k, max(stub_x0 + 120, nx0 - 30 + 270), r2, ["stub: M6 x 30 bolt through the cap's centre,",
+                                                          "head inside, nut outside - on the shaft's axis"])
+    # ---- the view from the end (right): the gearbox behind, the lever's swing, the C's feet and arms
+    ex, ey = 1170.0, cy - 10
+    kk = 2.0
+    sc.x(ex, 130, "Seen from the end", 15, "#212529", "m", 1)
+    gb = (reach + 8) * kk
+    sc.r(ex - gb, ey - gb, 2 * gb, 2 * gb, "#e9ecef", "#adb5bd", 2, 16)              # the gearbox, behind
+    sw = lv["swing"]
+    R = (lv["ctc"] + lv["r_end"] + 6) * kk
+    sect = [(ex, ey)] + [(ex + R * math.cos(math.radians(a_)), ey - R * math.sin(math.radians(a_))) for a_ in range(-int(sw), int(sw) + 1, 3)]
+    sc.p(sect, "#e7f5ff", "#a5d8ff", 1)
+    sc.x(ex + R + 8, ey + 4, "the lever swings here", 11, "#1c7ed6", "s", 1)
+    pts = [(ex + x * kk, ey - y * kk) for x, y in _lever_outline(lv, 12)]
+    sc.p(pts, "#ced4da", "#868e96", 1.5)
+    ln = lv["ctc"] * kk                                                                # the push rod, towards the seat
+    sc.l([(ex + ln, ey), (ex + ln, ey - gb - 30)], "#adb5bd", 5)
+    sc.x(ex + ln + 8, ey - gb - 22, "push rod", 11, "#868e96", "s", 1)
+    sc.c(ex, ey, (lv["r_cap"] + 7) * kk, "", "#495057", 1.5)
+    a = math.radians(br["phi"])
+    ux, uy = math.cos(a), -math.sin(a)                                                  # screen: y down
+    vx, vy = -uy, ux
+    hw = br["w"] / 2.0 * kk
+
+    def quad(r0, r1, sgn, f, s2):
+        P = lambda r_, w_: (ex + sgn * ux * r_ * kk + vx * w_, ey + sgn * uy * r_ * kk + vy * w_)
+        sc.p([P(r0, -hw), P(r1, -hw), P(r1, hw), P(r0, hw)], f, s2, 1.2)
+    sc.p([(ex + ux * br["r_out"] * kk + vx * hw, ey + uy * br["r_out"] * kk + vy * hw),
+          (ex - ux * br["r_out"] * kk + vx * hw, ey - uy * br["r_out"] * kk + vy * hw),
+          (ex - ux * br["r_out"] * kk - vx * hw, ey - uy * br["r_out"] * kk - vy * hw),
+          (ex + ux * br["r_out"] * kk - vx * hw, ey + uy * br["r_out"] * kk - vy * hw)], "", "#e67700", 1.5)   # the face, in front
+    for sgn in (1, -1):
+        quad(br["r_out"], reach, sgn, "#ffe8a1", "#e67700")                             # foot, behind on the gearbox
+        quad(br["r_in"], br["r_out"], sgn, "#fab005", "#e67700")                        # arm, end on
+        fx, fy = ex + sgn * ux * (br["r_out"] + br["foot"] * 0.55) * kk, ey + sgn * uy * (br["r_out"] + br["foot"] * 0.55) * kk
+        sc.c(fx, fy, 5, "#adb5bd", "#343a40", 1.2)
+    sc.c(ex, ey, 8, "#212529", "", 0)
+    sc.x(ex - gb + 8, ey + gb + 26, "the C's arms sit where the lever, its tail and the push rod never come;", 12, "#e67700", "s", 1)
+    sc.x(ex - gb + 8, ey + gb + 42, f"{br['r_in']:.0f} mm off the axis" + (f", {br['phi']} deg round from the lever's middle position" if br["phi"] != 90
+                                                                          else ", square to the lever's middle position"), 12, "#e67700", "s", 1)
+    sc.x(ex, ey - gb - 10, "gearbox (behind)", 11, "#868e96", "m")
+    notes = ("Order: lever on the shaft (key in, M8 tight, axle nut on) - spacers and cap with the stub - coupling on the stub - "
+             "sensor through the bracket's face, its shaft in the coupling - bracket's feet on the gearbox.",
+             "Line the sensor up with the shaft by eye: the coupling takes a mm or so. Tighten the coupling's screws with the lever "
+             "at mid travel and the sensor near the middle of its range, then Seat setup in this page.",
+             "Nothing but the coupling may push on the sensor's shaft. A worn or bent stub shows up as a jumpy position in Diagnostics.")
+    yn = max(r2 + 60, ey + gb + 80)
+    for i, s_ in enumerate(notes):
+        sc.x(30, yn + i * 22, s_, 12, "#495057")
+    sc.h = yn + len(notes) * 22 + 30
+    return sc.done("Position sensor on the shaft", "The cap's two holes and its centre come from the lever template, so the stub "
+                                                   "sits on the shaft's axis; the bracket's template has its bend lines.")
+
+
+def elec_parts_mech(add, d, lv, br=None):
+    """Levers, push rods and sensor mounts (lever drives)."""
+    n = d["motors"]
+    br = br or elec_bracket(d, lv)
+    strip_m = max(1, int(math.ceil((n * (br["flat"] + 20) + n * (2 * lv["r_cap"] + 24)) / 1000.0)))   # 2.9.5: C brackets and caps
+    plate_w = int(math.ceil((lv["length"] + 10) / 10.0) * 10)
+    plate_h = int(math.ceil((lv["width"] + 10) * n / 10.0) * 10)
+    add("Mechanics", f"aluminium plate 6061-T6, {lv['t_al']:g} mm, about {plate_w} x {plate_h} mm for {n} lever{'s' if n > 1 else ''} "
+        "(Lever template)", 1, 10.0 + 0.0003 * plate_w * plate_h * lv["t_al"] / 10.0, f"6061 aluminum plate {lv['t_al']:g}mm")
+    add("Mechanics", f"rod end (ball joint) {lv['rod']}, {lv['rod_part']}: two per push rod", 2 * n, 6.0, f"{lv['rod']} rod end bearing female")
+    add("Mechanics", f"threaded rod {lv['rod']}, 1 m, and jam nuts: the push rods", max(1, int(math.ceil(n / 2.0))), 8.0,
+        f"{lv['rod']} threaded rod 1m stainless")
+    add("Mechanics", f"bolts {lv['rod']} x {lv['rod_bolt']} with washers and nyloc nuts: the rod ends", 2 * n, 1.5, f"{lv['rod']} bolt nyloc nut")
+    add("Mechanics", f"M8 x {lv['bolt_len']} bolt and nyloc nut: each lever's clamp", n, 1.0, f"M8x{lv['bolt_len']} bolt 8.8")
+    add("Mechanics", "flexible shaft coupling, " + ("6 mm to 6.35 mm (1/4 in)" if d["sensor"] == "hall" else "6 mm to the pot's shaft"),
+        n, 4.0, "flexible shaft coupling 6mm 6.35mm" if d["sensor"] == "hall" else "flexible shaft coupling 6mm 6mm")
+    add("Mechanics", f"sensor caps and C brackets: aluminium strip 3 x 25 mm ({strip_m} m; 6063 or 5052 bends best), M5 spacers "
+        "20 mm, M5 screws, M6 x 30 bolts", 1, 8.0 + 4.0 * strip_m + 2.0 * n, "aluminum flat bar 3mm x 25mm")
+    add("Mechanics", "longer screws for the brackets' feet: the gearbox's own thread, 2 per motor", 2 * n, 0.5, "socket head screw M6 assortment")
+
+
+def elec_parts_imu(add, d):
+    """The WT901C-232 on the seat and its RS-232 module (board 1)."""
+    if not d.get("imu"):
+        return
+    add("Sensors", "motion sensor on the seat: WitMotion WT901C-232 (RS-232 model)", 1, 40.0, "WitMotion WT901C-232")
+    add("Sensors", "MAX3232 module, RS-232 to TTL, with a DB9 socket", 1, 5.0, "MAX3232 RS232 to TTL module DB9")
+    add("Sensors", "DB9 male plug with screw terminals", 1, 4.0, "DB9 male solderless screw terminal")
+
+
+def elec_imu_rows():
+    """The motion sensor's wiring list."""
+    return [{"from": "WT901C red (VCC, 5-36 V)", "to": "5V (the board's 5V strip)"},
+            {"from": "WT901C black (GND)", "to": "DB9 pin 5"},
+            {"from": "WT901C yellow (TX, data out)", "to": "DB9 pin 3"},
+            {"from": "WT901C green (RX, data in)", "to": "DB9 pin 2"},
+            {"from": "MAX3232 TXD", "to": "board D0 (RX)"},
+            {"from": "MAX3232 RXD", "to": "board D1 (TX)"},
+            {"from": "MAX3232 GND", "to": "GND (the board's GND strip)"},
+            {"from": "MAX3232 VCC", "to": "5V (the board's 5V strip)"}]
+
+
+def _ic_imu(sc, x, y):
+    """The WT901C-232, its four wires (red to 5V, the others into a DB9 plug), the MAX3232 module - 434 wide.
+    Returns the module's TTL pins (right side) and the 5V / GND flags drawn."""
+    sc.r(x, y, 130, 96, "#343a40", "#0b0d10", 2, 12)
+    for hx, hy in ((x + 11, y + 11), (x + 119, y + 11), (x + 11, y + 85), (x + 119, y + 85)):
+        sc.c(hx, hy, 4, "#0b0d10", "#5a616b", 1)
+    sc.x(x + 65, y + 40, "WT901C-232", 13, "#ffffff", "m", 1)
+    sc.x(x + 65, y + 58, "motion sensor", 10, "#ced4da", "m")
+    sc.x(x + 65, y + 74, "RS-232 output", 10, "#ffa8a8", "m", 1)
+    px, dbx = x + 130, x + 220
+    sc.r(dbx, y + 4, 40, 92, "#2e7d4f", "#1d5435", 2, 5)
+    sc.x(dbx + 20, y - 6, "DB9 plug", 10, "#212529", "m", 1)
+    for i, (lab, col, to) in enumerate((("red: VCC", "#e03131", "5V"), ("black: GND", "#212529", "5"),
+                                         ("yellow: TX", EW["imutx"], "3"), ("green: RX", EW["imurx"], "2"))):
+        yy = y + 22 + i * 21
+        if to == "5V":
+            sc.l([(px, yy), (px + 34, yy)], col, 3)
+            sc.tag(px + 38, yy, "5V", EW["v5"], "#ffffff", 9.5, "s")
+        else:
+            sc.l([(px, yy), (dbx, yy)], col, 3)
+            sc.x(dbx + 20, yy + 4, f"pin {to}", 9, "#ffffff", "m", 1)
+        sc.x(px + 4, yy - 5, lab, 8.5, "#495057", "s")
+    mx = dbx + 40
+    sc.p([(mx, y + 18), (mx + 12, y + 24), (mx + 12, y + 76), (mx, y + 82)], "#ced4da", "#868e96", 1)
+    bx = mx + 12
+    sc.r(bx, y, 150, 100, "#1a4f9a", "#123a73", 2, 6)
+    sc.r(bx + 22, y + 34, 50, 30, "#15171a", "", 0, 3)
+    sc.x(bx + 47, y + 53, "MAX3232", 8.5, "#e8eaee", "m", 1)
+    sc.x(bx + 75, y - 6, "MAX3232 module", 10, "#212529", "m", 1)
+    pins = {}
+    for i, k in enumerate(("TXD", "RXD", "GND", "VCC")):
+        yy = y + 16 + i * 22
+        sc.r(bx + 150, yy - 6, 12, 12, "#d4b04a", "#15171a", 1, 2)
+        sc.x(bx + 145, yy + 4, k, 10, "#ffffff", "e", 1)
+        pins[k] = (bx + 162, yy)
+    for k, lab, col in (("GND", "GND", "gnd"), ("VCC", "5V", "v5")):
+        px_, py_ = pins[k]
+        sc.l([(px_, py_), (px_ + 18, py_)], EW[col], 3)
+        sc.tag(px_ + 22, py_, lab, EW[col], "#ffffff", 9.5, "s")
+    return pins
+
+
+def elec_imu_signal(sc, up, x, y, lane_a, lane_b):
+    """The motion sensor's block at (x, y) and its two data wires up to D0 / D1 on the board's right side: TXD in
+    lane_a to D0, RXD in lane_b (further out) to D1 - no wire crosses another."""
+    pins = _ic_imu(sc, x, y)
+    for k, pin, lane, col in (("TXD", "D0", lane_a, "imutx"), ("RXD", "D1", lane_b, "imurx")):
+        sx, sy = pins[k]
+        tx, ty = up[pin]
+        sc.l([(sx, sy), (lane, sy), (lane, ty), (tx, ty)], EW[col], 3)
+    sc.x(x, y + 122, "Motion sensor on the seat (board 1): TXD to D0 (RX), RXD to D1 (TX). Never the sensor's yellow / green "
+                     "straight to D0 / D1 - RS-232 levels damage the board.", 11, "#495057", "s", 1)
+    return y + 130
+
+
+def elec_imu_check(chk, d):
+    if d.get("imu"):
+        chk("info", "Motion sensor on the seat (board 1)",
+            "The WT901C-232 talks RS-232: a MAX3232 module turns that into the board's levels on D0 / D1 (Serial1) - those "
+            "two pins are free in every SMC3 R4 build, and the USB port is separate. It feeds Seat setup, the seat angle "
+            "card and the checks; with two boards it goes on board 1." if d.get("drive") != "servo" else
+            "The WT901C-232 talks RS-232: a MAX3232 module turns that into the board's levels on D0 / D1 (Serial1) - free in "
+            "the servo build too. It feeds Seat setup and the seat angle card; with two boards it goes on board 1.")
+
+
+MM_PT = 72.0 / 25.4
+
+
+def elec_pdf_lever_pages(p, d, lv):
+    """The 1:1 template sheets on landscape pages of an ElecPdf: the lever (with the cap, when it fits beside it), and
+    (2.9.5) the sensor bracket."""
+    sc = elec_scene_lever(d, lv, page=True)
+    p.new_page(landscape=True)
+    elec_pdf_scene(p, sc, scale=MM_PT, at=(36.0, 34.0), frame=False)
+    if not any(it.get("s") == "Sensor cap, 1:1" for it in sc["items"]):
+        p.new_page(landscape=True)
+        elec_pdf_scene(p, elec_scene_lever(d, lv, page=True, part="cap"), scale=MM_PT, at=(36.0, 34.0), frame=False)
+    p.new_page(landscape=True)                                       # 2.9.5: the sensor bracket, 1:1
+    elec_pdf_scene(p, elec_scene_bracket(d, lv, elec_bracket(d, lv), page=True), scale=MM_PT, at=(36.0, 34.0), frame=False)
+
+
+def elec_lever_pdf(raw, version=""):
+    """The lever template alone (POST /elec/lever): (pdf bytes, file name) - or (None, why)."""
+    r = elec_design(raw)
+    d = r["inputs"]
+    lv = r.get("lever")
+    if not lv:
+        return None, "The lever template is for gear motors with a lever."
+    p = ElecPdf("Lever and sensor bracket templates - print at 100% (Actual size)")
+    elec_pdf_lever_pages(p, d, lv)
+    return p.bytes(), f"lever-template_{lv['ctc']:g}mm_{lv['shaft']:g}mm-shaft.pdf"
 
 
 # --------------------------------------------------------------------------------------------------------------
@@ -17681,6 +22509,15 @@ VENDOR = {
         "H4sIAAAAAAAC/6WX227jNhCGr+2nYG82TupQFE+SNkiBXaDozS5QNA9QyDLtqJXFgJSz3i787h1SskPKClCjQWxL1HD4fzOjEZXc3c3RHXruuhf7MUm2dfe8X+FK75Kt1ttGJTu9Vs39a62+KZOsGr1KdqXt4PilrP4ut8rGFtZUSfdslLoHHy+6VW1nk1/b19rodgcnT5VqFe4sLJrM5zWYmA79mKPZZ3D3VK/V0h3rw29K71RnvrvTr8o+L+f+53Np6+prCevXZXO69tSV7bo063D8d1233Zd6+9y5M7/qcn5EG6N36MYLvHmYz6umtBb9ofUukIjUoVPt2iI/C8TNZ5VubWf2VafNAhm4qIwy6BG1+6ZBt95kZvcvyixuH9yxt0fbgcEZqm8ooHJms9npOob4qU596jpTr/adWqCb/esNCl0ZkHjCG9xNkS/QD2QhiB/RKZzoiPxavZuVPvwXL/3KoAlBEFVr684xCD9ab1AQgp8ehyB8+HAexH/urfqitmX13SfAokew2pSNVRCr0GNBSMC4K+vWTxikvaVwgchh4/+Wb/OXiObw6fHOc/GLhou1brFVbh7mKVilEqdFsYRTRkg/o3uuLS7X60Ww7jjiQYwW52wu42R4Z25ktPI9LJaJDNZmmKZ+7SzNAnNblY3qbVkK15gDAn3C/4oiHev0ikKJkM30HYlhor0bZ3uhMCW4IBLWw4SAwhTnXAbmRndlEMqlZ0oLEEgCq4CDYuZykoFXMOJYigsIr3kEQa+AoBcQAkuSLYd489NBHsy44ADsgocUNKRIcZERFw3BwIjhQogJCjqmYFdQsBEFlKfMnK7cVUyGc8IC2wn9QqahfhZVEy4oeJGY5sLpl3k2oZ+N9fMr9POLLEAJpZ6AuPsNeCgPrCcIGGMhAY/riBDqCkjIvjolnyDgYwJxBYEYEVBMi/RUPHLpiSRNA/vJu4HmMqQQcR0JLn0dCep+eCEnKMSYQl5BISfykBas18ZksfT3h+BZMGOqmtKIQsbVlGe+jHieuVwU+RSFH3MYSYLuD8i4dnqGatzZe52qMgqoPsG378FvTzIBgvqV+vmX3QuqzAlPOWYgLceU5NGEgAL6lhPP/SMDZ6wYMwwa+1z0EI3ajBjo/2Sgkwy+9eaYUF9/DiOL5kxhCI9x2V4HmWeMnw8xAbuWwD2yAjXjxgWxLwh0ydTVXe70w0OE0WhGrN8/GKgUrkkwNg3AAoB/YgB+LQBnEQCfeExzSV355IWvJUFJZB/Ih0IDRoE5T32ry/NJ+Twoo5F8ca18GlfQuG3B3oJBKFPoLrnvWpAIwdNoRtRYfeH4m3469CII/fdYu7y6dkgsXl5szkAIJb0cEhlGbbSX61oomdTcN5/ZET7r2sIaajHsyYetnLJ6byplB4AncNtTekedKV+VgUmwsdWrv1QFG0H0+Evvod/v9sO4to79tOGHfdzJcS9msDpv+73W96x2QS93Zk797DicbbSBVWP1SG8CkpOG0wg+k3sHxz4e8L/Zt5UL+ftpetuR37697KDd5XtC9PLlX2FORvDC2Gjj8vUEiStN5BTsjOr2pj37fPDK1KF/+bt4/zo+zP8FNOGQppcOAAA="),
 }
 
+# The firmware sources (SMC3_R4 2.2.0b1 beta and the 2.1.1 release), gzip-compressed: the Electronics wizard
+# sets their starting values for a design and hands them out as a sketch folder (/elec/firmware).
+FIRMWARE_SRC = {
+    "SMC3_R4_v2.2.0b1.ino": base64.b64decode(
+        "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"),
+    "SMC3_R4_v2.1.1.ino": base64.b64decode(
+        "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"),
+}
+
 PAGE = r"""<!doctype html>
 <html data-theme="dark"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>SMC3 R4 Motion Control</title>
@@ -17787,11 +22624,59 @@ main[data-view=tools]{grid-template-columns:minmax(0,1.75fr) minmax(0,1fr);grid-
 main[data-view=profiles]{grid-template-columns:minmax(0,1fr) minmax(360px,430px);grid-template-areas:"genres pid" "profiles pid"}
 main[data-view=autotune]{grid-template-columns:minmax(360px,430px) minmax(0,1fr);grid-template-areas:"tune tunelive" "tuneres tunelive" "tunelog tunelog" "graphs graphs"}
 main[data-view=eeprom]{grid-template-columns:minmax(0,1fr) minmax(360px,430px);grid-template-areas:"eeprom pid" "backups pid"}
-main[data-view=settings]{grid-template-columns:repeat(2,minmax(0,1fr));grid-template-areas:"settings global" "settings mnames" "usb usb" "led sensor" "park park" "upd upd" "fwupd fwupd" "diag diag"}
+main[data-view=settings]{grid-template-columns:repeat(2,minmax(0,1fr));grid-template-areas:"settings global" "settings mnames" "usb usb" "drv drv" "led sensor" "park park" "upd upd" "fwupd fwupd" "diag diag"}
 main[data-view=help]{grid-template-columns:1fr;grid-template-areas:"help"}
 main[data-view=seat]{grid-template-columns:minmax(0,1fr) minmax(300px,380px);grid-template-areas:"seat seatlive" "park seatlive" "graphs graphs"}
 main[data-view=view3d]{grid-template-columns:1fr;grid-template-areas:"v3d"}
 main[data-view=frame]{grid-template-columns:minmax(0,1fr) minmax(0,1.05fr);grid-template-areas:"frwiz frres";align-items:start}
+main[data-view=elec]{grid-template-columns:minmax(0,1fr) minmax(0,1.05fr);grid-template-areas:"elwiz elres";align-items:start}
+.eltag{font-style:normal;display:inline-block;margin:5px 5px 0 0;padding:1px 8px;border-radius:10px;border:1px solid var(--fc,var(--line-2));font-size:11.5px;color:color-mix(in srgb,var(--fc,var(--dim)) 70%,var(--text))}
+.frtab td.elbuy,.frtab th.elbuy{padding-left:14px;white-space:nowrap}.elbuy a{color:var(--blue);text-decoration:none;white-space:nowrap}.elbuy a:hover{text-decoration:underline}
+.elpics{margin:0 0 12px}
+.eltabs{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 8px}
+.eltabs button{display:flex;align-items:center;gap:6px;height:30px;padding:0 11px;border-radius:15px;border:1px solid var(--line-2);background:var(--card-2);color:var(--dim);cursor:pointer;font-size:12.5px}
+.eltabs button svg{width:16px;height:16px}.eltabs button.on{border-color:var(--blue);color:var(--text);box-shadow:inset 0 0 0 1px var(--blue)}
+.eltabs .sp{margin-left:auto}
+.elpic{border:1px solid var(--line);border-radius:10px;background:#fff;overflow:hidden;cursor:zoom-in}
+.elpic svg{display:block;width:100%;height:auto}
+.elpiccap{font-size:12px;color:var(--dim);margin:5px 2px 0}
+.elico{display:inline-grid;place-items:center;flex:none;width:34px;height:34px;border-radius:9px;background:color-mix(in srgb,var(--ic) 16%,transparent);color:var(--ic)}
+.elico svg{width:21px;height:21px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+.elico.sm{width:22px;height:22px;border-radius:6px}.elico.sm svg{width:15px;height:15px}
+#el_steps button svg{width:15px;height:15px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+.ellay button{display:flex;gap:12px;align-items:flex-start}.ellay button>div{min-width:0}
+.elpk button{display:inline-flex;align-items:center;gap:8px}.elpk button .elico{width:24px;height:24px;border-radius:6px}.elpk button .elico svg{width:16px;height:16px}
+.elpk button.on .elico{background:rgba(255,255,255,.2);color:#fff}
+.elnote{display:flex;gap:10px;align-items:flex-start;border:1px solid var(--line);border-radius:9px;background:var(--card-2);padding:9px 12px;margin:0 0 12px;font-size:13px;color:var(--dim)}
+.elnote b{color:var(--text)}
+.frtab td .elico.sm{vertical-align:middle;margin-right:7px}
+.drvopts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin:0 0 10px}
+.drvopts button{display:flex;gap:12px;align-items:flex-start;text-align:left;padding:10px 12px;border-radius:9px;border:1px solid var(--line-2);background:var(--card-2);color:var(--text);cursor:pointer}
+.drvopts button b{display:block;font-size:14px}.drvopts button small{display:block;color:var(--dim);font-size:12.5px;margin-top:2px;line-height:1.35}
+.drvopts button.on{border-color:var(--blue);box-shadow:inset 0 0 0 1px var(--blue)}.drvopts button.now{border-color:var(--green-1)}
+.drvopts button:disabled{opacity:.6;cursor:not-allowed}
+@media (max-width:700px){.drvopts{grid-template-columns:1fr}}
+.card.na{display:none!important}
+.betafw{color:#ff6b6b!important;font-weight:700;cursor:pointer}
+.betafw i,.betanote i.led{display:inline-block;flex:none;width:9px;height:9px;border-radius:50%;background:#ff3030;box-shadow:0 0 7px #ff3030;margin-right:6px;vertical-align:-1px;animation:betablink 1s steps(1,end) infinite}
+@keyframes betablink{50%{opacity:.12;box-shadow:none}}
+.betanote{display:flex;gap:8px;align-items:flex-start;border:1px solid rgba(255,59,59,.5);background:rgba(255,59,59,.08);border-radius:9px;padding:9px 12px;margin:0 0 12px;font-size:13px;line-height:1.45}
+.betanote i.led{margin-top:4px}
+.srvgrid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px 14px;margin:6px 0 8px}
+@media (max-width:900px){.srvgrid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+.srvm{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 10px}
+.srvm span{border:1px solid var(--line-2);border-radius:8px;padding:5px 10px;font-size:13px;background:var(--card-2)}
+.srvm span.bad{border-color:var(--red);color:var(--red)}.srvm span.ok{border-color:var(--green-1)}.srvm span.wait{border-color:var(--amber)}
+.srvcalc{font-family:var(--mono);font-size:12.5px;color:var(--dim);margin:0 0 10px;line-height:1.5}
+.srvrev{display:flex;gap:14px;flex-wrap:wrap;align-items:center;font-size:13px}
+.fwbox>div{flex:1;min-width:0}.fwbox .fwfor{display:block;margin-top:6px;color:var(--dim);font-size:12.5px}
+.fwbox .fwbtns{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}.fwbox .fwbtns .btn{display:inline-flex;align-items:center;gap:6px;font-size:13px;padding:7px 12px;word-break:break-all;text-align:left}
+.ellinks{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:8px;margin:0 0 12px}
+.ellinks a{display:block;border:1px solid var(--line-2);border-radius:9px;padding:9px 12px;background:var(--card-2);text-decoration:none;color:var(--text)}
+.ellinks a b{display:block;font-size:13.5px;color:var(--blue)}.ellinks a span{display:block;font-size:12.5px;color:var(--dim);margin-top:2px}
+.elfw{margin:6px 0 12px}.elfw summary{cursor:pointer;font-weight:700;font-size:14px;display:flex;align-items:center;gap:8px}.elfw table{margin-top:8px}
+.elwire{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:0 16px}
+.elfrom{display:flex;align-items:center;gap:10px;border:1px dashed var(--line-2);border-radius:9px;padding:8px 12px;margin:0 0 12px;font-size:13px;color:var(--dim)}.elfrom button{margin-left:auto;flex:none}
 /* ---------- frame design (2.9.4) ---------- */
 .frsteps{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 14px}
 .frsteps button{display:flex;align-items:center;gap:7px;height:32px;padding:0 12px 0 6px;border-radius:16px;border:1px solid var(--line-2);background:var(--card-2);color:var(--dim);cursor:pointer;font-size:13px}
@@ -18169,6 +23054,20 @@ ul.tips{margin:6px 0 10px;padding-left:18px}ul.tips li{color:var(--dim);margin:4
 .modal{position:fixed;inset:0;background:rgba(2,6,12,.6);display:none;align-items:center;justify-content:center;z-index:50}
 .modal .box{background:var(--card);border:1px solid var(--line-2);border-radius:12px;padding:18px 20px;width:min(560px,94vw)}
 .modal h2{font-size:17px;margin:0 0 10px}.modal li{margin:5px 0}
+/* 2.9.5: All firmware */
+.modal.fwall .box{width:min(1280px,96vw);max-height:90vh;display:flex;flex-direction:column}
+.fwall .fwscroll{overflow:auto;min-height:0;flex:1;border:1px solid var(--line);border-radius:9px}
+.fwtab{width:100%;border-collapse:collapse;font-size:12.5px;min-width:1080px}
+.fwtab th{position:sticky;top:0;background:var(--card);text-align:left;padding:8px;border-bottom:1px solid var(--line-2);font-size:12px;color:var(--dim);white-space:nowrap;z-index:1}
+.fwtab td{padding:7px 8px;border-bottom:1px solid var(--line);vertical-align:top;line-height:1.4}
+.fwtab tr.fwg td{background:color-mix(in srgb,var(--blue) 9%,var(--card));font-weight:700;font-size:12.5px;padding:7px 8px}
+.fwtab tr.yours td{background:color-mix(in srgb,var(--green) 13%,transparent)}
+.fwtab td.fwf{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11.5px;word-break:break-all;min-width:190px}
+.fwtab .fwv{display:inline-block;padding:1px 7px;border-radius:9px;font-size:11px;font-weight:700;color:#fff;white-space:nowrap}
+.fwtab .fwv.rel{background:var(--green)}.fwtab .fwv.beta{background:#e03131}.fwtab .fwv.no{background:#868e96}
+.fwtab .fwpick{display:inline-block;margin-top:4px;padding:1px 7px;border-radius:9px;font-size:10.5px;font-weight:700;background:var(--green);color:#fff}
+.fwtab .fwch{color:var(--dim);font-size:11.5px;margin-top:3px}
+.fwtab button{white-space:nowrap}
 
 /* motor names */
 .nrow{display:grid;grid-template-columns:31px minmax(0,1fr) minmax(0,1fr);gap:10px;align-items:center;margin:8px 0}
@@ -18424,6 +23323,7 @@ details.oks .flist{margin-top:6px}
   <a href="#autotune"><svg class="i" viewBox="0 0 24 24"><path d="M4 20L15 9M13 4l1 2 2 1-2 1-1 2-1-2-2-1 2-1zM19 11l.7 1.3L21 13l-1.3.7L19 15l-.7-1.3L17 13l1.3-.7z"/></svg>Auto-Tune</a>
   <a href="#seat"><svg class="i" viewBox="0 0 24 24"><rect x="2.5" y="9" width="19" height="6" rx="3"/><circle cx="12" cy="12" r="1.6"/><path d="M8.5 9v6M15.5 9v6M12 3v3M12 18v3"/></svg>Seat Setup</a>
   <a href="#frame"><svg class="i" viewBox="0 0 24 24"><path d="M3 20h18M5 20V9l7-5 7 5v11M5 13h14M12 4v16"/></svg>Frame Design</a>
+  <a href="#elec"><svg class="i" viewBox="0 0 24 24"><path d="M13 2L5 13h6l-1 9 8-11h-6z"/></svg>Electronics</a>
   <a href="#eeprom"><svg class="i" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="1.5"/><path d="M9 2v4M15 2v4M9 18v4M15 18v4M2 9h4M2 15h4M18 9h4M18 15h4"/></svg>EEPROM</a>
   <a href="#settings"><svg class="i" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M4.9 19.1L7 17M17 7l2.1-2.1"/></svg>Settings<span class="nbadge" id="navbadge" data-k="navbadge" hidden></span></a>
   <a href="#help"><svg class="i" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9.5"/><path d="M9.1 9a3 3 0 0 1 5.8 1c0 2-3 3-3 3M12 17h.01"/></svg>Help</a>
@@ -18490,6 +23390,7 @@ details.oks .flist{margin-top:6px}
  <section class="card wide" style="grid-area:pid" data-views="dashboard tuning profiles eeprom">
   <div class="ct"><svg class="i" viewBox="0 0 24 24"><rect x="4" y="3" width="16" height="18" rx="2"/><path d="M8 8h8M8 12h8M8 16h5"/></svg>PID Settings</div>
   <table class="pid" id="pidtable"></table>
+  <p class="note srvonly" hidden>Servo firmware: only <b>PWMmax</b> does something here (each actuator's top speed, 255 = 20 000 pulses/s). The servo drives run their own position loops.</p>
  </section>
 
  <!-- loop & PWM -->
@@ -18551,6 +23452,7 @@ details.oks .flist{margin-top:6px}
  <!-- auto-tune -->
  <section class="card tune" style="grid-area:tune" data-views="dashboard autotune">
   <div class="ct" data-k="tune"><svg class="i" viewBox="0 0 24 24"><path d="M4 20L15 9M13 4l1 2 2 1-2 1-1 2-1-2-2-1 2-1zM19 11l.7 1.3L21 13l-1.3.7L19 15l-.7-1.3L17 13l1.3-.7z"/></svg>Auto-Tune</div>
+  <p class="note" id="tn_srv" hidden style="color:var(--amber)">Servo firmware: auto-tune tunes the DC motors' PID loop, which this firmware doesn't have - each servo drive runs its own (tune it with the drive's gain parameters). Speed: PWMmax; acceleration: Settings, Servo actuators.</p>
   <div class="frow">
    <div><span class="lbl" data-k="tmotor">Motor</span><select id="tm" class="msel" onchange="setSel(+this.value)"></select></div>
    <div><span class="lbl" data-k="tamp">Travel ±</span><select id="tamp"><option>60</option><option>80</option><option selected>100</option><option>150</option><option>200</option></select></div>
@@ -18802,6 +23704,49 @@ details.oks .flist{margin-top:6px}
   </div>
  </section>
 
+ <!-- motor drivers (page 2.9.5, firmware 2.1.2) -->
+ <section class="card wide" id="drvcard" style="grid-area:drv" data-views="settings">
+  <div class="ct"><svg class="i" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/><path d="M9 2v4M15 2v4M9 18v4M15 18v4M2 9h4M2 15h4M18 9h4M18 15h4"/></svg>Motor drivers <small>what the board's motor pins drive</small></div>
+  <div class="sstat" id="drv_stat"><i class="dot"></i><span>Not read yet</span></div>
+  <div class="drvopts" id="drv_opts">
+   <button data-drv="0"><span class="elico" style="--ic:#4c6ef5"><svg viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/><path d="M9 2v4M15 2v4M9 18v4M15 18v4M2 9h4M2 15h4M18 9h4M18 15h4"/></svg></span><span><b>IBT-2 / BTS7960</b><small>Two PWM inputs. RPWM on D2 / D4 / D6, LPWM on D9 / D10 / D11, R_EN and L_EN together on D3 / D5 / D7. What the firmware has always driven.</small></span></button>
+   <button data-drv="1"><span class="elico" style="--ic:#4c6ef5"><svg viewBox="0 0 24 24"><rect x="3" y="6" width="8" height="12" rx="1.5"/><rect x="13" y="6" width="8" height="12" rx="1.5"/><path d="M7 3v3M17 3v3M7 18v3M17 18v3"/></svg></span><span><b>PWM + direction</b><small>Cytron MD30C / MD13S / MDD10A / SmartDriveDuo-30 and -60, VNH and 100 A class bridges. DIR (or INA) on D2 / D4 / D6, PWM on D9 / D10 / D11, INB (if it has one) on D3 / D5 / D7.</small></span></button>
+  </div>
+  <p class="note" id="drv_note">Changing it needs firmware 2.2.0b1 (the beta in All firmware), the motors switched off (Disable Motors) and SimHub's motion output stopped. The board keeps it. Wire the drivers as the Electronics page's Signal wiring picture shows before switching the motors on again.</p>
+  <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+   <button class="btn b-blue" id="drv_save" disabled>Use this driver type</button>
+   <button class="btn b-grey" id="drv_khz">Set PWM to 20 kHz and save</button>
+   <a href="#elec" style="font-size:13px">Wiring pictures: Electronics</a>
+  </div>
+  <div class="msg" id="drv_msg"></div>
+ </section>
+
+ <!-- servo actuators (page 2.9.5, firmware 2.2.0b1 servo build) - shown instead of Motor drivers -->
+ <section class="card wide na" id="srvcard" style="grid-area:drv" data-views="settings">
+  <div class="ct"><svg class="i" viewBox="0 0 24 24"><rect x="2" y="9" width="13" height="6" rx="1.5"/><path d="M15 12h7M18 9v6M5 9V6h5v3"/></svg>Servo actuators <small>SMC3_R4_Servo firmware: step / direction</small></div>
+  <div class="betanote"><i class="led"></i><span><b>Beta firmware - not tested on a real rig yet.</b> It is written for and checked against this dashboard and should work with it. The first time: seat empty, motors off, a hand on the emergency stop, and move one actuator a little with the motor card's knob before SimHub drives the rig.</span></div>
+  <div class="sstat" id="srv_stat"><i class="dot"></i><span>Not read yet</span></div>
+  <div class="srvm" id="srv_m"></div>
+  <div class="srvgrid">
+   <div><span class="lbl">Usable stroke (mm)</span><input type="number" id="srv_stroke" min="10" max="1000" step="1" value="100" oninput="srvCalc()"></div>
+   <div><span class="lbl">Ball-screw lead (mm / turn)</span><input type="number" id="srv_lead" min="1" max="50" step="0.5" value="5" oninput="srvCalc()"></div>
+   <div><span class="lbl">Pulses per motor turn</span><input type="number" id="srv_ppr" min="50" max="100000" step="1" value="500" oninput="srvCalc()"></div>
+   <div><span class="lbl">Acceleration limit (m/s²)</span><input type="number" id="srv_acc" min="0.5" max="50" step="0.5" value="5" oninput="srvCalc()"></div>
+   <div><span class="lbl">Homing</span><select id="srv_home" onchange="srvCalc()"><option value="0">Bottom: release, settle 4 s, zero there</option><option value="1">Home switches (NC to GND on A0 / A1 / A2)</option></select></div>
+   <div><span class="lbl">Servo-on (SON) output</span><select id="srv_son" onchange="srvCalc()"><option value="0">On when HIGH (through a ULN2803A)</option><option value="2">On when LOW (wired straight)</option></select></div>
+   <div><span class="lbl">Emergency-stop contact</span><label class="srvrev" style="min-height:36px"><input type="checkbox" id="srv_es" onchange="srvCalc()"> NC contact A3 to GND</label></div>
+   <div><span class="lbl">Reverse a motor (instead of the drive's Pn097)</span><div class="srvrev"><label><input type="checkbox" id="srv_r0" onchange="srvCalc()"> 1</label><label><input type="checkbox" id="srv_r1" onchange="srvCalc()"> 2</label><label><input type="checkbox" id="srv_r2" onchange="srvCalc()"> 3</label></div></div>
+  </div>
+  <div class="srvcalc" id="srv_calc"></div>
+  <p class="note">PWMmax sets each actuator's top speed (255 = 20 000 pulses/s); Kp, Ki, Kd, PWMmin, dead zone and PWMrev do nothing on this firmware - each servo drive runs its own loop. Stroke, homing, servo-on, the e-stop contact and reverse change only with the motors switched off; the board saves them at once. Pulses per motor turn must match the drive's electronic gear (SFX-100 drives, Pn098 = 20: 500). Bottom homing needs the servo-on wire: the board must be able to let the seat sink.</p>
+  <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+   <button class="btn b-blue" id="srv_save">Save to the board</button>
+   <button class="btn b-grey" id="srv_rehome">Home again</button>
+   <a href="#elec" style="font-size:13px">Wiring pictures: Electronics</a>
+  </div>
+  <div class="msg" id="srv_msg"></div>
+ </section>
+
  <!-- USB cable (page 2.8, firmware 1.9.5) -->
  <section class="card wide" id="usbcard" style="grid-area:usb" data-views="settings">
   <div class="ct"><svg class="i" viewBox="0 0 24 24"><path d="M12 3v14"/><path d="M9 6l3-3 3 3"/><path d="M12 13l-4-2V8"/><circle cx="8" cy="7" r="1.2"/><path d="M12 11l4-2V6.5"/><rect x="14.8" y="4.2" width="2.4" height="2.4"/><circle cx="12" cy="19" r="2"/></svg>USB cable <small>for calibration, instead of WiFi</small></div>
@@ -18942,6 +23887,7 @@ details.oks .flist{margin-top:6px}
      <button class="btn b-orange" id="fw_go" data-k="fw_go" onclick="fwAsk()" disabled>Install on the board</button>
      <button class="btn b-grey" id="fw_clear" data-k="fw_clear" onclick="fwClear()" hidden>Forget the file</button>
     </div>
+    <div class="sbtns"><button class="btn b-grey" id="fw_all" onclick="fwAllOpen()"><svg class="i" viewBox="0 0 24 24"><path d="M4 5h16M4 10h16M4 15h16M4 20h10"/></svg>All firmware: every version and set-up</button></div>
     <div id="fw_run" hidden><div class="bar"><div id="fw_bar"></div></div><div class="muted" id="fw_stage"></div></div>
     <div class="msg" id="fw_msg"></div>
     <div class="fwlog" id="fw_log"></div>
@@ -19002,6 +23948,18 @@ details.oks .flist{margin-top:6px}
   <div id="fr_out"><p class="frsub">Working it out...</p></div>
  </section>
 
+ <!-- electronics design (2.9.5) -->
+ <section class="card wide" id="elwiz" style="grid-area:elwiz" data-views="elec">
+  <div class="ct">Electronics design</div>
+  <div class="frsteps" id="el_steps"></div>
+  <div id="el_body"></div>
+  <div class="frnav"><button class="btn b-grey" id="el_back">Back</button><button class="btn b-ghost" id="el_reset">Start over</button><span class="sp"></span><button class="btn b-blue" id="el_pdf">Export PDF</button><button class="btn b-green" id="el_next">Next</button></div>
+ </section>
+ <section class="card wide" id="elres" style="grid-area:elres" data-views="elec">
+  <div class="ct">Your design</div>
+  <div id="el_out"><p class="frsub">Working it out...</p></div>
+ </section>
+
  <section class="card help" style="grid-area:help" data-views="help">
   <div class="ct">Help</div>
   <div class="cols">
@@ -19017,6 +23975,15 @@ details.oks .flist{margin-top:6px}
     <h3>Diagnostics</h3><p>Settings section. <b>Quick check</b> reads the board and listens for a few seconds; <b>Full check</b> also moves each motor a little to see which way it goes, how much drive it needs, whether the wiring is swapped and how it answers a small step - and can ask you what you saw. Both make one file (saved on the NAS too) to download and give to whoever helps you. The page also watches while you drive and notes pot glitches, a motor moving the wrong way or stalling, hunting, cutoffs, the tilt limit and board restarts. It also keeps a <b>load map</b>: where each motor falls behind or runs at full power, each way across its travel - a quick check after a session names where the rig struggles (lifting a heavy driver, say). With the motion sensor, the full check also measures the seat itself: degrees per count, bounce and play in the linkage - for the traction-loss motor, how far the seat turns. For the rear slide it asks whether the rear went left or right.</p>
     <h3>Test signals on several motors (page 2.9)</h3><p>The Test Signal card's <b>Together</b> list, and Presets <b>Twist</b>, <b>Heave</b>, <b>Corner</b> and <b>Wave</b>, run one signal on several motors at once, each around its own centre (the level seat): Twist moves the two front lifts opposite each other - one goes down while the other goes up, the most twist the rig can do; Heave moves the lifts together; Corner the front lifts opposite each other with the rear slide; Wave every motor in turn, a third of a cycle apart. Only what the rig has the motors for is offered.</p>
     <h3>Restart the board (page 2.9, firmware 2.0)</h3><p>The <b>Restart</b> button next to Settings restarts the board as its RESET button does: the motors switch off first, the board is back in a few seconds and the page reconnects by itself (over the cable, once the port is back). It is refused while SimHub sends positions - a game is running - and while auto-tune, Seat setup or the full check runs. Nothing in the firmware restarts the board by itself; only this button, a firmware update you start, the RESET button or a power cut do.</p>
+    <h3>Electronics Design (page 2.9.5)</h3><p>A second wizard, for everything between the wall socket and the motors; nothing in it talks to the board. Five steps: <b>Motors</b> (how many, and which: presets for the wheelchair, worm and wiper motors rigs are built with, your own label's values, or the motor from your Frame Design), <b>Driver</b> (what each carries, the voltage and PWM frequency it takes, whether it limits its own current, and how the board drives it), <b>Power</b> (the kind of supply, its voltage and current, what takes the braking energy, PWMmax), <b>Protection</b> (fuse and wire per motor, emergency stop, sensors) and <b>Build</b> (wiring list, parts with eBay and Amazon searches, a ball-park cost and the first power-up, step by step). The first step also asks what moves the seat: a <b>gear motor with a lever</b> or a <b>ball-screw actuator with an AC servo</b> (SFX-100 style), and shows which firmware goes with which set-up. Under the verdict, the <b>firmware box</b> downloads the sketch for the selected build, named after it (for example <code>SMC3_R4_v2.2.0b1_MD30C_20kHz</code> or <code>SMC3_R4_Servo_v2.2.0b1_AASD-15A-750W_100mm_bottom_estop</code>): a sketch folder in a .zip with the build's starting values already set - driver type and PWM frequency, or for servos the stroke in pulses, acceleration, homing and the e-stop contact - and a header saying what was changed. Unzip, open it in the Arduino IDE, add your WiFi name and password, Upload. IBT-2 builds also get the 2.1.1 release. A board that ran SMC3 before keeps its saved settings; Settings shows them. The right side draws the wiring as pictures - <b>Whole rig</b> first (the PC, this page, every board, every driver and motor), <b>Power wiring</b>, <b>Signal wiring</b> for all boards at once and for each board (pin to pin), <b>Braking energy</b> and <b>Emergency stop</b>; for servo actuators also <b>The actuator</b>, cut open with every part named - with the wires in colour and every pin and terminal named; tap one to open it full size. It checks the design as you go and offers a fix for what it finds. <b>Export PDF</b> saves it all, the pictures on landscape pages. The rules of thumb come from rigs people have built and reported on; they size a first design and are only as good as the motor's label.</p>
+    <p><b>Lever, push rod and sensor mount.</b> Step 1 asks for the lever (between centres, swing), the motor's shaft and key, and the rod ends. The <b>Lever template</b> (Build step, and in the PDF) prints the lever 1:1 with its sensor cap: print at 100% / Actual size and check the 100 mm bar with a ruler, glue it on the plate, centre-punch, drill and cut. It suggests the plate (aluminium 6061-T6 or steel) from the motor's worst-case torque. <b>Push rod</b> shows the rod with a ball joint (rod end) at each end, square to the lever at mid travel. <b>Sensor mount</b> shows how the position sensor turns with the shaft - a cap on the lever's hub, a stub on the shaft's axis, a flexible coupling - and the <b>sensor bracket</b> that holds it still: a C bent from 3 x 25 mm aluminium strip, two feet on the gearbox's screws, two arms reaching past the lever and the face across the shaft's axis with the sensor's 10 mm hole in the middle. The page works out where the arms go - round the shaft, where the lever, its tail and the push rod never come over the whole swing - and how long the strip is; the <b>Sensor bracket</b> picture and the same PDF print it 1:1 with its hole, the feet's slots and the four bend lines (B: the arms, A: the feet the other way), and the bent C beside it. A long strip prints as its left half - the right half is its mirror. Check the arm length with the lever, cap, coupling and sensor on the shaft before bending.</p>
+    <p><b>Supplies.</b> The continuous rating covers what the motors draw <b>on average</b> while driving, with <b>a quarter to spare</b> so the supply runs cool - the rule for motion-control supplies. A motion rig's motors take turns (one lifts while the other lowers) and sit still much of the time, so together they draw far less than their ratings added up. Power step, <b>How hard do the motors work?</b> - about 35% of the rated current for a balanced seat with gentle moves, 50% for a seat mover, 75% for lifts that carry part of the rig, 100% for every motor at its rating all the time; the Frame Design works it out for its rig (Use that). The short peaks of a hard move - several times the rated current for a fraction of a second - come from the capacitors and the supply's current limit: a supply that limits its current rides through them; one that switches off and retries ("hiccup" on its data sheet) wants half as much again, and a PC supply switches off until PS_ON is switched again. One supply (or one 24 V pair) for all motors is the normal way; one per motor only helps when one cannot carry them all, and the wizard says when one would do. The pictures and the parts list count the supplies the same way. <b>Server supplies</b>: an HP DPS-1200FB is a 1200 W supply - 100 A at 12 V on 230 V mains, 75 A (900 W) on 120 V; each sits on a breakout board that switches it on. <b>PC supplies</b> (ATX, such as an EVGA SuperNOVA 1300 G2, about 108 A on +12 V): the 12 V comes from its PCIe and CPU cables, about 12.5 A each by the PCIe spec, and the 24-pin plug only switches it on (pin 16 to pin 15). One PC supply cannot make 24 V - all its 12 V connectors share one ground, and +12 V to the -12 V pin gives only about half an amp. For 24 V, two server or PC supplies go in series: the <b>upper</b> one (its -V on the other's +V) has its output ground separated from its case inside - nylon instead of the metal standoffs, the mains earth on the case kept - and a bypass diode goes across each; for a 24 V pair the wizard also offers one 24 V industrial supply in its place. <b>The supplies</b> picture shows it. Opening a supply means mains-voltage capacitors: if that is new to you, a 24 V supply made for it is the better buy.</p>
+    <p><b>Two-channel driver boards.</b> The Cytron <b>SmartDriveDuo-30 (MDDS30)</b> - 2 x 30 A, 80 A for a second, rated 35 V - and the <b>MDD10A</b> - 2 x 10 A for small motors - run two motors from one board with one supply input, as does the SmartDriveDuo-60. The pictures draw one box per board with both motors on it, the parts list counts boards, and each board gets one fuse sized for both motors (and wire for that fuse). The wiring list names each motor's own channel pins: MDDS30 AN1 / IN1 for channel 1 and AN2 / IN2 for channel 2 (its switches: 1 on, 2 off, 3 and 4 on, 5 off, 6 on - PWM input, both independent, linear, sign-magnitude); MDD10A PWM1 / DIR1 and PWM2 / DIR2. "One per motor" for supplies becomes one per driver board.</p>
+    <p><b>Board power and the motion sensor.</b> Every signal picture and the whole-rig picture show each board's own <b>12 V adapter</b> (1 A or more, 5.5 x 2.1 mm plug, centre +) in its barrel jack, which takes 6-24 V and makes a steady 5 V for the board and the Hall sensors; on USB alone the board gets about 4.7 V, and less once the motors run. The parts list buys one per board and a build step says why; the USB cable stays for SimHub. <b>Motion sensor</b>: the WT901C-232 on the seat goes to board 1's D0 / D1 through a MAX3232 module; it is in the whole-rig and signal pictures, the parts and the wiring list (Protection step: None leaves it out). Every firmware the wizard hands out listens for it with the same sensor code as the 2.1.1 release, and with the sensor in the design it is switched on from the start (a board that saved its settings keeps them).</p>
+    <p><b>All firmware.</b> The <b>All firmware</b> button (Electronics, next to the firmware downloads; and Settings, Firmware update) opens a table of every sketch this page can make: the published sketches (SMC3_R4 2.1.1, the release; SMC3_R4 2.2.0b1, the beta DC build; SMC3_R4_Servo 2.2.0b1, the beta servo build), a ready-made set-up for each driver (IBT-2, Cytron MD30C, SmartDriveDuo-30 / -60, MDD10A, MD13S, 100 A bridges, Monster Moto, your own driver with two PWM, PWM + DIR or PWM + INA / INB) and each servo drive, and the drivers no SMC3 firmware drives (Sabertooth). Each row says what it runs, what it is set up for, the driver inputs, the PWM frequency, what it does with the motion sensor and how it differs from the published sketch; every one downloads as a sketch folder in a .zip. The Electronics wizard's pick for your design sits on top in green; the ready-made files follow your design's motion sensor choice.</p>
+    <h3>Servo actuators (firmware SMC3_R4_Servo 2.2.0b1 - BETA)</h3><p><b>Beta firmware: not tested on a real rig yet.</b> It was written for this dashboard and checked against a model of the board and the simulator, and should work with it; while a beta runs, the board's L LED and the top-right LED of its matrix blink, and the page shows a red blinking <b>BETA</b> next to the firmware version (tap it for the details). The servo build drives ball-screw actuators with AC servo drives (SFX-100 style: AASD-15A and similar) by <b>pulse + direction</b>: three per board on D2-D7, servo-on on D9-D11, through two ULN2803A per board (the R4's pins give 8 mA; the drive's servo-on input runs on 12-24 V). SimHub talks SMC3 to it as before. There are no pots and no PID: at power-up the board releases the servos for 4 s so the seat sinks to the bottom and counts from there (or drives to home switches on A0-A2), then the actuators creep up. PWMmax is each actuator's top speed (255 = 20 000 pulses/s). <b>Settings, Servo actuators</b> (shown instead of Motor drivers): stroke, ball-screw lead and pulses per turn, the acceleration limit, homing, servo-on level, an emergency-stop contact on A3 (pressed: every motor off, the servos released, and Enable Motors homes again) and reverse per motor; <b>Home again</b> with the motors off. Auto-tune and the full check are for DC motors and say so. Firmware update refuses to swap the servo build for the DC build (or back) from the page: the pins mean different things, so that is done over USB after rewiring. Electronics, Ball-screw actuator: the parts, printed parts (STL links), drive settings and pictures.</p>
+    <h3>Motor drivers (Settings, firmware 2.2.0b1)</h3><p>The board drives either <b>IBT-2 / BTS7960</b> bridges (two PWM inputs) or <b>PWM + direction</b> drivers (Cytron MD30C, MD13S, MDD10A, SmartDriveDuo-30 / -60, VNH, 100 A class bridges). Firmware 2.2.0b1 (the beta in All firmware) makes this a setting: Settings, Motor drivers, with the motors switched off and SimHub stopped - no recompiling. A board never told keeps what it was built for (IBT-2). Cytron MD30C and MD13S take PWM up to 20 kHz: the same card sets 20 kHz and saves it. With PWM + direction a switched-off motor brakes instead of coasting. Older firmware: build the sketch with #define MODE1 (PWM + direction) or MODE2 (IBT-2).</p>
+
     <h3>Frame Design (page 2.9.4)</h3><p>A wizard for planning a rig before any metal is cut; nothing in it talks to the board. Six steps: <b>Motors</b> (2 to 6: a seat mover, 2 lifts + traction loss, 3 or 4 corner actuators, traction loss and surge under four corners, or a Stewart platform), <b>Drive</b> (a gear motor with a lever and push rod, or a ball-screw actuator), <b>Size</b> (the weights - driver, seat, wheel and wheelbase, pedals - and the distances), <b>Frame</b> (the section family, the material, bolted or welded; any member can have its own section and material; every joint with its fasteners and a picture), <b>Build</b> (the cut list to scale, the mounting hardware, the parts with a ball-park cost, what to assemble first, the steps) and <b>3D test</b>. The right-hand side shows the drawings with the main distances, the range and speed of every movement, the force each actuator needs against what it can make, and the checks; <b>What would make it better</b> lists suggestions and <b>Fix it for me</b> applies the ones that are needed. In the 3D test, turn the rig with the mouse, put a weight on the seat, slide the seat forwards or back and move each axis: <b>Rig</b> shows every part as built, <b>Heat map</b> shows where the load goes - the joints first - and lets the parts bend (drawn 20 times larger than life); an actuator turns red when it runs out of travel or of force. <b>Export PDF</b> saves all of it. It uses lever and beam formulas with a safety factor - a first design to check, not a finite-element analysis - and it never talks to the board.</p>
     <h3>Status bar</h3><p>LOW POWER means no position commands for 15 s, so the board runs at quarter drive until SimHub or this page sends targets again.</p>
     <h3>Firmware update (firmware 1.9.2)</h3><p>Settings, Firmware update installs new firmware over WiFi - no USB cable, and SimHub can stay open (with its motion output paused). In the Arduino IDE open the new .ino and use <b>Sketch, Export Compiled Binary</b>; choose that .bin on the page and press Install. The page checks the file (an SMC3_R4 build for the UNO R4 WiFi, and which version), the board switches the motors off, its WiFi module downloads and checks the file and installs it, and the page confirms the new version once the board is back. The board remembers the WiFi name and password it last joined with, so a build with the placeholders still connects. Needs the WiFi module's own firmware 0.4.0 or newer (0.5.0+ shows progress): Arduino IDE, Tools, Firmware Updater, with SimHub closed (it keeps the USB port busy) - and since that erases the sketch on the board, upload SMC3_R4 again over USB afterwards. The first install of it (SMC3_R4_v1.9.3.ino - 1.9.2 didn't compile in the Arduino IDE) goes over USB.</p>
@@ -19071,6 +24038,18 @@ details.oks .flist{margin-top:6px}
  <div style="display:flex;gap:10px;margin-top:12px"><button class="btn b-red" id="rb_go" onclick="rebootGo()">Restart the board</button><button class="btn b-grey" onclick="closeModal('mReboot')">Cancel</button></div>
 </div></div>
 
+<div class="modal" id="mBeta"><div class="box">
+ <h2><i class="led" style="display:inline-block;width:12px;height:12px;border-radius:50%;background:#ff3030;box-shadow:0 0 8px #ff3030;margin-right:8px;animation:betablink 1s steps(1,end) infinite"></i>Beta firmware on the board</h2>
+ <ul>
+  <li>The board runs firmware <b id="bt_ver">?</b>: a <b>beta</b> that has <b>not been tested on a real rig yet</b>. It was written for this dashboard and checked against it (and a simulated board), so it should work with it - but nobody has run it on actuators yet.</li>
+  <li>On the board, the <b>L</b> LED and the top-right LED of the red LED matrix blink while beta firmware runs.</li>
+  <li>The first time: seat empty, motors off, a hand on the emergency stop. Move one motor a little with its card's knob, then the others, before SimHub drives the rig.</li>
+  <li id="bt_servo" hidden>Servo build: after power-up (and <b>Home again</b>) the servos are released for 4 s so the seat settles to the bottom, then the board counts from there - or it drives to the home switches if you fitted them. Settings, Servo actuators.</li>
+  <li>Going back: the 2.1.1 release firmware is in the package (firmware/SMC3_R4_v2.1.1).</li>
+ </ul>
+ <div style="display:flex;gap:10px;margin-top:12px"><button class="btn b-blue" onclick="closeModal('mBeta')">Understood</button></div>
+</div></div>
+
 <div class="modal" id="mFw"><div class="box">
  <h2>Install firmware <span id="mf_v"></span></h2>
  <ul>
@@ -19080,6 +24059,13 @@ details.oks .flist{margin-top:6px}
  </ul>
  <p class="note" id="mf_note"></p>
  <div style="display:flex;gap:10px;margin-top:12px"><button class="btn b-orange" onclick="fwInstall()">Install</button><button class="btn b-grey" onclick="closeModal('mFw')">Cancel</button></div>
+</div></div>
+
+<div class="modal fwall" id="mFwAll"><div class="box">
+ <h2>All firmware</h2>
+ <p class="note" id="fwall_note" style="margin:0 0 10px"></p>
+ <div class="fwscroll" id="fwall_body"><p class="muted" style="padding:12px">Loading…</p></div>
+ <div style="display:flex;gap:10px;margin-top:12px;align-items:center"><button class="btn b-grey" onclick="closeModal('mFwAll')">Close</button><span class="muted" id="fwall_count"></span></div>
 </div></div>
 
 <div class="modal" id="mUpd"><div class="box">
@@ -19132,7 +24118,7 @@ const TIPS={
  lim:"<b>Max limit - safety cutoff</b>, in counts from each end of the pot range (23 = trips below 23 or above 1000).<br><br>If the pot ever reads beyond it - broken wire, slipped linkage, reversed motor - that motor shuts off and the matrix shows E1/E2/E3 until you press <b>Enable Motors</b>.<br><br>Must be smaller than Clip. Set it just outside the travel your mechanism can physically reach.",
  clip:"<b>Clip - usable travel window</b>, in counts from each end (100 = targets kept between 100 and 923). SimHub can never command the seat outside it, and PWMrev pushes back if it drifts past.<br><br>This is your range of motion: widen it carefully, watching for mechanical stops, to get more travel.",
  fpid:"<b>Fpid - control loop divider.</b> 1 = the PID runs 4000 times a second (most responsive); 2 = 2000.<br><br>Only raise it if <b>ISR max</b> climbs above ~200 µs. Changing it scales how strong Ki and Kd are, so re-check tuning afterwards.",
- pwmfreq:"<b>PWM switching frequency</b> for motors 1+2 and for motor 3.<br><br>25 kHz is above hearing so the motors don't whine; lower values whine audibly. The IBT-2's BTS7960 chips are rated up to 25 kHz - don't go higher.",
+ pwmfreq:"<b>PWM switching frequency</b> for motors 1+2 and for motor 3.<br><br>25 kHz is above hearing so the motors don't whine; lower values whine audibly. The IBT-2's BTS7960 chips are rated up to 25 kHz - don't go higher. Cytron MD30C / MD13S / MDD10A and Monster Moto take 20 kHz at most (Settings, Motor drivers sets it).",
  apply:"Sends this motor's column to the board <b>immediately</b>. Takes effect live, but is lost at power-off until you <b>Save to EEPROM</b>.",
  applyGlobal:"Sends the loop divider and PWM frequencies to the board now (not saved until Save to EEPROM).",
  read:"Loads the values currently running on the board into the table.",
@@ -19401,7 +24387,7 @@ function chartHeight(){const base={dashboard:108,graphs:230}[curView]||150;const
 function toggleExpand(){location.hash=curView==='graphs'?(prevView||'dashboard'):'graphs';}
 
 // ---------- views ----------
-const VIEWS=['dashboard','tuning','motors','graphs','view3d','tools','profiles','autotune','seat','frame','eeprom','settings','help'];
+const VIEWS=['dashboard','tuning','motors','graphs','view3d','tools','profiles','autotune','seat','frame','elec','eeprom','settings','help'];
 function showView(){let v=location.hash.slice(1);if(!VIEWS.includes(v))v='dashboard';
  if(v!=='graphs')prevView=v; curView=v;
  $('main').dataset.view=v;
@@ -19409,10 +24395,358 @@ function showView(){let v=location.hash.slice(1);if(!VIEWS.includes(v))v='dashbo
  document.querySelectorAll('#nav a').forEach(a=>a.classList.toggle('on',a.getAttribute('href')==='#'+v));
  const eb=$('expBtn');eb.dataset.k=v==='graphs'?'collapse':'expand';eb.dataset.tip=TIPS[eb.dataset.k];
  eb.innerHTML=v==='graphs'?'<svg class="i" viewBox="0 0 24 24"><path d="M4 14h6v6M20 10h-6V4M14 10l7-7M3 21l7-7"/></svg>':'<svg class="i" viewBox="0 0 24 24"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>';
- if(v==='profiles'){loadProfiles();loadGenres();} if(v==='settings'){fillSettings();diagLists();loadBoard(true);fwLoad(true);updLoad();usbLoad();} if(v==='tuning')loadBoard(true); if(v==='eeprom')loadBackups();
- if(v==='seat'){ssFilled=null;ssPoll();} if(v==='frame')frOpen();else if(typeof f3Close==='function')f3Close(); if(typeof v3Show==='function')v3Show(v==='view3d');
+ if(v==='profiles'){loadProfiles();loadGenres();} if(v==='settings'){fillSettings();diagLists();loadBoard(true);fwLoad(true);updLoad();usbLoad();drvLoad();srvLoad();} if(v==='tuning')loadBoard(true); if(v==='eeprom')loadBackups();
+ if(v==='seat'){ssFilled=null;ssPoll();} if(v==='frame')frOpen();else if(typeof f3Close==='function')f3Close(); if(v==='elec')elOpen(); if(typeof v3Show==='function')v3Show(v==='view3d');
  chartHeight();}
 window.addEventListener('hashchange',showView);
+
+// ---------- electronics design (2.9.5) ----------
+let EL=null,elIn=null,elMeta=null,elStep=0,elTimer=null,elSeq=0;
+const ELSTEPS=['Motors','Driver','Power','Protection','Build'],ELSTEPS_SRV=['Actuators','Drives','Power','Protection','Build'];
+const elSrv=()=>!!(elIn&&elIn.drive==='servo');
+const elSteps=()=>elSrv()?ELSTEPS_SRV:ELSTEPS;
+const ELF={   // field: label, unit, note
+ volts:['Voltage on the label','V',''],watts:['Power on the label','W','Output power. No figure? Volts x rated amps x 0.75.'],
+ rpm:['Speed at the output shaft','rpm','After the gearbox, at the label voltage.'],
+ i_noload:['Current with nothing on the shaft','A','Measure it on the bench; a healthy wheelchair motor draws 2 to 4 A.'],
+ i_rated:['Rated current','A','At full rated load. On the label, or watts / (volts x 0.75).'],
+ i_stall:['Current when stalled','A','Held still at the label voltage. Rarely on the label: see the resistance below.'],
+ r_wind:['Resistance across the motor wires','ohm','0 = not measured. With a value, the stalled current is worked out from it (volts / ohms).'],
+ drv_vmax:['Most voltage it takes','V','From its data sheet.'],drv_icont:['Current all day','A',''],drv_ipeak:['Current at most','A','For a few seconds.'],
+ psu_volts:['Supply voltage','V','Speed follows voltage; force follows current.'],psu_amps:['Current each supply gives','A',''],
+ pwm_max:['PWMmax you will set in Tuning','%','Limits how hard the board can drive: less top speed, less current into a stall.'],
+ pwm_khz:['PWM frequency the board runs','kHz','25 unless changed (Settings, Loop, PWM & smoothing). Cytron MD30C / MD13S / MDD10A take 20 at most.'],
+ wire_len:['Wire from supply to motor, one way','m','1 m is 3.3 ft.'],sens_len:['Sensor cable length','m',''],
+ srv_watts:['Servo power','W',''],srv_torque:['Torque all day','Nm','On the motor\'s label (rated torque).'],srv_peak:['Torque for a moment','Nm','Usually three times the rated torque.'],
+ srv_rpm:['Top speed of the motor','rpm',''],stroke:['Usable stroke','mm','The travel SimHub\'s 0-1023 spans; the SFX-100: 100 mm.'],
+ lead:['Ball-screw lead','mm','How far the nut goes a turn: 5 for a 1605 screw, 10 for a 1610.'],
+ ppr:['Pulses per motor turn','','The drive\'s electronic gear: 500 on a 10 000-count encoder with Pn098 = 20.'],
+ lever:['Lever: between centres','mm','Shaft to the rod end\'s bolt. Shorter: more force, less travel and speed.'],
+ load:['Average load while driving','%','Of the motors\' rated current. 100 = every motor at its rating all the time.'],
+ swing:['Swing either way from square','deg','45 is usual. Travel at the seat = 2 x lever x sin(swing).'],
+ shaft_d:['Motor shaft diameter','mm','Measure yours with a caliper: the template\'s bore. 3/4 in = 19.05 mm.'],
+ key_w:['Key width','mm','0 = no key (the clamp alone). Jazzy motors use a 3/16 in key: 4.76 mm.']};
+const elA=x=>{const f=Math.floor(x),r=x-f;return(r>0.5?f+1:r<0.5?f:(f%2?f+1:f))+' A';};   // 2.9.5: halves to even, as the page server's texts round
+const ELI={   // icons: 24 x 24 strokes
+ motor:'<rect x="2" y="8" width="12" height="8" rx="2"/><path d="M6 8v8M10 8v8"/><rect x="14" y="6" width="6" height="12" rx="1.5"/><path d="M17 12l4-5"/>',
+ big:'<rect x="1.5" y="7" width="13" height="10" rx="2"/><path d="M5 7v10M8 7v10M11 7v10"/><rect x="14.5" y="5" width="6.5" height="14" rx="1.5"/><path d="M17.7 12l4-6"/>',
+ worm:'<rect x="2" y="9" width="11" height="7" rx="2"/><circle cx="17" cy="12.5" r="4.5"/><path d="M13 12.5h-1M17 8v-4"/>',
+ wiper:'<rect x="3" y="10" width="9" height="6" rx="2"/><path d="M12 13h3M15 13l6-8"/>',
+ pencil:'<path d="M4 20l1-4L16 5l3 3L8 19z"/><path d="M14 7l3 3"/>',
+ frame:'<path d="M3 20h18M5 20V9l7-5 7 5v11M5 13h14M12 4v16"/>',
+ chip:'<rect x="6" y="6" width="12" height="12" rx="2"/><path d="M9 2v4M15 2v4M9 18v4M15 18v4M2 9h4M2 15h4M18 9h4M18 15h4"/>',
+ chip2:'<rect x="3" y="6" width="8" height="12" rx="1.5"/><rect x="13" y="6" width="8" height="12" rx="1.5"/><path d="M7 3v3M17 3v3M7 18v3M17 18v3"/>',
+ heat:'<rect x="4" y="13" width="16" height="7" rx="1.5"/><path d="M6 13V4M10 13V4M14 13V4M18 13V4"/>',
+ serial:'<path d="M4 12h3l2-5 3 10 3-10 2 5h3"/>',
+ psu:'<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M13 7.5l-3 4.5h4l-3 4.5"/>',
+ knob:'<rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="12" cy="12" r="4"/><path d="M12 12l2.5-2.5"/>',
+ rack:'<rect x="3" y="4" width="18" height="7" rx="1.5"/><rect x="3" y="13" width="18" height="7" rx="1.5"/><path d="M7 7.5h.01M7 16.5h.01M11 7.5h6M11 16.5h6"/>',
+ factory:'<path d="M3 20V10l5 3V10l5 3V6l8 4v10z"/><path d="M7 16h2M12 16h2M17 16h2"/>',
+ battery:'<rect x="2" y="7" width="17" height="10" rx="2"/><path d="M22 10.5v3M6 12h4M8 10v4M13 12h3"/>',
+ diode:'<path d="M2 12h6M16 12h6M8 6.5v11l8-5.5z"/><path d="M16 6.5v11"/>',
+ cap:'<path d="M2 12h8M14 12h8M10 6v12M14 6v12"/>',
+ none:'<circle cx="12" cy="12" r="9"/><path d="M5.7 5.7l12.6 12.6"/>',
+ stop:'<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4.5"/>',
+ plug:'<path d="M9 2v5M15 2v5M6 7h12v4a6 6 0 0 1-12 0z M12 17v5"/>',
+ relay:'<rect x="4" y="4" width="16" height="16" rx="2"/><path d="M8 9h8M8 13c1-1.5 2 1.5 3 0s2 1.5 3 0"/><path d="M8 17h8"/>',
+ fuse:'<rect x="3" y="8.5" width="18" height="7" rx="2"/><path d="M1 12h2M21 12h2M7 12h10"/>',
+ wire:'<path d="M3 17c4 0 4-10 9-10s5 10 9 10"/>',
+ hall:'<circle cx="12" cy="12" r="8.5"/><circle cx="12" cy="12" r="2.8"/><path d="M12 3.5v3.5"/>',
+ pot:'<circle cx="12" cy="12" r="8.5"/><path d="M12 12l4.5-4.5"/>',
+ board:'<rect x="4" y="3" width="16" height="18" rx="2"/><path d="M8 3v2M11 3v2M14 3v2M8 19v2M11 19v2M14 19v2"/><rect x="8" y="9" width="8" height="6" rx="1"/>',
+ fan:'<circle cx="12" cy="12" r="9"/><path d="M12 12c0-4 1-6 3-6s1 4-3 6zM12 12c4 0 6 1 6 3s-4 1-6-3zM12 12c0 4-1 6-3 6s-1-4 3-6zM12 12c-4 0-6-1-6-3s4-1 6 3z"/>',
+ brake:'<circle cx="12" cy="12" r="8"/><path d="M8 12h8"/>',
+ split:'<path d="M12 3v6M12 9l-6 6M12 9l6 6M6 15v5M18 15v5"/>',
+ one:'<rect x="7" y="4" width="10" height="7" rx="1.5"/><path d="M12 11v4M6 15h12M6 15v4M12 15v4M18 15v4"/>',
+ wrench:'<path d="M14.5 5.5a4 4 0 0 0-5 5L3 17l4 4 6.5-6.5a4 4 0 0 0 5-5l-2.5 2.5-3-1-1-3z"/>',
+ bolt:'<path d="M13 2L5 13h6l-1 9 8-11h-6z"/>',
+ shield:'<path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"/>',
+ cart:'<path d="M3 4h2l2.5 11h11L21 7H6.5"/><circle cx="9" cy="19.5" r="1.5"/><circle cx="17" cy="19.5" r="1.5"/>',
+ zoom:'<circle cx="11" cy="11" r="6.5"/><path d="M16 16l5 5M8.5 11h5M11 8.5v5"/>',
+ servo:'<rect x="7.5" y="1.5" width="9" height="6" rx="1.5"/><rect x="6.5" y="7.5" width="11" height="10" rx="1"/><path d="M12 17.5v4.5M9 22h6M9.5 10v5M14.5 10v5"/>',
+ rig:'<rect x="2" y="4" width="7" height="5" rx="1"/><rect x="2" y="14" width="7" height="5" rx="1"/><path d="M9 6.5h4M9 16.5h4M13 6.5v10"/><rect x="15" y="9" width="7" height="6" rx="1"/><path d="M13 12h2"/>',
+ down:'<path d="M12 3v12M7 10l5 5 5-5M5 21h14"/>',
+ print:'<path d="M6 9V3h12v6"/><rect x="3" y="9" width="18" height="8" rx="2"/><path d="M7 17v4h10v-4M7 13h.01"/>',
+ pcpsu:'<rect x="2.5" y="5" width="19" height="14" rx="2"/><circle cx="9" cy="12" r="4.5"/><path d="M9 7.5v9M4.5 12h9M16 9h3M16 12h3M16 15h3"/>',
+ lever:'<circle cx="6" cy="16" r="3.5"/><circle cx="6" cy="16" r="1.2"/><path d="M8.8 13.8L17 7.5"/><circle cx="18.5" cy="6.5" r="2"/>',
+ bracket:'<path d="M4 20h4V6h8v14h4"/><circle cx="12" cy="6" r="1.4"/>',
+ gauge:'<path d="M3.5 17a8.5 8.5 0 0 1 17 0"/><path d="M12 17l4.5-5.5"/><circle cx="12" cy="17" r="1.3"/><path d="M6 13.5l1 .6M18 13.5l-1 .6M12 9.5v1.2"/>',
+ rod:'<circle cx="6" cy="18" r="2.5"/><circle cx="18" cy="6" r="2.5"/><path d="M7.8 16.2l8.4-8.4"/>',
+};
+const ELC={motor:'#f08c00',driver:'#4c6ef5',power:'#e03131',prot:'#ae3ec9',wire:'#0c8599',board:'#00878f',sens:'#0c8599',ok:'#2f9e44'};
+function elIco(k,c,sm){return`<span class="elico${sm?' sm':''}" style="--ic:${c}"><svg viewBox="0 0 24 24">${ELI[k]||''}</svg></span>`;}
+const ELMI={jazzy_small:'motor',jazzy_big:'big',wc250_75:'motor',wc250_200:'motor',ec350:'big',worm200:'worm',wiper:'wiper',custom:'pencil'};
+const ELDI={ibt2:'chip',md30c:'chip',mdds30:'chip2',mdd10a:'chip2',mdds60:'chip2',hb100:'heat',md13s:'chip',monster:'chip2',sabertooth32:'serial',sabertooth60:'serial',custom:'pencil'};
+const ELPI={led:'psu',adj:'knob',meanwell:'factory',server:'rack',pc:'pcpsu',battery:'battery'};
+const ELGI={Motors:['motor','motor'],Drivers:['chip','driver'],Power:['psu','power'],Protection:['shield','prot'],Wiring:['wire','wire'],Sensors:['hall','sens'],Board:['board','board'],Mechanics:['lever','motor']};
+let elPic=null,elPicStep=-1;
+function elSvg(sc){const A={s:'start',m:'middle',e:'end'};let o=`<svg viewBox="0 0 ${sc.w} ${sc.h}" role="img" aria-label="${esc(sc.title)}" font-family="Inter,Segoe UI,Roboto,Arial,sans-serif"><rect width="${sc.w}" height="${sc.h}" fill="#fff"/>`;
+ for(const it of sc.items){
+  if(it.t==='r')o+=`<rect x="${it.x}" y="${it.y}" width="${it.w}" height="${it.h}" rx="${it.rx}" fill="${it.f||'none'}" stroke="${it.s||'none'}" stroke-width="${it.sw}"/>`;
+  else if(it.t==='l')o+=`<polyline points="${it.p.map(q=>q[0]+','+q[1]).join(' ')}" fill="none" stroke="${it.c}" stroke-width="${it.w}" stroke-linecap="round" stroke-linejoin="round"${it.d?' stroke-dasharray="6 4"':''}/>`;
+  else if(it.t==='c')o+=`<circle cx="${it.x}" cy="${it.y}" r="${it.r}" fill="${it.f||'none'}" stroke="${it.s||'none'}" stroke-width="${it.sw}"/>`;
+  else if(it.t==='p')o+=`<polygon points="${it.p.map(q=>q[0]+','+q[1]).join(' ')}" fill="${it.f||'none'}" stroke="${it.s||'none'}" stroke-width="${it.sw}"/>`;
+  else if(it.t==='x')o+=`<text x="${it.x}" y="${it.y}" font-size="${it.z}" fill="${it.c}" text-anchor="${A[it.a]}" font-weight="${it.b?700:400}">${esc(it.s)}</text>`;}
+ return o+'</svg>';}
+function elPics(){if(!EL)return[];const S=EL.scenes;const b=S.signals.length>1;   // 2.9.5: the whole rig first, every board's signals at once
+ let P=[['overview','Whole rig','rig',S.overview]];
+ if(S.actuator)P.push(['actuator','The actuator','servo',S.actuator]);
+ P.push(['power','Power wiring','bolt',S.power]);
+ if(S.supplies)P.push(['supplies','The supplies',EL.inputs.psu==='pc'?'pcpsu':'rack',S.supplies]);   // 2.9.5
+ if(S.sigall)P.push(['sigall','Signals, all boards','board',S.sigall]);
+ P=P.concat(S.signals.map((sc,i)=>['sig'+i,b?'Board '+(i+1):'Signal wiring','board',sc]));
+ if(S.braking)P.push(['braking','Braking energy','diode',S.braking]);
+ P.push(['estop','Emergency stop','stop',S.estop]);
+ if(S.lever)P.push(['lever','Lever template','lever',S.lever],['linkage','Push rod','rod',S.linkage],['sensormount','Sensor mount','hall',S.sensormount]);
+ if(S.lever&&S.bracket)P.push(['bracket','Sensor bracket','bracket',S.bracket]);   // 2.9.5: the C bracket's template
+ return P;}
+function elPicOpen(sc){const w=window.open('','_blank');if(!w)return;w.document.write(`<!doctype html><title>${esc(sc.title)}</title><body style="margin:0;background:#e9ecef">${elSvg(sc).replace('<svg ','<svg style="display:block;width:100%;height:auto;max-width:'+Math.round(sc.w*1.4)+'px;margin:0 auto" ')}</body>`);w.document.close();}
+function elField(k){return`<label class="ffld"><span>${esc(ELF[k][0])}</span><span class="fin"><input type="number" step="any" data-e="${k}" value="${+(+elIn[k]).toFixed(2)}"><i>${ELF[k][1]}</i></span>${ELF[k][2]?`<small>${esc(ELF[k][2])}</small>`:''}</label>`;}
+function elFields(keys){return`<div class="frgrid">${keys.map(elField).join('')}</div>`;}
+function elPick(k,opts){return`<div class="frpick elpk" data-ek="${k}">${opts.map(o=>`<button class="${String(elIn[k])===String(o[0])?'on':''}" data-ev="${o[0]}">${o[2]?elIco(o[2],o[3]||'var(--blue)'):''}${esc(o[1])}</button>`).join('')}</div>`;}
+async function elOpen(){if(elMeta){try{const r=await (await fetch('/elec/load')).json();elMeta=r.meta;}catch(e){}elRender();elCalc();return;}
+ try{const r=await (await fetch('/elec/load')).json();elMeta=r.meta;elIn=r.inputs;elRender();elCalc();}catch(e){$('el_out').innerHTML='<p class="frsub">The page server did not answer. Reload the page.</p>';}}
+// 2.9.5: server / PC supplies (12 V each; two in series for 24 V), the motion sensor on the seat
+const elPair=()=>!!(elIn&&['server','pc','battery'].includes(elIn.psu)&&+elIn.psu_volts>15);
+function elPsuNote(){if(!elIn)return'';const ps=(elMeta.psus||[]).find(x=>x.id===elIn.psu);const u=ps&&ps.unit;
+ if(elIn.psu==='server')return`<p class="frsub">The current is what <b>one</b> supply gives: an HP DPS-1200FB gives ${u?u.amps[elIn.mains]:75} A on ${elIn.mains} V mains (75 A on 120 V, 100 A on 230 V). Two in series for 24 V give the same current at twice the voltage. The supplies picture shows the breakout boards and how the upper supply's ground comes off its case.</p>`;
+ if(elIn.psu==='pc')return`<p class="frsub">The current is what <b>one</b> supply gives on +12 V (its label): about 108 A for a 1300 W single-rail supply. One PC supply makes 12 V only - its 12 V connectors share one ground, so joining two of them gives more current, never 24 V. For 24 V two go in series and the upper one has to be opened: The supplies picture shows how.</p>`;
+ return'';}
+function elImuPick(){return`<p class="frhead">Motion sensor on the seat</p>${elPick('imu',[[1,'WT901C-232, through a MAX3232 (board 1)','board',ELC.board],[0,'None','none','#868e96']])}
+   <p class="frsub">It feeds Seat setup, the seat angle card and the checks. D0 / D1 are free in every SMC3 R4 build; the signal wiring shows it.</p>`;}
+async function elLeverPdf(){const b=$('el_leverpdf');if(b)b.disabled=true;
+ try{const r=await fetch('/elec/lever',{method:'POST',headers:{'X-SMC3':'1'},body:JSON.stringify({inputs:elIn})});if(!r.ok)throw 0;
+  if((r.headers.get('Content-Type')||'').includes('json')){const j=await r.json();throw j.error||0;}
+  const cd=r.headers.get('Content-Disposition')||'',m=cd.match(/filename="([^"]+)"/),fn=m?m[1]:'lever-template.pdf';
+  const blob=await r.blob(),a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=fn;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(a.href),8000);
+  toast('Saved: '+esc(fn)+' - print it at 100% (Actual size)');
+ }catch(e){toast(typeof e==='string'?esc(e):'Could not make the lever template.',1);}if(b)b.disabled=false;}
+function elRender(){if(!elIn)return;
+ const SI=elSrv()?['servo','chip','bolt','shield','wrench']:['motor','chip','bolt','shield','wrench'];
+ $('el_steps').innerHTML=elSteps().map((n,i)=>`<button class="${i===elStep?'on':''}" data-s="${i}"><b>${i+1}</b><svg viewBox="0 0 24 24">${ELI[SI[i]]}</svg>${n}</button>`).join('');
+ let h='';
+ if(elStep===0){const f=elMeta.frame;
+  h+=`<p class="frhead">What moves the seat?</p><div class="frlay ellay" id="el_drive">
+    <button class="${elSrv()?'':'on'}" data-edrive="lever">${elIco('motor',ELC.motor)}<div><b>Gear motor with a lever</b><span>Wheelchair, worm or wiper motors turning a lever, a pot or Hall sensor on each. DC motor drivers (IBT-2, Cytron...). The firmware as it comes.</span><em>SMC3_R4 2.1.1 / 2.2.0b1</em></div></button>
+    <button class="${elSrv()?'on':''}" data-edrive="servo">${elIco('servo',ELC.driver)}<div><b>Ball-screw actuator with an AC servo (SFX-100 style)</b><span>A servo motor turns a ball screw in an aluminium profile; printed parts hold it together. Servo drives take pulse + direction. Fast, strong and quiet - and dearer.</span><em>SMC3_R4_Servo 2.2.0b1</em><em class="eltag fr-bad">BETA firmware</em></div></button></div>
+   <p class="frsub">A ball-screw actuator turned by a DC motor with a pot or Hall sensor counts as a gear motor here: same drivers, same firmware.</p>
+   <details class="elfw"><summary>${elIco('chip',ELC.board,1)}Which firmware for which set-up</summary><table class="frtab"><tr><th>Your set-up</th><th>Firmware</th><th>How</th></tr>${(elMeta.firmware||[]).map(x=>`<tr><td>${esc(x.setup)}</td><td><b>${esc(x.fw)}</b></td><td>${esc(x.how)}</td></tr>`).join('')}</table></details>`;
+  if(elSrv()){
+   h+=`<p class="frhead">How many actuators?</p>${elPick('motors',[1,2,3,4,5,6].map(n=>[n,n]))}
+    <div class="elnote">${elIco('board',ELC.board)}<span><b>Three actuators per board.</b> SimHub's SMC3 device has three channels, so the SFX-100's four actuators take two boards (3 + 1, or 2 + 2), each a SMC3 device in SimHub with its own copy of this page.</span></div>`;
+   if(f&&f.drive==='servo')h+=`<div class="elfrom">${elIco('frame',ELC.board)}<span>Your Frame Design uses ${f.motors} screw actuators, ${+f.stroke} mm travel, ${+f.lead} mm lead, ${+f.srv_torque} Nm servos.</span><button class="btn b-grey" id="el_fromframe">Use that</button></div>`;
+   h+=`<p class="frhead">Which servo?</p><div class="frlay ellay" id="el_servo">${(elMeta.servos||[]).map(m=>`<button class="${m.id===elIn.servo?'on':''}" data-esv="${m.id}">${elIco(m.id==='custom'?'pencil':'servo',ELC.driver)}<div><b>${esc(m.name)}</b><span>${esc(m.note)}</span>${m.id==='custom'?'':`<em>${m.watts} W</em><em>${m.torque} Nm</em><em>${m.peak} Nm peak</em><em>${m.rpm} rpm</em>`}</div></button>`).join('')}</div>
+    ${elFields(['srv_watts','srv_torque','srv_peak','srv_rpm'])}
+    <p class="frhead">The actuator</p>${elFields(['stroke','lead','ppr'])}
+    <div class="frderived" id="el_der"></div>
+    <p class="frsub">The parts of an SFX-100 actuator, the printed parts and complete kits are in the Build step; the picture on the right shows one cut open.</p>`;
+  }else{
+  h+=`<p class="frhead">How many motors?</p>${elPick('motors',[1,2,3,4,5,6].map(n=>[n,n]))}
+   <div class="elnote">${elIco('board',ELC.board)}<span><b>Three motors per board.</b> SimHub speaks SMC3 to a board with three channels (A, B, C), and the UNO R4 WiFi has the pins for three drivers and three sensors - it is not short of power for more, the protocol is. Four to six motors take a second board, wired the same way, which SimHub drives as a second SMC3 device. This page talks to one board: the second needs its own copy of the page (another container, another port).</span></div>`;
+  if(f&&f.drive!=='servo')h+=`<div class="elfrom">${elIco('frame',ELC.board)}<span>Your Frame Design uses ${f.motors} motors of ${Math.round(f.volts)} V, ${Math.round(f.watts)} W, ${Math.round(f.rpm)} rpm.</span><button class="btn b-grey" id="el_fromframe">Use that motor</button></div>`;
+  h+=`<p class="frhead">Which motor?</p><p class="frsub">The values are typical for each kind: check them against the label on yours and correct them below. Used wheelchair motors differ a lot between chairs and years.</p>
+   <div class="frlay ellay" id="el_motor">${elMeta.motors.map(m=>`<button class="${m.id===elIn.motor?'on':''}" data-em="${m.id}">${elIco(ELMI[m.id]||'motor',ELC.motor)}<div><b>${esc(m.name)}</b><span>${esc(m.note)}</span>${m.values.volts?`<em>${m.values.volts} V</em><em>${m.values.watts} W</em><em>${m.values.rpm} rpm</em><em>${m.values.i_rated} A rated</em>`:''}</div></button>`).join('')}</div>
+   <p class="frhead">The motor's values</p>${elFields(['volts','watts','rpm','i_rated','i_noload','i_stall','r_wind'])}
+   <p class="frhead">Does it have a parking brake?</p>${elPick('brake',[[1,'Yes (wheelchair motors do)','brake',ELC.motor],[0,'No','none','#868e96']])}
+   <div class="frderived" id="el_der"></div>
+   <p class="frhead">The lever and its push rod</p><p class="frsub">A plate lever clamped and keyed on the motor's shaft, a rod with a ball joint at each end to the seat. The Build step has a 1:1 template to print and cut, and how the position sensor mounts on the shaft.</p>
+   ${elFields(['lever','swing','shaft_d','key_w'])}
+   <p class="frhead">Rod ends (ball joints)</p>${elPick('rod',[['m8','M8','rod',ELC.motor],['m10','M10','rod',ELC.motor],['m12','M12','rod',ELC.motor]])}
+   <div class="frderived" id="el_lev"></div>`;}
+ }else if(elSrv()&&elStep===1){
+  h+=`<p class="frhead">How the board drives them</p>
+   <div class="elnote">${elIco('chip',ELC.driver)}<span><b>Pulse, direction and servo-on through two ULN2803A per board.</b> The UNO R4's pins give 8 mA - less than a drive's optocoupler inputs take - and the AASD-15A's servo-on input runs on 12-24 V. The ULN2803A switches the drives' inputs to 0 V: pulse + and direction + from the board's 5V, servo-on with 24 V on pin 9. A board that is off or restarting leaves them open: the servos let go. Signal wiring shows every pin.</span></div>
+   <p class="frhead">Where is home?</p>${elPick('home',[['bottom','The bottom: released for 4 s, the seat sinks, that is zero','servo',ELC.driver],['switches','Home switches at the bottom (NC to GND on A0-A2)','hall',ELC.sens]])}
+   <p class="frsub">The board can't know where an actuator is when it starts: it finds zero first. At the bottom is what SimFeedback does and needs no parts - nothing may be under the seat then. Switches cost a few dollars and notice a broken wire.</p>
+   <p class="frhead">Set each drive up first</p><p class="frsub">On the bench, the drive on the mains with its motor and nothing else, with the drive's own keys (its manual shows how):</p>
+   <table class="frtab"><tr><th>Parameter</th><th>Value</th><th>What it does</th></tr>${(EL&&EL.params||[]).map(x=>`<tr><td>${esc(x.p)}</td><td><b>${esc(x.v)}</b></td><td>${esc(x.what)}</td></tr>`).join('')}</table>`;
+ }else if(elSrv()&&elStep===2){
+  h+=`<p class="frhead">Your mains</p>${elPick('mains',[[120,'120 V','plug','#8d5524'],[230,'230 V','plug','#8d5524']])}
+   <p class="frsub">The SFX-100's AASD-15A sets are 220 V; on 120 V mains ask the seller for the 110 V version. The drives take single phase on L1 and L2.</p>
+   <div class="elnote">${elIco('bolt',ELC.power)}<span><b>The drives run straight from the mains</b> - no motor supply to size, and the drives deal with the braking energy themselves. They need a 2-pole switch or breaker with an RCD / GFCI, earth on every drive and motor, and a small <b>24 V supply (1 A)</b> for the drives' inputs and servo-on. Power wiring shows it.</span></div>`;
+ }else if(elSrv()&&elStep===3){
+  h+=`<p class="frhead">Emergency stop</p>${elPick('estop',[['relay','Button: cuts servo-on, tells the board','stop',ELC.prot],['ac','The same, and a mains contactor','plug',ELC.prot],['none','None','none','#868e96']])}
+   <p class="frsub">The first contact opens the 24 V to every drive's pin 9: the servos let go at once, whatever the board does. The next one opens A3 on each board: it stops, releases the servos and homes again once you press Enable Motors - after an emergency stop the seat has sunk and the old positions mean nothing. Settings, Servo actuators: tick the e-stop contact.</p>${elImuPick()}`;
+ }else if(elStep===1){const tag={ok:['fr-ok','works as it comes'],mode1:['fr-info','Settings: PWM + direction'],no:['fr-bad','not for this board']};
+  const pt={limit:'limits its own current',temp:'lowers its current when hot',none:'no current limit',unknown:'current limit: check'};
+  h+=`<p class="frhead">Which driver?</p><p class="frsub">The driver switches the motor current. Choose it for the motor's stalled current and for the supply voltage - with room to spare on both.</p>
+   <div class="frlay ellay" id="el_driver">${elMeta.drivers.map(m=>`<button class="${m.id===elIn.driver?'on':''}" data-ed="${m.id}">${elIco(ELDI[m.id]||'chip',m.fw==='no'?'#868e96':ELC.driver)}<div><b>${esc(m.name)}</b><span>${esc(m.note)}</span>${m.id==='custom'?'':`${m.ch===2?'<em>two motors per board</em>':''}<em>${m.icont} A all day</em><em>${m.ipeak} A at most</em><em>to ${m.vmax} V</em>${m.fmax?`<em>PWM to ${m.fmax} kHz</em>`:''}<em>${pt[m.prot]}</em>`}<em class="eltag ${tag[m.fw][0]}">${tag[m.fw][1]}</em></div></button>`).join('')}</div>`;
+  if(elIn.driver==='custom')h+=`<p class="frhead">Its ratings</p>${elFields(['drv_vmax','drv_icont','drv_ipeak'])}<label class="ffld" style="margin-bottom:12px"><span>Its inputs</span><select id="el_wire">${elMeta.wire.map(w=>`<option value="${w.id}"${w.id===elIn.drv_wire?' selected':''}>${esc(w.name)}</option>`).join('')}</select></label>`;
+  h+=`<p class="frhead">A fan on the drivers?</p>${elPick('fan',[[1,'Yes, blowing on the heat sinks','fan',ELC.driver],[0,'No fan','none','#868e96']])}<p class="frsub">Heat is what ends most drivers. A fan costs little and roughly doubles what a small bridge carries.</p>
+   ${elFields(['pwm_khz'])}`;
+ }else if(elStep===2){const fl=elMeta.frame&&elMeta.frame.drive!=='servo'&&elMeta.frame.load;   // 2.9.5: supplies sized for the average load
+  h+=`<p class="frhead">How hard do the motors work?</p>${elPick('load',[[35,'Light: a balanced seat, gentle moves','gauge',ELC.power],[50,'A seat mover','gauge',ELC.power],[75,'Lifts that carry part of the rig','gauge',ELC.power],[100,'Every motor at its rating, all the time','gauge','#868e96']])}
+   ${fl?`<div class="elfrom">${elIco('frame',ELC.board)}<span>Your Frame Design: its motors work at about ${fl}% of their rated current on average.</span><button class="btn b-grey" id="el_loadframe">Use that</button></div>`:''}
+   ${elFields(['load'])}
+   <p class="frsub">The supplies are sized for what the motors draw on average while driving, with a quarter to spare - not for every motor at its rated current at once, which only a wheelchair climbing a hill does all day. The short peaks of a hard move come from the capacitors and the supply's current limit, not from more supplies.${EL&&EL.numbers&&EL.numbers.i_avg!=null&&elIn.psu!=='battery'?` Here: about <b>${elA(EL.numbers.i_avg)}</b> on average, <b>${elA(EL.numbers.need_good)}</b> with the quarter to spare.`:''}</p>
+   <p class="frhead">What supplies the power?</p><div class="frlay ellay" id="el_psu">${elMeta.psus.map(m=>`<button class="${m.id===elIn.psu?'on':''}" data-ep="${m.id}">${elIco(ELPI[m.id]||'psu',ELC.power)}<div><b>${esc(m.name)}</b><span>${esc(m.note)}</span></div></button>`).join('')}</div>
+   ${elFields(['psu_volts','psu_amps'])}${elPsuNote()}
+   ${elIn.psu==='battery'?'':`<p class="frhead">How many supplies?</p>${elPick('psu_share',(()=>{const two=EL&&EL.numbers&&EL.numbers.ch===2,per=two?'driver board':'motor';const u=EL&&EL.numbers?(EL.numbers.units||+elIn.motors):+elIn.motors,cnt=k=>` (${k} suppl${k===1?'y':'ies'})`;
+    return elPair()?[['shared','One pair for all motors'+cnt(2),'one',ELC.power],['each','One pair per '+per+cnt(2*u),'split',ELC.power]]:[['shared','One for all motors'+cnt(1),'one',ELC.power],['each','One per '+per+cnt(u),'split',ELC.power]];})())}
+   <p class="frsub">One for all motors is the normal way: the motors take turns - one lifts while the other lowers - so together they draw far less than their ratings added up. One per ${EL&&EL.numbers&&EL.numbers.ch===2?'driver board':'motor'} only helps when one supply cannot carry them all. The Power wiring picture and the parts list count them the same way.</p>`}
+   <p class="frhead">Your mains</p>${elPick('mains',[[120,'120 V','plug','#8d5524'],[230,'230 V','plug','#8d5524']])}
+   <p class="frhead">What takes the braking energy?</p>${elPick('regen',[['diode_cap','A diode and capacitors','diode',ELC.prot],['battery','A buffer battery','battery',ELC.prot],['none','Nothing','none','#868e96']])}
+   <p class="frsub">A motor stopped or reversed quickly works as a generator for a moment. That energy has to go somewhere, or the supply cuts out and the drivers see more volts than they are made for. The Braking energy picture shows how to wire it.</p>
+   ${elFields(['pwm_max'])}`;
+ }else if(elStep===3){const nm=EL?EL.numbers:null;
+  h+=`<p class="frhead">Emergency stop</p>${elPick('estop',[['relay','Button + relay on the motor supply','relay',ELC.prot],['ac','Button in the mains','plug',ELC.prot],['none','None','none','#868e96']])}
+   <p class="frhead">Fuse and wire for each motor</p><div class="frgrid">
+    <label class="ffld"><span>Fuse</span><select id="el_fuse"><option value="0">Auto${nm?': '+nm.fuse_auto+' A':''}</option>${elMeta.fuses.map(f=>`<option value="${f}"${+elIn.fuse===f?' selected':''}>${f} A</option>`).join('')}</select><small>One in the positive wire to each driver.</small></label>
+    <label class="ffld"><span>Wire</span><select id="el_mm2"><option value="0">Auto: sized for the fuse</option>${elMeta.gauges.map(g=>`<option value="${g.mm2}"${+elIn.wire_mm2===g.mm2?' selected':''}>${esc(g.name)} - to ${g.amps} A</option>`).join('')}</select></label></div>
+   ${elFields(['wire_len'])}
+   <p class="frhead">Position sensors</p>${elPick('sensor',[['hall','Hall sensors (contactless)','hall',ELC.sens],['pot','10 k potentiometers','pot',ELC.sens]])}
+   ${elFields(['sens_len'])}${elImuPick()}`;
+ }else h+=`<div id="el_build"></div>`;
+ $('el_body').innerHTML=h;
+ $('el_back').disabled=elStep===0;$('el_next').hidden=elStep===elSteps().length-1;
+ if(elPicStep!==elStep){elPicStep=elStep;const sg=EL&&EL.scenes&&EL.scenes.sigall?'sigall':'sig0';
+  elPic=(elSrv()?['overview',sg,'power','estop','actuator']:['overview',sg,'power','estop','overview'])[elStep];}
+ elShow();}
+function elShow(){if(!EL)return;const d=EL.inputs,nm=EL.numbers,srv=d.drive==='servo';
+ const word={ok:'Looks buildable',warn:'Buildable, with points to look at',bad:'Change the design before buying parts'}[EL.verdict];
+ let o=`<div class="frverd fr-${EL.verdict}"><i></i>${word}<span style="margin-left:auto;font-weight:400;color:var(--dim);font-size:13px">${srv?d.motors+' servo actuator'+(d.motors>1?'s':''):d.motors+' motor'+(d.motors>1?'s':'')+', '+(+d.psu_volts)+' V'}</span></div>`;
+ o+=elFwBox(srv);
+ const P=elPics();const cur=P.find(q=>q[0]===elPic)||P[0];elPic=cur[0];
+ o+=`<div class="elpics"><div class="eltabs" id="el_tabs">${P.map(q=>`<button data-pic="${q[0]}" class="${q[0]===cur[0]?'on':''}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${ELI[q[2]]}</svg>${esc(q[1])}</button>`).join('')}<button class="sp" data-big="1" title="Open full size"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${ELI.zoom}</svg>Full size</button></div>
+  <div class="elpic" id="el_pic" title="Click to open full size">${elSvg(cur[3])}</div>${cur[3].note?`<p class="elpiccap">${esc(cur[3].note)}</p>`:''}</div>`;
+ if(srv)o+=`<table class="frtab"><tr><th>Each actuator</th><th class="n"></th></tr>
+  <tr><td>Force all day (for a moment)</td><td class="n">${Math.round(nm.f_rated)} (${Math.round(nm.f_peak)}) N</td></tr>
+  <tr><td>... in kilos</td><td class="n">${Math.round(nm.f_rated/9.81)} (${Math.round(nm.f_peak/9.81)}) kg</td></tr>
+  <tr><td>Top speed</td><td class="n">${Math.round(nm.v_top)} mm/s</td></tr>
+  <tr><td>Pulses for the stroke, one pulse</td><td class="n">${nm.travel}, ${nm.res.toFixed(3)} mm</td></tr></table>
+  <table class="frtab"><tr><th>All ${d.motors>1?d.motors+' actuators':'together'}</th><th class="n"></th></tr>
+  <tr><td>Servo sets</td><td class="n">${d.motors} x ${esc(EL.servo.short)}</td></tr>
+  <tr><td>From the wall, all flat out</td><td class="n">about ${Math.round(nm.amps_rated)} A at ${d.mains} V</td></tr>
+  <tr><td>Boards</td><td class="n">${EL.boards} x UNO R4 WiFi, ${2*EL.boards} x ULN2803A</td></tr>
+  <tr><td>Parts, about</td><td class="n">${EL.cost.low.toLocaleString('en-US')} - ${EL.cost.high.toLocaleString('en-US')} USD</td></tr></table>`;
+ else o+=`<table class="frtab"><tr><th>Each motor, on this supply</th><th class="n"></th></tr>
+  <tr><td>Top speed at the shaft</td><td class="n">${Math.round(nm.rpm)} rpm</td></tr>
+  <tr><td>Torque all day (for a moment)</td><td class="n">${Math.round(nm.torque)} (${Math.round(nm.torque_peak)}) Nm</td></tr>
+  <tr><td>Current at rated load</td><td class="n">${elA(nm.i_rated)}</td></tr>
+  <tr><td>Current when stalled at full drive</td><td class="n">${elA(nm.i_stall)}</td></tr>
+  <tr><td>Fuse and wire</td><td class="n">${nm.fuse} A, ${esc(nm.wire)}</td></tr></table>
+  <table class="frtab"><tr><th>All ${d.motors>1?d.motors+' motors':'together'}</th><th class="n"></th></tr>
+  <tr><td>Motors draw on average (with a quarter to spare)</td><td class="n">${elA(nm.need_min)} (${elA(nm.need_good)})</td></tr>
+  <tr><td>Supply chosen</td><td class="n">${d.psu==='battery'?'batteries':elA(nm.psu_total)+', '+Math.round(nm.psu_w)+' W'}</td></tr>
+  <tr><td>Drivers</td><td class="n">${EL.driver_units} x ${esc(EL.driver.name.split(',')[0].split(' (')[0])}</td></tr>
+  <tr><td>Boards</td><td class="n">${EL.boards} x UNO R4 WiFi</td></tr>
+  <tr><td>Parts, about</td><td class="n">${EL.cost.low.toLocaleString('en-US')} - ${EL.cost.high.toLocaleString('en-US')} USD</td></tr></table>`;
+ if(EL.fixes.length){const n=EL.fixes.filter(f=>f.level!=='tip').length;
+  o+=`<div class="frfix" id="el_fixes"><h4>What would make it better${n?`<button class="btn b-blue" id="el_fixall">Fix it for me (${n})</button>`:''}</h4>${EL.fixes.map((f,i)=>`<div class="frchk fr-${f.level}"><div><b>${esc(f.title)}</b><span>${esc(f.text)}</span></div><button data-efix="${i}">${f.level==='tip'?'Try it':'Apply'}</button></div>`).join('')}</div>`;}
+ o+=EL.checks.map(c=>`<div class="frchk fr-${c.level}"><b>${esc(c.title)}</b><span>${esc(c.text)}</span></div>`).join('');
+ o+=`<p class="frnote">Rules of thumb from motion rigs people have built and reported on, with the values typed in - a first design to check, only as good as the motor's label. Mains wiring can kill and a shorted supply or battery starts fires: fuse every positive wire, keep mains under covers, and test with nobody in the seat and the emergency stop in your hand.</p>`;
+ $('el_out').innerHTML=o;
+ const der=$('el_der');
+ if(der&&srv)der.innerHTML=`<div><span>Force all day</span><b>${Math.round(nm.f_rated)} N</b></div><div><span>Top speed</span><b>${Math.round(nm.v_top)} mm/s</b></div><div><span>Pulses for the stroke</span><b>${nm.travel}</b></div>`;
+ else if(der&&!srv&&nm.rpm!=null)der.innerHTML=`<div><span>Speed on ${+d.psu_volts} V</span><b>${Math.round(nm.rpm)} rpm</b></div><div><span>Torque all day</span><b>${Math.round(nm.torque)} Nm</b></div><div><span>Stalled, on ${+d.psu_volts} V</span><b>${elA(nm.i_stall)}</b></div>`;
+ const lvd=$('el_lev'),LV=EL.lever;
+ if(lvd&&LV)lvd.innerHTML=`<div><span>Travel at the seat</span><b>${Math.round(LV.travel)} mm</b></div><div><span>Lever plate (aluminium / steel)</span><b>${LV.t_al} / ${LV.t_st} mm</b></div><div><span>Push at the rod, worst case</span><b>${Math.round(LV.f_end)} N</b></div>`;
+ const bl=$('el_build');
+ if(bl)bl.innerHTML=`<p class="frhead">Wiring pictures</p><p class="frsub">The same pictures as on the right, one tap to open each full size - print them or keep them on a phone at the bench.</p>
+  <div class="frpick elpk" id="el_picbtns">${elPics().map(q=>`<button data-open="${q[0]}">${elIco(q[2],q[0]==='power'?ELC.power:q[0]==='braking'?ELC.prot:q[0]==='estop'?'#e03131':q[0]==='actuator'?ELC.driver:ELC.board)}${esc(q[1])}</button>`).join('')}</div>
+  <p class="frhead">Wiring list</p><p class="frsub">${srv?'Each drive, every terminal. ':'Driver inputs: '+esc(EL.wire_kind)+'. Same list for each motor, with its own pins. '}${d.motors>3&&!(EL.driver&&EL.driver.pins)?(srv?'Actuators':'Motors')+' 4 to '+d.motors+' go on a second board, on the same pins.':''}${!srv&&EL.driver&&EL.driver.pins?'Two motors per driver board, each on its own channel; the board has one supply input and one fuse.':''}</p>
+  <div class="elwire">${EL.wiring.map(w=>`<table class="frtab"><tr><th>${srv?'Actuator '+w.motor+(EL.boards>1?' (board '+w.board+')':'')+': drive':(w.title?esc(w.title):'Motor '+w.motor+': driver')}</th><th>goes to</th></tr>${w.rows.map(x=>`<tr><td>${esc(x.from)}</td><td>${esc(x.to)}</td></tr>`).join('')}</table>`).join('')}${EL.imu_wiring?`<table class="frtab"><tr><th>Motion sensor (board 1)</th><th>goes to</th></tr>${EL.imu_wiring.map(x=>`<tr><td>${esc(x.from)}</td><td>${esc(x.to)}</td></tr>`).join('')}</table>`:''}</div>
+  ${!srv&&EL.lever?`<p class="frhead">${elIco('lever',ELC.motor,1)}Levers, push rods, sensor mounts</p><p class="frsub">The template prints the lever 1:1 for ${esc(String(EL.lever.ctc))} mm between centres and a ${esc(String(EL.lever.shaft))} mm shaft, with the sensor cap: print at 100% (Actual size), check the 100 mm bar with a ruler, glue it on the plate, drill and cut.${EL.bracket?` The same PDF has the <b>sensor bracket</b> 1:1: a ${Math.round(EL.bracket.flat)} mm strip of 3 x 25 mm aluminium with its hole, slots and four bend lines - bent into a C, its feet on the gearbox, its arms past the lever, the sensor in its face.`:''} Aluminium 6061-T6 ${EL.lever.t_al} mm (or two ${EL.lever.t_half} mm plates bolted together), or steel ${EL.lever.t_st} mm. The Push rod and Sensor mount pictures show the rest.</p>
+  <div class="fwbtns"><button class="btn b-blue" id="el_leverpdf"><svg class="i" viewBox="0 0 24 24"><path d="M12 3v12M7 10l5 5 5-5M5 21h14"/></svg>Lever and sensor bracket templates (PDF, 1:1)</button></div>`:''}
+  ${srv?`<p class="frhead">${elIco('print','#fd7e14',1)}Printed parts, files and kits</p><p class="frsub">${esc(EL.print)}</p>
+  <div class="ellinks">${EL.links.map(l=>`<a href="${esc(l.url)}" target="_blank" rel="noopener"><b>${esc(l.title)}</b><span>${esc(l.note)}</span></a>`).join('')}</div>
+  <p class="frhead">Drive settings</p><table class="frtab"><tr><th>Parameter</th><th>Value</th><th>What it does</th></tr>${EL.params.map(x=>`<tr><td>${esc(x.p)}</td><td><b>${esc(x.v)}</b></td><td>${esc(x.what)}</td></tr>`).join('')}</table>`:''}
+  <p class="frhead">Parts, and where to look</p>
+  <p class="frsub" id="el_cost"><b>About ${EL.cost.low.toLocaleString('en-US')} to ${EL.cost.high.toLocaleString('en-US')} US dollars.</b> ${esc(EL.cost.note)}</p>
+  <table class="frtab"><tr><th>What</th><th class="n">How many</th><th class="n">About</th><th class="elbuy">Look on</th></tr>${EL.cost.items.map(c=>`<tr><td>${ELGI[c.group]?elIco(ELGI[c.group][0],ELC[ELGI[c.group][1]],1):''}${esc(c.group)}: ${esc(c.what)}${c.note?` <span style="color:var(--dim)">(${esc(c.note)})</span>`:''}</td><td class="n">${c.qty}</td><td class="n">${Math.round(c.total).toLocaleString('en-US')} USD</td><td class="elbuy"><a href="${esc(c.ebay)}" target="_blank" rel="noopener">eBay</a> &middot; <a href="${esc(c.amazon)}" target="_blank" rel="noopener">Amazon</a></td></tr>`).join('')}<tr><td><b>Total of the lines above</b></td><td></td><td class="n"><b>${EL.cost.total.toLocaleString('en-US')} USD</b></td><td></td></tr></table>
+  <p class="frhead">First power-up, step by step</p><ol class="frlist">${EL.steps.map(x=>`<li><b>${esc(x.title)}</b>${esc(x.text)}</li>`).join('')}</ol>
+  <p class="frsub">Export PDF saves all of this with the wiring pictures (one landscape page each) and the checks.</p>`;}
+function elCalc(sync){clearTimeout(elTimer);elTimer=setTimeout(async()=>{const seq=++elSeq;
+ try{const r=await post('/elec/calc',{inputs:elIn});if(seq!==elSeq||!r.ok)return;EL=r.design;
+  if(sync){elIn=Object.assign({},EL.inputs);elRender();}else{elIn.i_stall=EL.inputs.i_stall;elShow();}
+ }catch(e){}},sync?0:220);}
+// 2.9.5: the firmware for this build - named after it, its starting values set - one click
+function elFwBox(srv){const F=EL.firmware;if(!F)return'';
+ if(!F.supported)return `<div class="betanote fwbox" id="el_fw"><div><b>No firmware for this driver.</b> ${esc(F.why)}<div class="fwbtns"><button class="btn b-grey" id="el_fwall">All firmware</button></div></div></div>`;
+ const B=F.beta,R=F.release;
+ const btn=(x,k)=>`<button class="btn ${k==='beta'?'b-red':'b-green'} elfwdl" data-fw="${k}"><svg class="i" viewBox="0 0 24 24"><path d="M12 3v12M7 10l5 5 5-5M5 21h14"/></svg>Download ${esc(x.file)}</button>`;
+ const head=srv?'Beta firmware for servo actuators.':(R?'Firmware for this build: the release, or the beta.':'Beta firmware for this driver.');
+ const txt=srv?'SMC3_R4_Servo 2.2.0b1 has not been tested on a real rig yet. It was written for this dashboard and checked against a model of the board, and should work with it - first runs with the actuators off the rig, then nobody in the seat, a hand on the emergency stop.'
+  :(R?`The release ${esc(R.ver)} drives ${esc(B.what[0].split(':')[0])} as it comes. The beta ${esc(B.ver)} adds the driver-type and PWM settings - not tested on a real rig yet, but written for and checked against this dashboard.`
+  :`PWM + direction drivers need SMC3_R4 ${esc(B.ver)}: a beta, not tested on a real rig yet. It was written for this dashboard and checked against a model of the board, and should work with it - first runs with the levers off, then nobody in the seat, a hand on the emergency stop.`);
+ return `<div class="betanote fwbox" id="el_fw"><i class="led"></i><div><b>${head}</b> ${txt}
+  <div class="fwfor">Set up for: ${B.what.map(esc).join(' · ')}.</div>
+  <div class="fwbtns">${btn(B,'beta')}${R?btn(R,'release'):''}<button class="btn b-grey" id="el_fwall"><svg class="i" viewBox="0 0 24 24"><path d="M4 5h16M4 10h16M4 15h16M4 20h10"/></svg>All firmware</button></div>
+  <div class="fwfor">A sketch folder in a .zip: unzip, open the .ino in the Arduino IDE, put your WiFi name and password in, board "Arduino UNO R4 WiFi", Upload. ${esc(B.saved)}</div></div></div>`;}
+async function elFwGet(which){const F=EL&&EL.firmware;const x=F&&F[which];if(!x)return;
+ const bs=document.querySelectorAll('.elfwdl');bs.forEach(b=>b.disabled=true);
+ try{const r=await fetch('/elec/firmware',{method:'POST',headers:{'X-SMC3':'1'},body:JSON.stringify({inputs:elIn,which})});
+  if(!r.ok)throw 0;if((r.headers.get('Content-Type')||'').includes('json')){const j=await r.json();throw j.error||0;}
+  const blob=await r.blob(),a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=x.file;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(a.href),8000);
+  toast('Saved: '+esc(x.file));
+ }catch(e){toast(typeof e==='string'?esc(e):'Could not make the firmware file.',1);}bs.forEach(b=>b.disabled=false);}
+// 2.9.5: every firmware this page hands out, in one table - the wizard's pick for the design on top
+let fwAll=null;
+async function fwAllInputs(){if(elIn)return elIn;try{const r=await (await fetch('/elec/load')).json();return r.inputs;}catch(e){return {};}}
+async function fwAllOpen(){openModal('mFwAll');$('fwall_body').innerHTML='<p class="muted" style="padding:12px">Loading…</p>';
+ const inputs=await fwAllInputs();
+ try{const r=await post('/elec/fwcat',{inputs});if(!r.ok)throw 0;fwAll={rows:r.rows,inputs};
+  $('fwall_note').innerHTML=`Every sketch this page can make, each a sketch folder in a .zip: unzip, open the .ino in the Arduino IDE, put your WiFi name and password in, board "Arduino UNO R4 WiFi", Upload. <b>Release</b>: the version on GitHub. <b>Beta</b>: not tested on a real rig yet. ${r.pick.length?`The Electronics wizard's pick for your design is on top (green): <b>${r.pick.map(esc).join('</b> or <b>')}</b>.`:'Your design has no SMC3 firmware (see the Electronics wizard).'} The ready-made files use your design's motion sensor choice (${r.imu?'switched on':'none'}). Older releases are on GitHub (Releases); 2.1.1 has all their fixes.`;
+  let g='',h=`<table class="fwtab"><tr><th>Firmware file</th><th>Version</th><th>Runs</th><th>Set up for</th><th>Driver inputs</th><th>PWM</th><th>Motion sensor (WT901C)</th><th>What is different</th><th></th></tr>`;
+  r.rows.forEach((x,i)=>{if(x.group!==g){g=x.group;h+=`<tr class="fwg"><td colspan="9">${esc(g)}</td></tr>`;}
+   h+=`<tr class="${x.yours?'yours':''}"><td class="fwf">${x.ok?esc(x.file):'-'}${x.yours&&x.ok?'<br><span class="fwpick">the wizard\'s pick</span>':''}</td>
+    <td>${x.ok?`<span class="fwv ${x.beta?'beta':'rel'}">${esc(x.ver)} ${x.beta?'beta':'release'}</span>`:'<span class="fwv no">none</span>'}</td>
+    <td>${esc(x.build)}</td><td>${esc(x.hw)}</td><td>${esc(x.inputs)}</td><td>${esc(x.pwm)}</td><td>${esc(x.imu)}</td>
+    <td>${esc(x.summary)}</td>
+    <td>${x.ok?`<button class="btn ${x.beta?'b-red':'b-green'} fwalldl" data-i="${i}"><svg class="i" viewBox="0 0 24 24"><path d="M12 3v12M7 10l5 5 5-5M5 21h14"/></svg>Download</button>`:''}</td></tr>`;});
+  $('fwall_body').innerHTML=h+'</table>';
+  $('fwall_count').textContent=`${r.rows.filter(x=>x.ok).length} files to download`;
+ }catch(e){$('fwall_body').innerHTML='<p class="muted" style="padding:12px">The page server did not answer.</p>';}}
+async function fwAllGet(i){const x=fwAll&&fwAll.rows[i];if(!x)return;
+ const bs=document.querySelectorAll('.fwalldl');bs.forEach(b=>b.disabled=true);
+ try{const r=await fetch('/elec/firmware',{method:'POST',headers:{'X-SMC3':'1'},body:JSON.stringify({inputs:fwAll.inputs,id:x.id})});
+  if(!r.ok)throw 0;if((r.headers.get('Content-Type')||'').includes('json')){const j=await r.json();throw j.error||0;}
+  const blob=await r.blob(),a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=x.file;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(a.href),8000);
+  toast('Saved: '+esc(x.file));
+ }catch(e){toast(typeof e==='string'?esc(e):'Could not make the firmware file.',1);}bs.forEach(b=>b.disabled=false);}
+$('mFwAll').addEventListener('click',e=>{const b=e.target.closest('.fwalldl');if(b)fwAllGet(+b.dataset.i);else if(e.target.id==='mFwAll')closeModal('mFwAll');});
+async function elPdf(){const b=$('el_pdf');b.disabled=true;
+ try{const r=await fetch('/elec/pdf',{method:'POST',headers:{'X-SMC3':'1'},body:JSON.stringify({inputs:elIn})});if(!r.ok)throw 0;
+  const blob=await r.blob(),a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='motion-rig-electronics-design.pdf';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(a.href),8000);toast('PDF saved: motion-rig-electronics-design.pdf');
+ }catch(e){toast('Could not make the PDF.',1);}b.disabled=false;}
+function elPatch(list){for(const p of list)Object.assign(elIn,p);elCalc(true);}
+$('elwiz').addEventListener('input',e=>{const k=e.target.dataset&&e.target.dataset.e;if(!k)return;const v=parseFloat(e.target.value);if(!isFinite(v))return;elIn[k]=v;
+ if(['volts','watts','rpm','i_noload','i_rated','i_stall','r_wind'].includes(k))elIn.motor='custom';
+ if(['srv_watts','srv_torque','srv_peak','srv_rpm'].includes(k))elIn.servo='custom';elCalc();});
+$('elwiz').addEventListener('change',e=>{const t=e.target;
+ if(t.dataset&&t.dataset.e){elCalc(true);return;}
+ if(t.id==='el_wire'){elIn.drv_wire=t.value;elCalc(true);}
+ else if(t.id==='el_fuse'){elIn.fuse=+t.value;elCalc(true);}
+ else if(t.id==='el_mm2'){elIn.wire_mm2=+t.value;elCalc(true);}});
+$('elwiz').addEventListener('click',e=>{const b=e.target.closest('button');if(!b)return;
+ if(b.dataset.s!==undefined){elStep=+b.dataset.s;elRender();}
+ else if(b.dataset.em){const m=elMeta.motors.find(x=>x.id===b.dataset.em);elIn.motor=m.id;Object.assign(elIn,m.values);if(m.id!=='custom')elIn.r_wind=0;elCalc(true);}
+ else if(b.dataset.ed){elIn.driver=b.dataset.ed;elCalc(true);}
+ else if(b.dataset.edrive){const sv=b.dataset.edrive==='servo';if(sv===elSrv())return;elIn.drive=b.dataset.edrive;
+  if(sv&&elIn.motors<3)elIn.motors=4;if(!sv&&elIn.motors===4)elIn.motors=2;elPicStep=-1;elCalc(true);}
+ else if(b.dataset.esv){const m=(elMeta.servos||[]).find(x=>x.id===b.dataset.esv);elIn.servo=m.id;if(m.id!=='custom')Object.assign(elIn,{srv_watts:m.watts,srv_torque:m.torque,srv_peak:m.peak,srv_rpm:m.rpm});elCalc(true);}
+ else if(b.dataset.ep){const id=b.dataset.ep,ps=(elMeta.psus||[]).find(x=>x.id===id),was=elIn.psu;elIn.psu=id;
+  if(['server','pc'].includes(was)&&['led','adj','meanwell'].includes(id)&&EL&&EL.numbers){const g=elIn.psu_share==='each'?+elIn.motors:1;   // back to an ordinary supply: sized for the motors
+   elIn.psu_amps=[10,15,20,25,30,40,50,60,80,100,120].find(x=>x>=EL.numbers.need_good/g-0.05)||120;}
+  if(id==='server'||id==='pc'){elIn.psu_volts=elIn.volts<15?12:24;if(ps&&ps.unit)elIn.psu_amps=ps.unit.amps[elIn.mains];}   // 2.9.5: what one gives
+  if(id==='battery'){elIn.psu_volts=elIn.volts<15?12:24;elIn.regen='diode_cap';elIn.psu_share='shared';}elCalc(true);}
+ else if(b.dataset.ev!==undefined){const k=b.parentNode.dataset.ek;elIn[k]=isNaN(+b.dataset.ev)?b.dataset.ev:+b.dataset.ev;
+  if(k==='mains'&&elIn.psu==='server'){const ps=(elMeta.psus||[]).find(x=>x.id==='server');if(ps&&ps.unit)elIn.psu_amps=ps.unit.amps[elIn.mains];}
+  elCalc(true);}
+ else if(b.id==='el_leverpdf')elLeverPdf();
+ else if(b.id==='el_loadframe'){elIn.load=+elMeta.frame.load;elCalc(true);toast('Load taken from your Frame Design.');}
+ else if(b.id==='el_fromframe'){Object.assign(elIn,elMeta.frame);elCalc(true);toast(elMeta.frame.drive==='servo'?'Actuators taken from your Frame Design.':'Motor taken from your Frame Design.');}
+ else if(b.id==='el_back'){if(elStep>0){elStep--;elRender();}}
+ else if(b.id==='el_next'){if(elStep<elSteps().length-1){elStep++;elRender();$('elwiz').scrollIntoView({block:'nearest'});}}
+ else if(b.id==='el_reset'){if(confirm('Start the electronics design over with the starting values?')){elStep=0;post('/elec/calc',{inputs:{}}).then(r=>{EL=r.design;elIn=Object.assign({},EL.inputs);elRender();});}}
+ else if(b.dataset.open){const q=elPics().find(x=>x[0]===b.dataset.open);if(q)elPicOpen(q[3]);}
+ else if(b.id==='el_pdf')elPdf();});
+$('elres').addEventListener('click',e=>{const fb=e.target.closest('.elfwdl');if(fb){elFwGet(fb.dataset.fw);return;}
+ if(e.target.closest('#el_fwall')){fwAllOpen();return;}                       // 2.9.5: every firmware, one table
+ const pb=e.target.closest('[data-pic],[data-big],#el_pic');
+ if(pb&&EL){const P=elPics();if(pb.dataset.pic){elPic=pb.dataset.pic;elShow();}else{const c=P.find(q=>q[0]===elPic)||P[0];elPicOpen(c[3]);}return;}
+ const t=e.target.closest('[data-efix],#el_fixall');if(!t||!EL)return;e.preventDefault();
+ if(t.id==='el_fixall')elPatch(EL.fixes.filter(f=>f.level!=='tip').map(f=>f.patch));else elPatch([EL.fixes[+t.dataset.efix].patch]);});
 
 // ---------- frame design (2.9.4) ----------
 let FR=null,frIn=null,frMeta=null,frStep=0,frUnits='metric',frTimer=null,frSeq=0;
@@ -20090,6 +25424,81 @@ async function lnkFlip(){if(lnkBusy)return;const on=lnkSt.kind==='usb'||!!lnkSt.
  }catch(e){toast('No answer from the page.',true);}
  lnkBusy=false;$('lnk').classList.remove('dis');}
 function durText(s){s=Math.max(0,Math.round(s||0));return s<60?s+' s':s<3600?Math.floor(s/60)+' min':Math.floor(s/3600)+' h '+Math.floor(s%3600/60)+' min';}
+// ---------- motor drivers (2.9.5, firmware 2.1.2) ----------
+let drvSt=null,drvPick=null;
+async function drvLoad(){try{drvSt=await (await fetch('/board/driver',{cache:'no-store'})).json();}catch(e){drvSt=null;}drvShow();}
+function drvShow(){const r=drvSt||{};const names=['IBT-2 / BTS7960','PWM + direction'];let cls='',h;
+ if(!r.connected)h='The board is not connected.';
+ else if(!r.known)h='The board has not said yet.';
+ else{cls='on';h=`The board drives <b>${names[r.type]}</b> motor drivers`+(r.settable?' (firmware '+esc(r.firmware)+': changeable here).':` - firmware ${esc(r.firmware||'?')} was built that way (#define ${r.type?'MODE1':'MODE2'}); firmware 2.2.0b1 (the beta in All firmware) makes it changeable here.`);
+  if(r.khz)h+=` PWM ${r.khz[0]} / ${r.khz[1]} kHz.`;}
+ $('drv_stat').innerHTML=`<i class="dot ${cls}"></i><span>${h}</span>`;
+ if(drvPick===null&&r.known)drvPick=r.type;
+ document.querySelectorAll('#drv_opts button').forEach(b=>{const v=+b.dataset.drv;b.classList.toggle('on',v===drvPick);b.classList.toggle('now',r.known&&v===r.type);b.disabled=!r.settable;});
+ let why='';
+ if(r.connected&&r.known&&!r.settable)why='Needs firmware 2.2.0b1 (the beta in All firmware) - or build the sketch with #define MODE1 / MODE2.';
+ else if(r.simhub)why='SimHub is sending positions - stop its motion output first.';
+ else if(r.connected&&!r.motors_off)why='Switch the motors off first (Disable Motors).';
+ $('drv_save').disabled=!(r.settable&&!r.simhub&&r.motors_off&&drvPick!==null&&drvPick!==r.type);
+ $('drv_msg').textContent=why;}
+document.addEventListener('click',async e=>{const b=e.target.closest&&e.target.closest('#drv_opts button,#drv_save,#drv_khz');if(!b)return;
+ if(b.dataset.drv!==undefined){drvPick=+b.dataset.drv;drvShow();return;}
+ if(b.id==='drv_save'){b.disabled=true;const r=await post('/board/driver',{type:drvPick});if(r.ok)toast('The board now drives '+esc(r.what)+' motor drivers.');else toast(esc(r.error),true);drvLoad();return;}
+ if(b.id==='drv_khz'){b.disabled=true;await post('/cmd',{pair:'~',a:20,b:20});const r=await post('/eeprom/save');if(r.ok){toast('PWM set to 20 kHz for all motors and saved to EEPROM.');$('f1').value=20;$('f2').value=20;}else toast(esc(r.error),true);b.disabled=false;setTimeout(drvLoad,600);}});
+// ---------- servo actuators (2.9.5, firmware 2.2.0b1 servo build) ----------
+let srvSt=null,servoFw=false,srvFilled=false,srvPollAt=0;
+async function srvLoad(){try{srvSt=await (await fetch('/board/servo',{cache:'no-store'})).json();}catch(e){srvSt=null;}srvShow();}
+function srvUi(){document.querySelectorAll('.srvonly').forEach(e=>{if(e.hidden===servoFw)e.hidden=!servoFw;});
+ const tn=$('tn_srv');if(tn&&tn.hidden===servoFw)tn.hidden=!servoFw;
+ // homing state for the motor cards while a motor is off (a read every 2 s)
+ const s=data[data.length-1];if(servoFw&&s&&s.dis.some(x=>x)&&Date.now()-srvPollAt>2000&&curView!=='settings'){srvPollAt=Date.now();srvLoad();}}
+function srvNum(id){const v=parseFloat($(id).value);return isFinite(v)?v:NaN;}
+function srvCalc(){const st=srvNum('srv_stroke'),ld=srvNum('srv_lead'),pp=Math.round(srvNum('srv_ppr')),ac=srvNum('srv_acc');const out=$('srv_calc');
+ if(!(st>0&&ld>0&&pp>0&&ac>0)){out.textContent='Fill in stroke, lead, pulses per turn and acceleration.';return null;}
+ const travel=Math.round(st/ld*pp),accel=Math.round(ac*pp/ld),mms=20000/pp*ld,rpm=20000/pp*60;
+ const flags=(+$('srv_home').value)|(+$('srv_son').value)|($('srv_es').checked?32:0)|[0,1,2].reduce((a,m)=>a|($('srv_r'+m).checked?4<<m:0),0);
+ const warn=[];if(travel>32000)warn.push('over 32 000 pulses for the travel - set the drive to fewer pulses per turn');if(travel<200)warn.push('under 200 pulses for the travel - too coarse');
+ if(rpm>3000)warn.push(`${Math.round(rpm)} rpm at PWMmax 255 is above a 3000 rpm servo's rating - keep PWMmax below ${Math.floor(255*3000/rpm)} or use more pulses per turn`);
+ if(accel<10||accel>5000)warn.push('acceleration out of range');
+ out.innerHTML=`${travel} pulses for the stroke · top speed at PWMmax 255: ${Math.round(mms)} mm/s (${Math.round(rpm)} rpm) · acceleration ${accel} × 1000 pulses/s²`+
+  (warn.length?'<br><b style="color:var(--red)">'+warn.map(esc).join('; ')+'</b>':'');
+ return {travel,accel,flags,ok:!warn.length,mech:{stroke:st,lead:ld,ppr:pp}};}
+function srvShow(){const r=srvSt||{};const sv=r.servo===true;
+ $('srvcard').classList.toggle('na',!sv);$('drvcard').classList.toggle('na',sv);   // (hidden belongs to the views)
+ if(!sv)return;
+ if(!srvFilled&&r.travel){srvFilled=true;const mc=r.mech||{stroke:100,lead:5,ppr:500};
+  $('srv_lead').value=mc.lead;$('srv_ppr').value=mc.ppr;$('srv_stroke').value=+(r.travel/mc.ppr*mc.lead).toFixed(1);
+  if(r.accel)$('srv_acc').value=+(r.accel*mc.lead/mc.ppr).toFixed(2);
+  if(r.flags!=null){$('srv_home').value=r.flags&1;$('srv_son').value=r.flags&2;$('srv_es').checked=!!(r.flags&32);[0,1,2].forEach(m=>$('srv_r'+m).checked=!!(r.flags&(4<<m)));}}
+ let cls='on',h;
+ if(!r.connected){cls='';h='The board is not connected.';}
+ else if(r.estop){cls='off';h='<b>Emergency stop pressed</b> (A3 open): every motor is off and the servos are released. Release the button, then Enable Motors - it homes first.';}
+ else if(r.settling){cls='warn';h='Released: the seat settles to the bottom (4 s), then the board takes that as zero and switches the motors on.';}
+ else if(r.homing){cls='warn';h='Homing: driving each actuator to its home switch.';}
+ else if(r.homed){h=`Homed ${r.switches?'on the home switches':'at the bottom'}; the servos are on. Positions are pulses counted from there (${r.travel} for the travel).`;}
+ else{cls='';h='Not homed - Enable Motors homes first.';}
+ $('srv_stat').innerHTML=`<i class="dot ${cls}"></i><span>${h}</span>`;
+ const s=data[data.length-1];
+ $('srv_m').innerHTML=[0,1,2].map(m=>{const f=(r.fault||[])[m],w=(r.want||[])[m],off=s?s.dis[m]:true;let t,c;
+  if(r.estop){t='e-stop';c='bad';}else if(f){t='home switch not found';c='bad';}else if(r.homing||r.settling){t=w||off?'homing, then on':'homing';c='wait';}else if(off){t='off';c='';}else{t='on';c='ok';}
+  const sw=r.switches&&r.inputs_open?' · switch '+(r.inputs_open[m]?'open (at home)':'closed'):'';
+  return `<span class="${c}"><b>${esc(mshort(m))}</b> ${t}${sw}</span>`;}).join('');
+ srvCalc();
+ const busy=r.simhub?'SimHub is sending positions - stop its motion output first.':(!r.motors_off?'Switch the motors off first (Disable Motors) to change stroke, homing or wiring, or to home again.':'');
+ $('srv_rehome').disabled=!(r.connected&&r.motors_off&&!r.simhub&&!r.homing&&!r.settling&&!r.estop);
+ $('srv_msg').textContent=busy;}
+document.addEventListener('click',async e=>{const b=e.target.closest&&e.target.closest('#srv_save,#srv_rehome');if(!b)return;
+ if(b.id==='srv_save'){const c=srvCalc();if(!c){toast('Fill in every value first.',true);return;}if(!c.ok){toast('Fix what is shown in red first.',true);return;}
+  const r0=srvSt||{};const body={mech:c.mech,accel:c.accel};
+  if(c.travel!==r0.travel)body.travel=c.travel;if(c.flags!==r0.flags)body.flags=c.flags;
+  b.disabled=true;const r=await post('/board/servo',body);b.disabled=false;
+  if(r.ok)toast('Saved on the board.');else toast(esc(r.error),true);srvFilled=false;srvLoad();return;}
+ if(b.id==='srv_rehome'){if(!confirm('Home again? The servos are released'+((srvSt||{}).switches?' and drive to their home switches.':': the seat sinks to the bottom and settles for 4 s, then the board counts from there. Keep clear of the rig.')))return;
+  b.disabled=true;const r=await post('/board/servo',{home:true});if(r.ok)toast('Homing - the motors stay off afterwards until Enable Motors.');else toast(esc(r.error),true);setTimeout(srvLoad,400);}});
+// beta firmware: the badge and the disclaimer (once per version and browser)
+function betaShow(){$('bt_ver').textContent=rebootFw||'?';$('bt_servo').hidden=!servoFw;openModal('mBeta');}
+function betaOnce(v){if(betaOnce.v===v)return;betaOnce.v=v;let seen=null;try{seen=localStorage.getItem('smc3_beta_seen');}catch(e){}
+ if(seen!==v){try{localStorage.setItem('smc3_beta_seen',v);}catch(e){}setTimeout(betaShow,600);}}
 async function usbLoad(){try{usbShow(await (await fetch('/usb/status',{cache:'no-store'})).json());}catch(e){}}
 async function usbAllow(){const r=await post('/config',{usb_link:$('usb_allow').checked});if(r.error)toast(esc(r.error)+' The cable stays until then.',true);else cfg=r;usbLoad();}
 async function usbDrop(){if(wsPort){await wsRelease();toast('Back to WiFi: the port is free for SimHub.');return;}
@@ -20460,6 +25869,8 @@ function updateStatus(j){const s=data[data.length-1];const fresh_inc=watch.newes
  let h=connected?'<span data-k="st_conn"><i class="dot on"></i>Board Connected</span>'+(man.active?'<span class="mheld" data-k="st_held">Page has the seat</span>':''):`<span data-k="st_conn"><i class="dot off"></i>Not connected <span class="muted" style="font-weight:400">(${esc(j.host||'no address set')})</span></span>`;
  linkK=(j.link||{}).kind||'wifi';lnkShow(j.link||{});
  if(j.fw)h+=`<span data-k="st_fw">fw v${esc(j.fw)}</span>`;
+ servoFw=j.servo===true;srvUi();
+ if(connected&&/\db\d+$/.test(j.fw||'')){h+=`<span class="betafw" data-k="st_beta" onclick="betaShow()"><i></i>BETA${servoFw?' servo':''}</span>`;betaOnce(j.fw);}
  rebootFw=j.fw||'';const rb=$('rebootBtn');if(rb){const can=connected&&!vgt('2.0b2',rebootFw);rb.disabled=!connected||tuneRunning;rb.classList.toggle('old',connected&&!can);}
  h+='<span data-k="st_page">page v__VERSION__</span>';
  if(s&&connected){h+=`<span data-k="st_isr">ISR max ${s.isr} µs</span><span data-k="st_div">Fpid/${s.div}</span>`+(s.low?'<span class="bad" data-k="st_low">LOW POWER</span>':'<span class="ok" data-k="st_full">Full power</span>');
@@ -20491,14 +25902,16 @@ function updateStatus(j){const s=data[data.length-1];const fresh_inc=watch.newes
 function updateCards(){const s=data[data.length-1];
  for(let m=0;m<3;m++){const st=$('ms'+m);
   if(!s||!connected){st.className='state nodata';st.lastElementChild.textContent='No data';continue;}
-  const x=s.m[m];const off=s.dis[m];st.className='state'+(off?' off':'');st.lastElementChild.textContent=off?'Off':'Online';
+  const x=s.m[m];const off=s.dis[m];st.className='state'+(off?' off':'');
+  const hs=servoFw&&off&&srvSt&&srvSt.servo?(srvSt.estop?'E-stop':((srvSt.fault||[])[m]?'No home':(srvSt.homing?'Homing':'Off'))):(off?'Off':'Online');
+  if(st.lastElementChild.textContent!==hs)st.lastElementChild.textContent=hs;
   const dragging=drag&&drag.m===m&&drag.v!=null;
   if(!dragging)$('mp'+m).textContent=Math.round(x.g);$('mfb'+m).textContent=x.f.toFixed(1);$('me'+m).textContent=(x.g-x.f).toFixed(1);$('mo'+m).textContent=x.p.toFixed(1);
   const pc=v=>Math.max(0,Math.min(100,v/1023*100))+'%';if(!dragging){$('mf'+m).style.width=pc(x.g);$('mk'+m).style.left=pc(x.g);}$('mt'+m).style.left=pc(x.f);
   $('mk'+m).setAttribute('aria-valuenow',Math.round(x.g));
   $('rg'+m).textContent=x.g.toFixed(1);$('rf'+m).textContent=x.f.toFixed(1);$('re'+m).textContent=(x.g-x.f).toFixed(1);$('rp'+m).textContent=x.p.toFixed(1);
   const dv=drvText(x);if($('md'+m))$('md'+m).textContent=dv;if($('rd'+m))$('rd'+m).textContent=dv;}}
-function drvText(x){if(x.o==null)return '-';if(x.o==='b')return 'braked';if(x.o==='x')return 'off';return (x.d>0?'+':'')+x.d.toFixed(0)+(x.o==='r'?' rev':'');}
+function drvText(x){if(x.o==null)return '-';if(x.o==='s'){const v=Math.round(x.d*20000/255);return (v>0?'+':'')+v+' p/s';}if(x.o==='b')return 'braked';if(x.o==='x')return 'off';return (x.d>0?'+':'')+x.d.toFixed(0)+(x.o==='r'?' rev':'');}
 function cssv(n){return getComputedStyle(document.documentElement).getPropertyValue(n).trim()}
 let HIDE=new Set();try{HIDE=new Set(JSON.parse(localStorage.getItem('smc3_hide')||'[]'));}catch(e){}
 function legPaint(){document.querySelectorAll('.leg span[data-l]').forEach(e=>e.classList.toggle('off',HIDE.has(e.dataset.l)));}
@@ -21755,7 +27168,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.upd.seen()                          # this version's own page runs in a browser
             self._json({"connected": self.board.connected, "host": self.cfg.get("host"),
                         "samples": self.board.since(since, limit=1500), "fw": self._fw(),
-                        "fwnum": (self.board.fw_cache or [0, 0])[1],
+                        "fwnum": (self.board.fw_cache or [0, 0])[1], "servo": self.board.is_servo(),
                         "gen": {"mode": self.gen.mode, "motor": self.gen.motor, "combo": self.gen.combo},
                         "scanning": self.finder.scanning, "watch": self.monitor.summary(),
                         "diag": {"state": self.diag.state, "motor": None if self.diag.motor is None else self.diag.motor,
@@ -21769,6 +27182,18 @@ class Handler(BaseHTTPRequestHandler):
                         "link": self.board.link_info()})
         elif u.path == "/config":
             self._json(self.cfg.public())
+        elif u.path == "/board/driver":                  # 2.9.5 / firmware 2.1.2: which motor driver
+            b = self.board
+            st = b.latest()
+            self._json({"ok": True, **b.driver_info(fresh=True), "khz": b.params.get("PWMFREQ"),
+                        "connected": b.connected, "motors_off": bool(st and all(st["dis"][m] for m in range(3))),
+                        "simhub": bool(b.simhub_driving())})
+        elif u.path == "/board/servo":                   # 2.9.5 / firmware 2.2.0b1 servo build
+            b = self.board
+            st = b.latest()
+            self._json({"ok": True, **b.servo_info(fresh=True), "mech": self.cfg.get("servo_mech"),
+                        "motors_off": bool(st and all(st["dis"][m] for m in range(3))),
+                        "simhub": bool(b.simhub_driving()) if b.connected else False})
         elif u.path == "/usb/status":                    # 2.8: the USB cable
             self._json(self._usb_status())
         elif u.path == "/usb/browser":                   # 2.9: the page's own USB link (Web Serial over a WebSocket)
@@ -21807,6 +27232,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.fwup.sent(len(body))
             except OSError:
                 pass
+        elif u.path == "/elec/load":                     # 2.9.5: the electronics design wizard
+            self._json({"inputs": self.elec.load(), "meta": ElecStore.meta(self.frame.load())})
         elif u.path == "/frame/load":                    # 2.9.4: the frame design wizard
             self._json({"inputs": self.frame.load(), "meta": FrameStore.meta()})
         elif u.path == "/seat/status":
@@ -22176,6 +27603,55 @@ class Handler(BaseHTTPRequestHandler):
             ok, msg = self.board.reboot()
             self._json({"ok": ok, "error": None if ok else msg})
             return
+        if p == "/board/driver":                         # 2.9.5 / firmware 2.1.2: [kD n]
+            try:
+                n = int(req.get("type"))
+            except (TypeError, ValueError):
+                n = -1
+            if n not in (0, 1):
+                self._json({"ok": False, "error": "type must be 0 (IBT-2) or 1 (PWM + direction)."}, 400)
+                return
+            if self.tuner.running() or self.seat.state != "idle" or self.diag.running():
+                self._json({"ok": False, "error": "Auto-tune, Seat setup or a diagnostics check is running - stop it first."})
+                return
+            ok, msg = self.board.set_driver_type(n)
+            self._json({"ok": ok, "error": None if ok else msg, "what": msg if ok else None})
+            return
+        if p == "/board/servo":                          # 2.9.5 / firmware 2.2.0b1: servo settings, home again
+            if self.tuner.running() or self.seat.state != "idle" or self.diag.running() or self.park.state != "idle":
+                self._json({"ok": False, "error": "Auto-tune, Seat setup, parking or a diagnostics check is running - stop it first."})
+                return
+            if req.get("home"):
+                ok, r = self.board.servo_home()
+                self._json({"ok": ok, "error": None if ok else r, "info": r if ok else None})
+                return
+            mech = req.get("mech")
+            if isinstance(mech, dict):
+                try:
+                    m = {"stroke": max(10.0, min(1000.0, float(mech.get("stroke")))),
+                         "lead": max(1.0, min(50.0, float(mech.get("lead")))),
+                         "ppr": max(50, min(100000, int(mech.get("ppr"))))}
+                except (TypeError, ValueError):
+                    self._json({"ok": False, "error": "Stroke, lead and pulses per turn must be numbers."})
+                    return
+                self.cfg.update(servo_mech=m)
+            vals = {}
+            for k, lo, hi in (("travel", 200, 32000), ("accel", 10, 5000), ("flags", 0, 63)):
+                if req.get(k) is not None:
+                    try:
+                        v = int(req[k])
+                    except (TypeError, ValueError):
+                        v = None
+                    if v is None or not lo <= v <= hi:
+                        self._json({"ok": False, "error": f"{k} must be {lo}..{hi}."})
+                        return
+                    vals[k] = v
+            if not vals:
+                self._json({"ok": True, "error": None, "mech": self.cfg.get("servo_mech")})
+                return
+            ok, r = self.board.servo_set(**vals)
+            self._json({"ok": ok, "error": None if ok else r, "info": r if ok else None, "mech": self.cfg.get("servo_mech")})
+            return
         if p == "/usb/owner":                            # 2.9 / firmware 2.0: who gets the board's USB connector
             try:
                 mode = int(req.get("mode"))
@@ -22374,6 +27850,50 @@ class Handler(BaseHTTPRequestHandler):
             design = frame_design(req.get("inputs"))
             self.frame.save(design["inputs"])
             self._json({"ok": True, "design": design})
+        elif p == "/elec/calc":                          # 2.9.5: the electronics design, from the wizard's inputs
+            design = elec_design(req.get("inputs"))
+            self.elec.save(design["inputs"])
+            self._json({"ok": True, "design": design})
+        elif p == "/elec/pdf":
+            body, design = elec_pdf(req.get("inputs"), VERSION)
+            self.elec.save(design["inputs"])
+            self.send_response(200)
+            self.send_header("Content-Type", "application/pdf")
+            self.send_header("Content-Disposition", 'attachment; filename="motion-rig-electronics-design.pdf"')
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+        elif p == "/elec/lever":                        # 2.9.5: the lever template alone, to print at 1:1
+            body, fname = elec_lever_pdf(req.get("inputs"), VERSION)
+            if body is None:
+                self._json({"ok": False, "error": fname})
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/pdf")
+            self.send_header("Content-Disposition", f'attachment; filename="{fname}"')
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+        elif p == "/elec/fwcat":                        # 2.9.5: every firmware this page hands out, as a table
+            self._json({"ok": True, **elec_firmware_catalog(req.get("inputs"))})
+        elif p == "/elec/firmware":                     # 2.9.5: the sketch for the design, as a .zip
+            if req.get("id"):                           # 2.9.5: any row of the firmware table
+                fname, body = elec_firmware_by_id(req.get("id"), req.get("inputs"), VERSION)
+            else:
+                fname, body = elec_firmware(req.get("inputs"), "release" if req.get("which") == "release" else "beta", VERSION)
+            if not fname:
+                self._json({"ok": False, "error": body})
+                return
+            log(f"electronics: firmware {fname} ({len(body)} bytes) handed out")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/zip")
+            self.send_header("Content-Disposition", f'attachment; filename="{fname}"')
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
         elif p == "/frame/pdf":
             body, design = frame_pdf(req.get("inputs"), VERSION)
             self.frame.save(design["inputs"])
@@ -22448,6 +27968,9 @@ class Handler(BaseHTTPRequestHandler):
             self._seat_post(p[6:], req)
         elif p == "/diag/start":
             kind = req.get("kind") if req.get("kind") in ("full", "sensor", "imu") else "quick"
+            if kind == "full" and self.board.is_servo():
+                self._json({"ok": False, "error": SERVO_NO_FULL})
+                return
             if kind in ("full", "sensor") and self.park.state != "idle":     # 2.9.3
                 self._json({"ok": False, "error": "The seat is being parked - wait for it."})
                 return
@@ -22538,6 +28061,9 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"busy": False, "subnet": prefix, "found": found, "connected": self.board.connected,
                         "current": self.board.current_host})
         elif p == "/tune/start":
+            if self.board.is_servo() or (self.board.is_servo() is None and self.board.servo_info(fresh=True).get("servo")):
+                self._json({"ok": False, "error": SERVO_NO_TUNE})
+                return
             try:
                 motor = int(req.get("motor", 0)) % 3
                 amp = int(max(40, min(400, float(req.get("amp", 100)))))
@@ -22838,6 +28364,7 @@ def main():
     Handler.manual = ManualControl(board, cfg, events)
     Handler.park = ParkControl(board, cfg, events, Handler.manual)          # 2.9.3
     Handler.frame = FrameStore(args.data)                                   # 2.9.4
+    Handler.elec = ElecStore(args.data)                                     # 2.9.5
     Handler.park.busy = lambda: busy(park=False) or ("A firmware update is running." if Handler.fwup.state == "running"
                                                      else None)
     Handler.monitor.park = Handler.park

@@ -38,7 +38,11 @@ The page lets you:
 - **plan a rig before you build it** with **Frame Design**: a wizard for 2 to 6 motors that works out travel, speed
   and force, sizes every frame member and joint, lets you test the rig in **3D** with a weight on the seat, and
   exports the cut list, the hardware, a ball-park cost and the build steps as a **PDF**
-  ([Frame design](#frame-design)).
+  ([Frame design](#frame-design));
+- **plan the electronics** with **Electronics Design**: motors, drivers (IBT-2 and Cytron among them), supplies,
+  protection and the wiring as pictures, the parts with a ball-park cost, **1:1 templates** for the lever and the
+  sensor bracket, and **the firmware set up for your design** - with an **All firmware** table of every sketch
+  ([Electronics design](#electronics-design)).
 
 It knows two kinds of rig: **two front lifts plus a traction-loss motor** (motors 1 and 2 lift the front corners,
 motor 3 is mounted horizontally and swings the rear left and right about a pivot at the front - the default), and
@@ -57,7 +61,7 @@ can use the USB cable instead (page 2.8, firmware 1.9.5; 2.0 recommended - it gi
 
 | Folder | What it is |
 |---|---|
-| [`firmware/SMC3_R4`](firmware/SMC3_R4) | Firmware for the **Arduino UNO R4 WiFi**. It speaks the SMC3 v0.70 protocol, so SimHub, SimTools, FlyPT Mover and SMC3Utils work unchanged. It adds a 4 kHz control loop, 14-bit pot readings, quiet 25 kHz PWM, target smoothing, a fixed PID, WiFi telemetry at 100 samples a second, an LED matrix that shows live motor bars and problems in words, a level trim with travel limits and end stops for each motor, a soft start, firmware updates over WiFi from the page, its own USB port (2.0: no WiFi chip in between), games on the LED matrix while idle (2.1), park mode (2.1.1), and an optional WT901C motion sensor with tilt limits for each direction. |
+| [`firmware/SMC3_R4`](firmware/SMC3_R4) | Firmware for the **Arduino UNO R4 WiFi**. It speaks the SMC3 v0.70 protocol, so SimHub, SimTools, FlyPT Mover and SMC3Utils work unchanged. It adds a 4 kHz control loop, 14-bit pot readings, quiet 25 kHz PWM, target smoothing, a fixed PID, WiFi telemetry at 100 samples a second, an LED matrix that shows live motor bars and problems in words, a level trim with travel limits and end stops for each motor, a soft start, firmware updates over WiFi from the page, its own USB port (2.0: no WiFi chip in between), games on the LED matrix while idle (2.1), park mode (2.1.1), and an optional WT901C motion sensor with tilt limits for each direction. The page's Electronics Design also hands out sketches set up for other drivers and for ball-screw actuators with AC servos (beta 2.2.0b1). |
 | [`scope/`](scope) | `smc3_scope.py`: the page server. It's one file using only the Python standard library, with a Dockerfile and compose files for a NAS or any PC. A ready-made Docker image is on `ghcr.io/winreboot/smc3-scope`; step by step for Windows, Mac, Linux, Raspberry Pi, Docker and Synology: [docs/INSTALL.md](docs/INSTALL.md). |
 | [`tools/simboard.py`](tools/simboard.py) | A simulated rig. You can try everything without hardware, and inject faults (reversed motor, swapped wiring, glitchy pot and more). |
 | [`firmware/SMC3_smooth`](firmware/SMC3_smooth) | The original SMC3 for the **UNO R3**, with target smoothing and the PID fixes, for anyone staying on an R3. |
@@ -422,6 +426,124 @@ make. That makes it a first design to check, not a finite-element analysis: fati
 not modelled, the joint figures are estimates, and the cost is a rough guide. A motion rig can hurt you - have a
 design you will sit in checked, fit mechanical end stops, and keep an emergency stop within reach.
 
+### Electronics design
+
+Page 2.9.5. A second wizard in the menu, for everything between the wall socket and the motors: the motors, the
+drivers, the supplies, the protection, the wiring as pictures, the parts with a ball-park cost, the first power-up -
+and the firmware set up for your design. Like Frame Design it is a calculator and a drawing board: nothing in it talks
+to the board, it works without a rig, and it keeps your design between visits.
+
+![Electronics Design: the wizard on the left; the verdict, the firmware for the design and the wiring pictures on the right](docs/img/electronics-design_v2.9.5.png)
+
+The right-hand side follows every change: a verdict, the checks in plain words (each with a fix where there is one),
+the firmware box and the wiring pictures. The wizard has five steps:
+
+1. **Motors** - what moves the seat: a **gear motor with a lever** (wheelchair, worm and wiper motors) or a
+   **ball-screw actuator with an AC servo** (SFX-100 style); how many (three per board - four to six take a second
+   board, a second SMC3 device in SimHub); which motor - presets for the motors rigs are built with (Pride Jazzy,
+   MY1016Z, ElectroCraft, worm gear, wiper), your own label's values, or the motor from your Frame Design; the parking
+   brake; the **lever and its push rod** (between centres, swing, the shaft and its key, M8 / M10 / M12 rod ends).
+
+   ![The Motors step: what moves the seat, how many, which motor, the lever and its push rod](docs/img/electronics-motors-step_v2.9.5.png)
+
+2. **Driver** - IBT-2 (BTS7960), Cytron **MD30C**, **SmartDriveDuo-30 (MDDS30)**, **MDD10A**, SmartDriveDuo-60,
+   MD13S, 100 A class bridges, the Monster Moto shield, or your own: what each carries all day and for a moment, the
+   voltage and PWM frequency it takes, whether it limits its own current, and how the board drives it. Two-channel
+   boards run two motors each and are drawn and counted as boards. Sabertooth is listed too, with why no SMC3 firmware
+   drives it.
+
+   ![The Driver step: each driver with what it carries, the voltage, the PWM and how the board drives it](docs/img/electronics-driver-step_v2.9.5.png)
+
+3. **Power** - **how hard the motors work** (a balanced seat, a seat mover, lifts that carry part of the rig, or every
+   motor at its rating - the Frame Design works it out for its rig), the kind of supply, its voltage and current, how
+   many, your mains, **what takes the braking energy** (a diode and capacitors, or a buffer battery) and PWMmax.
+
+   ![The Power step: how hard the motors work, the supply, how many, the braking energy](docs/img/electronics-power-step_v2.9.5.png)
+
+4. **Protection** - a fuse and the wire for each driver board, the emergency stop with a relay, the position sensors
+   (pots or contactless Hall sensors) and the motion sensor on the seat.
+5. **Build** - the wiring list pin by pin, the parts with eBay and Amazon searches and a ball-park cost, the **lever
+   and sensor bracket templates** to print 1:1, and the first power-up, step by step.
+
+   ![The Build step: wiring list, parts and cost, first power-up](docs/img/electronics-build-step_v2.9.5.png)
+
+**The pictures** - tap one to open it full size. **Whole rig** first: the PC, this page, every board with its own
+12 V adapter, every driver, motor and sensor.
+
+![Whole rig: PC, page, board with its adapter, two MDDS30 boards, three motors, the motion sensor, the supply](docs/img/electronics-whole-rig_v2.9.5.png)
+
+**Power wiring** (supply, emergency stop and relay, diode, capacitors, a fuse per driver board) and **Signal wiring**
+(each board pin to pin):
+
+![Power wiring: industrial supply, emergency stop, relay, braking diode and capacitors, fuses, two MDDS30 boards](docs/img/electronics-power-wiring_v2.9.5.png)
+
+![Signal wiring: UNO R4 WiFi with its 12 V adapter, two MDDS30 boards, three Hall sensors, the WT901C through a MAX3232](docs/img/electronics-signal-wiring_v2.9.5.png)
+
+<img src="docs/img/electronics-braking_v2.9.5.png" width="49%" alt="Braking energy: a diode and capacitors"> <img src="docs/img/electronics-emergency-stop_v2.9.5.png" width="49%" alt="Emergency stop with a relay">
+
+**Lever, push rod and sensor mount.** The **Lever template** prints the lever 1:1 with its sensor cap: print at 100%
+/ Actual size, check the 100 mm bar with a ruler, glue it on the plate, centre-punch, drill and cut. It suggests the
+plate (aluminium 6061-T6 or steel) from the motor's worst-case torque. **Push rod** shows the rod with a ball joint
+at each end, square to the lever at mid travel. **Sensor mount** shows how the position sensor turns with the shaft -
+a cap on the lever's hub, a stub on the shaft's axis, a flexible coupling - and the bracket that holds it still.
+
+<img src="docs/img/electronics-push-rod_v2.9.5.png" width="49%" alt="Push rod: a rod end at each end, square to the lever at mid travel"> <img src="docs/img/electronics-sensor-mount_v2.9.5.png" width="49%" alt="Sensor mount: the cap, the coupling, the sensor and its C bracket">
+
+The **sensor bracket** is a C bent from 3 x 25 mm aluminium strip: two feet on the gearbox's screws, two arms reaching
+past the lever, and the face across the shaft's axis with the sensor's 10 mm hole. The page works out where the arms
+go - round the shaft, where the lever, its tail and the push rod never come over the whole swing - and how long the
+strip is. The **Sensor bracket** picture and the same PDF as the lever print it 1:1, with the hole, the slots in the
+feet, the four bend lines and the bent C beside it.
+
+<img src="docs/img/electronics-lever-template_v2.9.5.png" width="49%" alt="Lever template, 1:1"> <img src="docs/img/electronics-sensor-bracket_v2.9.5.png" width="49%" alt="Sensor bracket template, 1:1: the strip with its hole, slots and bend lines">
+
+([An example of the templates](docs/examples/lever-and-bracket-templates-example_v2.9.5.pdf).)
+
+**Supplies** are sized the way motion-control supplies are: for what the motors draw **on average** while driving,
+with **a quarter to spare**. A rig's motors take turns - one lifts while another lowers - and sit still much of the
+time, so together they draw far less than their ratings added up; the short peaks of a hard move come from the
+capacitors and the supply's current limit. One supply (or one 24 V pair) for all motors is the normal way, and the
+wizard says when one would do. Besides 24 V supplies made for it, it knows **12 V server supplies** (HP DPS-1200FB
+on a breakout board) and **PC supplies** (ATX, from their PCIe and CPU cables), two in series for 24 V, with the upper
+one's output ground separated from its case:
+
+![Two server supplies in series for 24 V: breakout boards, bypass diodes, the standoffs to swap for nylon](docs/img/electronics-supplies_v2.9.5.png)
+
+**Board power.** Each board gets its own **12 V adapter** (1 A or more, 5.5 x 2.1 mm plug, centre +) in its barrel
+jack, which makes a steady 5 V for the board and the Hall sensors; on USB alone the board gets about 4.7 V. Every
+signal picture and the whole rig show it, and the parts list buys one per board. The USB cable stays for SimHub.
+
+**Firmware for your design.** Under the verdict, the firmware box downloads the sketch for the design, named after
+it - `SMC3_R4_v2.2.0b1_MDDS30_25kHz`, for example: a sketch folder in a .zip with the starting values already set
+(driver type, PWM frequency, the motion sensor switched on when the design has one) and a header saying what was
+changed. Unzip, open it in the Arduino IDE, add your WiFi name and password, Upload. IBT-2 designs also get the 2.1.1
+release. Every sketch listens for the WT901C motion sensor with the same code as the 2.1.1 release.
+
+**All firmware** (here, and in Settings, Firmware update) opens a table of every sketch the page can make - the
+published sketches, a ready-made set-up for each driver and servo drive, and the drivers no SMC3 firmware drives -
+with what each runs, what it is set up for, the driver inputs, the PWM, the motion sensor and what is different. The
+wizard's pick sits on top in green, and every row downloads.
+
+![All firmware: every sketch, the wizard's pick on top, each with a Download button](docs/img/electronics-all-firmware_v2.9.5.png)
+
+**Ball-screw actuators with AC servos** (SFX-100 style, beta firmware `SMC3_R4_Servo` 2.2.0b1): the servo set (AASD-15A
+with a 750 W or 400 W motor, or your own pulse + direction drive), the stroke, ball-screw lead and pulses per turn,
+where home is (the bottom, or home switches), the drive's own settings to make first, the parts and printed parts,
+and the pictures - **The actuator** cut open with every part named, and the signal wiring through two ULN2803A per
+board.
+
+<img src="docs/img/electronics-servo-actuator_v2.9.5.png" width="49%" alt="The actuator, cut open: servo motor, coupling, ball screw, nut, printed parts"> <img src="docs/img/electronics-servo-signal-wiring_v2.9.5.png" width="49%" alt="Servo signal wiring: pulse, direction and servo-on through two ULN2803A to the AASD-15A drives">
+
+**Export PDF** saves it all - the design, the checks, the wiring list, the parts and steps, and the pictures on
+landscape pages ([an example](docs/examples/electronics-design-example_v2.9.5.pdf), [one with servo
+actuators](docs/examples/electronics-design-servo-example_v2.9.5.pdf)).
+
+![Pages of the exported PDF](docs/img/electronics-pdf_v2.9.5.png)
+
+The rules of thumb come from rigs people have built and reported on: they size a first design, and they are only as
+good as the motor's label. A motion rig can hurt you - fuse every driver, keep the emergency stop within reach, and
+make the first runs with the levers off and nobody in the seat.
+
 ### Tuning
 
 Every SMC3Utils setting is here, per motor: Kp, Ki, Kd, Ks, PWMmin, PWMmax, PWMrev, dead zone, the safety
@@ -637,6 +759,22 @@ own firmware 0.4.0 or newer (Arduino IDE, Tools, Firmware Updater).
 
 ![Firmware update: SMC3_R4 1.9.3 installed over WiFi](docs/img/firmware-update.png)
 
+**All firmware** (page 2.9.5), in the same card: the table of every sketch the page can make, each one to download -
+see [Electronics design](#electronics-design).
+
+**Motor drivers** (page 2.9.5, beta firmware 2.2.0b1): what the board's motor pins drive - **IBT-2 / BTS7960**
+bridges (two PWM inputs) or **PWM + direction** drivers (Cytron MD30C, MD13S, MDD10A, SmartDriveDuo-30 / -60, VNH,
+100 A class bridges) - chosen here with the motors switched off and SimHub stopped, saved on the board, no
+recompiling. Cytron MD30C and MD13S take PWM up to 20 kHz: the same card sets 20 kHz and saves it. A board never told
+keeps what it was built for (IBT-2). With older firmware the sketch's `#define MODE1` / `MODE2` decides.
+
+<img src="docs/img/settings-motor-drivers_v2.9.5.png" width="740" alt="Motor drivers: IBT-2 / BTS7960 or PWM + direction, and Set PWM to 20 kHz">
+
+**Servo actuators** (page 2.9.5, beta firmware `SMC3_R4_Servo` 2.2.0b1), shown instead of Motor drivers when the
+board runs the servo build: the stroke, ball-screw lead and pulses per turn, the acceleration limit, homing (at the
+bottom, or on home switches), the servo-on level, an emergency-stop contact on A3, reverse per actuator, and **Home
+again** with the motors off.
+
 **Restart** (page 2.9, firmware 2.0): the button next to Settings restarts the board as its RESET button does - the
 motors switch off first, and the page reconnects by itself. It is refused while SimHub sends positions, and while
 auto-tune, Seat setup or the full check runs.
@@ -782,7 +920,11 @@ The Help section in the page sums everything up, including every LED matrix code
 
 - **Arduino UNO R4 WiFi**. The firmware is written for it: WiFi, LED matrix and the RA4M1's timers.
 - Motor bridges: **IBT-2 / BTS7960** (`MODE2`, the default), or a bridge with PWM plus two direction pins
-  (`MODE1`).
+  (`MODE1`) - Cytron MD30C, MD13S, MDD10A, SmartDriveDuo-30 / -60, VNH and 100 A class bridges. With beta firmware
+  2.2.0b1 that is a setting (Settings, Motor drivers). The page's [Electronics design](#electronics-design) draws the
+  wiring for each.
+- A **12 V adapter** for the board's barrel jack (1 A or more, 5.5 x 2.1 mm plug, centre +), besides the USB cable
+  for SimHub: on USB alone the board gets about 4.7 V, and Hall sensors want 5 V.
 - Up to three DC motors with feedback pots, such as worm-gear wiper motors on crank arms or linear actuators, and
   a motor supply that suits them. Typical layouts: two lifts at the front plus a horizontal **traction-loss** motor
   sliding the rear (SimHub's 2DOF + traction loss), or three lifts.
@@ -859,6 +1001,10 @@ chip until the next reset** in the page's Settings, USB cable (or press RESET tw
 
 From firmware 1.9.2 on, later versions can be installed from the page instead (Settings, Firmware update).
 
+The page can also hand you a sketch already set up for your rig: Electronics, the firmware box (or **All firmware**)
+downloads a sketch folder in a .zip with the driver type, PWM frequency and motion sensor set - open it in the
+Arduino IDE, add your WiFi name and password, Upload.
+
 Your SMC3Utils settings stay in EEPROM in the same layout. If the board had none, the defaults are written.
 
 ### 2. Run the page
@@ -883,7 +1029,7 @@ board on network**).
 [latest release](https://github.com/winreboot/smc3-r4/releases/latest) and run
 
 ```sh
-python3 smc3_scope_v2.9.4.py --host 192.168.1.50 --bind 0.0.0.0 --web 8198
+python3 smc3_scope_v2.9.5.py --host 192.168.1.50 --bind 0.0.0.0 --web 8198
 ```
 
 (`py` instead of `python3` on Windows). `--bind 0.0.0.0` makes the page reachable from other devices; without it,
@@ -992,6 +1138,8 @@ noise. To see what the diagnostics find, add a fault:
   - 2.1.1: park mode - the page may take the seat past the travel limits to park it; a motor that rests past its end
     stop comes back up when the motors are switched on (also with the soft start off), with up to PWMrev's drive while
     it lags; the board keeps the motion sensor while Use the sensor is ticked, and reports its link (`[rdj]`).
+  - 2.2.0b1 (beta, from the page's All firmware): the motor driver type as a setting (`[kD n]`), and the servo build
+    `SMC3_R4_Servo` for ball-screw actuators with AC servo drives.
 
   See the [CHANGELOG](CHANGELOG.md).
 - New commands are documented in [docs/PROTOCOL.md](docs/PROTOCOL.md). They go over WiFi; USB stays plain SMC3

@@ -53,6 +53,10 @@ are two separate bytes. The same commands work over USB (SimHub, SMC3Utils) and 
 | `[kZR]` | 2.0 | The page only: restart the board, as its RESET button does - the motors are switched off first and the page's connection closed. Refused while SimHub is sending positions (the last one less than 10 s ago) and during a firmware update. |
 | `[kPm]` | 2.1.1 | Park mode for the motors in m (bits 0-2; 0 = off) for the next 3 s - the page repeats it every second while it parks the seat or sets the park position, and it lapses 3 s after the last one. Those motors' limits become the SMC3 cutoff, 8 counts in from it: they may go past their Clip window, travel limits and end stops. SMC3's PWMrev push back into the Clip window is left out for them and the tilt limits wait (1.5 s after it ends). The diagnostics frame's seat flags say when it is on (bit 5). |
 | `[rdj]` | 2.1.1 | The page only (WiFi, or USB in page mode): one "SM3I" frame (below) - the motion sensor link as the board sees it. |
+| `[kDn]` | 2.2.0b1 (beta) | The page only, with all three motors switched off, not while SimHub sends positions or during an update: the motor driver type. n = 0 IBT-2 / BTS7960 (RPWM on D2 / D4 / D6, LPWM on D9 / D10 / D11, R_EN + L_EN on D3 / D5 / D7 - what `MODE2` builds), 1 PWM + direction (DIR or INA on D2 / D4 / D6, PWM on D9 / D10 / D11, INB on D3 / D5 / D7 - what `MODE1` builds). Saved at once (EEPROM 110-111); a board never told runs what it was built for. `[rd!]` bit1 says which type runs. |
+| `[kf=]` f = 83, 84, 86 | 2.2.0b1 (beta, servo build) | Servo settings, saved at once: 83 = pulses for the full 0-1023 travel, 84 = acceleration in 1000 pulses/s², 86 = flags (bit0 home switches on A0-A2, bit1 servo-on active LOW, bits 2-4 reverse motor 1-3, bit5 emergency-stop contact on A3). |
+| `[kG1]` | 2.2.0b1 (beta, servo build) | The page only, with every motor off and SimHub quiet: release the servos and home again. |
+| `[rdq]` `[rdp]` `[rdg]` `[rdh]` | 2.2.0b1 (beta, servo build) | Read the homing state (bit7 = emergency stop pressed) / the travel in pulses / the acceleration / the flags and inputs (bits 0-2 home switches open, bit3 emergency-stop input open). |
 
 ### Seat set-up (firmware 1.9)
 
@@ -317,6 +321,15 @@ Written as soon as `[k 82 '=']` changes it.
 
 Written by `[kO 0]` and `[kO 1]`; `[kO 2]` and the double RESET don't change it.
 
+### EEPROM 110-111 (firmware 2.2.0b1, beta): the motor driver type
+
+| Address | Content |
+|---|---|
+| 110 | 0xD2 = valid (otherwise the type the sketch was built with) |
+| 111 | 0 = IBT-2 / BTS7960, 1 = PWM + direction |
+
+Written by `[kD n]`.
+
 ### EEPROM 112-210 (firmware 1.9.2): WiFi memory
 
 | Address | Content |
@@ -330,6 +343,15 @@ Written by `[kO 0]` and `[kO 1]`; `[kO 2]` and the double RESET don't change it.
 Written after the board has joined the network with the name and password compiled into the sketch, if they differ
 from what is stored. A build that has the placeholders (`YourNetworkName`), or whose details don't work, joins with
 the stored ones. The diagnostics frame copies EEPROM 0-71 only, so the password never leaves the board.
+
+### EEPROM 220-225 (servo build 2.2.0b1, beta): servo settings
+
+| Address | Content |
+|---|---|
+| 220 | 0xE5 = valid |
+| 221-222 | Pulses for the full 0-1023 travel |
+| 223-224 | Acceleration, 1000 pulses/s² |
+| 225 | Flags (as `[k 86 =]`) |
 
 ### Firmware update (firmware 1.9.2)
 

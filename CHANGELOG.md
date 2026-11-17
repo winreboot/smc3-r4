@@ -3,6 +3,45 @@
 `smc3_scope` (the page) and `SMC3_R4` (the firmware) are versioned separately. The page works with older
 firmware too; the notes say which firmware a feature needs.
 
+## Page 2.9.5 (firmware 2.1.1 unchanged; beta firmware 2.2.0b1 built in)
+
+- **Electronics Design**, a second wizard in the menu: everything between the wall socket and the motors. It keeps
+  the design in `electronics.json` in the data folder and never talks to the board. `GET /elec/load`,
+  `POST /elec/calc`, `POST /elec/pdf`, `POST /elec/lever`, `POST /elec/fwcat`, `POST /elec/firmware`.
+- **What moves the seat**: a gear motor with a lever (wheelchair, worm and wiper motor presets, your own label's
+  values, or the motor from the Frame Design), or a ball-screw actuator with an AC servo (SFX-100 style: AASD-15A with
+  a 750 W or 400 W motor, or your own pulse + direction drive). One to six motors - three per board.
+- **Drivers**: IBT-2 (BTS7960), Cytron MD30C, SmartDriveDuo-30 (MDDS30), MDD10A, SmartDriveDuo-60, MD13S, 100 A class
+  bridges, the Monster Moto shield, or your own; Sabertooth listed with why no SMC3 firmware drives it. Two-channel
+  boards are drawn and counted as boards, with one fuse each for both motors.
+- **Power**: the supply sized for what the motors draw on average while driving, with a quarter to spare - pick how
+  hard the motors work (35 / 50 / 75 / 100%) or take the Frame Design's figure. Industrial, LED, adjustable, 12 V
+  server and PC supplies (two in series for 24 V, the upper one's ground separated from its case), batteries; one for
+  all motors or one per driver board; the braking energy into a diode and capacitors or a buffer battery.
+- **Protection**: a fuse and the wire for each driver board, the emergency stop with a relay, pots or Hall sensors,
+  the WT901C motion sensor.
+- **Build**: the wiring list pin by pin, the parts with eBay and Amazon searches and a ball-park cost, the first
+  power-up step by step.
+- **Pictures** of the wiring, every pin and terminal named: Whole rig, Power wiring, Signal wiring (all boards and
+  each board), Braking energy, Emergency stop, Lever template, Push rod, Sensor mount, Sensor bracket, the supplies,
+  and for servo actuators the actuator cut open. Each board is drawn with its own 12 V adapter in the barrel jack,
+  and the parts list buys one.
+- **Lever and sensor bracket templates**, 1:1 in one PDF: the lever with its sensor cap, and the C bracket that holds
+  the position sensor - bent from 3 x 25 mm aluminium strip, the arms placed where the lever and the push rod never
+  come, with its hole, slots and bend lines.
+- **Firmware for the design**: a sketch folder in a .zip, named after the build, with its starting values set -
+  driver type, PWM frequency, the motion sensor switched on when the design has one, or for servos the stroke,
+  acceleration, homing and e-stop contact - and a header saying what was changed.
+- **All firmware**: a table of every sketch the page can make - the published sketches, a ready-made set-up for each
+  driver and servo drive - with what each runs, the driver inputs, the PWM, the motion sensor and what is different;
+  the wizard's pick on top, every row downloadable. Also in Settings, Firmware update.
+- **Export PDF** of the whole design, the pictures on landscape pages; examples are in docs/examples.
+- **Settings, Motor drivers** (beta firmware 2.2.0b1, `[kD n]`): IBT-2 / BTS7960 or PWM + direction, chosen on the
+  page and saved on the board - no recompiling; Set PWM to 20 kHz for the Cytron MD30C and MD13S.
+- **Settings, Servo actuators** (beta firmware `SMC3_R4_Servo` 2.2.0b1): stroke, lead, pulses per turn, acceleration,
+  homing, servo-on level, emergency-stop contact, reverse per actuator, Home again.
+- The simulator (`tools/simboard.py`) runs the beta firmware too: `--fw220`, `--servo`.
+
 ## Page 2.9.4 (firmware 2.1.1 unchanged)
 
 Tested as eight page betas; all of them are in this release. Nothing in it changes how the page talks to the board.
