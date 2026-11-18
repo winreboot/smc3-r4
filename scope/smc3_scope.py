@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-smc3_scope v2.9.5 - live scope, tuner and auto-tuner for the SMC3_R4 motion controller (Arduino UNO R4 WiFi).
+smc3_scope v2.9.6 - live scope, tuner and auto-tuner for the SMC3_R4 motion controller (Arduino UNO R4 WiFi).
 
 Connects to the board's TCP telemetry port, keeps a rolling buffer of samples and serves a web page with live
 charts, a parameter editor (sends ordinary SMC3 commands back to the board), test signals and a per-motor
@@ -18,6 +18,18 @@ Every option can also come from the environment (Docker): SMC3_HOST, SMC3_PORT, 
 SMC3_DATA_DIR.  Settings changed in the page (board address, theme, auto-find) are saved to
 <data dir>/config.json and survive restarts and upgrades.  Standard-library Python 3.8+ only.
 
+v2.9.6 (firmware 2.1.1 unchanged; beta firmware 2.2.0b1 built in): Frame Design, the 3D test and the drive.
+        Heat map: each part is held where something is bolted to it - its joints, brackets, the seat's slider, the yaw
+        pivot bolt - and where it stands: levelling feet, rollers, the actuators' feet. It bends only between those,
+        straight under every plate and past its last bracket; a short span bends less than a long one, and never much
+        more than a 50th of its length. Screw actuators: Ball-screw length and Turns per inch (beside the lead) in the
+        Drive step; the nut, the bearings and the machined ends take about 150 mm of the screw - a check says how much
+        travel it gives, how long the actuator is and how high it holds the frame, and asks for a longer screw when the
+        travel needs one. The actuator is as long as its screw with the servo on top, its bracket low on its body, and
+        it stands on a rubber foot: on the floor, on the traction-loss sub-frame's rails (right under the actuators) or
+        on a foot plate on the cross-member under it - a rig on SFX-100s sits about 170 mm (6.7 in) off the ground at mid
+        travel. Lever motors: the gearbox beside the lever on its mounting block. The notes over the 3D view sit behind a
+        Notes button, its dot red, amber or green; closed unless opened, and remembered.
 v2.9.5 (firmware 2.1.1 unchanged; beta firmware 2.2.0b1 built in): Electronics Design, a second wizard in the menu,
         for everything between the wall socket and the motors - and the firmware that goes with it. Nothing in it
         talks to the board.
@@ -396,7 +408,7 @@ v1.4: settings dialog (board address, port, find-board scan, auto-find), day/nig
       fixed a thread race that made the page flash "not reachable".
 """
 
-VERSION = "2.9.5"
+VERSION = "2.9.6"
 
 import argparse
 import base64
@@ -13398,6 +13410,8 @@ FRAME_DEFAULTS = {
     "ctc": 50.0, "swing": 45.0,
     # linear: a ball-screw actuator
     "travel": 100.0, "lead": 5.0, "servo_torque": 2.4, "servo_peak": 7.2, "servo_rpm": 3000.0,
+    # 2.9.6: the whole ball screw (mm) - the nut, the bearings and the machined ends take FRAME_SCREW_OVERHEAD of it
+    "screw_len": 250.0,
     # geometry (mm)
     "arm": 800.0, "spacing": 600.0, "cg_h": 300.0, "cg_off": 150.0, "pivot_h": 250.0,
     "wheelbase": 1300.0, "track": 600.0, "tl_radius": 800.0,
@@ -13412,11 +13426,11 @@ FRAME_LAYOUT_DEFAULTS = {   # what a layout starts from (the page fills these in
     "lift2tl": {"moves": "cockpit", "moving_kg": 70.0, "arm": 800.0, "spacing": 600.0, "cg_h": 300.0, "cg_off": 150.0,
                 "pivot_h": 250.0, "tl_radius": 800.0, "ctc": 60.0},
     "hexapod": {"moves": "cockpit", "moving_kg": 90.0, "drive": "linear", "preset": "custom", "travel": 300.0, "lead": 10.0,
-                "servo_torque": 2.4, "servo_peak": 7.2, "servo_rpm": 3000.0},
+                "screw_len": 450.0, "servo_torque": 2.4, "servo_peak": 7.2, "servo_rpm": 3000.0},
 }
 for _k in ("heave3", "corner4", "corner4tl", "corner4tlsurge"):      # rigs that stand on their actuators start from SFX-100s
     FRAME_LAYOUT_DEFAULTS[_k] = {"moves": "cockpit", "moving_kg": 80.0, "drive": "linear", "preset": "sfx100", "travel": 100.0,
-                                 "lead": 5.0, "servo_torque": 2.4, "servo_peak": 7.2, "servo_rpm": 3000.0}
+                                 "lead": 5.0, "screw_len": 250.0, "servo_torque": 2.4, "servo_peak": 7.2, "servo_rpm": 3000.0}
 for _k in ("seat2", "lift2tl"):                                      # tilting rigs start from wheelchair motors
     FRAME_LAYOUT_DEFAULTS[_k].update(drive="rotary", preset="wheelchair")
 
@@ -13430,14 +13444,31 @@ FRAME_PRESETS = {     # drive presets: fills the drive fields
     "wiper": ("rotary", "Wiper motor, 12 V, 45 rpm (light seat movers only)",
               {"rpm": 45, "torque": 8, "torque_peak": 25, "motor_w": 60, "volts": 12, "ratio": 1}),
     "sfx100": ("linear", "SFX-100 style: 1605 ball screw, 750 W servo, 100 mm",
-               {"travel": 100, "lead": 5, "servo_torque": 2.4, "servo_peak": 7.2, "servo_rpm": 3000}),
+               {"travel": 100, "screw_len": 250, "lead": 5, "servo_torque": 2.4, "servo_peak": 7.2, "servo_rpm": 3000}),
     "sfx150": ("linear", "As SFX-100 with 150 mm travel",
-               {"travel": 150, "lead": 5, "servo_torque": 2.4, "servo_peak": 7.2, "servo_rpm": 3000}),
+               {"travel": 150, "screw_len": 300, "lead": 5, "servo_torque": 2.4, "servo_peak": 7.2, "servo_rpm": 3000}),
     "screw1610": ("linear", "1610 ball screw (10 mm lead), 750 W servo, 150 mm: twice the speed, half the force",
-                  {"travel": 150, "lead": 10, "servo_torque": 2.4, "servo_peak": 7.2, "servo_rpm": 3000}),
+                  {"travel": 150, "screw_len": 300, "lead": 10, "servo_torque": 2.4, "servo_peak": 7.2, "servo_rpm": 3000}),
     "servo400": ("linear", "1605 ball screw, 400 W servo (1.27 Nm), 100 mm",
-                 {"travel": 100, "lead": 5, "servo_torque": 1.27, "servo_peak": 3.8, "servo_rpm": 3000}),
+                 {"travel": 100, "screw_len": 250, "lead": 5, "servo_torque": 1.27, "servo_peak": 3.8, "servo_rpm": 3000}),
 }
+# 2.9.6: a screw actuator's size (mm), SFX-100 style, standing on its rod with the body on the frame: a foot under the
+# rod, the rod at least this far out at the bottom of the stroke, the printed bottom cap, the bracket's centre above the
+# bottom of the body; the body is as long as the screw, with the servo on top. The nut, the bearings and the machined
+# ends take about 150 mm of the screw: a 250 mm screw gives the SFX-100's 100 mm of travel.
+FRAME_SCREW_OVERHEAD = 150.0
+FRAME_LIN = {"foot": 25.0, "rod_min": 20.0, "cap": 30.0, "bracket": 45.0, "motor": 160.0}
+
+
+def _frame_lin_h(travel):
+    """How high a screw actuator holds the frame's bracket at mid travel (mm): foot, rod, cap, bracket."""
+    return FRAME_LIN["foot"] + FRAME_LIN["rod_min"] + travel / 2.0 + FRAME_LIN["cap"] + FRAME_LIN["bracket"]
+
+
+def _frame_corner_h(d, travel):
+    """The moving frame's height above the actuators' feet at mid travel, for a rig standing on its actuators (mm):
+    screw actuators hold it on a bracket low on their body; lever motors stand under it."""
+    return _frame_lin_h(travel) if d["drive"] == "linear" else 300.0 + travel
 
 FRAME_MATERIALS = {   # id: (name, yield MPa, yield next to a weld MPa, E MPa, density g/cm3)
     "al6061": ("Aluminium 6061-T6", 241.0, 103.0, 69000.0, 2.70),
@@ -13558,7 +13589,7 @@ def frame_inputs(raw):
     d["preset"] = raw.get("preset") if raw.get("preset") in FRAME_PRESETS else "custom"
     for k, lo, hi in (("driver_kg", 30, 200), ("moving_kg", 5, 600), ("rpm", 5, 20000), ("torque", 0.05, 500),
                       ("torque_peak", 0.05, 1500), ("motor_w", 10, 5000), ("volts", 6, 400), ("ratio", 0.2, 200),
-                      ("ctc", 15, 300), ("swing", 10, 75), ("travel", 20, 600), ("lead", 1, 50),
+                      ("ctc", 15, 300), ("swing", 10, 75), ("travel", 20, 600), ("lead", 1, 50), ("screw_len", 100, 1500),
                       ("servo_torque", 0.1, 50), ("servo_peak", 0.1, 150), ("servo_rpm", 100, 6000),
                       ("arm", 150, 2000), ("spacing", 150, 1500), ("cg_h", 0, 1200), ("cg_off", -500, 500),
                       ("pivot_h", 80, 1200), ("wheelbase", 500, 2500), ("track", 300, 1500), ("tl_radius", 300, 2500),
@@ -13793,6 +13824,21 @@ def frame_design(raw):
         chk("warn", "A little slow", f"{v_load:.0f} mm/s under load; 150-700 mm/s is the FAQ's range for good motion.")
     else:
         chk("ok", "Fast enough", f"{v_load:.0f} mm/s under load ({v0:.0f} mm/s with no load); 150-700 mm/s is the FAQ's range for good motion.")
+    if d["drive"] == "linear":
+        usable = d["screw_len"] - FRAME_SCREW_OVERHEAD
+        tpi = FRAME_IN / d["lead"]
+        if travel > usable + 1:
+            chk("bad", "The ball screw is too short",
+                f"A {_frame_both(d['screw_len'])} ball screw gives about {_frame_both(max(0.0, usable))} of travel: the nut, the "
+                f"bearings and the machined ends take about {FRAME_SCREW_OVERHEAD:.0f} mm. For {_frame_both(travel)} of travel "
+                f"use a {_frame_both(travel + FRAME_SCREW_OVERHEAD)} screw, or less travel.")
+        else:
+            body = d["screw_len"] + FRAME_LIN["motor"]
+            where = (f" It holds the frame {_frame_both(_frame_lin_h(travel))} off the ground at mid travel." if fam == "corner" else "")
+            chk("ok", "Ball screw",
+                f"{_frame_both(d['screw_len'])} long with a {d['lead']:g} mm lead ({tpi:.2f} turns per inch): about "
+                f"{_frame_both(usable)} of travel, {_frame_both(travel)} used. Each actuator is about {_frame_both(body)} "
+                f"long with its servo on top." + where)
     if d["drive"] == "rotary":
         if d["ctc"] < 25:
             chk("warn", "Very short lever", "Below 25 mm between centres there is little room for the bearings and the "
@@ -13885,7 +13931,7 @@ def frame_design(raw):
             member("seatx", "Moving frame: cross-members under the seat (the slider bolts to these)", "simple", B,
                    (d["driver_kg"] + d["seat_kg"]) * FRAME_G * dyn / 2.0, 4, B,
                    "the driver and seat on two cross-members (cut four: two more at the actuators)", ("top", ck["seat_xs"][1], 0.0))
-            wheel_frame(300 + travel)
+            wheel_frame(_frame_corner_h(d, travel))
             member("mount", "Actuator brackets", "cantilever", 80.0, f_des, geo["nl"], 160,
                    "the actuator's full force 80 mm out from the rail", ("top", L / 2.0, B / 2.0))
             if geo["nl"] == 3:
@@ -14083,6 +14129,12 @@ def frame_design(raw):
             fix("bad" if m_peak < 1.0 else "warn", f"Shorten the lever to {new_ctc:.0f} mm",
                 f"The force is {m_peak:.1f} times what a quick move asks for. A {new_ctc:.0f} mm lever gives 1.5 times, with "
                 f"{2 * new_ctc * math.sin(math.radians(d['swing'])):.0f} mm of travel instead of {travel:.0f} mm.", {"ctc": new_ctc})
+    if d["drive"] == "linear" and travel > d["screw_len"] - FRAME_SCREW_OVERHEAD + 1:
+        need = math.ceil((travel + FRAME_SCREW_OVERHEAD) / 50.0) * 50.0
+        fix("bad", f"Use a {need:.0f} mm ball screw",
+            f"{travel:.0f} mm of travel needs about {travel + FRAME_SCREW_OVERHEAD:.0f} mm of screw (the nut, the bearings and the "
+            f"machined ends take about {FRAME_SCREW_OVERHEAD:.0f} mm); ball screws are sold cut to length.",
+            {"screw_len": need, "preset": "custom"})
     if seat.get("better") is not None and abs(seat["better"] - d["cg_off"]) > 40:
         fix("warn" if d["layout"] == "seat2" and abs(d["cg_off"]) > 60 else "tip", "Move the seat: " + seat["move"], seat["why"],
             {"cg_off": seat["better"]})
@@ -14133,7 +14185,8 @@ def frame_design(raw):
                   "Arduino UNO R4 WiFi with the SMC3 R4 firmware (3 motors per board)"
                   + (f": {math.ceil(n / 3)} boards for {n} motors" if n > 3 else "")]
     else:
-        parts += [f"{n} x linear actuator: {d['travel']:.0f} mm travel, {d['lead']:.0f} mm screw lead, "
+        parts += [f"{n} x linear actuator: {d['travel']:.0f} mm travel, a {d['screw_len']:.0f} mm ball screw with a {d['lead']:g} mm "
+                  f"lead ({FRAME_IN / d['lead']:.2f} turns per inch), "
                   f"{d['servo_torque']:.2g} Nm servo at {d['servo_rpm']:.0f} rpm ({act['servo_w']:.0f} W)",
                   f"{n} x servo drive matched to the motors (they bring their own position loop; the controller sends "
                   f"step/direction, as the SFX-100 project does)",
@@ -14700,7 +14753,7 @@ def _frame_drawings(d, fam, geo, mem, travel, seat, ck):
         dimh(front, -b / 2, b / 2, -150, _frame_both(b))
     elif fam == "corner":
         L, B, nl = d["wheelbase"], d["track"], geo["nl"]
-        hgt = 300 + travel
+        hgt = _frame_corner_h(d, travel)
         cxr, cxf = min(-L / 2 - 50, ck["rear"]), max(L / 2 + 50, ck["front"])
         for yy in (-B / 2, B / 2):
             line(top, cxr, yy, cxf, yy, "moving", 9, wid("side"))
@@ -14871,6 +14924,8 @@ def _frame_model3d(d, fam, geo, mem, travel, ranges, f_des=0.0, seat=None, ck=No
     out = {"family": fam, "layout": d["layout"], "drive": d["drive"], "ctc": d["ctc"], "swing": d["swing"], "travel": travel,
            "axes": axes, "limits": {k: rng.get(k, 0.0) for k in ("pitch", "roll", "yaw", "heave", "surge")},
            "pivots": {}, "members": members, "acts": acts, "mounts": mounts, "feet": [], "rollers": []}
+    if lin:     # 2.9.6: a screw actuator's body around its bracket (below, above) and the servo on top, mm
+        out["act_body"] = [FRAME_LIN["cap"] + FRAME_LIN["bracket"], d["screw_len"] - FRAME_LIN["bracket"], FRAME_LIN["motor"]]
     back = seat["back_x"] if seat else -250.0
     tlf = max((e_["need"] if isinstance(e_, dict) else 0.0) for e_ in [{}]) if False else 0.0
     if "pivx" in use:
@@ -14941,19 +14996,23 @@ def _frame_model3d(d, fam, geo, mem, travel, ranges, f_des=0.0, seat=None, ck=No
         else:
             zs_, sxs_ = seat_part(ph, use["spine"]["section"], b / 2 - 60)
             gear_part("tilt", ph, zs_, (-(b / 2 - 60), b / 2 - 60), b / 2 - 60, sxs_)
+        hu_ = FRAME_SECTIONS[use["pivx"]["section"]]["shape"]["h"] if yaw else hr      # the cross-member under the actuators
+        zf_ = zt + (hu_ / 2.0 + 7.5 if lin else 0.0)    # 2.9.6: a screw actuator's rubber foot on its plate on that cross-member
         for i, s_ in enumerate((1, -1)):
             ya = s_ * b / 2
-            act(f"M{i + 1}", "lift", "yaw", (sx * a, ya, zt), (sx * a, ya, ph), [sx, 0, 0], lin, (0, -s_ * yo))
+            act(f"M{i + 1}", "lift", "yaw", (sx * a, ya, zf_), (sx * a, ya, ph), [sx, 0, 0], lin, (0, -s_ * yo))
+            if lin:
+                out.setdefault("stands", []).append(["yaw", sx * a, ya, zf_])
             mount("tilt", (sx * a, s_ * (b / 2 - yo), ph), "Actuator body bracket on the end of the cross-member (rod down)" if lin else
                   "Push-rod bracket on the moving frame", f_des, use["cross"]["section"], nrm=(0, s_, 0) if lin else (0, 0, -1))
             mount("yaw", (sx * a, ya, zt),
-                  "Motor mount" if not lin else "Rod-end mount under the actuator", f_des, use["pivx"]["section"] if yaw else rs)
+                  "Motor mount" if not lin else "Foot plate under the actuator (its rubber foot stands on it)", f_des, use["pivx"]["section"] if yaw else rs)
         out["pivots"]["tilt"] = [0, 0, ph]
         out["clear"] = ph
         out["floor"] = zt + (ht if yaw else hr) / 2
     elif fam == "corner":
         L, B, nl = d["wheelbase"], d["track"], geo["nl"]
-        hgt = 300 + travel
+        hgt = _frame_corner_h(d, travel)
         cxr, cxf = min(-L / 2 - 50, ck["rear"]), max(L / 2 + 50, ck["front"])
         yo = (45 + FRAME_SECTIONS[use["side"]["section"]]["shape"]["b"] / 2) if lin else 0.0     # screw actuators stand outside the frame
         Bf = B - 2 * yo
@@ -14968,6 +15027,8 @@ def _frame_model3d(d, fam, geo, mem, travel, ranges, f_des=0.0, seat=None, ck=No
         for i, (px, py) in enumerate(pts):
             mx, my = (px + yo, py) if py == 0 else (px, py - (yo if py > 0 else -yo))
             act(f"M{i + 1}", "lift", "yaw", (px, py, 0), (px, py, hgt), [1 if px > 0 else -1, 0, 0], lin, (mx - px, my - py))
+            if lin:          # 2.9.6: a rubber foot under the rod, on the floor or on the sub-frame's rail
+                out.setdefault("stands", []).append(["yaw", px, py, 0.0])
             mount("tilt", (mx, my, hgt), "Actuator body bracket on the side of the frame (rod down)" if lin else "Actuator bracket", f_des,
                   use["side"]["section"], use["mount"]["M"], nrm=((-1, 0, 0) if py == 0 else (0, 1 if py > 0 else -1, 0)) if lin else (0, 0, -1))
         out["pivots"]["tilt"] = [0, 0, hgt]
@@ -14975,25 +15036,27 @@ def _frame_model3d(d, fam, geo, mem, travel, ranges, f_des=0.0, seat=None, ck=No
         if "yaw" in axes:
             ts, ss = use["tl"]["section"], use["side"]["section"]
             ht, hs = FRAME_SECTIONS[ts]["shape"]["h"], FRAME_SECTIONS[ss]["shape"]["h"]
-            zb = -40 - ht / 2 - hs / 2 - 45
+            # 2.9.6: the sub-frame's rails run under the actuators' feet, its top at their level (z = 0)
+            zy = -ht / 2
+            zb = zy - ht / 2 - hs / 2 - 45
             xp, xr = L / 2 + 90, -L / 2 - 110
-            out["pivots"]["yaw"] = [xp, 0, (-40 + zb) / 2]
-            out["yaw_pin"] = [zb - hs / 2 - 12, -40 + FRAME_SECTIONS[use["pivx"]["section"]]["shape"]["h"] / 2 + 12]
+            out["pivots"]["yaw"] = [xp, 0, (zy + zb) / 2]
+            out["yaw_pin"] = [zb - hs / 2 - 12, zy + FRAME_SECTIONS[use["pivx"]["section"]]["shape"]["h"] / 2 + 12]
             out["yaw_r"] = L
-            for yy in (-B / 2 - 70, B / 2 + 70):
-                bar("yaw", (xr, yy, -40), (xp + 100, yy, -40), "tl", bow=(0, 1, 0))
-                roller((xr, yy, -40 - ht / 2 - 22.5), (xp, 0))
-            bar("yaw", (xr, -B / 2 - 70, -40), (xr, B / 2 + 70, -40), None, ts, nm="traction-loss cross-member")
-            bar("yaw", (xp, -B / 2 - 70, -40), (xp, B / 2 + 70, -40), "pivx", bow=(1, 0, 0))
+            for yy in (-B / 2, B / 2):
+                bar("yaw", (xr, yy, zy), (xp + 100, yy, zy), "tl", bow=(0, 1, 0))
+                roller((xr, yy, zy - ht / 2 - 22.5), (xp, 0))
+            bar("yaw", (xr, -B / 2, zy), (xr, B / 2, zy), None, ts, nm="traction-loss cross-member")
+            bar("yaw", (xp, -B / 2, zy), (xp, B / 2, zy), "pivx", bow=(1, 0, 0))
             grp = "surge" if "surge" in axes else "base"       # the frame the sub-frame swings on
-            act("M5", "yaw", grp, (xr, -B / 2 - 380, -40), (xr, 0, -40), [0, 1, 0])
+            act("M5", "yaw", grp, (xr, -B / 2 - 380, zy), (xr, 0, zy), [0, 1, 0])
             for yy in (-B / 2 - 150, B / 2 + 150):
                 bar(grp, (-L / 2 - 250, yy, zb), (L / 2 + 250, yy, zb), None, ss, nm="lower frame rail")
             for xc in (-L / 2 - 250, xr, L / 2 + 250):
                 bar(grp, (xc, -B / 2 - 150, zb), (xc, B / 2 + 150, zb), None, ss, nm="lower frame cross-member")
             bar(grp, (xp, -B / 2 - 150, zb), (xp, B / 2 + 150, zb), "pivx", bow=(1, 0, 0))
             bar(grp, (xr, -B / 2 - 450, zb), (xr, -B / 2 - 150, zb), None, ss, nm="traction-loss motor mount (lower frame)")
-            mount(grp, (xp, 0, (-40 + zb) / 2), "Yaw pivot bolt, through both cross-members", tlf, use["pivx"]["section"], kind="pin")
+            mount(grp, (xp, 0, (zy + zb) / 2), "Yaw pivot bolt, through both cross-members", tlf, use["pivx"]["section"], kind="pin")
             mount(grp, (xr, -B / 2 - 380, zb + hs / 2), "Traction-loss motor mount", tlf, ss)
             if "surge" in axes:
                 zf = zb - hs - 45
@@ -15042,6 +15105,11 @@ def _frame_joints(d, model, mem):
     def unit(a):
         ln = math.sqrt(dot(a, a))
         return (a[0] / ln, a[1] / ln, a[2] / ln) if ln > 1e-9 else (0.0, 0.0, 0.0)
+
+    def sj_of(mb, p):
+        ab = sub(mb["b"], mb["a"])
+        u_ = unit(ab)
+        return max(0.0, min(math.sqrt(dot(ab, ab)), dot(sub(p, mb["a"]), u_)))
 
     def mat_of(mb):
         m = use.get(mb["id"])
@@ -15177,6 +15245,12 @@ def _frame_joints(d, model, mem):
                              "d2": [round(v, 4) for v in unit(db)], "tee": True, "V": V, "M": Mo, "kw": kw, "i": a_, "j": b_,
                              "e": "x", "t": tj, "ti": ti, "dist": 0.0}
     joints = []
+
+    def hold(mb, t, half):
+        """mb is held at t (0-1 along it), over half (mm) each way: a joint's plates, a mount's plate."""
+        ln = math.dist(mb["a"], mb["b"])
+        if ln > 1:
+            mb.setdefault("pins", []).append([round(min(1.0, max(0.0, t)), 4), round(half / ln, 4)])
     for jt in found.values():
         mi, mj = M[jt["i"]], M[jt["j"]]
         meth = method(mi["sec"], mat_of(mi), mat_of(mj))
@@ -15207,6 +15281,10 @@ def _frame_joints(d, model, mem):
                        "name": f"{mi['nm'][0].upper() + mi['nm'][1:]} to {mj['nm']}", "single": False})
         mi.setdefault("hot", []).append([te, round(uh, 3)])
         mj.setdefault("hot", []).append([round(jt["t"], 3), round(uh, 3)])
+        # 2.9.6: where each member is held - the heat map bends it only between these, never under a plate or bolt
+        shj = FRAME_SECTIONS[mj["sec"]]["shape"]
+        hold(mi, te, max(shj["b"], shj["h"]) / 2.0 + min(80.0, max(sh["b"], sh["h"])))
+        hold(mj, jt["t"], max(sh["b"], sh["h"]) / 2.0 + min(80.0, max(shj["b"], shj["h"])))
     # braces: one diagonal where it does some good - at the foot of a post or of a wheel upright, and in the corners
     # where the yaw-pivot cross-member meets the rails the traction-loss motor bends; each end gets its own bracket
     cen = {}
@@ -15247,6 +15325,25 @@ def _frame_joints(d, model, mem):
             if jt["tee"]:                                  # towards the middle of the frame
                 sg = 1 if (cen[mi["g"]][0] - p[0]) * jt["d2"][0] + (cen[mi["g"]][1] - p[1]) * jt["d2"][1] >= 0 else -1
             brace(mi, who, p, jt["d1"], jt["d2"], sg)
+    # 2.9.6: what stands on the floor or carries a frame holds the member there in the heat map: levelling feet,
+    # the traction-loss rollers, the actuators' rubber feet
+    for g_, pts in (("base", model.get("feet") or []), ("yaw", [r_["p"] for r_ in model.get("rollers") or []]),
+                    (None, model.get("stands") or [])):
+        for q in pts:
+            gq, q = (q[0], q[1:]) if g_ is None else (g_, q)
+            for mb in M:
+                if mb.get("brace") or rg[mb["g"]] != rg[gq]:
+                    continue
+                ab = sub(mb["b"], mb["a"])
+                ln = math.sqrt(dot(ab, ab))
+                if ln < 1:
+                    continue
+                sj = dot(sub(q, mb["a"]), unit(ab))
+                if not (-20 <= sj <= ln + 20):
+                    continue
+                shq = FRAME_SECTIONS[mb["sec"]]["shape"]
+                if math.dist(q, [mb["a"][k] + unit(ab)[k] * sj for k in range(3)]) <= max(shq["b"], shq["h"]) / 2.0 + 30:
+                    hold(mb, sj / ln, 40.0)
     for mt in model["mounts"]:
         mat_id = d["material"] if FRAME_SECTIONS[mt["sec"]]["family"] != "tslot" else "tslot"
         if mt["kind"] == "pin":
@@ -15265,6 +15362,7 @@ def _frame_joints(d, model, mem):
                  (mem[0]["P_work"] / mem[0]["P"] if mem[0]["P"] else 1.0))
         sh = FRAME_SECTIONS[mt["sec"]]["shape"]
         near, axis, shift = 1e9, [0, 0, 0], 0.0     # the member it sits on: its plate runs along it and is no wider
+        host, host_t = None, 0.0
         for mb in M:
             if rg[mb["g"]] != rg[mt["g"]] or mb.get("brace"):
                 continue
@@ -15278,6 +15376,25 @@ def _frame_joints(d, model, mem):
             if dist < near:
                 near, axis = dist, [round(v, 4) for v in u_]
                 shift = (max(65.0, min(lj - 65.0, sj)) - sj) if lj >= 130 else (lj / 2.0 - sj)      # keep the plate on the member
+                host, host_t = mb, (sj + shift) / lj
+        # 2.9.6: whatever is bolted to a member holds it there - a bracket's plate, the seat's slider; the yaw pivot bolt
+        # holds the cross-member it passes through in each frame - so the heat map bends members only between them
+        if mt["kind"] == "pin":
+            for mb in M:
+                if mb.get("brace"):
+                    continue
+                ab = sub(mb["b"], mb["a"])
+                if math.hypot(ab[0], ab[1]) < 1:
+                    continue
+                q = sj_of(mb, mt["p"])
+                u_ = unit(ab)
+                if math.hypot(mb["a"][0] + u_[0] * q - mt["p"][0], mb["a"][1] + u_[1] * q - mt["p"][1]) < 60:
+                    hold(mb, q / math.sqrt(dot(ab, ab)), 45.0)
+        elif host is not None and near < 150:
+            if mt.get("flag") == "bare":
+                hold(host, sj_of(host, mt["p"]) / math.dist(host["a"], host["b"]), 30.0)
+            else:
+                hold(host, host_t, 65.0)
         joints.append({"g": mt["g"], "p": mt["p"], "d1": mt["nrm"], "d2": axis if near < 150 else [0, 0, 0], "off": round(shift, 1) if near < 150 else 0.0, "tee": False, "kind": meth, "bolt": bolt,
                        "n": nb, "u": u, "uw": u * kw, "uh": u * kw, "V": mt["V"], "M": mt["M"], "hw": hw, "sec": mt["sec"], "through": sh["t"] + 6,
                        "name": mt["name"], "single": True, "brace": mt.get("flag") == "brace", "bare": mt.get("flag") == "bare"})
@@ -15799,7 +15916,8 @@ def frame_pdf(raw, version=""):
                  ["Lever", f"{d['ctc']:.0f} mm between centres, swinging +/-{d['swing']:.0f} deg"],
                  ["Current per motor: rated / stalled", f"{a['amps_rated']:.0f} A / {a['amps_stall']:.0f} A"]]
     else:
-        rows += [["Actuator", f"{d['lead']:.0f} mm screw lead, {d['servo_torque']:.2g} Nm servo at {d['servo_rpm']:.0f} rpm"]]
+        rows += [["Actuator", f"{d['screw_len']:.0f} mm ball screw, {d['lead']:g} mm lead ({FRAME_IN / d['lead']:.2f} turns per inch), "
+                              f"{d['servo_torque']:.2g} Nm servo at {d['servo_rpm']:.0f} rpm"]]
     p.table([("Actuator", 250, "start"), ("", 266, "start")], rows)
 
     p.heading("Checks")
@@ -22736,7 +22854,10 @@ main[data-view=elec]{grid-template-columns:minmax(0,1fr) minmax(0,1.05fr);grid-t
 .f3wrap canvas{display:block;width:100%;height:100%;touch-action:none}
 .f3hud{position:absolute;left:10px;top:10px;right:10px;pointer-events:none;font-size:12.5px;line-height:1.35}
 .f3views,.f3views button{pointer-events:auto}.f3hud div{display:table;background:rgba(8,14,22,.84);border-left:3px solid var(--fc);padding:4px 9px;margin:0 0 4px;border-radius:4px;color:#e7edf5;max-width:100%}
-.f3hud{right:190px}
+.f3hud{right:190px;top:48px}
+.f3notes{position:absolute;left:10px;top:10px;height:30px;padding:0 11px;display:flex;align-items:center;gap:7px;border:1px solid #2c3b4f;border-radius:7px;background:rgba(8,14,22,.84);color:#cfd9e4;font-size:12.5px;cursor:pointer;z-index:2}
+.f3notes i{width:8px;height:8px;border-radius:50%;background:var(--green)}.f3notes[data-level=warn] i{background:var(--amber)}.f3notes[data-level=bad] i{background:var(--red)}
+.f3notes.on{border-color:var(--blue);color:#fff}.f3notes:hover{border-color:#4a6283}.f3wrap.f3notesoff .f3hud{display:none}
 .f3views{position:absolute;right:10px;top:10px;display:flex}.f3views button{height:30px;padding:0 12px;border:1px solid #2c3b4f;background:rgba(8,14,22,.84);color:#9fb3c8;cursor:pointer;font-size:12.5px}
 .f3views button:first-child{border-radius:7px 0 0 7px}.f3views button:last-child{border-radius:0 7px 7px 0;border-left:0}.f3views button.on{background:var(--blue);border-color:var(--blue);color:#fff}
 .f3legend{position:absolute;right:10px;bottom:10px;width:210px;font-size:11px;color:#9fb3c8;background:rgba(8,14,22,.84);border-radius:6px;padding:6px 9px;pointer-events:none}
@@ -23944,7 +24065,7 @@ details.oks .flist{margin-top:6px}
  </section>
  <section class="card wide" id="frres" style="grid-area:frres" data-views="frame">
   <div class="ct">Your design</div>
-  <div id="f3box" hidden><div class="f3wrap"><canvas id="f3c"></canvas><div class="f3hud" id="f3hud"></div><div class="f3views" id="f3views"><button data-view="rig" class="on">Rig</button><button data-view="heat">Heat map</button></div><div class="f3legend" id="f3legend" hidden><span>load used - joints first, then along the beam</span><i></i><div><b>0</b><b>50%</b><b>80%</b><b>100%</b><b>120%+</b></div></div><div class="f3pose" id="f3pose"></div><div class="f3tip">drag: turn - wheel or pinch: zoom - right-drag: move</div></div></div>
+  <div id="f3box" hidden><div class="f3wrap f3notesoff"><canvas id="f3c"></canvas><button type="button" class="f3notes" id="f3notes" data-level="ok" aria-pressed="false" title="Show the notes"><i></i><span>Notes</span></button><div class="f3hud" id="f3hud"></div><div class="f3views" id="f3views"><button data-view="rig" class="on">Rig</button><button data-view="heat">Heat map</button></div><div class="f3legend" id="f3legend" hidden><span>load used - joints first, then along the beam</span><i></i><div><b>0</b><b>50%</b><b>80%</b><b>100%</b><b>120%+</b></div></div><div class="f3pose" id="f3pose"></div><div class="f3tip">drag: turn - wheel or pinch: zoom - right-drag: move</div></div></div>
   <div id="fr_out"><p class="frsub">Working it out...</p></div>
  </section>
 
@@ -23984,7 +24105,7 @@ details.oks .flist{margin-top:6px}
     <h3>Servo actuators (firmware SMC3_R4_Servo 2.2.0b1 - BETA)</h3><p><b>Beta firmware: not tested on a real rig yet.</b> It was written for this dashboard and checked against a model of the board and the simulator, and should work with it; while a beta runs, the board's L LED and the top-right LED of its matrix blink, and the page shows a red blinking <b>BETA</b> next to the firmware version (tap it for the details). The servo build drives ball-screw actuators with AC servo drives (SFX-100 style: AASD-15A and similar) by <b>pulse + direction</b>: three per board on D2-D7, servo-on on D9-D11, through two ULN2803A per board (the R4's pins give 8 mA; the drive's servo-on input runs on 12-24 V). SimHub talks SMC3 to it as before. There are no pots and no PID: at power-up the board releases the servos for 4 s so the seat sinks to the bottom and counts from there (or drives to home switches on A0-A2), then the actuators creep up. PWMmax is each actuator's top speed (255 = 20 000 pulses/s). <b>Settings, Servo actuators</b> (shown instead of Motor drivers): stroke, ball-screw lead and pulses per turn, the acceleration limit, homing, servo-on level, an emergency-stop contact on A3 (pressed: every motor off, the servos released, and Enable Motors homes again) and reverse per motor; <b>Home again</b> with the motors off. Auto-tune and the full check are for DC motors and say so. Firmware update refuses to swap the servo build for the DC build (or back) from the page: the pins mean different things, so that is done over USB after rewiring. Electronics, Ball-screw actuator: the parts, printed parts (STL links), drive settings and pictures.</p>
     <h3>Motor drivers (Settings, firmware 2.2.0b1)</h3><p>The board drives either <b>IBT-2 / BTS7960</b> bridges (two PWM inputs) or <b>PWM + direction</b> drivers (Cytron MD30C, MD13S, MDD10A, SmartDriveDuo-30 / -60, VNH, 100 A class bridges). Firmware 2.2.0b1 (the beta in All firmware) makes this a setting: Settings, Motor drivers, with the motors switched off and SimHub stopped - no recompiling. A board never told keeps what it was built for (IBT-2). Cytron MD30C and MD13S take PWM up to 20 kHz: the same card sets 20 kHz and saves it. With PWM + direction a switched-off motor brakes instead of coasting. Older firmware: build the sketch with #define MODE1 (PWM + direction) or MODE2 (IBT-2).</p>
 
-    <h3>Frame Design (page 2.9.4)</h3><p>A wizard for planning a rig before any metal is cut; nothing in it talks to the board. Six steps: <b>Motors</b> (2 to 6: a seat mover, 2 lifts + traction loss, 3 or 4 corner actuators, traction loss and surge under four corners, or a Stewart platform), <b>Drive</b> (a gear motor with a lever and push rod, or a ball-screw actuator), <b>Size</b> (the weights - driver, seat, wheel and wheelbase, pedals - and the distances), <b>Frame</b> (the section family, the material, bolted or welded; any member can have its own section and material; every joint with its fasteners and a picture), <b>Build</b> (the cut list to scale, the mounting hardware, the parts with a ball-park cost, what to assemble first, the steps) and <b>3D test</b>. The right-hand side shows the drawings with the main distances, the range and speed of every movement, the force each actuator needs against what it can make, and the checks; <b>What would make it better</b> lists suggestions and <b>Fix it for me</b> applies the ones that are needed. In the 3D test, turn the rig with the mouse, put a weight on the seat, slide the seat forwards or back and move each axis: <b>Rig</b> shows every part as built, <b>Heat map</b> shows where the load goes - the joints first - and lets the parts bend (drawn 20 times larger than life); an actuator turns red when it runs out of travel or of force. <b>Export PDF</b> saves all of it. It uses lever and beam formulas with a safety factor - a first design to check, not a finite-element analysis - and it never talks to the board.</p>
+    <h3>Frame Design (page 2.9.4)</h3><p>A wizard for planning a rig before any metal is cut; nothing in it talks to the board. Six steps: <b>Motors</b> (2 to 6: a seat mover, 2 lifts + traction loss, 3 or 4 corner actuators, traction loss and surge under four corners, or a Stewart platform), <b>Drive</b> (a gear motor with a lever and push rod, or a ball-screw actuator), <b>Size</b> (the weights - driver, seat, wheel and wheelbase, pedals - and the distances), <b>Frame</b> (the section family, the material, bolted or welded; any member can have its own section and material; every joint with its fasteners and a picture), <b>Build</b> (the cut list to scale, the mounting hardware, the parts with a ball-park cost, what to assemble first, the steps) and <b>3D test</b>. The right-hand side shows the drawings with the main distances, the range and speed of every movement, the force each actuator needs against what it can make, and the checks; <b>What would make it better</b> lists suggestions and <b>Fix it for me</b> applies the ones that are needed. In the 3D test, turn the rig with the mouse, put a weight on the seat, slide the seat forwards or back and move each axis: <b>Rig</b> shows every part as built, <b>Heat map</b> shows where the load goes - the joints first - and lets the parts bend (drawn 20 times larger than life); an actuator turns red when it runs out of travel or of force. In the heat map a part bends only between the places where something is bolted to it - its joints, brackets, the seat's slider, the yaw pivot bolt - so it never comes off a plate or a bolt, and its end past the last bracket stays straight; a short span between two joints bends less than a long one, and never much more than a 50th of its length; levelling feet, rollers and the actuators' feet hold what they stand under or on. The notes - what runs out of travel or is close to its limit - are behind the <b>Notes</b> button at the top left of the view, its dot red, amber or green; it remembers whether you left them open. <b>Ball-screw actuators</b>: the Drive step asks for the ball screw's length and its lead (in mm per turn, or in turns per inch); the nut, the bearings and the machined ends take about 150 mm of the screw. The actuator is drawn as long as its screw with the servo on top, its bracket low on its body, and it stands on a rubber foot - on the floor, on the traction-loss sub-frame's rails (right under the actuators) or on a foot plate on the cross-member under it - a rig standing on SFX-100s (250 mm screws) sits about 170 mm (6.7 in) off the ground at mid travel. <b>Export PDF</b> saves all of it. It uses lever and beam formulas with a safety factor - a first design to check, not a finite-element analysis - and it never talks to the board.</p>
     <h3>Status bar</h3><p>LOW POWER means no position commands for 15 s, so the board runs at quarter drive until SimHub or this page sends targets again.</p>
     <h3>Firmware update (firmware 1.9.2)</h3><p>Settings, Firmware update installs new firmware over WiFi - no USB cable, and SimHub can stay open (with its motion output paused). In the Arduino IDE open the new .ino and use <b>Sketch, Export Compiled Binary</b>; choose that .bin on the page and press Install. The page checks the file (an SMC3_R4 build for the UNO R4 WiFi, and which version), the board switches the motors off, its WiFi module downloads and checks the file and installs it, and the page confirms the new version once the board is back. The board remembers the WiFi name and password it last joined with, so a build with the placeholders still connects. Needs the WiFi module's own firmware 0.4.0 or newer (0.5.0+ shows progress): Arduino IDE, Tools, Firmware Updater, with SimHub closed (it keeps the USB port busy) - and since that erases the sketch on the board, upload SMC3_R4 again over USB afterwards. The first install of it (SMC3_R4_v1.9.3.ino - 1.9.2 didn't compile in the Arduino IDE) goes over USB.</p>
     <h3>USB cable for calibration (page 2.8, firmware 1.9.5; 2.0 recommended)</h3><p>The board's WiFi module now and then holds the board up for a second or more, so the page's moves can lag and auto-tune redoes a test move. For calibration, link the page to the board over its USB cable instead: close SimHub, then flip the switch at the top of the page to <b>USB</b>. In Chrome, Edge, Brave or Firefox 151+ on the PC with the cable (page 2.9) the page opens the port itself - pick the Arduino in the browser's list once; the page must be a secure one (https, or localhost), and Settings, USB cable says how when it isn't. With firmware 2.0 the port is the main chip's own (a COM port of its own): no USB stall, no lost bytes; an Arduino IDE upload goes through the WiFi chip, so press <b>WiFi chip until the next reset</b> in Settings, USB cable first (or press the board's RESET twice, about a second apart). Other browsers, or another PC: press <b>Win+R</b> on the PC with the cable and paste the line from <b>Settings, USB cable</b>. That starts a small bridge (Windows PowerShell, nothing to install) which finds the board's COM port and links it to the page; the switch at the top of the page then shows <b>USB</b> and the board makes no WiFi calls at all. When you're done flip the switch to <b>WiFi</b> and start SimHub again: the bridge lets go of the port and waits, so from then on the switch moves between WiFi and the cable (close SimHub before flipping to USB). Closing the bridge window ends it. Settings, USB cable can also turn bridges away (WiFi only). Firmware updates from the page still go over WiFi.</p>
@@ -24769,7 +24890,9 @@ const FRF={   // field: label, unit (a kind in FRU, or the unit as text), step, 
  ctc:['Lever length, centre to centre','len',1,'Shaft centre to rod-end centre (CTC). Shorter = more force, less travel and speed.'],
  swing:['Lever swing each way','°',1,'From square to the push rod. 45 is a good target; never more than 60.'],
  travel:['Travel','len',5,'End to end.'],
- lead:['Screw lead','mm per turn',1,'1605 screw = 5, 1610 screw = 10.'],
+ lead:['Screw lead','mm/turn',1,'1605 screw = 5, 1610 screw = 10.'],
+ tpi:['Turns per inch','turns/in',0.01,'The same lead counted the imperial way (25.4 / lead): 5.08 for a 1605 screw, 2.54 for a 1610.'],
+ screw_len:['Ball-screw length','len',10,'The whole screw. The nut, the bearings and the machined ends take about 150 mm (6 in) of it: a 250 mm screw gives the SFX-100\'s 100 mm of travel. It sets how tall the actuator is and how high it holds the frame.'],
  servo_torque:['Servo torque it can give all day','torque',0.1,'Rated torque: 2.4 Nm for a 750 W, 3000 rpm servo.'],
  servo_peak:['Servo torque at most','torque',0.1,'Usually three times the rated torque.'],
  servo_rpm:['Servo speed','rpm',100,''],
@@ -24797,7 +24920,7 @@ function frLen(mm){return frUnits==='imperial'?(mm/25.4).toFixed(1)+' in':Math.r
 function frForce(n){return frUnits==='imperial'?Math.round(n/4.448)+' lbf':Math.round(n)+' N';}
 function frMass(kg){return frUnits==='imperial'?Math.round(kg*2.2046)+' lb':(+kg.toFixed(1))+' kg';}
 function frStress(m){return frUnits==='imperial'?(m/6.895).toFixed(1)+' ksi':Math.round(m)+' MPa';}
-function frField(k){return`<label class="ffld"><span>${esc(frLab(k))}</span><span class="fin"><input type="number" step="any" data-f="${k}" value="${frFmt(k,frIn[k])}"><i>${esc(frUnit(k))}</i></span>${frNote(k)?`<small>${esc(frNote(k))}</small>`:''}</label>`;}
+function frField(k){return`<label class="ffld"><span>${esc(frLab(k))}</span><span class="fin"><input type="number" step="any" data-f="${k}" value="${frFmt(k,k==='tpi'?25.4/Math.max(0.1,frIn.lead||5):frIn[k])}"><i>${esc(frUnit(k))}</i></span>${frNote(k)?`<small>${esc(frNote(k))}</small>`:''}</label>`;}
 function frFields(keys){return`<div class="frgrid">${keys.map(frField).join('')}</div>`;}
 async function frOpen(){if(frMeta){frCalc();if(frStep===5)f3Open();return;}
  try{const r=await (await fetch('/frame/load')).json();frMeta=r.meta;frIn=r.inputs;frRender();frCalc();}catch(e){$('fr_out').innerHTML='<p class="frsub">The page server did not answer. Reload the page.</p>';}}
@@ -24814,9 +24937,9 @@ function frRender(){if(!frIn)return;const L=frLayout(),fam=L.family;
   if(frIn.layout==='seat2')h+=`<p class="frhead">What moves?</p><div class="frpick" id="fr_moves"><button class="${frIn.moves==='seat'?'on':''}" data-v="seat">The seat only</button><button class="${frIn.moves==='cockpit'?'on':''}" data-v="cockpit">Seat, wheel and pedals together</button></div><p class="frsub">Seat only is lighter and quicker, and your hands and feet feel the movement against a still wheel and pedals. Moving everything suits flying and keeps the controls where your body is.</p>`;
  }else if(frStep===1){
   h+=`<p class="frhead">What drives it?</p><div class="frpick" id="fr_drive"><button class="${frIn.drive==='rotary'?'on':''}" data-v="rotary">Gear motor with a lever</button><button class="${frIn.drive==='linear'?'on':''}" data-v="linear">Linear actuator (ball screw)</button></div>
-   <p class="frsub">${frIn.drive==='rotary'?'A wheelchair, worm-gear or wiper motor turns a short lever; a push rod with rod ends moves the rig. Cheap and strong, driven by this project\'s SMC3 R4 board.':'A servo motor turns a ball screw that pushes straight up and down (the SFX-100 kind). Fast and precise; it needs servo drives, which are not the SMC3 R4 board.'}</p>
+   <p class="frsub">${frIn.drive==='rotary'?'A wheelchair, worm-gear or wiper motor turns a short lever; a push rod with rod ends moves the rig. Cheap and strong, driven by this project\'s SMC3 R4 board.':'A servo motor turns a ball screw that pushes straight up and down (the SFX-100 kind). Fast and precise; each motor needs its own servo drive, which the SMC3_R4_Servo firmware (beta) drives - see Electronics.'}</p>
    <label class="ffld" style="margin:0 0 12px"><span>Start from</span><select id="fr_preset"><option value="custom">My own values</option>${frMeta.presets.filter(p=>p.drive===frIn.drive).map(p=>`<option value="${p.id}"${p.id===frIn.preset?' selected':''}>${esc(p.name)}</option>`).join('')}</select><small>Typical values to start from. Check them against your motor's label or data sheet.</small></label>`
-   +frFields(frIn.drive==='rotary'?['rpm','torque','torque_peak','ratio','ctc','swing','motor_w','volts']:['travel','lead','servo_torque','servo_peak','servo_rpm'])
+   +frFields(frIn.drive==='rotary'?['rpm','torque','torque_peak','ratio','ctc','swing','motor_w','volts']:['travel','screw_len','lead','tpi','servo_torque','servo_peak','servo_rpm'])
    +`<div class="frderived" id="fr_der"></div>`;
  }else if(frStep===2){
   h+=`<p class="frhead">Weight</p>`+frFields(['driver_kg','moving_kg','seat_kg'].concat(frIn.moves==='cockpit'?['wheel_kg','pedal_kg']:[],['accel']))+`<p class="frhead">Distances</p>`
@@ -24836,7 +24959,7 @@ function frRender(){if(!frIn)return;const L=frLayout(),fam=L.family;
   const keys=(fam==='pivot'?['arm','spacing','pivot_h','cg_h']:fam==='corner'?['wheelbase','track']:['base_r','plat_r','hex_h']).concat(frIn.drive==='rotary'?['ctc']:['travel']);
   const R={arm:[200,1600,10],spacing:[200,1200,10],pivot_h:[80,700,10],cg_h:[0,800,10],wheelbase:[600,2200,10],track:[300,1200,10],base_r:[300,1200,10],plat_r:[200,1000,10],hex_h:[250,1200,10],ctc:[20,150,1],travel:[40,400,5],driver_kg:[30,200,1],seat_slide:[-120,120,5]};
   const sl=k=>{const u=FRU[FRF[k][1]],imp=u&&frUnits==='imperial',c=v=>imp?+(v*u[2]).toFixed(u===FRU.mass?0:1):v;return`<label class="ffld fsl"><span>${esc(frLab(k))}<b>${frFmt(k,frIn[k])} ${esc(frUnit(k))}</b></span><input type="range" data-f="${k}" min="${c(R[k][0])}" max="${c(R[k][1])}" step="${imp?(u===FRU.mass?1:0.1):R[k][2]}" value="${frFmt(k,frIn[k])}"></label>`;};
-  h+=`<p class="frhead">Test it in 3D</p><p class="frsub">The rig as designed, with its real sections, motors and an x-ray seat. Put a weight on the seat and move it: members colour green, amber or red by how much of their allowance the load uses; a motor or actuator turns red when it runs out of travel or of force. <b>Rig</b> shows every part straight, as built; <b>Heat map</b> shows the stress and lets the parts bend (drawn 20 times larger than life) - switch back and forth to compare.</p>
+  h+=`<p class="frhead">Test it in 3D</p><p class="frsub">The rig as designed, with its real sections, motors and an x-ray seat. Put a weight on the seat and move it: members colour green, amber or red by how much of their allowance the load uses; a motor or actuator turns red when it runs out of travel or of force. <b>Rig</b> shows every part straight, as built; <b>Heat map</b> shows the stress and lets the parts bend (drawn 20 times larger than life, never much more than a 50th of a span) - switch back and forth to compare. What is close to its limit is under <b>Notes</b> at the top left of the view.</p>
    <p class="frhead">Weight on the seat</p>${sl('driver_kg')}
    <div class="frpick" id="f3_w">${[[68,'150 lb'],[100,'220 lb'],[136,'300 lb'],[181,'400 lb']].map(w=>`<button data-w="${w[0]}">${frUnits==='imperial'?w[1]:w[0]+' kg'}</button>`).join('')}</div>
    <p class="frhead">Slide the seat</p>${sl('seat_slide')}
@@ -24893,7 +25016,7 @@ function frShow(){if(!FR)return;const a=FR.actuator,d=FR.inputs;
  o+=`<p class="frnote">Lever and beam formulas with a safety factor of 2 against the largest force an actuator can make - a first design to check, not a finite-element analysis. Fatigue, weld quality and torsion are not modelled. A motion rig can hurt you: have a design you will sit in checked, fit mechanical end stops and keep an emergency stop within reach.</p>`;
  $('fr_out').innerHTML=o;
  const der=$('fr_der');
- if(der)der.innerHTML=frStep===1?`<div><span>Travel</span><b>${frLen(a.travel)}</b></div><div><span>Speed, no load</span><b>${Math.round(a.speed_noload)} mm/s</b></div><div><span>Force at most</span><b>${frForce(a.force_peak)}</b></div>`
+ if(der)der.innerHTML=frStep===1?`<div><span>Travel</span><b>${frLen(a.travel)}</b></div><div><span>Speed, no load</span><b>${Math.round(a.speed_noload)} mm/s</b></div><div><span>Force at most</span><b>${frForce(a.force_peak)}</b></div>`+(FR.inputs.drive==='linear'&&FR.model3d&&FR.model3d.act_body?`<div><span>Actuator, with its servo</span><b>${frLen(FR.inputs.screw_len+FR.model3d.act_body[2])}</b></div>`+(FR.family==='corner'?`<div><span>Frame off the ground</span><b>${frLen(FR.model3d.clear)}</b></div>`:''):'')
   :FR.ranges.slice(0,3).map(r=>`<div><span>${esc(r.name)}</span><b>${r.unit==='mm'?frLen(r.range):r.range.toFixed(1)+'°'}</b></div>`).join('');
  const sz=$('fr_size');
  if(sz){sz.innerHTML=`<option value="auto">Lightest that passes, per member</option>`+FR.sizes.map(s=>`<option value="${esc(s.id)}"${s.id===d.size?' selected':''}>${esc(s.name)}</option>`).join('');
@@ -24932,10 +25055,10 @@ function f3Label(txt){const T=F3.THREE,c=document.createElement('canvas');c.widt
  const sp=new T.Sprite(new T.SpriteMaterial({map:new T.CanvasTexture(c),depthTest:false,transparent:true}));sp.scale.set(0.42,0.147,1);sp.renderOrder=5;return sp;}
 const f3Opt={xray:true,bend:true,stress:true};
 async function f3Open(){
- if(!F3&&!f3Busy){f3Busy=true;$('f3hud').innerHTML='Starting the 3D view...';
+ if(!F3&&!f3Busy){f3Busy=true;{const w=document.querySelector('.f3wrap');if(w)w.classList.remove('f3notesoff');}$('f3hud').innerHTML='Starting the 3D view...';
   try{await f3Init();}catch(e){$('f3hud').innerHTML='<b class="fr-bad" style="color:var(--red)">The 3D view could not start.</b> It needs WebGL (hardware acceleration on). '+esc(e&&e.message||e);}
   f3Busy=false;}
- if(!F3)return;F3.on=true;f3Build();F3.resize();requestAnimationFrame(f3Frame);}
+ if(!F3)return;f3NotesShow(f3NotesOn);F3.on=true;f3Build();F3.resize();requestAnimationFrame(f3Frame);}
 function f3Close(){if(F3)F3.on=false;}
 async function f3Init(){
  const THREE=await import('three');const {OrbitControls}=await import('three/addons/controls/OrbitControls.js');
@@ -24962,6 +25085,26 @@ function f3Shape(sh){const T=F3.THREE,b=sh.b/1000,h=sh.h/1000,t=Math.max(sh.t/10
   P.forEach((q,i)=>i?s.lineTo(q[0],q[1]):s.moveTo(q[0],q[1]));s.closePath();}
  else{rectPath(s,b,h,false);const o=new T.Path();rectPath(o,b-2*t,h-2*t,true);s.holes.push(o);}
  return s;}
+// 2.9.6: how far a part is drawn bent at t (0-1 along it), in metres, 20 times larger than life. It is held over each
+// of its pins (t, half-width) and bends between them; a cantilever's free end bends beyond its last pin; a plain
+// member's end past its last pin stays straight. A span bends with its length: the member's own figure for a span
+// as long as the one it was worked out for, less for a shorter one - and never much more than a 50th of the span
+// (2.9.6), so a frame on the floor or a rail bent sideways still reads as a frame.
+function f3BendFn(mb,m,L){const amp=m.defl_work/1000*20,Lm=Math.max(0.05,(m.L||L*1000)/1000),cant=mb.model==='cantilever';if(!(amp>0)||L<0.02)return null;
+ const iv=(mb.pins||[]).map(q=>[Math.max(0,q[0]-q[1]),Math.min(1,q[0]+q[1])]);
+ if(cant){const tf=mb.fix==='t'?mb.fx:mb.fix==='a'?0:mb.fix==='b'?1:0.5;iv.push([tf,tf]);}
+ else if(iv.length<2){iv.push([0,0],[1,1]);}
+ iv.sort((p,q)=>p[0]-q[0]);const P=[];for(const v of iv){const l=P[P.length-1];if(l&&v[0]<=l[1]+1e-4)l[1]=Math.max(l[1],v[1]);else P.push(v.slice());}
+ const S=[],add=(t0,t1,k)=>{const len=(t1-t0)*L;if(len>0.01){const raw=amp*Math.pow(Math.min(1,len*(k==='b'&&cant?0.5:1)/Lm),1.5),cap=len/50;S.push([t0,t1,k,cap*Math.tanh(raw/cap)]);}};
+ if(cant&&P[0][0]>0)add(0,P[0][0],'f0');
+ for(let i=0;i+1<P.length;i++)add(P[i][1],P[i+1][0],'b');
+ if(cant&&P[P.length-1][1]<1)add(P[P.length-1][1],1,'f1');
+ if(!S.length)return null;
+ return t=>{for(const q of S)if(t>=q[0]&&t<=q[1]){const u=(t-q[0])/(q[1]-q[0]);return q[3]*(q[2]==='b'?Math.sin(Math.PI*u):q[2]==='f1'?u*u:(1-u)*(1-u));}return 0;};}
+// 2.9.6: the notes over the 3D view sit behind a small button, closed unless you open them (remembered)
+let f3NotesOn=false;try{f3NotesOn=localStorage.getItem('smc3_f3notes')==='1';}catch(e){}
+function f3NotesPill(n,lv){const b=$('f3notes');if(!b)return;b.dataset.level=lv;b.querySelector('span').textContent=n?`Notes (${n})`:'Notes';b.title=n?(f3NotesOn?'Hide the notes':'Show the notes'):'Nothing to note';}
+function f3NotesShow(on){f3NotesOn=on;try{localStorage.setItem('smc3_f3notes',on?'1':'0');}catch(e){}const w=document.querySelector('.f3wrap');if(w)w.classList.toggle('f3notesoff',!on);const b=$('f3notes');if(b){b.classList.toggle('on',on);b.setAttribute('aria-pressed',on?'true':'false');}}
 function f3Build(){if(!F3||!FR)return;const T=F3.THREE,M=FR.model3d,V=p=>new T.Vector3(p[0]/1000,p[2]/1000,-p[1]/1000);
  if(F3.root){F3.scene.remove(F3.root);F3.root.traverse(o=>{if(o.geometry)o.geometry.dispose();if(o.material){if(o.material.map)o.material.map.dispose();o.material.dispose();}});}
  const heat=f3View==='heat';
@@ -24972,7 +25115,7 @@ function f3Build(){if(!F3||!FR)return;const T=F3.THREE,M=FR.model3d,V=p=>new T.V
  const stressCol=u=>new T.Color(u>1?0xe03b3b:u>0.8?0xf5b301:0x2fae3e);
  const cen={};for(const g of ['base','surge','yaw','tilt']){const ms=M.members.filter(x=>x.g===g),c=new T.Vector3();ms.forEach(x=>c.add(V(x.a)).add(V(x.b)));if(ms.length)c.multiplyScalar(0.5/ms.length);cen[g]=c;}
  for(const mb of M.members){const a=V(mb.a),b=V(mb.b),L=a.distanceTo(b);if(L<1e-4)continue;
-  const sh=FR.sections[mb.sec]||{k:'tube',b:50,h:50,t:3},geo=new T.ExtrudeGeometry(f3Shape(sh),{depth:L,steps:14,bevelEnabled:false});
+  const sh=FR.sections[mb.sec]||{k:'tube',b:50,h:50,t:3},geo=new T.ExtrudeGeometry(f3Shape(sh),{depth:L,steps:Math.max(14,Math.ceil(L/0.02)),bevelEnabled:false});
   const z=b.clone().sub(a).normalize(),up=Math.abs(z.y)>0.9?new T.Vector3(1,0,0):new T.Vector3(0,1,0),x=up.clone().cross(z).normalize(),y=z.clone().cross(x);
   if(sh.k==='chan'){const to=cen[mb.g].clone().sub(a.clone().add(b).multiplyScalar(0.5));to.y=0;const dt=to.dot(x);   // a mirrored pair: every channel opens towards the middle (or all away from it)
    if(Math.abs(dt)>0.01&&((dt<0)!==!!FR.chan_out)){x.negate();y.negate();}}
@@ -24986,14 +25129,16 @@ function f3Build(){if(!F3||!FR)return;const T=F3.THREE,M=FR.model3d,V=p=>new T.V
     cols[i*3]=cc.r;cols[i*3+1]=cc.g;cols[i*3+2]=cc.b;}
    geo.setAttribute('color',new T.BufferAttribute(cols,3));}
   const m=by[mb.id],u=m?m.util_work:0,steel=m?m.material_id==='steel':(FR.inputs.material==='steel'&&sh.k!=='tslot'),metal=new T.Color(steel?0x6b7785:0xb7c0ca);
-  // parts bend only in the heat map: the rig view keeps every part straight
-  if(m&&f3Opt.bend&&heat){const bow=new T.Vector3(mb.bow[0],mb.bow[2],-mb.bow[1]),amp=m.defl_work/1000*20,pos=geo.attributes.position,p=new T.Vector3();
-   for(let i=0;i<pos.count;i++){p.fromBufferAttribute(pos,i);const t=Math.min(1,Math.max(0,p.clone().sub(a).dot(z)/L)),f=mb.model==='cantilever'?(mb.fix==='t'?(t>mb.fx?Math.pow((t-mb.fx)/Math.max(1e-6,1-mb.fx),2):0):t*t):Math.sin(Math.PI*t);
-    pos.setXYZ(i,p.x+bow.x*amp*f,p.y+bow.y*amp*f,p.z+bow.z*amp*f);}
+  // parts bend only in the heat map: the rig view keeps every part straight. 2.9.6: a part bends only between the
+  // places where something is bolted to it (joints, brackets, the slider, the pivot bolt) - never under a plate or past one
+  const bf=(m&&f3Opt.bend&&heat)?f3BendFn(mb,m,L):null;
+  if(bf){const bow=new T.Vector3(mb.bow[0],mb.bow[2],-mb.bow[1]),pos=geo.attributes.position,p=new T.Vector3();
+   for(let i=0;i<pos.count;i++){p.fromBufferAttribute(pos,i);const f=bf(Math.min(1,Math.max(0,p.clone().sub(a).dot(z)/L)));
+    pos.setXYZ(i,p.x+bow.x*f,p.y+bow.y*f,p.z+bow.z*f);}
    pos.needsUpdate=true;geo.computeVertexNormals();}
   let col=metal.clone();if(heat)col=new T.Color(0xffffff);else if(m&&f3Opt.stress)col.lerp(stressCol(u),u>0.8?0.9:0.35);
   const mat=new T.MeshStandardMaterial({vertexColors:heat,color:col,metalness:heat?0.1:0.55,roughness:heat?0.7:0.42,emissive:(m&&(heat||f3Opt.stress)&&u>1)?0x7a0e0e:0x000000});
-  const mesh=new T.Mesh(geo,mat);mesh.userData={id:mb.id,a,b,h:sh.h/1000,base:col.clone()};G[mb.g].add(mesh);if(mb.g==='tilt')F3.tiltBars.push(mesh);}
+  const mesh=new T.Mesh(geo,mat);mesh.userData={id:mb.id,k:M.members.indexOf(mb),a,b,h:sh.h/1000,base:col.clone()};G[mb.g].add(mesh);if(mb.g==='tilt')F3.tiltBars.push(mesh);}
  for(const J of (M.joints||[]))f3Joint(J,G,heat);
  for(const f of (M.feet||[])){const ft=new T.Mesh(new T.CylinderGeometry(0.03,0.036,0.03,18),new T.MeshStandardMaterial({color:0x1c2128,roughness:0.7}));const p=V(f);p.y-=0.015;ft.position.copy(p);ft.userData={a:1};G.base.add(ft);}
  // the seat: x-ray by default, so it never hides the frame
@@ -25036,12 +25181,20 @@ function f3Build(){if(!F3||!FR)return;const T=F3.THREE,M=FR.model3d,V=p=>new T.V
  const rotary=M.drive==='rotary',ctc=M.ctc/1000;
  for(const A of M.acts){const g=G[A.g],base=V(A.base),top=V(A.top),dir=new T.Vector3(A.dir[0],A.dir[2],-A.dir[1]),o={A,g,base,top,topG:A.axis==='yaw'?G.yaw:A.axis==='surge'?G.surge:G.tilt,neutral:base.distanceTo(top),parts:[]};
   if(A.axis==='lift'&&rotary){o.shaft=base.clone().add(new T.Vector3(0,0.095,0)).sub(dir.clone().multiplyScalar(ctc));o.dir=dir;
-   const gb=new T.Mesh(new T.BoxGeometry(0.12,0.12,0.1),dm());gb.position.copy(o.shaft);g.add(gb);
-   const can=new T.Mesh(new T.CylinderGeometry(0.045,0.045,0.17,18),om());can.rotation.z=Math.PI/2;can.position.copy(o.shaft).sub(dir.clone().multiplyScalar(0.145));if(Math.abs(dir.x)<0.5)can.rotation.set(Math.PI/2,0,0);g.add(can);
+   // 2.9.6: the gearbox sits beside the lever (inboard), so the lever and the push rod's lower end are on the shaft outside it
+   const ax=new T.Vector3(0,1,0).cross(dir).normalize();if(o.shaft.z*ax.z>0)ax.negate();const gc=o.shaft.clone().addScaledVector(ax,0.072);
+   const gb=new T.Mesh(new T.BoxGeometry(0.12,0.12,0.1),dm());gb.position.copy(gc);g.add(gb);
+   const ms=new T.Mesh(new T.BoxGeometry(0.15,0.035,0.12),dm());ms.position.set(gc.x,base.y+0.0175,gc.z);g.add(ms);   // its mounting block, down to what it stands on
+   const sft=new T.Mesh(new T.CylinderGeometry(0.0095,0.0095,0.05,14),new T.MeshStandardMaterial({color:0xb7c0ca,metalness:0.7,roughness:0.3}));sft.quaternion.setFromUnitVectors(new T.Vector3(0,1,0),ax);sft.position.copy(o.shaft).addScaledVector(ax,0.012);g.add(sft);
+   const can=new T.Mesh(new T.CylinderGeometry(0.045,0.045,0.17,18),om());can.rotation.z=Math.PI/2;can.position.copy(gc).sub(dir.clone().multiplyScalar(0.145));if(Math.abs(dir.x)<0.5)can.rotation.set(Math.PI/2,0,0);g.add(can);
    o.lever=stick(0.016);o.rod=stick(0.009);o.parts=[o.lever,o.rod,can];}
   else{const horiz=A.axis==='yaw'||A.axis==='surge';o.body=stick(0.034);o.rod=stick(0.013);o.parts=[o.body,o.rod];
    if(A.flip){o.cap=new T.Mesh(new T.CylinderGeometry(0.03,0.03,1,14),dm());root.add(o.cap);   // body on the moving frame with the servo on top; the rod and its foot below
-    const ft=new T.Mesh(new T.CylinderGeometry(0.04,0.045,0.018,18),dm());ft.position.copy(base).add(new T.Vector3(0,0.009,0));g.add(ft);
+    // 2.9.6: a rubber foot under the rod, standing on the floor or on the frame under it: the pad, a steel cup, the ball stud
+    const rub=new T.MeshStandardMaterial({color:0x111316,roughness:0.95,metalness:0}),stl=new T.MeshStandardMaterial({color:0x9aa5b1,metalness:0.75,roughness:0.3});
+    const pad=new T.Mesh(new T.CylinderGeometry(0.036,0.042,0.016,24),rub);pad.position.copy(base).add(new T.Vector3(0,0.008,0));pad.userData={foot:1};g.add(pad);
+    const cup=new T.Mesh(new T.CylinderGeometry(0.026,0.03,0.006,20),stl);cup.position.copy(base).add(new T.Vector3(0,0.019,0));g.add(cup);
+    const ball=new T.Mesh(new T.SphereGeometry(0.011,14,10),stl);ball.position.copy(base).add(new T.Vector3(0,0.025,0));g.add(ball);
     const to=new T.Vector3((A.to||[0,0])[0]/1000,0,-(A.to||[0,0])[1]/1000),tl=to.length();   // its mounting bracket: a clamp round the body, bolted to the frame
     const sm=new T.MeshStandardMaterial({color:0x8793a1,metalness:0.7,roughness:0.35});
     const col=new T.Mesh(new T.CylinderGeometry(0.046,0.046,0.075,20),sm);col.position.copy(top);o.topG.add(col);
@@ -25095,7 +25248,7 @@ function f3Joint(J,G,heat){const T=F3.THREE,D=v=>new T.Vector3(v[0],v[2],-v[1]),
    prism(pts,th,-th/2,J.kind==='weld'?new T.MeshStandardMaterial({color:heat?hc:0x596373,metalness:0.4,roughness:0.6}):pm);
    if(J.kind!=='weld'){const cn=p.clone().addScaledVector(d1,w2).addScaledVector(d2,sg*w2);
     for(let i=0;i<2;i++){const f=0.02+0.028*i;cyl(cn.clone().addScaledVector(d1,f).addScaledVector(d2,sg*0.004),d2,0.014,dia*0.75,bm);cyl(cn.clone().addScaledVector(d2,sg*f).addScaledVector(d1,0.004),d1,0.014,dia*0.75,bm);}}}}}
-function f3Stick(m,p,q){const T=F3.THREE,d=q.clone().sub(p),L=Math.max(d.length(),1e-4);m.position.copy(p).addScaledVector(d,0.5);m.scale.set(1,L,1);m.quaternion.setFromUnitVectors(new T.Vector3(0,1,0),d.multiplyScalar(1/L));}
+function f3Stick(m,p,q){const T=F3.THREE,d=q.clone().sub(p),L=Math.max(d.length(),1e-4);m.position.copy(p).addScaledVector(d,0.5);if(m.parent)m.parent.worldToLocal(m.position);m.scale.set(1,L,1);m.quaternion.setFromUnitVectors(new T.Vector3(0,1,0),d.multiplyScalar(1/L));}   // p, q in world space; 2.9.6: placed in its parent's space (the rig is lifted onto the floor)
 function f3Pose(t){const M=FR.model3d,L=M.limits,a=FR.actuator,k=f3Amp,w=2*Math.PI,P={pitch:0,roll:0,yaw:0,heave:0,surge:0,sway:0};
  const s=(per,ph)=>Math.sin(w*t/per+(ph||0));
  if(f3Move==='all'){P.pitch=L.pitch*k*0.6*s(3.1);P.roll=L.roll*k*0.6*s(2.3,1);P.yaw=(L.yaw||0)*k*0.7*s(4.1,2);P.heave=(L.heave||0)*k*0.4*s(1.9,0.5);P.surge=(L.surge||0)*k*0.6*s(3.7,1.2);P.sway=(L.sway||0)*k*0.5*s(2.9,2.2);}
@@ -25119,7 +25272,7 @@ function f3Frame(){if(!F3||!F3.on||!F3.root||!FR)return;requestAnimationFrame(f3
    const dw=o.dir.clone().transformDirection(o.g.matrixWorld),end=sh.clone().addScaledVector(dw,ctc*Math.cos(al)).add(new T.Vector3(0,ctc*Math.sin(al),0));
    f3Stick(o.lever,sh,end);f3Stick(o.rod,end,tp);ext=dz;}
   else{ext=b.distanceTo(tp)-o.neutral;const d=tp.clone().sub(b).normalize(),bl=Math.max(0.05,o.neutral-half-0.04);
-   if(o.A.flip){const e=tp.clone().addScaledVector(d,M.travel*mm+0.07);f3Stick(o.body,tp.clone().addScaledVector(d,-0.04),e);f3Stick(o.cap,e,e.clone().addScaledVector(d,0.075));f3Stick(o.rod,b,tp);}
+   if(o.A.flip){const ab=M.act_body||[40,M.travel+70,75],e=tp.clone().addScaledVector(d,ab[1]*mm);f3Stick(o.body,tp.clone().addScaledVector(d,-ab[0]*mm),e);f3Stick(o.cap,e,e.clone().addScaledVector(d,ab[2]*mm));f3Stick(o.rod,b.clone().addScaledVector(d,0.025),tp);}   // 2.9.6: the body as long as its ball screw, the bracket low on it
    else{f3Stick(o.body,b,b.clone().addScaledVector(d,bl));f3Stick(o.rod,b,tp);}}
   const over=Math.abs(ext)>half*1.02+0.0005;if(over)out.push(o.A.name);
   const c=over||F3.drop?red:heat?hc:weak?amber:org;o.parts.forEach(p=>{p.material.color.copy(c);p.material.emissive.setHex(over||F3.drop?0x5a0a0a:0);});}
@@ -25136,7 +25289,7 @@ function f3Frame(){if(!F3||!F3.on||!F3.root||!FR)return;requestAnimationFrame(f3
  for(const j of (FR.joints||[]))if(j.u>1)say.push(['bad','Joint: '+j.name+' - '+Math.round(j.u*100)+'% of what '+j.hw+' should carry.']);else if(j.u>0.8)say.push(['warn','Joint: '+j.name+' - '+Math.round(j.u*100)+'% with '+j.hw+'.']);
  if(!say.length)say.push(['ok','Nothing complains at this weight and movement.']);
  const key=say.map(x=>x[1]).join('|');
- if(key!==F3.said){F3.said=key;$('f3hud').innerHTML=say.map(x=>`<div class="fr-${x[0]}"><i></i>${esc(x[1])}</div>`).join('');$('f3hud').dataset.level=say.some(x=>x[0]==='bad')?'bad':say.some(x=>x[0]==='warn')?'warn':'ok';}
+ if(key!==F3.said){F3.said=key;$('f3hud').innerHTML=say.map(x=>`<div class="fr-${x[0]}"><i></i>${esc(x[1])}</div>`).join('');const lv=say.some(x=>x[0]==='bad')?'bad':say.some(x=>x[0]==='warn')?'warn':'ok';$('f3hud').dataset.level=lv;f3NotesPill(say.length,lv);}
  const pz=$('f3pose');if(pz){const now=performance.now();if(!F3.pt||now-F3.pt>150){F3.pt=now;pz.textContent=M.axes.map(x=>x+' '+(P[x]>=0?'+':'')+P[x].toFixed(x==='heave'||x==='surge'||x==='sway'?0:1)+(x==='heave'||x==='surge'||x==='sway'?' mm':'°')).join('   ');}}
  F3.ctl.update();F3.R.render(F3.scene,F3.cam);}
 function f3Controls(){const mv=$('f3_move');if(!mv||!FR)return;const ax=FR.model3d.axes;
@@ -25152,7 +25305,8 @@ async function frPdf(){const b=$('fr_pdf');b.disabled=true;
   const blob=await r.blob(),a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='motion-rig-frame-design.pdf';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(a.href),8000);toast('PDF saved: motion-rig-frame-design.pdf');
  }catch(e){toast('Could not make the PDF.',1);}b.disabled=false;}
 $('frwiz').addEventListener('input',e=>{if(e.target.id==='f3_amp'){f3Amp=e.target.value/100;$('f3_ampv').textContent=e.target.value+'% of its range';return;}
- const k=e.target.dataset&&e.target.dataset.f;if(!k)return;const v=parseFloat(e.target.value);if(!isFinite(v))return;frIn[k]=frConv(k,v,true);if(k==='seat_slide'&&F3&&F3.seat)F3.seat.position.x=F3.seatX+frIn.seat_slide/1000;if(e.target.type==='range'){const b=e.target.parentNode.querySelector('b');if(b)b.textContent=e.target.value+' '+frUnit(k);}if(['rpm','torque','torque_peak','motor_w','volts','ratio','travel','lead','servo_torque','servo_peak','servo_rpm'].includes(k)){frIn.preset='custom';const ps=$('fr_preset');if(ps)ps.value='custom';}frCalc();});
+ const k=e.target.dataset&&e.target.dataset.f;if(!k)return;const v=parseFloat(e.target.value);if(!isFinite(v))return;if(k==='tpi'){if(v<=0)return;frIn.lead=25.4/v;const le=document.querySelector('#fr_body input[data-f=lead]');if(le)le.value=frFmt('lead',frIn.lead);}else frIn[k]=frConv(k,v,true);
+ if(k==='lead'&&frIn.lead>0){const te=document.querySelector('#fr_body input[data-f=tpi]');if(te)te.value=frFmt('tpi',25.4/frIn.lead);}if(k==='seat_slide'&&F3&&F3.seat)F3.seat.position.x=F3.seatX+frIn.seat_slide/1000;if(e.target.type==='range'){const b=e.target.parentNode.querySelector('b');if(b)b.textContent=e.target.value+' '+frUnit(k);}if(['rpm','torque','torque_peak','motor_w','volts','ratio','travel','lead','tpi','screw_len','servo_torque','servo_peak','servo_rpm'].includes(k)){frIn.preset='custom';const ps=$('fr_preset');if(ps)ps.value='custom';}frCalc();});
 $('frwiz').addEventListener('change',e=>{const t=e.target;
  if(t.dataset&&t.dataset.f){if(t.type==='range')frCalc();else frCalc(true);return;}
  if(t.id==='f3_xray'||t.id==='f3_stress'||t.id==='f3_bend'){f3Opt[t.id.slice(3)]=t.checked;f3Build();return;}
@@ -25170,6 +25324,7 @@ document.addEventListener('click',e=>{const t=e.target.closest&&e.target.closest
  if(t.id==='fr_braceclear'){frIn.braces=[];frCalc(true);}
  else if(t.id==='fr_fixall'){const fl=FR.fixes.filter(f=>f.first);frPatch((fl.length?fl:FR.fixes.filter(f=>f.level!=='tip')).map(f=>f.patch));}
  else frPatch([FR.fixes[+t.dataset.fix].patch]);});
+$('f3notes').addEventListener('click',()=>{f3NotesShow(!f3NotesOn);f3NotesPill($('f3hud').children.length,$('f3hud').dataset.level||'ok');});
 $('f3views').addEventListener('click',e=>{const b=e.target.closest('button');if(b){f3View=b.dataset.view;f3Build();}});
 $('frwiz').addEventListener('click',e=>{if(e.target.id==='fr_mixclear'){e.preventDefault();frIn.mix={};frCalc();return;}const b=e.target.closest('button');if(!b)return;
  if(b.dataset.s!==undefined){frStep=+b.dataset.s;frRender();}

@@ -3,6 +3,26 @@
 `smc3_scope` (the page) and `SMC3_R4` (the firmware) are versioned separately. The page works with older
 firmware too; the notes say which firmware a feature needs.
 
+## Page 2.9.6 (firmware 2.1.1 unchanged)
+
+- **Frame Design, ball-screw actuators**: the Drive step asks for the **ball screw's length** and shows **turns per
+  inch** beside the lead (type either; 2.54 turns per inch = a 10 mm lead). The presets fill the length in (SFX-100:
+  250 mm). A check says how much travel the screw gives (the nut, the bearings and the machined ends take about
+  150 mm), how long the actuator is with its servo on top and how high it holds the frame; with more travel than the
+  screw gives, **Use a 350 mm ball screw** (or whatever fits) under What would make it better. The parts list and the
+  PDF name the screw's length, lead and turns per inch.
+- **3D test, the actuators**: a screw actuator is as long as its screw with the servo on top, its bracket low on its
+  body - a rig on SFX-100s sits about 170 mm (6.7 in) off the ground at mid travel. Each one stands on a **rubber
+  foot** (a pad, a steel cup and the ball stud under the rod): on the floor, on the traction-loss sub-frame (its rails
+  now run right under the actuators) or on a foot plate on the cross-member under it. Lever motors: the gearbox sits
+  beside the lever on a mounting block, the shaft showing.
+- **3D test, the heat map**: each part is held where something is bolted to it - joints, brackets, the seat's slider,
+  the yaw pivot bolt - and where it stands: levelling feet, rollers, the actuators' feet. It bends only between those,
+  straight under every plate and past its last bracket; a short span bends less than a long one, and never much more
+  than a 50th of its length.
+- **3D test, the notes**: what runs out of travel or is close to its limit sits behind a **Notes** button at the top
+  left of the view, its dot red, amber or green; closed unless you open it, and remembered.
+
 ## Page 2.9.5 (firmware 2.1.1 unchanged; beta firmware 2.2.0b1 built in)
 
 - **Electronics Design**, a second wizard in the menu: everything between the wall socket and the motors. It keeps

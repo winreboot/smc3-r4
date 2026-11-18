@@ -353,7 +353,12 @@ actuator must push against what it can, and a list of checks in plain words.
 
 2. **Drive** - a gear motor with a lever and a push rod (presets for wheelchair, worm-gear and wiper motors) or a
    ball-screw actuator (SFX-100 style presets), or your own numbers: rpm, torque, gearing, lever length and swing, or
-   travel, screw lead and servo.
+   travel, the **ball screw's length** and **lead** (in mm per turn, or in **turns per inch** - type either), and the
+   servo. The nut, the bearings and the machined ends take about 150 mm of a screw: the page says how much travel it
+   gives, how long the actuator is with its servo on top and how high it holds the frame (page 2.9.6), and suggests a
+   longer screw when the travel needs one.
+
+   <img src="docs/img/frame-design-drive-screw_v2.9.6.png" width="560" alt="The Drive step: travel, ball-screw length, lead and turns per inch, the servo; the actuator's length and the frame's height">
 3. **Size** - the weights (driver, seat and slider, wheel and wheelbase, pedals, everything else that moves) and the
    distances. Millimetres and kilograms, or inches and pounds.
 
@@ -392,10 +397,12 @@ actuator must push against what it can, and a list of checks in plain words.
 
    ![The Build step: cut list, hardware, assembly order and cost](docs/img/frame-design-build-step_v2.9.4.png)
 
-6. **3D test** - the rig as designed: real sections, plates and bolts, motors or actuators with their brackets, the
-   seat on its slider, the wheelbase on its deck, the pedals. Drag to turn it, scroll to zoom.
+6. **3D test** - the rig as designed: real sections, plates and bolts, the seat on its slider, the wheelbase on its
+   deck, the pedals; screw actuators as long as their screws, each standing on a **rubber foot** - on the floor, on the
+   traction-loss sub-frame or on a foot plate - and lever motors with the lever beside the gearbox. Drag to turn it,
+   scroll to zoom.
 
-   ![The 3D test](docs/img/frame-design-3dtest_v2.9.4.png)
+   ![The 3D test: four SFX-100 style actuators on rubber feet, the frame 170 mm off the ground](docs/img/frame-design-3dtest_v2.9.6.png)
 
    - **Weight on the seat**: a slider and 150 / 220 / 300 / 400 lb buttons; the weight is drawn on the seat with its
      amount.
@@ -404,11 +411,17 @@ actuator must push against what it can, and a list of checks in plain words.
      first. An actuator turns red when it runs out of travel or of force.
    - **Adjust the design** with sliders and watch it change.
    - **Rig** shows every part as built. **Heat map** colours the frame by how much of its allowance the load uses -
-     the joints first, fading along each beam - and lets the parts bend, drawn 20 times larger than life.
+     the joints first, fading along each beam - and lets the parts bend, drawn 20 times larger than life (never much
+     more than a 50th of a span). A part is held wherever something is bolted to it or it stands - joints, brackets,
+     the seat's slider, the pivot bolt, feet, rollers - and bends only between those, straight under every plate.
+   - **Notes**: what runs out of travel or is close to its limit, behind the **Notes** button at the top left of the
+     view; its dot is red, amber or green.
 
    ![Rig view, close up: plates, bolts, the wheel deck, the seat slider](docs/img/frame-design-3d-close_v2.9.4.png)
 
-   ![Heat map with 136 kg (300 lb) on the seat](docs/img/frame-design-heatmap_v2.9.4.png)
+   ![Heat map with 136 kg (300 lb) on the seat: each part bends between where it is held](docs/img/frame-design-heatmap_v2.9.6.png)
+
+   <img src="docs/img/frame-design-feet_v2.9.6.png" width="560" alt="A screw actuator's rubber foot on the traction-loss sub-frame">
 
 Every layout carries a seat on a slider, a steering wheel on a deck frame and pedals; on a seat mover that moves the
 seat only, the wheel and pedals stand on the base.
@@ -1029,7 +1042,7 @@ board on network**).
 [latest release](https://github.com/winreboot/smc3-r4/releases/latest) and run
 
 ```sh
-python3 smc3_scope_v2.9.5.py --host 192.168.1.50 --bind 0.0.0.0 --web 8198
+python3 smc3_scope_v2.9.6.py --host 192.168.1.50 --bind 0.0.0.0 --web 8198
 ```
 
 (`py` instead of `python3` on Windows). `--bind 0.0.0.0` makes the page reachable from other devices; without it,
