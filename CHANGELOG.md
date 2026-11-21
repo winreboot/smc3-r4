@@ -3,6 +3,25 @@
 `smc3_scope` (the page) and `SMC3_R4` (the firmware) are versioned separately. The page works with older
 firmware too; the notes say which firmware a feature needs.
 
+## Page 2.9.7 (firmware 2.1.1 unchanged)
+
+- **New pictures throughout the page**, all renders made for it in one style - a dark studio backdrop with a blue rim
+  light, the same in Dark and Day: the seat emblem in the header, a full cockpit on four ball-screw actuators in the
+  menu, and a gear motor (or a ball-screw actuator) on each motor card.
+- **Electronics Design**: a picture on every card - the two drive choices, the motor presets (wheelchair, scooter-type,
+  worm and wiper motors), the drivers (the IBT-2 on its heat sink, single- and two-channel boards, 100 A bridges, the
+  shield, the boxed controllers), the power supplies (LED, adjustable, industrial, server, PC, batteries in series)
+  and the servo kits. Cards for your own motor or driver keep their icon. Settings, Motor drivers: the two driver kinds
+  pictured.
+- **Frame Design**: *What drives it?* (gear motor with a lever, or linear actuator) and, on a seat mover, *What moves?*
+  (the seat only, or seat, wheel and pedals together) are picked from picture tiles.
+- **Settings, What moves the seat**: gear motors turning a lever, or ball-screw linear actuators - two picture tiles set
+  every motor, and a menu beside each motor's name sets that one, for a rig that has both. The Dashboard's motor cards
+  show the matching picture. Saved with the page's settings (`motor_kind` in `config.json`); until it is set, the cards
+  show the actuator with the servo firmware and the gear motor otherwise. It changes only the pictures.
+- The pictures (WebP, about 140 KB in all) are served by the page itself, so it still works without internet access.
+  The page asks for them by its version and they carry an ETag, so a picture changed in an update shows at once.
+
 ## Page 2.9.6 (firmware 2.1.1 unchanged)
 
 - **Frame Design, ball-screw actuators**: the Drive step asks for the **ball screw's length** and shows **turns per

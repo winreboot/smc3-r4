@@ -42,7 +42,9 @@ The page lets you:
 - **plan the electronics** with **Electronics Design**: motors, drivers (IBT-2 and Cytron among them), supplies,
   protection and the wiring as pictures, the parts with a ball-park cost, **1:1 templates** for the lever and the
   sensor bracket, and **the firmware set up for your design** - with an **All firmware** table of every sketch
-  ([Electronics design](#electronics-design)).
+  ([Electronics design](#electronics-design));
+- **say what moves your seat** - gear motors turning a lever, or ball-screw actuators, or both - and each motor card
+  shows the matching picture ([What moves the seat](#what-moves-the-seat)).
 
 It knows two kinds of rig: **two front lifts plus a traction-loss motor** (motors 1 and 2 lift the front corners,
 motor 3 is mounted horizontally and swings the rear left and right about a pivot at the front - the default), and
@@ -53,7 +55,7 @@ the same time. You can open it from any browser, including your phone. For calib
 can use the USB cable instead (page 2.8, firmware 1.9.5; 2.0 recommended - it gives the board its own USB port): see
 [USB cable for calibration](docs/INSTALL.md#usb-cable-for-calibration).
 
-![Dashboard: three motors moving under SimHub, motor 2 selected](docs/img/dashboard.png)
+![Dashboard: three motors under SimHub, a gear motor on each card, the rig in the menu](docs/img/dashboard_v2.9.7.png)
 
 ---
 
@@ -103,7 +105,7 @@ is.
 
 **Day, Dark and Auto** (which follows your computer):
 
-![Day theme](docs/img/dashboard-day.png)
+![Day theme](docs/img/dashboard-day_v2.9.7.png)
 
 **Every control explains itself.** Hover over any setting, button or status item to see what it does on the rig,
 what too low and too high feel like, and where to start.
@@ -351,14 +353,14 @@ actuator must push against what it can, and a list of checks in plain words.
    | 6 | 4 corners + traction loss + surge | pitch, roll, heave, yaw, surge |
    | 6 | Stewart platform | all six |
 
-2. **Drive** - a gear motor with a lever and a push rod (presets for wheelchair, worm-gear and wiper motors) or a
-   ball-screw actuator (SFX-100 style presets), or your own numbers: rpm, torque, gearing, lever length and swing, or
+2. **Drive** - picked from two picture tiles: a gear motor with a lever and a push rod (presets for wheelchair,
+   worm-gear and wiper motors) or a ball-screw actuator (SFX-100 style presets), or your own numbers: rpm, torque, gearing, lever length and swing, or
    travel, the **ball screw's length** and **lead** (in mm per turn, or in **turns per inch** - type either), and the
    servo. The nut, the bearings and the machined ends take about 150 mm of a screw: the page says how much travel it
    gives, how long the actuator is with its servo on top and how high it holds the frame (page 2.9.6), and suggests a
    longer screw when the travel needs one.
 
-   <img src="docs/img/frame-design-drive-screw_v2.9.6.png" width="560" alt="The Drive step: travel, ball-screw length, lead and turns per inch, the servo; the actuator's length and the frame's height">
+   <img src="docs/img/frame-design-drive_v2.9.7.png" width="560" alt="The Drive step: gear motor or linear actuator as picture tiles; travel, ball-screw length, lead and turns per inch">
 3. **Size** - the weights (driver, seat and slider, wheel and wheelbase, pedals, everything else that moves) and the
    distances. Millimetres and kilograms, or inches and pounds.
 
@@ -424,7 +426,10 @@ actuator must push against what it can, and a list of checks in plain words.
    <img src="docs/img/frame-design-feet_v2.9.6.png" width="560" alt="A screw actuator's rubber foot on the traction-loss sub-frame">
 
 Every layout carries a seat on a slider, a steering wheel on a deck frame and pedals; on a seat mover that moves the
-seat only, the wheel and pedals stand on the base.
+seat only, the wheel and pedals stand on the base. On a seat mover, **What moves?** is picked from two picture tiles:
+the seat only, or seat, wheel and pedals together (page 2.9.7).
+
+<img src="docs/img/frame-design-moves_v2.9.7.png" width="560" alt="Frame Design, a seat mover: what moves - the seat only, or seat, wheel and pedals together">
 
 ![A seat mover, four corners, four corners with traction loss and surge, and a Stewart platform](docs/img/frame-design-layouts_v2.9.4.jpg)
 
@@ -443,7 +448,8 @@ design you will sit in checked, fit mechanical end stops, and keep an emergency 
 
 Page 2.9.5. A second wizard in the menu, for everything between the wall socket and the motors: the motors, the
 drivers, the supplies, the protection, the wiring as pictures, the parts with a ball-park cost, the first power-up -
-and the firmware set up for your design. Like Frame Design it is a calculator and a drawing board: nothing in it talks
+and the firmware set up for your design. Every motor, driver, supply and servo card has a picture of that kind of
+part (page 2.9.7). Like Frame Design it is a calculator and a drawing board: nothing in it talks
 to the board, it works without a rig, and it keeps your design between visits.
 
 ![Electronics Design: the wizard on the left; the verdict, the firmware for the design and the wiring pictures on the right](docs/img/electronics-design_v2.9.5.png)
@@ -457,7 +463,7 @@ the firmware box and the wiring pictures. The wizard has five steps:
    MY1016Z, ElectroCraft, worm gear, wiper), your own label's values, or the motor from your Frame Design; the parking
    brake; the **lever and its push rod** (between centres, swing, the shaft and its key, M8 / M10 / M12 rod ends).
 
-   ![The Motors step: what moves the seat, how many, which motor, the lever and its push rod](docs/img/electronics-motors-step_v2.9.5.png)
+   <img src="docs/img/electronics-motors-step_v2.9.7.png" width="560" alt="The Motors step: what moves the seat, how many, which motor - each with its picture">
 
 2. **Driver** - IBT-2 (BTS7960), Cytron **MD30C**, **SmartDriveDuo-30 (MDDS30)**, **MDD10A**, SmartDriveDuo-60,
    MD13S, 100 A class bridges, the Monster Moto shield, or your own: what each carries all day and for a moment, the
@@ -465,13 +471,13 @@ the firmware box and the wiring pictures. The wizard has five steps:
    boards run two motors each and are drawn and counted as boards. Sabertooth is listed too, with why no SMC3 firmware
    drives it.
 
-   ![The Driver step: each driver with what it carries, the voltage, the PWM and how the board drives it](docs/img/electronics-driver-step_v2.9.5.png)
+   <img src="docs/img/electronics-driver-step_v2.9.7.png" width="560" alt="The Driver step: each driver with its picture, what it carries, the voltage, the PWM and how the board drives it">
 
 3. **Power** - **how hard the motors work** (a balanced seat, a seat mover, lifts that carry part of the rig, or every
    motor at its rating - the Frame Design works it out for its rig), the kind of supply, its voltage and current, how
    many, your mains, **what takes the braking energy** (a diode and capacitors, or a buffer battery) and PWMmax.
 
-   ![The Power step: how hard the motors work, the supply, how many, the braking energy](docs/img/electronics-power-step_v2.9.5.png)
+   <img src="docs/img/electronics-power-step_v2.9.7.png" width="560" alt="The Power step: how hard the motors work, the supply with its picture, how many, the braking energy">
 
 4. **Protection** - a fuse and the wire for each driver board, the emergency stop with a relay, the position sensors
    (pots or contactless Hall sensors) and the motion sensor on the seat.
@@ -714,6 +720,18 @@ sensor can't - its jumps come from the wiring, its 5 V and GND, or the motor sup
 
 <img src="docs/img/position-sensors_v2.9.1.png" width="520" alt="Motor names card with Position sensors: Contactless Hall sensors">
 
+#### What moves the seat
+
+Page 2.9.7. **Gear motors turning a lever**, or **ball-screw linear actuators**: the two picture tiles set every motor,
+and the menu beside each motor's name sets that one - for a rig that has both, say actuators for the lifts and a gear
+motor for traction loss. The motor cards on the Dashboard show the matching picture. It is saved with the page's
+settings; until you pick, the cards show the actuator with the servo firmware and the gear motor otherwise. It
+changes only the pictures.
+
+<img src="docs/img/settings-what-moves_v2.9.7.png" width="560" alt="Settings, What moves the seat: actuators for motors 1 and 2, a gear motor for motor 3">
+
+![The motor cards: two actuators and a gear motor](docs/img/dashboard-actuators_v2.9.7.png)
+
 ![Settings with motor names](docs/img/settings.png)
 
 **LED matrix** and **Motion sensor** (firmware 1.8) are set here too, and saved on the board at once:
@@ -781,7 +799,7 @@ bridges (two PWM inputs) or **PWM + direction** drivers (Cytron MD30C, MD13S, MD
 recompiling. Cytron MD30C and MD13S take PWM up to 20 kHz: the same card sets 20 kHz and saves it. A board never told
 keeps what it was built for (IBT-2). With older firmware the sketch's `#define MODE1` / `MODE2` decides.
 
-<img src="docs/img/settings-motor-drivers_v2.9.5.png" width="740" alt="Motor drivers: IBT-2 / BTS7960 or PWM + direction, and Set PWM to 20 kHz">
+<img src="docs/img/settings-motor-drivers_v2.9.7.png" width="740" alt="Motor drivers: IBT-2 / BTS7960 or PWM + direction, and Set PWM to 20 kHz">
 
 **Servo actuators** (page 2.9.5, beta firmware `SMC3_R4_Servo` 2.2.0b1), shown instead of Motor drivers when the
 board runs the servo build: the stroke, ball-screw lead and pulses per turn, the acceleration limit, homing (at the
@@ -1042,7 +1060,7 @@ board on network**).
 [latest release](https://github.com/winreboot/smc3-r4/releases/latest) and run
 
 ```sh
-python3 smc3_scope_v2.9.6.py --host 192.168.1.50 --bind 0.0.0.0 --web 8198
+python3 smc3_scope_v2.9.7.py --host 192.168.1.50 --bind 0.0.0.0 --web 8198
 ```
 
 (`py` instead of `python3` on Windows). `--bind 0.0.0.0` makes the page reachable from other devices; without it,
