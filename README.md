@@ -29,7 +29,12 @@ The page lets you:
 - **restart the board** from the page - never while SimHub is driving;
 - **park the seat** with the **(P)** in Quick Controls: it goes down evenly to a park position you set - past the
   travel limits if it has to - and the motors switch off there, so no corner sinks on its own; it comes back up level
-  when you switch the motors on ([Park](#park));
+  when you switch the motors on, also after the page restarted ([Park](#park));
+- **level the park position with the bubble**: drag the bubble to where it should be and the lifts move the seat
+  there, step by step, until the motion sensor agrees ([Level with the bubble](#level-with-the-bubble));
+- **let the board park the seat itself** (firmware 2.2.0) when the game stops sending motion, or from a **park
+  button** on the rig with its own light - it rises evenly as soon as the game moves again
+  ([Park on the board and the park button](#park-on-the-board-and-the-park-button));
 - **watch motion presets in the 3D view** - wave, twist, heave, corner, an airliner landing and a lap of a circuit -
   while the real seat moves ([Motion presets](#motion-presets));
 - **centre the pots**: with the seat level, the page tells you which way to move each pot's belt, and how many
@@ -63,7 +68,7 @@ can use the USB cable instead (page 2.8, firmware 1.9.5; 2.0 recommended - it gi
 
 | Folder | What it is |
 |---|---|
-| [`firmware/SMC3_R4`](firmware/SMC3_R4) | Firmware for the **Arduino UNO R4 WiFi**. It speaks the SMC3 v0.70 protocol, so SimHub, SimTools, FlyPT Mover and SMC3Utils work unchanged. It adds a 4 kHz control loop, 14-bit pot readings, quiet 25 kHz PWM, target smoothing, a fixed PID, WiFi telemetry at 100 samples a second, an LED matrix that shows live motor bars and problems in words, a level trim with travel limits and end stops for each motor, a soft start, firmware updates over WiFi from the page, its own USB port (2.0: no WiFi chip in between), games on the LED matrix while idle (2.1), park mode (2.1.1), and an optional WT901C motion sensor with tilt limits for each direction. The page's Electronics Design also hands out sketches set up for other drivers and for ball-screw actuators with AC servos (beta 2.2.0b1). |
+| [`firmware/SMC3_R4`](firmware/SMC3_R4) | Firmware for the **Arduino UNO R4 WiFi**. It speaks the SMC3 v0.70 protocol, so SimHub, SimTools, FlyPT Mover and SMC3Utils work unchanged. It adds a 4 kHz control loop, 14-bit pot readings, quiet 25 kHz PWM, target smoothing, a fixed PID, WiFi telemetry at 100 samples a second, an LED matrix that shows live motor bars and problems in words, a level trim with travel limits and end stops for each motor, a soft start, firmware updates over WiFi from the page, its own USB port (2.0: no WiFi chip in between), games on the LED matrix while idle (2.1), park mode (2.1.1), park on the board with a park button and the motor driver type as a setting (2.2.0), and an optional WT901C motion sensor with tilt limits for each direction. [`firmware/SMC3_R4_Servo`](firmware/SMC3_R4_Servo) is the same sketch built for ball-screw actuators with AC servo drives (pulse + direction). The page's Electronics Design hands out sketches set up for each driver and servo drive. |
 | [`scope/`](scope) | `smc3_scope.py`: the page server. It's one file using only the Python standard library, with a Dockerfile and compose files for a NAS or any PC. A ready-made Docker image is on `ghcr.io/winreboot/smc3-scope`; step by step for Windows, Mac, Linux, Raspberry Pi, Docker and Synology: [docs/INSTALL.md](docs/INSTALL.md). |
 | [`tools/simboard.py`](tools/simboard.py) | A simulated rig. You can try everything without hardware, and inject faults (reversed motor, swapped wiring, glitchy pot and more). |
 | [`firmware/SMC3_smooth`](firmware/SMC3_smooth) | The original SMC3 for the **UNO R3**, with target smoothing and the PID fixes, for anyone staying on an R3. |
@@ -274,7 +279,8 @@ Step by step:
 
 ### Park
 
-Page 2.9.3, firmware 1.9 or newer; firmware 2.1.1 lets the park position go past the travel limits. With the motors
+Page 2.9.3, firmware 1.9 or newer; firmware 2.1.1 lets the park position go past the travel limits, and firmware
+2.2.0 can park the seat by itself ([below](#park-on-the-board-and-the-park-button)). With the motors
 off, a heavy corner can sink while friction holds the other, and the seat sits twisted until the next start. **Park**
 lowers the seat evenly first - every motor arriving at its park position at the same time - and switches the motors
 off there, where nothing sinks any further.
@@ -289,6 +295,10 @@ off there, where nothing sinks any further.
 - **Press it again, or Enable Motors, to unpark.** The seat rises evenly back to level, the same way it went down, and
   then SimHub has it. If a motor can't get back up, the page says which one and where it stopped, and switches the
   motors off again.
+- **Enable Motors with a lift at its end stop** (page 2.9.8): whenever a lift that is off rests at or within 24 counts
+  of its end stop - or past it - Enable Motors raises the seat evenly the same way, with the end stops out of the way,
+  even if the page didn't park it. The page remembers that it parked the seat across restarts, and the events say
+  which lift and why.
 - **While it pulses** (parking or unparking), pressing it stops: the motors switch off where the seat is.
 
 **After every park the page checks** that each motor got to its park position (or rests against its stop short of
@@ -307,10 +317,8 @@ end of each lift's travel window, with the rear slide centred. To set your own:
    power is off: on its lowest point, its stops, or wherever it settles. "Down" is the way each corner sinks - from
    the full check's answer, or else from where it rests with the motors off. **Raise 10** goes back up; the
    **▼ ▲** arrows on a row move one motor on its own (the rear slide gets −10 −1 +1 +10).
-3. With the motion sensor, press **Level side to side**: it evens the seat out using how each lift tilts it (Seat
-   setup measured that). Press it again until the roll is close to 0.
-
-![Park position card while setting it: arrows per motor, Lower the lifts, Level side to side, Save](docs/img/park-setting_v2.9.3.png)
+3. With the motion sensor, level it with the bubble ([below](#level-with-the-bubble)): **Level side to side**, or
+   drag the bubble where you want it.
 
 4. Press **Save this as the park position**. The positions are kept, and with the sensor the seat's angles there.
 5. Press **Park here now** to try it, or **Back up (cancel)** to glide back to where the seat was and give it to
@@ -323,11 +331,56 @@ end of each lift's travel window, with the rear slide centred. To set your own:
 You can also type the positions into the **Park at** boxes and press **Save typed values**, change the **Speed**
 (10-300 counts/s), or press **Default** to forget your park position.
 
+#### Level with the bubble
+
+Page 2.9.8, with the motion sensor and a Seat setup (it measured how each lift tilts the seat). While you set the
+park position, the card shows the seat's tilt as a bubble:
+
+- **Click or drag the bubble** to where it should be, or use the arrow keys (0.2° a press). The lifts move the seat
+  there a step at a time, and the sensor checks each step. *Seat now*'s bubble in Seat setup works the same way.
+- **Level side to side** goes on until the roll is under 0.1°: one lift up and the other down, so the height and the
+  pitch stay.
+- **Level front to back** says first how far it would raise the lifts. With two front lifts (and the rear on the
+  traction-loss slide) their height sets the pitch, so a seat parked lower than level tips front to back - that's
+  normal; the card says how far up level would be.
+- A lift already on its bottom stays there, pressed on gently, and the other lift does it; the message says which.
+  Moving a lift with its arrows, or **Stop**, ends the levelling.
+
+![Setting the park position: the bubble shows the seat at +0.4° roll and +2.0° pitch, the moves to level it](docs/img/park-bubble_v2.9.8.png)
+
+<img src="docs/img/park-levelled_v2.9.8.png" width="560" alt="Levelled side to side: the right lift stayed on its bottom, the left one did it">
+
+If a lift that was raised to level it sinks back once the motors are off, the park message says so: then the tilt
+comes from where the two lifts bottom out, and only the mechanics change it.
+
+#### Park on the board and the park button
+
+Firmware 2.2.0. The board can park the seat itself - the same glide as Park, every motor arriving together, then the
+motors switch off - so it works with the page closed. In the **Park position** card, **On the board**:
+
+- **Park on its own** (off unless you choose a time, 10 s to 30 min): when SimHub sends no motion for that long - no
+  positions, or the same position (a menu, a paused game, the car standing still) - the seat parks. As soon as SimHub
+  moves again it rises evenly to SimHub's position. With it on, the board also starts parked at power-up and rises
+  when the game moves.
+- **Park button (D8)**: a momentary push button from D8 to GND. Press: park. Press again: it rises evenly. On the way
+  down or up a press switches the motors off where the seat is. A press counts after 0.15 s, and a button held at
+  switch-on only after it is let go.
+- **Button light (D12)**: an LED from D12 to GND through 470 Ω - the button's own ring light. On = parked, blinking =
+  on the way, a short flicker = it can't park now.
+- **Enable Motors** and the **(P)** go through the board too, and the events list what the board did.
+
+<img src="docs/img/park-board_v2.9.8.png" width="560" alt="Park position card: On the board - park on its own, the park button and its light, and what the board is doing">
+
+![The park button's wiring: S1 from D8 to GND, its light from D12 through 470 ohm](docs/img/park-button-wiring_v2.9.8.png)
+
+It is not an emergency stop - it asks the board. Keep a switch that cuts the motor power within reach.
+
 **How far down:** with firmware 2.1.1 the board has a **park mode**: while the page parks the seat or you set the park
 position, those motors may go past their travel limits, Clip window and end stops - anywhere inside the SMC3 cutoff
 (Max limit). SMC3's PWMrev push back into the Clip window is left out and the tilt limits wait. Park mode lasts only
 while the page refreshes it every second, and lapses 3 s after the last refresh. With older firmware the park position
-stays inside the travel window, and unpark is Enable Motors: each motor creeps back up by itself.
+stays inside the travel window, and unpark is Enable Motors: each motor creeps back up by itself. Firmware 2.2.0 also
+lets a motor switched on at or just inside its end stop creep back without a noisy reading tripping the end stop.
 
 ### Frame design
 
@@ -533,10 +586,10 @@ jack, which makes a steady 5 V for the board and the Hall sensors; on USB alone 
 signal picture and the whole rig show it, and the parts list buys one per board. The USB cable stays for SimHub.
 
 **Firmware for your design.** Under the verdict, the firmware box downloads the sketch for the design, named after
-it - `SMC3_R4_v2.2.0b1_MDDS30_25kHz`, for example: a sketch folder in a .zip with the starting values already set
+it - `SMC3_R4_v2.2.0_MDDS30_25kHz`, for example: a sketch folder in a .zip with the starting values already set
 (driver type, PWM frequency, the motion sensor switched on when the design has one) and a header saying what was
-changed. Unzip, open it in the Arduino IDE, add your WiFi name and password, Upload. IBT-2 designs also get the 2.1.1
-release. Every sketch listens for the WT901C motion sensor with the same code as the 2.1.1 release.
+changed. Unzip, open it in the Arduino IDE, add your WiFi name and password, Upload. Every sketch is made from the
+2.2.0 release; All firmware still lists 2.1.1.
 
 **All firmware** (here, and in Settings, Firmware update) opens a table of every sketch the page can make - the
 published sketches, a ready-made set-up for each driver and servo drive, and the drivers no SMC3 firmware drives -
@@ -545,7 +598,8 @@ wizard's pick sits on top in green, and every row downloads.
 
 ![All firmware: every sketch, the wizard's pick on top, each with a Download button](docs/img/electronics-all-firmware_v2.9.5.png)
 
-**Ball-screw actuators with AC servos** (SFX-100 style, beta firmware `SMC3_R4_Servo` 2.2.0b1): the servo set (AASD-15A
+**Ball-screw actuators with AC servos** (SFX-100 style, firmware `SMC3_R4_Servo` 2.2.0 - it hasn't run on servo
+actuators yet): the servo set (AASD-15A
 with a 750 W or 400 W motor, or your own pulse + direction drive), the stroke, ball-screw lead and pulses per turn,
 where home is (the bottom, or home switches), the drive's own settings to make first, the parts and printed parts,
 and the pictures - **The actuator** cut open with every part named, and the signal wiring through two ULN2803A per
@@ -793,7 +847,7 @@ own firmware 0.4.0 or newer (Arduino IDE, Tools, Firmware Updater).
 **All firmware** (page 2.9.5), in the same card: the table of every sketch the page can make, each one to download -
 see [Electronics design](#electronics-design).
 
-**Motor drivers** (page 2.9.5, beta firmware 2.2.0b1): what the board's motor pins drive - **IBT-2 / BTS7960**
+**Motor drivers** (page 2.9.5, firmware 2.2.0): what the board's motor pins drive - **IBT-2 / BTS7960**
 bridges (two PWM inputs) or **PWM + direction** drivers (Cytron MD30C, MD13S, MDD10A, SmartDriveDuo-30 / -60, VNH,
 100 A class bridges) - chosen here with the motors switched off and SimHub stopped, saved on the board, no
 recompiling. Cytron MD30C and MD13S take PWM up to 20 kHz: the same card sets 20 kHz and saves it. A board never told
@@ -801,10 +855,18 @@ keeps what it was built for (IBT-2). With older firmware the sketch's `#define M
 
 <img src="docs/img/settings-motor-drivers_v2.9.7.png" width="740" alt="Motor drivers: IBT-2 / BTS7960 or PWM + direction, and Set PWM to 20 kHz">
 
-**Servo actuators** (page 2.9.5, beta firmware `SMC3_R4_Servo` 2.2.0b1), shown instead of Motor drivers when the
+**Servo actuators** (page 2.9.5, firmware `SMC3_R4_Servo` 2.2.0), shown instead of Motor drivers when the
 board runs the servo build: the stroke, ball-screw lead and pulses per turn, the acceleration limit, homing (at the
 bottom, or on home switches), the servo-on level, an emergency-stop contact on A3, reverse per actuator, and **Home
 again** with the motors off.
+
+**Fan** (page 2.9.8, firmware 2.2.0), for the Motion Shield - a controller board for the UNO R4 that is still in the
+works, with a 4-pin PC fan header: the board runs the fan itself from its temperature. **Quiet** (a slow built-in
+curve), **Smart** (your curve, and faster early while the motors work hard), **My curve** (five points you drag),
+**Fixed** or **Full**; full speed at the hot limit and without a temperature, in every mode. The card shows the
+temperature, the rpm and the last 30 minutes. Without the shield it says so, and the board leaves A4 / A5 alone.
+
+<img src="docs/img/fan-card_v2.9.8.png" width="740" alt="Settings, Fan: Smart mode, the curve, the board temperature, rpm and the last 30 minutes">
 
 **Restart** (page 2.9, firmware 2.0): the button next to Settings restarts the board as its RESET button does - the
 motors switch off first, and the page reconnects by itself. It is refused while SimHub sends positions, and while
@@ -951,9 +1013,10 @@ The Help section in the page sums everything up, including every LED matrix code
 
 - **Arduino UNO R4 WiFi**. The firmware is written for it: WiFi, LED matrix and the RA4M1's timers.
 - Motor bridges: **IBT-2 / BTS7960** (`MODE2`, the default), or a bridge with PWM plus two direction pins
-  (`MODE1`) - Cytron MD30C, MD13S, MDD10A, SmartDriveDuo-30 / -60, VNH and 100 A class bridges. With beta firmware
-  2.2.0b1 that is a setting (Settings, Motor drivers). The page's [Electronics design](#electronics-design) draws the
+  (`MODE1`) - Cytron MD30C, MD13S, MDD10A, SmartDriveDuo-30 / -60, VNH and 100 A class bridges. With firmware 2.2.0
+  that is a setting (Settings, Motor drivers). The page's [Electronics design](#electronics-design) draws the
   wiring for each.
+- Optional: a **park button** (momentary, D8 to GND) and its light (an LED from D12 through 470 Ω), firmware 2.2.0.
 - A **12 V adapter** for the board's barrel jack (1 A or more, 5.5 x 2.1 mm plug, centre +), besides the USB cable
   for SimHub: on USB alone the board gets about 4.7 V, and Hall sensors want 5 V.
 - Up to three DC motors with feedback pots, such as worm-gear wiper motors on crank arms or linear actuators, and
@@ -1060,7 +1123,7 @@ board on network**).
 [latest release](https://github.com/winreboot/smc3-r4/releases/latest) and run
 
 ```sh
-python3 smc3_scope_v2.9.7.py --host 192.168.1.50 --bind 0.0.0.0 --web 8198
+python3 smc3_scope_v2.9.8.py --host 192.168.1.50 --bind 0.0.0.0 --web 8198
 ```
 
 (`py` instead of `python3` on Windows). `--bind 0.0.0.0` makes the page reachable from other devices; without it,
@@ -1140,6 +1203,8 @@ noise. To see what the diagnostics find, add a fault:
 | `--pot-crackle 2:3` | motor 2's pot crackles about 3 times a second (bursts the glitch filter can't catch) |
 | `--supply-sag 2.5` | a weak shared motor supply: every motor gets less drive when they all pull at once |
 | `--fw211` | firmware 2.1.1: park mode, coming back up from past an end stop, the board's sensor link report |
+| `--fw2200` | firmware 2.2.0: park on the board (`--bp-auto 10`, `--bp-pos 150,150,512` to start with settings), the driver type setting, the end-stop rules of 2.2.0; `--servo` the servo build; `--fan` the Motion Shield with its fan |
+| `--deg-per-count 0.0056` | how much the lifts tilt the seat (default 0.03; real rigs 0.005-0.01) |
 | `--pot-offset 1:-60` | motor 1's pot belt sits 60 counts round (for Centre the pots); `--tooth 37`: counts per belt tooth |
 | `--lift-hard 2:140:0.35` | lifting motor 2 needs more drive past pot 140 (the sunk end of a `--sag` lift: a corner PWMmax alone can't lift) |
 | `--imu-baud 9600` / `--imu-angles-only` | the sensor's baud rate at start / it sends angles only |
@@ -1169,8 +1234,10 @@ noise. To see what the diagnostics find, add a fault:
   - 2.1.1: park mode - the page may take the seat past the travel limits to park it; a motor that rests past its end
     stop comes back up when the motors are switched on (also with the soft start off), with up to PWMrev's drive while
     it lags; the board keeps the motion sensor while Use the sensor is ticked, and reports its link (`[rdj]`).
-  - 2.2.0b1 (beta, from the page's All firmware): the motor driver type as a setting (`[kD n]`), and the servo build
-    `SMC3_R4_Servo` for ball-screw actuators with AC servo drives.
+  - 2.2.0: park on the board - on its own when the game stops, from a park button on D8 with its light on D12
+    (`[kb n]`, `[rdk]`); a motor switched on at or just inside its end stop comes back without the end stop tripping;
+    the motor driver type as a setting (`[kD n]`); the servo build `SMC3_R4_Servo` for ball-screw actuators with AC
+    servo drives; fan control for the Motion Shield (`[kv n]`, `[rdv]`).
 
   See the [CHANGELOG](CHANGELOG.md).
 - New commands are documented in [docs/PROTOCOL.md](docs/PROTOCOL.md). They go over WiFi; USB stays plain SMC3

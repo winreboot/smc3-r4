@@ -31,6 +31,10 @@ jobs:
             fqbn: arduino:renesas_uno:unor4wifi
             platform: arduino:renesas_uno
             sketch: firmware/SMC3_R4
+          - board: UNO R4 WiFi, servo build
+            fqbn: arduino:renesas_uno:unor4wifi
+            platform: arduino:renesas_uno
+            sketch: firmware/SMC3_R4_Servo
           - board: UNO R3
             fqbn: arduino:avr:uno
             platform: arduino:avr

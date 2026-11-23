@@ -90,6 +90,21 @@ The USB port (page 2.8, firmware 1.9.5 USB page mode; the simulator says 1.9.6 u
                        first bytes arrive and doesn't answer for SEC seconds (WiFi joining in setup())
   --usb-unplug AT,FOR  test (page 2.8.2): AT s after the page first uses the cable, the cable is pulled (the port
                        goes away) for FOR s, then it is back as a new port
+
+Park on the board (firmware 2.2.0b2, --fw222): the board parks the seat by itself when SimHub sends no motion (none, or
+the same position) for the set time, and from a park button on D8; [kb n] settings, [kb P/U/S], [rdk] "SM3K".
+  --bp-auto SEC        park on its own after SEC s, saved at start (with --bp-pos 150,150,512: the park positions)
+  [zs2] over TCP       the fake SimHub sends one still position (a menu, a paused game); [zs1] moving, [zs0] off
+  [zb 1] / [zb 0]      press / release the park button (simulator only)
+
+The Motion Shield's fan (firmware 2.2.0b3, --fw223 --fan): the board runs a 4-pin fan from the board temperature;
+[kv n] settings, [rdv] "SM3V".  The board warms with the motors' work and cools with the fan's air.
+  --fan-kind K         pwm (default), stuck (doesn't turn), 3pin (no speed control), 2pin (no speed signal)
+  --fan-ambient C      the air around the board (default 25)
+  [zv n] over TCP      simulator only: the air around the board is n C (the board follows within a minute or two);
+                       [zv 200+n]: the board itself jumps to n C
+  [zn n]               simulator only: the temperature sensor 0 fine, 1 open, 2 shorted
+  [zf n]               simulator only: the fan 0 a PWM fan, 1 stuck, 2 3-pin, 3 2-pin
 """
 import argparse, math, os, random, re, select, socket, struct, threading, time, urllib.request, zlib
 
@@ -123,6 +138,15 @@ ap.add_argument("--servo-switches", action="store_true", help="servo build: home
 ap.add_argument("--servo-broken", type=int, default=0, help="servo build: motor M's home switch never closes (broken wire)")
 ap.add_argument("--servo-wrongdir", type=int, default=0, help="servo build: motor M's drive turns the other way (Pn097)")
 ap.add_argument("--servo-start", type=float, default=2500, help="servo build: where the actuators are at power-up (pulses)")
+ap.add_argument("--fw2200", action="store_true", help="firmware 2.2.0: the release of 2.2.0b4 (no beta marks)")
+ap.add_argument("--fw224", action="store_true", help="firmware 2.2.0b4: 2.2.0b3 + coming back from the end stops with a noisy pot (switched on within 24 counts of an end stop counts too; back = 16 counts inside for 0.25 s)")
+ap.add_argument("--fw223", action="store_true", help="firmware 2.2.0b3: 2.2.0b2 + the Motion Shield's fan ([kv], [rdv] SM3V); with --fan the shield is there")
+ap.add_argument("--fan", action="store_true", help="2.2.0b3: the Motion Shield is there - its fan chip and the board's temperature")
+ap.add_argument("--fan-kind", default="pwm", choices=["pwm", "stuck", "3pin", "2pin"], help="2.2.0b3: the fan on J_FAN (stuck: doesn't turn; 3pin: no speed control; 2pin: no speed signal)")
+ap.add_argument("--fan-ambient", type=float, default=25.0, help="2.2.0b3: the air around the board, C (the board warms with the motors' work)")
+ap.add_argument("--fw222", action="store_true", help="firmware 2.2.0b2: 2.2.0b1 + park on the board (on its own when the game stops, a park button on D8, [kb], [rdk] SM3K); with --servo the servo build")
+ap.add_argument("--bp-auto", type=int, default=-1, help="2.2.0b2: park on its own after this many seconds, saved at start (with --bp-pos)")
+ap.add_argument("--bp-pos", default="", help="2.2.0b2: park positions saved at start, e.g. 150,150,512")
 ap.add_argument("--fw212", action="store_true", help="firmware 2.1.2b1: 2.1.1 + the motor driver type as a setting ([kD n], EEPROM 110-111)")
 ap.add_argument("--drv", type=int, default=-1, help="2.1.2b1: the driver type saved at start (0 IBT-2, 1 PWM + direction; default: never set)")
 ap.add_argument("--fw211b1", action="store_true", help="firmware 2.1.1b1: 2.1 + the sensor lock fixed, [rdj] SM3I, set-up only to a found sensor")
@@ -159,6 +183,7 @@ ap.add_argument("--sag-pull", type=float, default=0.09)
 ap.add_argument("--pot-glitches", action="append", default=[])
 ap.add_argument("--sensor-on", action="store_true")
 ap.add_argument("--seat-tilt", default="")
+ap.add_argument("--deg-per-count", type=float, default=0.03, help="degrees the seat tilts per pot count of a lift (0.03; a real rig 0.005-0.01)")
 ap.add_argument("--stops", action="append", default=[])
 ap.add_argument("--seat-setup", action="store_true")
 ap.add_argument("--layout", choices=["tl", "lifts"], default="tl")
@@ -214,10 +239,11 @@ if args.swap_pots:
     a, b = [int(x) - 1 for x in args.swap_pots.split(",")]
     potmap[a], potmap[b] = b, a
 SLOP = [0.0, 0.0, 0.0]
-POT_NOISE = {}                                # --pot-noise: motor index -> sigma
+POT_NOISE = {}                                # --pot-noise: motor index -> sigma ("1:5" or "1:5,2:5")
 if args.pot_noise:
-    m_, c_ = args.pot_noise.split(":")
-    POT_NOISE[int(m_) - 1] = float(c_)
+    for pn_ in args.pot_noise.split(","):
+        m_, c_ = pn_.split(":")
+        POT_NOISE[int(m_) - 1] = float(c_)
 SAG_PULL = args.sag_pull                      # --sag: the seat's weight, in drive units (1 = full PWM)
 POT_GLITCH = {}                               # --pot-glitches: motor index -> glitches per second
 for g_ in args.pot_glitches:
@@ -240,7 +266,7 @@ if args.stick:
 if args.slop:
     m_, c_ = args.slop.split(":")
     SLOP[int(m_) - 1] = float(c_)
-DEG_PER_COUNT = 0.03
+DEG_PER_COUNT = args.deg_per_count                # --deg-per-count (2.9.8b3): how much the lifts tilt the seat
 YAW_PER_COUNT = 0.02                          # --layout tl: degrees the seat turns per count of motor 3
 TL_DIR = -1 if args.tl_left else 1            # +1: higher numbers move the rear to the right
 SENSOR_OFFSET = (1.3, -0.8)                   # the sensor isn't mounted perfectly level
@@ -261,6 +287,14 @@ for st_ in args.start:
 FW = {"ver": ("1.9" if args.old19 else ("1.9.1" if args.fw191 else ("1.9.3" if args.no_potfilter else
        ("1.9.4" if args.fw194 else ("1.9.5" if args.fw195 else ("1.9.6" if args.fw196 else ("1.9.7" if (args.fw197 or args.fw197_stuck) else ("2.0b1" if args.fw20b1 else ("2.2.0b1" if (args.fw220 or args.servo) else ("2.1.2b1" if args.fw212 else ("2.1.1" if args.fw211 else ("2.1.1b5" if args.fw2115 else ("2.1.1b4" if args.fw2114 else ("2.1.1b3" if args.fw2113 else ("2.1.1b2" if args.fw2112 else ("2.1.1b1" if args.fw211b1 else ("2.1" if args.fw21 else ("2.0" if (args.fw20 or args.fw20_esp) else "1.9.8")))))))))))))))))) if args.fw >= 19
       else f"{args.fw // 10}.{args.fw % 10}"}
+if args.fw222 and args.fw >= 19:
+    FW["ver"] = "2.2.0b2"
+if args.fw223 and args.fw >= 19:
+    FW["ver"] = "2.2.0b3"
+if args.fw224 and args.fw >= 19:
+    FW["ver"] = "2.2.0b4"
+if args.fw2200 and args.fw >= 19:
+    FW["ver"] = "2.2.0"
 
 
 def _vt(v):
@@ -592,6 +626,7 @@ class Chan:                                   # the firmware's per-motor state
     def __init__(self, i):
         self.i = i
         self.target = 512; self.goal_acc = 512 << 12; self.goal_q = 512 << 4
+        self.cmd = 512                                                              # 2.2.0b2 CmdTarget
         self.kp, self.ki, self.kd, self.ks = 100, 40, 40, 1
         self.pwmmin, self.pwmmax, self.pwmrev, self.dz = 50, 100, 200, 0
         self.cut, self.clip = 23, 100
@@ -603,6 +638,7 @@ class Chan:                                   # the firmware's per-motor state
         self.soft, self.soft_ticks, self.soft_out, self.soft_since = False, 0, 0, 0.0   # 1.9.1 soft start
         self.soft_bad = 0                                                              # 2.1.1b2
         self.out_back = False                                                          # 2.1.1b3
+        self.in_n = 0                                                                  # 2.2.0b4
         self.update_ilim()
 
     def window(self):                         # target limits in force: SMC3 clip and the travel limits (1.9)
@@ -621,7 +657,9 @@ class Chan:                                   # the firmware's per-motor state
         if args.fw >= 19:
             v += self.trim
         lo, hi = self.window()
-        self.target = int(max(lo, min(hi, v)))
+        self.cmd = int(max(lo, min(hi, v)))   # 2.2.0b2: what was asked for ...
+        if BP["state"] == BP_RUN or not bp_fw():
+            self.target = self.cmd            # ... reaches the motor unless the board parks the seat
 
     def update_ilim(self):
         self.ilim = ((FULL << 13) // self.ki) if self.ki > 0 else 0
@@ -630,8 +668,541 @@ class Chan:                                   # the firmware's per-motor state
 lock = threading.Lock()
 TICKS = [0]
 SIMHUB = [False]                          # switched with [zs1] / [zs0] from any client (simulator only)
+SIMHUB_STILL = [False]                    # [zs2]: SimHub sends one still position (a menu, a paused game)
 HOLD = [0.0]                              # 1.9 [kH n]: SimHub's positions are ignored until then
 PARK = {"mask": 0, "until": 0.0}          # 2.1.1b4 [kP mask]: park mode, 3 s from the last one
+
+
+# ---- 2.2.0b2: park on the board (as the firmware: EEPROM 230-243, BpState, [kb], [rdk] SM3K) ----
+BP_RUN, BP_PARKING, BP_PARKED, BP_UNPARKING = 0, 1, 2, 3
+BPW_AUTO, BPW_BUTTON, BPW_PAGE, BPW_ENABLE, BPW_BOOT, BPW_STOP = 1, 2, 3, 4, 5, 6
+BPE_TRIP, BPE_SHORT, BPE_UP = 1, 2, 4
+BP = {"ee": False, "pos": [512, 512, 512], "speed": 60, "auto": 0, "flags": 0, "use": 7, "posset": 0,   # saved
+      "state": BP_RUN, "why": 0, "fault": 0, "mask": 0, "refuse": 0, "frm": [0, 0, 0], "to": [0, 0, 0], "live": False,
+      "t0": 0.0, "dur": 0.0, "ramp_end": 0.0, "since": 0.0, "stall_ref": [0, 0, 0], "stall_t": [0.0, 0.0, 0.0],
+      "ref": [512, 512, 512], "move_t": 0.0, "last_sh": [0.0, 0.0, 0.0], "unpark_req": 0,
+      "parks": 0, "unparks": 0, "presses": 0,
+      "pin_low": False, "raw": False, "raw_t": 0.0, "armed": False, "down": False, "led_fast": 0.0}   # [zb 1/0]: the button
+if args.bp_pos:
+    BP["pos"] = [int(x) for x in args.bp_pos.split(",")][:3]; BP["posset"] = 7; BP["ee"] = True
+if args.bp_auto >= 0:
+    BP["auto"] = args.bp_auto; BP["ee"] = True
+
+
+def bp_fw():                                  # firmware 2.2.0b2 and newer
+    v = FW["ver"]
+    if args.fw < 19 or _vt(v) < (2, 2):
+        return False
+    m = re.match(r"2\.2(?:\.0)?b(\d*)$", v)
+    return not m or int(m.group(1) or 0) >= 2
+
+
+def bp_valid():
+    return BP["ee"] and BP["use"] != 0 and (BP["posset"] & BP["use"]) == BP["use"]
+
+
+def bp_enabled_mask():
+    return sum(1 << i for i, c in enumerate(C) if not c.disabled)
+
+
+def bp_ready():
+    if 1 <= OTA["state"] <= 5:
+        return False
+    if servo_fw() and (SERVO["state"] != HS_HOMED or SERVO["estop"]):
+        return False
+    return True
+
+
+def bp_refused(why):
+    BP["refuse"] = why; BP["led_fast"] = time.time() + 1.5
+
+
+def bp_keep_mask():
+    park_set(BP["mask"])
+
+
+def bp_clamp_park(i, v):
+    c = C[i]
+    return max(c.cut + 8, min(1023 - c.cut - 8, v))
+
+
+def bp_centre(i):
+    c = C[i]
+    lo, hi = c.window()
+    return int(max(lo, min(hi, 512 + c.trim)))
+
+
+def bp_start_ramp(now):
+    dist = 0
+    for i in range(3):
+        if BP["mask"] & (1 << i):
+            dist = max(dist, abs(BP["to"][i] - BP["frm"][i]))
+            BP["stall_ref"][i] = C[i].fb_q >> 4; BP["stall_t"][i] = now
+    BP["dur"] = max(1.0, dist * 1.25 / (BP["speed"] or 60))
+    BP["t0"], BP["ramp_end"] = now, 0.0
+
+
+def bp_park(why):
+    if BP["state"] != BP_RUN:
+        bp_refused(4); return False
+    if not bp_valid():
+        bp_refused(1); return False
+    if not bp_ready():
+        bp_refused(2); return False
+    mk = BP["use"] & bp_enabled_mask()
+    if not mk:
+        bp_refused(3); return False
+    now = time.time()
+    BP["mask"] = mk
+    bp_keep_mask()
+    for i in range(3):
+        if mk & (1 << i):
+            BP["frm"][i] = C[i].target; BP["to"][i] = bp_clamp_park(i, BP["pos"][i])
+    BP.update(state=BP_PARKING, why=why, fault=0, refuse=0, since=now)
+    bp_start_ramp(now)
+    print(f"simboard: board park ({why}) -> {BP['to']}", flush=True)
+    return True
+
+
+def bp_end_parked(fault):
+    for i, c in enumerate(C):
+        if BP["mask"] & (1 << i):
+            if not c.disabled:
+                c.reason = 9
+            c.disabled = True
+            if servo_fw(): SERVO["want"] &= ~(1 << i); SERVO["v"][i] = 0
+    BP["fault"] |= fault
+    BP["state"], BP["since"] = BP_PARKED, time.time()
+    if PARK["mask"]:
+        park_set(0)
+
+
+def bp_unpark(why):
+    if BP["state"] in (BP_PARKING, BP_UNPARKING):
+        bp_refused(4); return False
+    if 1 <= OTA["state"] <= 5:
+        bp_refused(2); return False
+    now = time.time()
+    if servo_fw() and (SERVO["state"] != HS_HOMED or SERVO["estop"]):
+        for i, c in enumerate(C):
+            if BP["use"] & (1 << i): enable(c)
+        BP.update(state=BP_RUN, why=why, since=now, move_t=now)
+        return True
+    BP["mask"] = BP["use"]
+    bp_keep_mask()
+    live = usb["last_tgt"] and now - usb["last_tgt"] < 2.0
+    BP["live"] = bool(live)
+    for i, c in enumerate(C):
+        if BP["mask"] & (1 << i):
+            fb = (c.fb_q >> 4) if c.disabled else c.target
+            lo, hi = c.window()
+            BP["frm"][i] = int(max(lo, min(hi, fb)))
+            BP["to"][i] = c.cmd if live else bp_centre(i)
+            c.target = BP["frm"][i]
+    BP.update(state=BP_UNPARKING, why=why, fault=0, refuse=0, since=now)
+    for i, c in enumerate(C):
+        if BP["mask"] & (1 << i) and c.disabled:
+            if not servo_fw():
+                soft_start_from(c)
+            enable(c)
+    board["grace"] = now + 1.5
+    bp_start_ramp(now)
+    BP["unparks"] += 1
+    print(f"simboard: board unpark ({why}) -> {'SimHub' if live else BP['to']}", flush=True)
+    return True
+
+
+def bp_stop_here():
+    if BP["state"] in (BP_PARKING, BP_UNPARKING):
+        BP["why"] = BPW_STOP
+        bp_end_parked(0)
+
+
+def bp_press():
+    BP["presses"] += 1
+    st = BP["state"]
+    if st in (BP_PARKING, BP_UNPARKING):
+        bp_stop_here(); return
+    if st == BP_PARKED:
+        bp_unpark(BPW_BUTTON); return
+    if time.time() < HOLD[0] or PARK["mask"]:
+        BP["mask"] = BP["use"] & bp_enabled_mask()
+        if BP["mask"]:
+            BP.update(why=BPW_STOP, fault=0); bp_end_parked(0)
+        return
+    if BP["use"] & bp_enabled_mask():
+        bp_park(BPW_BUTTON)
+    else:
+        bp_unpark(BPW_BUTTON)
+
+
+def bp_saw(i, simhub):
+    """A position command for motor i (after set_target): motion resets the clock; SimHub moving unparks."""
+    now = time.time()
+    c = C[i]
+    if simhub:
+        gap = not BP["last_sh"][i] or now - BP["last_sh"][i] > 1.0
+        BP["last_sh"][i] = now
+        if gap:
+            BP["ref"][i] = c.cmd; return
+    if abs(c.cmd - BP["ref"][i]) <= 3:
+        return
+    BP["ref"][i] = c.cmd; BP["move_t"] = now
+    if simhub and BP["state"] == BP_PARKED and BP["why"] in (BPW_AUTO, BPW_BOOT) and not (BP["fault"] & (BPE_TRIP | BPE_UP)):
+        BP["unpark_req"] = BPW_AUTO
+
+
+def bp_task(now):
+    """loop()'s BoardParkTask, every 10 ms here (under the lock)."""
+    if not bp_fw():
+        return
+    if BP["flags"] & 1:                       # the button: 150 ms the same, released once first
+        low = BP["pin_low"]
+        if low != BP["raw"]:
+            BP["raw"], BP["raw_t"] = low, now
+        elif now - BP["raw_t"] >= 0.15:
+            if not low:
+                BP["armed"], BP["down"] = True, False
+            elif BP["armed"] and not BP["down"]:
+                BP["down"] = True
+                bp_press()
+    else:
+        BP["armed"] = BP["down"] = False
+    if BP["unpark_req"]:
+        w, BP["unpark_req"] = BP["unpark_req"], 0
+        if BP["state"] == BP_PARKED and now >= HOLD[0]:
+            bp_unpark(w)
+    st = BP["state"]
+    if st == BP_RUN:
+        if (BP["auto"] and bp_valid() and bp_ready() and now >= HOLD[0] and not PARK["mask"] and not any_soft() and
+                (BP["use"] & bp_enabled_mask()) and now - BP["move_t"] > BP["auto"]):
+            bp_park(BPW_AUTO)
+        return
+    if st not in (BP_PARKING, BP_UNPARKING):
+        return
+    bp_keep_mask()
+    off = BP["mask"] & ~bp_enabled_mask()
+    if off:
+        cmd = all(C[i].reason == 2 for i in range(3) if off & (1 << i))
+        if cmd:
+            BP["why"] = BPW_STOP
+        bp_end_parked(0 if cmd else BPE_TRIP)
+        return
+    x = min(1.0, (now - BP["t0"]) / BP["dur"]) if BP["dur"] else 1.0
+    e = x * x * (3 - 2 * x)
+    for i, c in enumerate(C):
+        if BP["mask"] & (1 << i):
+            to = c.cmd if (st == BP_UNPARKING and BP["live"]) else BP["to"][i]
+            lo, hi = c.window()
+            c.target = int(max(lo, min(hi, BP["frm"][i] + round((to - BP["frm"][i]) * e))))
+    if x < 1.0:
+        return
+    if not BP["ramp_end"]:
+        BP["ramp_end"] = now
+    done, far = True, 0
+    for i, c in enumerate(C):
+        if not BP["mask"] & (1 << i):
+            continue
+        fb = c.fb_q >> 4
+        if abs(fb - BP["stall_ref"][i]) > 2:
+            BP["stall_ref"][i], BP["stall_t"][i] = fb, now
+        d = abs(fb - c.target)
+        if d <= (6 if st == BP_PARKING else 20):
+            continue
+        if d > (15 if st == BP_PARKING else 20):
+            far |= 1 << i
+        if st == BP_PARKING and now - BP["ramp_end"] > 1.0 and now - BP["stall_t"][i] >= 0.8:
+            continue
+        done = False
+    if done or now - BP["ramp_end"] > (6.0 if st == BP_PARKING else 4.0):
+        if st == BP_PARKING:
+            bp_end_parked(BPE_SHORT if far else 0); BP["parks"] += 1
+            print(f"simboard: board parked (fault {BP['fault']})", flush=True)
+        elif far:
+            bp_end_parked(BPE_UP)
+            print("simboard: board unpark - a motor couldn't get back up: parked again", flush=True)
+        else:
+            for i, c in enumerate(C):
+                if BP["mask"] & (1 << i):
+                    c.target = c.cmd if BP["live"] else BP["to"][i]
+            BP.update(state=BP_RUN, since=now, move_t=now)
+            BP["ref"] = [c.cmd for c in C]
+            park_set(0)
+            PARK["mask"] = 0
+            for c in C:
+                lo, hi = c.window(); c.target = max(lo, min(hi, c.target))
+            print("simboard: board unparked - SimHub has the seat", flush=True)
+
+
+def bp_setting(n, v):
+    if n < 3:
+        if not 0 <= v <= 1023: return
+        BP["pos"][n] = v; BP["posset"] |= 1 << n
+    elif n == 3:
+        if not 10 <= v <= 300: return
+        BP["speed"] = v
+    elif n == 4:
+        if not 0 <= v <= 3600: return
+        BP["auto"] = v; BP["move_t"] = time.time()
+    elif n == 5:
+        BP["flags"] = v & 3
+        if not v & 1: BP["armed"] = BP["down"] = False
+    elif n == 6:
+        if not 1 <= v <= 7: return
+        BP["use"] = v
+    else:
+        return
+    BP["ee"] = True
+
+
+def bp_frame():
+    now = time.time()
+    left = 65535
+    if BP["state"] == BP_RUN and BP["auto"] and bp_valid() and (BP["use"] & bp_enabled_mask()):
+        left = max(0, int(math.ceil(BP["auto"] - (now - BP["move_t"]))))
+    pl = struct.pack("<9B3hHHHHHHHH3h", BP["state"], BP["why"], BP["fault"], BP["mask"],
+                     (1 if BP["ee"] else 0) | (BP["posset"] << 1), BP["use"], BP["flags"],
+                     (1 if BP["raw"] else 0) | (2 if BP["armed"] else 0) | (4 if BP["down"] else 0), BP["refuse"],
+                     *BP["pos"], BP["speed"], BP["auto"], min(65535, int(now - BP["move_t"])), left,
+                     BP["parks"], BP["unparks"], BP["presses"], min(65535, int((now - BP["since"]) * 10)), *BP["to"])
+    return b"SM3K" + bytes([1, len(pl)]) + pl
+
+
+def bp_led(now):                              # what the light on D12 shows (the simulator's [zb] answer)
+    if not BP["flags"] & 2: return 0
+    if now < BP["led_fast"]: return 3
+    return {BP_PARKED: 1, BP_PARKING: 2, BP_UNPARKING: 2}.get(BP["state"], 0)
+
+# ---- 2.2.0b3: the Motion Shield's fan (as the firmware: EMC2301 + the board's NTC, EEPROM 250-265, [kv n], [rdv] SM3V).
+# --fan: the shield is there (the board finds the fan chip and the temperature); without it the board only "looked".
+# The world: the board warms with the motors' work and cools with the fan's airflow; the fan follows its PWM.
+FM_QUIET, FM_SMART, FM_CURVE, FM_FIXED, FM_FULL = range(5)
+FP_CHIP, FP_ADC, FP_PULLUP, FP_LOOKED = 1, 2, 4, 8
+FANF_STALL, FANF_SENSOR, FANF_HOT, FANF_NOPWM, FANF_WATCH, FANF_LOST = 1, 2, 4, 8, 16, 32
+FWHY_MODE, FWHY_HOT, FWHY_SENSOR, FWHY_KICK, FWHY_TRY = range(5)
+FAN_QUIET = ([35, 45, 55, 62, 70], [0, 25, 35, 60, 100])
+FAN_KINDS = {"pwm": 0, "stuck": 1, "3pin": 2, "2pin": 3}
+FAN = {"ee": False, "mode": FM_SMART, "fixed": 50, "minrun": 25, "hot": 70, "boost": 60,
+       "ct": [30, 40, 50, 60, 70], "cd": [0, 30, 45, 70, 100]}
+
+
+def fan_fw():                                 # firmware 2.2.0b3 and newer
+    v = FW["ver"]
+    if args.fw < 19 or _vt(v) < (2, 2):
+        return False
+    m = re.match(r"2\.2(?:\.0)?b(\d*)$", v)
+    return not m or int(m.group(1) or 0) >= 3
+
+
+def fan_boot(now):
+    """Power-up: the settings stay (EEPROM); the board looks for the shield and decides a first speed at once."""
+    FAN.update({"present": FP_LOOKED, "out": 0, "drive": 0, "target": 0, "why": 0, "fault": 0, "load": 0.0,
+                "temp": None, "ctemp": None, "hot_on": False, "rpm": 0, "count": 0, "adc": 0, "rpm_max": 0, "stalls": 0,
+                "watches": 0, "buserrs": 0, "kick_until": 0.0, "try_until": 0.0, "try_pct": 0, "stall_since": 0.0,
+                "nopwm_since": 0.0, "full_since": 0.0, "ctl_at": 0.0, "bad": 0, "hist": [], "step_at": now})
+    FAN.setdefault("t_board", float(args.fan_ambient) + 2.0)
+    FAN.setdefault("ambient", float(args.fan_ambient))
+    FAN.setdefault("fan_rpm", 0.0)
+    FAN.setdefault("kind", FAN_KINDS.get(args.fan_kind, 0))
+    FAN.setdefault("ntc", 0)
+    FAN.setdefault("drv", [0.0, 0.0, 0.0])
+    FAN.setdefault("phys_at", now)
+    if not (fan_fw() and args.fan):
+        return
+    FAN["present"] |= FP_PULLUP | FP_ADC | FP_CHIP
+    for _ in range(3):
+        fan_sample()
+    fan_control(now)
+    FAN["ctl_at"] = now
+
+
+def fan_curve_at(ct, cd, t):
+    pts = sorted(zip(ct, cd), key=lambda p: p[0])     # stable, as the firmware's insertion sort
+    if t is None or t <= pts[0][0]:
+        return pts[0][1]
+    for (t0, d0), (t1, d1) in zip(pts, pts[1:]):
+        if t <= t1:
+            if t1 <= t0:
+                return d1
+            num, den = (d1 - d0) * 10 * (int(round(t * 10)) - t0 * 10), (t1 - t0) * 10
+            q = abs(num) // den                       # C's integer division: towards zero
+            v = d0 * 10 + (q if num >= 0 else -q)
+            return max(0, min(100, (v + 5) // 10))
+    return pts[-1][1]
+
+
+def fan_sample():
+    """One temperature conversion (1 Hz): the NTC's voltage, the middle one of the last three, smoothed."""
+    t = FAN["t_board"] + random.uniform(-0.05, 0.05)
+    if FAN["ntc"] == 1: v = 5.0
+    elif FAN["ntc"] == 2: v = 0.0
+    else:
+        r = 10000.0 * math.exp(3950.0 * (1.0 / (t + 273.15) - 1.0 / 298.15))
+        v = 5.0 * r / (10000.0 + r)
+    FAN["adc"] = max(-32768, min(32767, int(round(v / 6.144 * 32768))))
+    ok = 0.05 < v < 4.95
+    if ok:
+        r = 10000.0 * v / (5.0 - v)
+        t = 1.0 / (1.0 / 298.15 + math.log(r / 10000.0) / 3950.0) - 273.15
+        ok = -30.0 < t < 130.0
+    if not ok:
+        FAN["bad"] += 1
+        if FAN["bad"] >= 3:
+            FAN["temp"] = None; FAN["hist"] = []
+        return
+    FAN["bad"] = 0
+    FAN["hist"] = (FAN["hist"] + [int(round(t * 10))])[-3:]
+    med = sorted(FAN["hist"])[1] if len(FAN["hist"]) == 3 else FAN["hist"][-1]
+    FAN["temp"] = med / 10.0 if FAN["temp"] is None else FAN["temp"] + (med / 10.0 - FAN["temp"]) * 0.3
+
+
+def fan_control(now):
+    """Once a second, as the firmware's FanControl()."""
+    f = FAN
+    t = f["temp"]
+    if t is not None:
+        tx = round(t * 10)
+        if f["ctemp"] is None or tx > f["ctemp"]: f["ctemp"] = tx
+        elif tx + 20 < f["ctemp"]: f["ctemp"] = tx + 20
+    else:
+        f["ctemp"] = None
+    tc = None if f["ctemp"] is None else f["ctemp"] / 10.0
+    why = FWHY_MODE
+    if f["mode"] == FM_QUIET: want = fan_curve_at(*FAN_QUIET, tc)
+    elif f["mode"] == FM_SMART:
+        want = fan_curve_at(f["ct"], f["cd"], tc)
+        w = int(f["load"])
+        b = 0 if w <= 20 else min(f["boost"], f["boost"] * (w - 20) // 40)
+        want = max(want, b)
+    elif f["mode"] == FM_CURVE: want = fan_curve_at(f["ct"], f["cd"], tc)
+    elif f["mode"] == FM_FIXED: want = f["fixed"]
+    else: want = 100
+    if f["try_until"] and f["try_until"] > now:
+        want, why = f["try_pct"], FWHY_TRY
+    else:
+        f["try_until"] = 0.0
+    if t is None:
+        want, why = 100, FWHY_SENSOR; f["fault"] |= FANF_SENSOR; f["hot_on"] = False
+    else:
+        f["fault"] &= ~FANF_SENSOR
+        if round(t * 10) >= f["hot"] * 10: f["hot_on"] = True
+        elif round(t * 10) < (f["hot"] - 3) * 10: f["hot_on"] = False
+        if f["hot_on"]: want, why = 100, FWHY_HOT
+    f["fault"] = (f["fault"] | FANF_HOT) if f["hot_on"] else (f["fault"] & ~FANF_HOT)
+    want = min(100, want)
+    if 0 < want < f["minrun"]: want = f["minrun"]
+    f["target"] = want
+    was = f["out"]
+    at_once = why in (FWHY_HOT, FWHY_SENSOR, FWHY_TRY) or f["mode"] == FM_FULL or not f["ctl_at"]
+    if want >= f["out"]:
+        u = max(f["out"] + 10, f["minrun"])
+        f["out"] = want if (at_once or u > want) else u
+    else:
+        o = want if at_once else f["out"] - 3
+        o = max(o, want)
+        if want == 0 and o < f["minrun"]: o = 0
+        f["out"] = o
+    if was == 0 and f["out"] > 0: f["kick_until"] = now + 1.5
+    f["drive"] = f["out"]
+    if f["kick_until"] > now and f["drive"] < 40:
+        f["drive"], why = 40, FWHY_KICK
+    f["why"] = why
+    kicking = f["kick_until"] > now
+    if f["drive"] >= 30 and not kicking and f["rpm"] == 0:
+        if not f["stall_since"]: f["stall_since"] = now
+        if now - f["stall_since"] >= 6.0 and not f["fault"] & FANF_STALL:
+            f["fault"] |= FANF_STALL; f["stalls"] = min(65535, f["stalls"] + 1)
+    else:
+        f["stall_since"] = 0.0
+        if f["rpm"] > 0: f["fault"] &= ~FANF_STALL
+    if f["drive"] >= 90 and f["rpm"] > 0:
+        if not f["full_since"]: f["full_since"] = now
+        if now - f["full_since"] >= 5.0 and f["rpm"] > f["rpm_max"]: f["rpm_max"] = f["rpm"]
+    else:
+        f["full_since"] = 0.0
+    if f["drive"] == 0 and f["rpm_max"] and f["rpm"] > f["rpm_max"] * 4 // 5:
+        if not f["nopwm_since"]: f["nopwm_since"] = now
+        if now - f["nopwm_since"] >= 15.0: f["fault"] |= FANF_NOPWM
+    else:
+        f["nopwm_since"] = 0.0
+        if f["drive"] == 0: f["fault"] &= ~FANF_NOPWM
+
+
+def fan_world(now):
+    """The board's temperature and the fan's speed (the simulator's physics)."""
+    f = FAN
+    dt = max(0.0, min(1.0, now - f["phys_at"])); f["phys_at"] = now
+    if dt <= 0: return
+    duty = (f["drive"] / 100.0) if (f["present"] & FP_CHIP) else 0.0
+    if f["kind"] == 1: want = 0.0
+    elif f["kind"] == 2: want = 2000.0
+    elif duty <= 0.001: want = 0.0
+    elif duty < 0.2: want = 460.0
+    else: want = 460.0 + (duty - 0.2) / 0.8 * 1540.0
+    f["fan_rpm"] += (want - f["fan_rpm"]) * min(1.0, dt / 1.5)
+    work = sum(f["drv"]) / 3.0
+    p = 2.0 + 40.0 * work                        # watts warming the board
+    r = 1.0 - 0.65 * min(1.0, f["fan_rpm"] / 2000.0)   # C per watt: less with more air
+    teq = f["ambient"] + p * r
+    f["t_board"] += (teq - f["t_board"]) * min(1.0, dt / 60.0)
+
+
+def fan_task(now):
+    """loop(): the world, the motors' work (10 Hz), one round of readings and a decision a second."""
+    if not fan_fw():
+        return
+    fan_world(now)
+    f = FAN
+    if not (f["present"] & FP_CHIP):
+        return
+    if now - f.get("load_at", 0.0) >= 0.1:
+        f["load_at"] = now
+        en = [d if not C[i].disabled else 0.0 for i, d in enumerate(f["drv"])]
+        w = sum(en) / 3.0 * 100.0
+        if w > f["load"]: f["load"] += (w - f["load"]) / 30.0
+        else: f["load"] -= (f["load"] - w) / 600.0
+    if now - f["step_at"] < 1.0:
+        return
+    f["step_at"] = now
+    fan_sample()
+    if f["kind"] == 3 or f["fan_rpm"] < 480: f["count"], f["rpm"] = 0x1FFF, 0
+    else:
+        f["count"] = min(0x1FFF, int(round(3932160.0 / f["fan_rpm"]))); f["rpm"] = min(65535, 3932160 // f["count"])
+    fan_control(now)
+    f["ctl_at"] = now
+
+
+def fan_save(n):
+    FAN["ee"] = True
+
+
+def fan_setting(n, v):
+    """[w v][kv n] (the page only): 0 mode, 1 fixed, 2 lowest running, 3 hot, 4 Smart's top, 5-9 / 10-14 the curve;
+    16 try a speed for 8 s (255: stop), 17 look for the chip again."""
+    f = FAN
+    if n == 0 and 0 <= v <= FM_FULL: f["mode"] = v; fan_save(n)
+    elif n == 1 and 0 <= v <= 100: f["fixed"] = v; fan_save(n)
+    elif n == 2 and 10 <= v <= 60: f["minrun"] = v; fan_save(n)
+    elif n == 3 and 40 <= v <= 95: f["hot"] = v; fan_save(n)
+    elif n == 4 and 0 <= v <= 100: f["boost"] = v; fan_save(n)
+    elif 5 <= n < 10 and 0 <= v <= 120: f["ct"][n - 5] = v; fan_save(n)
+    elif 10 <= n < 15 and 0 <= v <= 100: f["cd"][n - 10] = v; fan_save(n)
+    elif n == 16:
+        if 0 <= v <= 100: f["try_pct"] = v; f["try_until"] = time.time() + 8.0; f["step_at"] = 0.0
+        else: f["try_until"] = 0.0; f["step_at"] = 0.0
+
+
+def fan_frame():
+    f = FAN
+    now = time.time()
+    left = int(math.ceil(f["try_until"] - now)) if f["try_until"] and f["try_until"] > now else 0
+    tx = -32768 if f["temp"] is None else int(round(f["temp"] * 10))
+    cx = -32768 if f["ctemp"] is None else int(f["ctemp"])
+    pl = struct.pack("<10BhhHHhH4B5B5BHHHB", f["present"], f["mode"], f["drive"], f["out"], f["target"], f["why"],
+                     f["fault"], min(100, int(f["load"])), 1 if f["ee"] else 0, 0x37 if f["present"] & FP_CHIP else 0,
+                     tx, cx, f["rpm"], f["count"], f["adc"], f["rpm_max"], f["fixed"], f["minrun"], f["hot"], f["boost"],
+                     *f["ct"], *f["cd"], f["stalls"], f["watches"], f["buserrs"], max(0, min(255, left)))
+    return b"SM3V" + bytes([1, len(pl)]) + pl
 
 
 def park_fw():
@@ -655,6 +1226,9 @@ def soft_start_from(c):
     lo, hi = c.cut_window()
     fb = c.fb_q
     c.soft_out = (lo * 16 - fb) if fb < lo * 16 else ((fb - hi * 16) if fb > hi * 16 else 0)
+    if creep_near() and not c.soft_out and (fb < (lo + 24) * 16 or fb > (hi - 24) * 16):
+        c.soft_out = 1                            # 2.2.0b4: just inside counts too
+    c.in_n = 0
     c.soft_ticks, c.soft, c.soft_bad = 0, True, 0
     c.out_back = c.soft_out > 0                   # 2.1.1b3: the end-stop exemption, apart from the creep
     c.goal_acc = fb << 8; c.goal_q = fb
@@ -672,6 +1246,10 @@ def any_soft():
 
 def creep_b3():                               # firmware 2.1.1b3: the end-stop exemption apart from the creep
     return args.fw >= 19 and _vt(FW["ver"]) >= (2, 1, 1) and FW["ver"] not in ("2.1.1b1", "2.1.1b2")
+
+
+def creep_near():                             # firmware 2.2.0b4: from just inside an end stop too; back after 0.25 s
+    return args.fw >= 19 and _vt(FW["ver"]) >= (2, 2, 0) and FW["ver"] not in ("2.2.0b1", "2.2.0b2", "2.2.0b3")
 
 
 def creep_fix():                              # firmware 2.1.1b2: back from outside its end stops, robustly
@@ -697,7 +1275,8 @@ def enable(c):
         c.disabled, c.reason = False, 0
         return
     lo, hi = c.cut_window()
-    outside = c.fb_q > hi * 16 or c.fb_q < lo * 16
+    nr = 24 if creep_near() else 0            # 2.2.0b4: just inside too
+    outside = c.fb_q > (hi - nr) * 16 or c.fb_q < (lo + nr) * 16
     if c.disabled and soft_fw() and (SOFT["rate"] > 0 or (creep_fix() and outside)):
         soft_start_from(c)
     elif c.disabled and creep_b3():
@@ -764,10 +1343,18 @@ def boot(cold=True):
         else:                                 # (simplified: the real board also heads for 512 without one)
             c.target = max(lo, min(hi, int(p.pot_x)))
         c.disabled, c.reason = True, 3
-        if not servo_fw():
+        c.cmd = c.target
+        if bp_fw() and not servo_fw() and BP["auto"] and bp_valid():
+            c.reason = 9                      # 2.2.0b2: park on its own on - it starts parked
+        elif not servo_fw():
             enable(c)                         # 1.9.1: creeps from where it is
     if servo_fw():
         servo_boot()                          # 2.2.0b1 servo build: released, settle, home, then on
+    BP.update(state=BP_RUN, why=0, fault=0, mask=0, move_t=time.time(), since=time.time(), last_sh=[0.0, 0.0, 0.0],
+              ref=[c.cmd for c in C], unpark_req=0)
+    if bp_fw() and not servo_fw() and BP["auto"] and bp_valid():
+        BP.update(state=BP_PARKED, why=BPW_BOOT, mask=BP["use"])
+    fan_boot(time.time())                     # 2.2.0b3: the shield's fan (a first speed at once)
     power_scale = 7
     last_target_t = 0.0
     t0 = time.time()
@@ -1103,6 +1690,7 @@ def chan_tick(c):
     if past and (c.soft or (creep_b3() and c.out_back)) and c.soft_out > 0:   # 1.9.1: back from past an end stop
         out_q = (clo << 4) - fb if fb < (clo << 4) else fb - (chi << 4)
         hard = fb > ((1023 - c.cut) << 4) or fb < (c.cut << 4)
+        c.in_n = 0                            # 2.2.0b4: not back yet
         if creep_fix():                       # 2.1.1b2: against where it started + 24, only when it lasts 25 ms
             if not hard and out_q <= c.soft_out + (24 << 4):
                 past = False; c.soft_bad = 0
@@ -1112,7 +1700,18 @@ def chan_tick(c):
             past = False; c.soft_out = min(c.soft_out, out_q)
     elif not past and c.soft_out:             # well inside (16 counts): the end stops count as usual again
         inside = min(fb - (clo << 4), (chi << 4) - fb)
-        c.soft_out = 0 if (inside > (16 << 4) or not (c.soft or (creep_b3() and c.out_back))) else 1
+        if creep_near():                      # 2.2.0b4: 16 inside for 0.25 s; within 8 of the end stop starts again
+            if not (c.soft or c.out_back):
+                c.soft_out, c.in_n = 0, 0
+            else:
+                c.soft_out = 1
+                if inside > (16 << 4):
+                    c.in_n += 1
+                    if c.in_n >= PID_HZ // 4: c.soft_out, c.in_n = 0, 0
+                elif inside <= (8 << 4):
+                    c.in_n = 0
+        else:
+            c.soft_out = 0 if (inside > (16 << 4) or not (c.soft or (creep_b3() and c.out_back))) else 1
         if c.soft_out == 0: c.out_back = False
     if past:
         if not c.disabled:
@@ -1259,7 +1858,9 @@ def sim_loop():
                     try: c.close()
                     except OSError: pass
                 clients.clear()
-            soft_now = any_soft()                 # 1.9.1: full power while creeping; give up after 40 s
+            bp_task(time.time())                  # 2.2.0b2: park on the board
+            fan_task(time.time())                 # 2.2.0b3: the Motion Shield's fan
+            soft_now = any_soft() or BP["state"] in (BP_PARKING, BP_UNPARKING)   # 1.9.1: full power while creeping; give up after 40 s
             power_scale = 9 if ((time.time() - last_target_t) > 15 and not soft_now) else 7
             if soft_now:
                 for c in C:
@@ -1269,6 +1870,7 @@ def sim_loop():
                 park_set(0)
             for _ in range(SUB):
                 out = [chan_tick(c) for c in C]
+                FAN["drv"] = [0.0 if br else abs(d) for d, br in out]   # 2.2.0b3: the motors' work (the fan's Smart mode)
                 if args.supply_sag:                   # --supply-sag: one supply for every motor
                     tot = sum(abs(d) for d, br in out if not br)
                     if tot > 0.6:
@@ -1333,10 +1935,13 @@ def fake_simhub():
                 v = 512 + 120 * math.sin(t * (0.7 + 0.3 * i)) + 25 * math.sin(t * 7.3 + i)
                 if args.heavy:                    # a bit more travel, so the heavy corner reaches its hard part
                     v = 512 + 200 * math.sin(t * (0.7 + 0.3 * i)) + 25 * math.sin(t * 7.3 + i)
+                if SIMHUB_STILL[0]:
+                    v = 512                       # [zs2]: a still position (a menu, a paused game)
                 if held:
                     usb["held"] = usb.get("held", 0) + 1
                 else:
                     c.set_target(int(v))
+                    if bp_fw(): bp_saw(i, True)
                 usb["tgt"] += 1; usb["ok"] += 1
             usb["last"] = usb["last_tgt"] = t
             last_target_t = t                     # (held or not, like the firmware: SimHub is alive)
@@ -1524,6 +2129,7 @@ def handle_cmd(c, a, b, out, cl=None):
         if c in "ABC":
             ch = C["ABC".index(c)]
             ch.set_target(w)
+            if bp_fw(): bp_saw(ch.i, cl is None)   # (cl None: from SimHub's side of the USB port)
             if args.fw >= 14: last_target_t = time.time()
             board["last_pos"] = time.time()
         elif c == "w" and args.fw >= 19:
@@ -1540,6 +2146,15 @@ def handle_cmd(c, a, b, out, cl=None):
                 USBP["on"] = False; USB_CL["extras"] = False   # (under handle_cmd's lock: not usb_page_end())
                 if was_native != USBO["native"] and args.usb:
                     USBP["replug"] = time.time() + 0.3    # another port on the PC: the old one goes away, a new one appears
+        elif c == "k" and a == ord("v") and fan_fw():  # 2.2.0b3: the Motion Shield's fan (the page only)
+            if cl is not None and b < 32:
+                fan_setting(b, VREG[0])
+        elif c == "k" and a == ord("b") and bp_fw():   # 2.2.0b2: park on the board (the page only)
+            if cl is not None:
+                if b == ord("P"): bp_park(BPW_PAGE)
+                elif b == ord("U"): bp_unpark(BPW_PAGE)
+                elif b == ord("S"): bp_stop_here()
+                elif b < 16: bp_setting(b, VREG[0])
         elif c == "k" and a == ord("G") and b != ord("=") and servo_fw() and cl is not None:   # 2.2 servo: home again
             if b in (1, ord("1")):
                 servo_rehome()
@@ -1661,8 +2276,18 @@ def handle_cmd(c, a, b, out, cl=None):
                     threading.Thread(target=ota_run, daemon=True).start()
         elif c == "z" and a == ord("e"):          # simulator only: [ze 1] press / [ze 0] release the emergency stop
             SERVO["estop_in"] = b in (1, ord("1"))
-        elif c == "z" and a == ord("s"):          # simulator only: fake SimHub on/off
-            SIMHUB[0] = (b == ord("1"))
+        elif c == "z" and a == ord("s"):          # simulator only: fake SimHub on/off ([zs2]: a still position)
+            SIMHUB[0] = (b == ord("1")) or (b == ord("2"))
+            SIMHUB_STILL[0] = (b == ord("2"))
+        elif c == "z" and a == ord("b"):          # simulator only: [zb 1] press / [zb 0] release the park button (D8)
+            BP["pin_low"] = b in (1, ord("1"))
+        elif c == "z" and a == ord("v"):          # simulator only: [zv n] the air around the board, [zv 200+n] the board
+            if b >= 200: FAN["t_board"] = float(b - 200)
+            else: FAN["ambient"] = float(b)
+        elif c == "z" and a == ord("n"):          # simulator only: [zn n] the temperature sensor 0 fine, 1 open, 2 shorted
+            FAN["ntc"] = b if b < 3 else b - ord("0")
+        elif c == "z" and a == ord("f"):          # simulator only: [zf n] the fan 0 PWM, 1 stuck, 2 3-pin, 3 2-pin
+            FAN["kind"] = b if b < 4 else b - ord("0")
         elif c == "z" and a == ord("t"):          # simulator only: [zt b] motor b>>4 (1-3), (b & 15) - 8 teeth of its pot belt
             mi, n = (b >> 4) - 1, (b & 15) - 8
             if 0 <= mi < 3:
@@ -1673,6 +2298,10 @@ def handle_cmd(c, a, b, out, cl=None):
             if args.fw >= 19: save_seat()
         elif c == "e" and a == ord("n") and 1 <= OTA["state"] <= 5:
             pass                                  # 1.9.2: not during a firmware update
+        elif c == "e" and a == ord("n") and bp_fw() and BP["state"] == BP_PARKED and (b == ord("a") or ord("1") <= b <= ord("3")):
+            bp_unpark(BPW_ENABLE)                 # 2.2.0b2: parked by the board - rise evenly
+        elif c == "e" and a == ord("n") and bp_fw() and BP["state"] != BP_RUN:
+            pass                                  # on the way down / up: the board finishes first
         elif c == "e" and a == ord("n"):
             if b == ord("a"):
                 for ch in C: enable(ch)
@@ -1702,6 +2331,8 @@ def handle_cmd(c, a, b, out, cl=None):
             elif k == "d" and args.fw >= 17: out.append(diag_frame())
             elif k == "j" and imu_fix() and cl is not None: out.append(imu_info_frame())   # 2.1.1 (the page only)
             elif k == "u" and ota_fw(): out.append(ota_frame())
+            elif k == "k" and bp_fw() and cl is not None: out.append(bp_frame())   # 2.2.0b2 (the page only)
+            elif k == "v" and fan_fw() and cl is not None: out.append(fan_frame())  # 2.2.0b3 (the page only)
 
 
 def client(conn):
@@ -1829,6 +2460,7 @@ def usb_cmd(c, a, b, out):
                 usb["held"] = usb.get("held", 0) + 1
                 return
             C["ABC".index(c)].set_target(a * 256 + b)
+            if bp_fw(): bp_saw("ABC".index(c), True)
             return
     if c == "r" and a == ord("d") and b in (ord("d"), ord("u")):
         return                                    # the diagnostics and update frames are the page's only

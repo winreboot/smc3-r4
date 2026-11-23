@@ -41,9 +41,107 @@
 // Pots: wiper must stay within 0-5 V (the R4 is a 5 V board, so existing wiring is fine).
 //****************************************************************************************************************
 
-#define FW_VERSION     "2.1.1"         // shown in the USB boot banner; [ver] still answers 70 for SMC3Utils
-#define FW_VERSION_NUM 21              // reported by [rd!] so smc3_scope can check what it is talking to (1.9.x = 19, 2.0 = 20, 2.1 = 21)
-#define FW_CAPS        "SMC3CAPS:ota1,wifimem1,usbpage1,modreset2,nativeusb1,reboot1,idleanim1,imuinfo1,park1,recover1"   // 1.9.2: what this build can do - smc3_scope looks for it in a .bin
+// ===============================================================================================================
+//  2.2.0: the release of the 2.2.0 betas (b1-b4), checked on the PC against a model of the board.  The servo build
+//  (pulse + direction, SERVO_STEPDIR 1) and the Motion Shield's fan control haven't run on servo actuators or a built
+//  shield yet.  After flashing any build: first runs with nobody in the seat and the emergency stop in your hand.
+// ===============================================================================================================
+
+// 2.2.0b1: which motors this build drives.  0 = DC motors through H-bridges with a position sensor on each (SMC3, as
+// always).  1 = servo drives that take PULSE + DIRECTION (ball-screw actuators, SFX-100 style: AASD-15A and similar AC
+// servo drives, integrated servos) - no position sensors, the drive closes the loop.  The servo build is the same
+// sketch with this set to 1 (SMC3_R4_Servo_v2.2.0.ino); see "SERVO BUILD" below for pins and set-up.
+#ifndef SERVO_STEPDIR
+#define SERVO_STEPDIR  0
+#endif
+
+#define FW_VERSION     "2.2.0"         // shown in the USB boot banner; [ver] still answers 70 for SMC3Utils
+#define FW_VERSION_NUM 22              // reported by [rd!] so smc3_scope can check what it is talking to (1.9.x = 19, 2.0 = 20, 2.1 = 21)
+#define FW_BETA        0               // 1 = a beta: the matrix blinks a corner LED, the banner says BETA (2.2.0b1-b4)
+#if SERVO_STEPDIR
+#define FW_CAPS_BUILD  ",servo1"
+#else
+#define FW_CAPS_BUILD  ""
+#endif
+#define FW_CAPS        "SMC3CAPS:ota1,wifimem1,usbpage1,modreset2,nativeusb1,reboot1,idleanim1,imuinfo1,park1,recover1,drvsel1,boardpark1,fan1" FW_CAPS_BUILD   // 1.9.2: what this build can do - smc3_scope looks for it in a .bin
+
+// v2.2.0:   the release of 2.2.0b1-b4 (everything below from 2.1.2b1 on), without the beta marker: the motor driver type
+//                as a setting, the servo build, park on the board with a park button and its light, the Motion
+//                Shield's fan, and coming back from the end stops with a noisy pot.  Nothing else changed from 2.2.0b4.
+// v2.2.0b4: BETA.  Coming back from the end stops with a noisy pot.  A lift resting at or just past its end stop (a park
+//                position past the end stops, or one that sank) used to be switched off again on Enable Motors or at
+//                power-up: the creep-back exemption ended at the first reading 16 counts inside, and the next noisy
+//                reading past the end stop tripped it; switched on just inside it got no exemption at all.  Now a
+//                motor switched on less than 24 counts inside an end stop gets the exemption too, and it ends only
+//                after the motor has stayed 16 counts inside for 0.25 s (a reading within 8 counts of the end stop
+//                starts the wait again).  The other rules are as in 2.1.1: never more than 24 counts further out
+//                than where it started, inside the SMC3 cutoff, each judged when it lasts 25 ms; gone after 40 s.
+//                Nothing else changed.
+// v2.2.0b3: BETA.  The Motion Shield's fan (board v0.8): a 4-pin PWM fan run by its EMC2301 fan chip (I2C 0x2F) from
+//                the board temperature (the NTC between the motor drivers, on the ADS1115 at 0x49, input 2).  The
+//                board runs the fan itself; the page only sets it.  Modes: Quiet (a built-in slow curve), Smart (your
+//                curve, and faster early while the motors work hard), My curve, Fixed speed, Full.  In every mode:
+//                full speed at the hot limit (70 C unless set) and when the temperature can't be read; a fan that
+//                should turn and doesn't is reported; the fan chip's own watchdog runs it at full speed if the board
+//                ever stops talking to it for 4 s.  Found by itself at power-up: only when SDA/SCL rise by
+//                themselves (the shield's pull-ups) does the board talk on A4/A5; a board without the shield never
+//                touches them.  Settings ([w value][kv n], the page only, saved at once): n 0 mode, 1 fixed %, 2
+//                lowest running %, 3 hot limit C, 4 Smart's speed at full motor work %, 5-9 curve temperatures C,
+//                10-14 curve speeds %; 16 try this speed for 8 s (not saved), 17 look for the fan chip again.
+//                [rdv] "SM3V" frame.  FW_CAPS says "fan1".  Nothing else changed.
+
+// v2.2.0b2: BETA.  Park on the board: the seat parks by itself when the game stops, and from a push button.
+//                Every motor in use glides to its park position (set on the page; it may be past the travel limits,
+//                Clip and end stops, inside the SMC3 cutoff), all arriving together and easing in and out, then the
+//                motors switch off - what the page's Park does, done by the board, so it works without the page open.
+//                Park on its own (off unless set): no motion from SimHub - no positions, or the same position within
+//                3 counts - for 10 s to 60 min ([w s][kb 4]); it rises evenly again (to SimHub's position, every
+//                motor together) as soon as SimHub moves.  With it on, the board also starts parked at power-up (the
+//                motors off, the seat where it rests) and rises when the game moves.  Park button (flag bit0): a
+//                momentary push button from D8 to GND (the board's pull-up; press = park, press again = up; on the
+//                way down or up a press switches the motors off where the seat is).  It must read pressed for
+//                150 ms and released once before it counts, so a stuck button or a noise spike does nothing.  Light
+//                (flag bit1): an LED from D12 to GND through 470 ohm (or the button's own 5 V LED): on = parked,
+//                blinking = on the way, a short flicker = not now.  Enable Motors while parked rises evenly too.
+//                Settings ([w value][kb n], the page only, saved at once): n 0-2 park position (pot counts),
+//                3 speed (counts/s, 10-300), 4 seconds without motion (0 = off), 5 flags, 6 motors in use.
+//                [kb 'P'] park, [kb 'U'] unpark, [kb 'S'] stop on the way (the page only); [rdk] "SM3K" frame.
+//                The diagnostics frame says DisableReason 9 for a motor the board parked.  FW_CAPS says "boardpark1".
+//                Not an emergency stop: the button asks the board; an emergency stop cuts the motor power.
+
+// v2.2.0b1: BETA.  The servo build (SERVO_STEPDIR 1): pulse + direction for servo drives - ball-screw actuators of the
+//                SFX-100 kind.  SimHub still speaks SMC3 to it ([A] [B] [C] targets, three actuators per board) and
+//                the dashboard sees positions as before; the drive does the position control, so PID, PWMmin and
+//                the pot settings do nothing here.  A 40 kHz interrupt sends the pulses (20 kHz at most, one pulse
+//                every two ticks, 25 us high); the 4 kHz control interrupt plans each actuator's speed towards its
+//                smoothed target with an acceleration limit, top speed = PWMmax / 255 x 20 kHz (a quarter of it
+//                after SimHub goes quiet, like SMC3's low power).  Homing: the drive can't tell where the actuator
+//                is, so at power-up (and [kG 1]) the servos are released for 4 s - the seat sinks onto its bottom
+//                stops - and the bottom counts as zero (what SimFeedback does); or, with home switches on A0-A2
+//                (normally closed to GND), each actuator drives down until its switch opens.  Then the actuators
+//                creep up to their targets (the soft start).  Disable Motors stops the pulses and the drive holds
+//                the actuator where it is (the servos stay on), so the position stays known.  Settings ([w] then
+//                [k f =], saved at once): f 83 = pulses for the full 0-1023 travel, 84 = acceleration in 1000
+//                pulses/s^2, 86 = flags (bit0 home switches, bit1 servo-on active LOW - HIGH unless set - bit2-4
+//                reverse motor 1-3, bit5 emergency-stop input on A3) (85 is 'U', the USB page command).
+//                Emergency stop (flag bit5): a normally closed contact from A3 to GND.  Open (pressed, or a broken
+//                wire) for 20 ms: every motor off, the servos released, the positions count as lost - after the
+//                button is released (500 ms closed), Enable Motors homes first.  The same button should cut the
+//                drives' servo-on supply (or their power) by itself, so the stop doesn't depend on the board.
+//                Reads: [rdq] state (bit7 = emergency stop pressed), [rdp] travel pulses, [rdg] acceleration,
+//                [rdh] flags + inputs (bits 0-2 home switches open, bit3 emergency-stop input open).
+//                Both builds: the beta marker (matrix corner LED and the built-in LED blink once a second).
+//                The DC build is 2.1.2b1 + the beta marker.
+
+// v2.1.2b1: the motor driver type is a setting instead of a choice made when compiling.  [kD n] (the page only,
+//                with all three motors switched off, not while SimHub is sending positions or during an update):
+//                0 = IBT-2 / BTS7960 (two PWM inputs: RPWM on D2/D4/D6, LPWM on D9/D10/D11, R_EN + L_EN on
+//                D3/D5/D7 - what MODE2 built), 1 = PWM + direction (Cytron MD30C / MD13S / SmartDriveDuo, VNH and
+//                100 A class bridges: DIR or INA on D2/D4/D6, PWM on D9/D10/D11, INB on D3/D5/D7 - what MODE1
+//                built).  Saved at once (EEPROM 110 = 0xD2 valid, 111 = type); a board never told uses the
+//                #define below (MODE2 = IBT-2), so an existing rig behaves exactly as before.  [rd!] flags bit1 now
+//                says which type is running.  With PWM + direction a switched-off motor brakes (PWM low on a
+//                sign-magnitude driver) where an IBT-2 lets it coast.  Nothing changes for SimHub or SMC3Utils.
 
 // v2.1.1: park, a motor comes back up from wherever it rests, and the motion sensor stays found.
 //                Park ([kP mask], refreshed by the page, lapses 3 s after the last one): the motors in mask may go
@@ -246,6 +344,7 @@
 //----------------------------------------------------------------------------------------------------------------
 
 // MODE1: H-bridge with PWM + two direction inputs.   MODE2: IBT-2 / BTS7960 ("43A Chinese" bridge).
+// 2.1.2: only the starting value - the page sets the driver type ([kD n], saved in EEPROM) without compiling.
 #define MODE2
 
 // Uncomment to reverse the direction of Motor 1 (same meaning as the original).
@@ -293,6 +392,8 @@
 #define LED_HORIZON_DEG   10.0f    // seat horizon: degrees that move/tilt the horizon to the edge of the matrix
 
 #define IMU_PORT 1                 // 1 = listen for a WitMotion WT901C on Serial1 (D0 RX / D1 TX), 0 = leave D0/D1 alone
+#define FAN_CTRL 1                 // 2.2.0b3: 1 = run the Motion Shield's 4-pin fan (found by itself at power-up: without
+                                   // the shield's pull-ups on SDA/SCL, A4/A5 are left alone), 0 = never touch A4/A5
 
 //----------------------------------------------------------------------------------------------------------------
 //  WIFI / TELEMETRY OPTIONS   <<< put your network name and password here >>>
@@ -386,6 +487,17 @@
 //                              f = 80 / 81: the sensor's level roll / pitch x100 (saved at once) - 1.9;
 //                              f = 82: soft-start speed, counts/s, 0 = off (saved at once) - 1.9.1
 //    [kSV] [kRL] [kCL] [kHn]   Seat set-up: save, reload saved, clear, page holds the seat n x 100 ms - 1.9
+//    [kD n]                    Motor driver type: 0 IBT-2 / BTS7960, 1 PWM + direction (the page only, all motors
+//                              off; saved at once) - 2.1.2
+//    [kG1]                     Servo build: release the servos and home again (the page only, all motors off) - 2.2
+//    [kb n] [kbP] [kbU] [kbS]  Park on the board: setting n = value register (n 0-2 park position, 3 speed, 4 s
+//                              without motion, 5 flags, 6 motors in use); park, unpark, stop (the page only) - 2.2.0b2
+//    [rdk]                     Park on the board: "SM3K" frame (the page only) - 2.2.0b2
+//    [kv n]                    The Motion Shield's fan: setting n = value register (0 mode, 1 fixed %, 2 lowest
+//                              running %, 3 hot limit, 4 Smart's top speed, 5-9 curve temperatures, 10-14 curve
+//                              speeds; 16 try a speed for 8 s, 17 look for the chip again) (the page only) - 2.2.0b3
+//    [rdv]                     The fan: "SM3V" frame (the page only) - 2.2.0b3
+//    [rdq] [rdp] [rdg] [rdh]   Servo build: state, travel pulses, acceleration, flags + home inputs - 2.2
 //    [kU1] / [kU0]             USB only: the page is on the USB cable for the next 5 s (repeat every second) / no
 //                              longer - telemetry and [rdd] come over USB, no WiFi calls meanwhile - 1.9.5
 //    [xe1] / [xe0]             Sensor acceleration + gyro after every telemetry burst on / off - 1.9
@@ -405,6 +517,9 @@
 #if ENABLE_WIFI
 #include <WiFiS3.h>
 #include <OTAUpdate.h>                         // 1.9.2: comes with the UNO R4 boards package (no install needed)
+#endif
+#if FAN_CTRL
+#include <Wire.h>                               // 2.2.0b3: the fan chip and the temperature sensor (A4/A5)
 #endif
 
 //----------------------------------------------------------------------------------------------------------------
@@ -481,7 +596,95 @@ uint8_t           SoftBad[NUM_MOTORS]   = {0, 0, 0};           // 2.1.1: PID cyc
 volatile uint8_t  OutBack[NUM_MOTORS]   = {0, 0, 0};           // 2.1.1: switched on from past an end stop, not back yet
 unsigned long     SoftSince[NUM_MOTORS] = {0, 0, 0};           // millis() when it started (gives up after 40 s)
 #define SOFT_MAX_MS  40000UL
+// 2.2.0b4: a noisy pot resting at its end stop.  Switched on less than SOFT_NEAR counts inside an end stop counts as
+// coming back too (one reading there may be past it); and back means SOFT_IN_COUNTS inside for SOFT_IN_MS in a row -
+// a reading SOFT_IN_RESET counts from the end stop (or past it) starts the wait again.  Before, the first reading 16
+// counts inside ended the exemption and the next noisy one past the end stop switched the motor off.
+#define SOFT_NEAR       24
+#define SOFT_IN_COUNTS  16
+#define SOFT_IN_RESET   8
+#define SOFT_IN_MS      250
+volatile uint16_t SoftInN[NUM_MOTORS]   = {0, 0, 0};           // 2.2.0b4: PID cycles in a row well inside (ISR)
 #define SOFT_EE      105                                       // EEPROM 105 = 0xB5 "valid", 106-107 = speed
+
+// 2.1.2: the motor driver type, a setting ([kD n]); the #define MODE1 / MODE2 above is only its starting value
+#define DRV_IBT2     0                                         // IBT-2 / BTS7960: two PWM inputs + enable
+#define DRV_PWMDIR   1                                         // PWM + direction pin(s): Cytron, VNH, 100 A bridges
+#define DRV_EE       110                                       // EEPROM 110 = 0xD2 "valid", 111 = type
+#ifdef MODE1
+volatile uint8_t  DriverType = DRV_PWMDIR;
+#else
+volatile uint8_t  DriverType = DRV_IBT2;
+#endif
+
+//----------------------------------------------------------------------------------------------------------------
+//  SERVO BUILD (2.2.0b1, SERVO_STEPDIR 1): pulse + direction servo drives, three actuators per board
+//
+//    Motor 1: PULSE D2, DIRECTION D3, SERVO-ON D9, home switch A0 (optional)
+//    Motor 2: PULSE D4, DIRECTION D5, SERVO-ON D10, home switch A1
+//    Motor 3: PULSE D6, DIRECTION D7, SERVO-ON D11, home switch A2
+//    Emergency-stop contact (normally closed, optional, flag bit5): A3 to GND
+//    The UNO R4's pins are rated 8 mA, less than a servo drive's optocoupler inputs want, and the AASD-15A's
+//    switching inputs (servo-on) run on 12-24 V: go through a ULN2803A (8 open-collector outputs, two chips for three
+//    drives) - board pin -> ULN input, ULN GND to the board's GND and the 24 V supply's 0 V, ULN COM pin left open.
+//    AASD-15A CN2 (DB25): pin 3 PULS+ and pin 4 SIGN+ to the board's 5V, pin 14 PULS- and pin 5 SIGN- to a ULN
+//    output each; pin 9 (COM+, 12-24 V) to +24 V through the emergency stop's contact, pin 10 (COM) to 0 V, pin 6
+//    (SigIn1 = SRV-ON) to a ULN output.  A board pin HIGH = the optocoupler on, so servo-on is active HIGH (the
+//    default); a board that is off or restarting leaves the ULN inputs open and the servo lets go.  Set the drive to
+//    position mode, pulse + direction (Pn096 0), servo-on from SigIn1 (Pn003 0); electronic gear so 20 kHz covers
+//    your top speed (Pn098 = 20 on the SFX-100's AASD-15A: 500 pulses per turn, 2400 rpm at 20 kHz).  Positive
+//    pulses must lift the actuator: reverse it in the drive (Pn097) or with flag bits 2-4.
+//----------------------------------------------------------------------------------------------------------------
+#if SERVO_STEPDIR
+#define STEP_TICK_HZ      40000                // the pulse interrupt
+#define STEP_IRQ_PRIORITY 5                    // above the control interrupt (6), below serial receive (4)
+#define STEP_MAX_PPS      (STEP_TICK_HZ / 2)   // a pulse is one tick high and at least one tick low
+#define SERVO_EE          220                  // EEPROM 220 = 0xE5 "valid", 221-222 travel, 223-224 acceleration, 225 flags
+#define SERVO_SETTLE_MS   4000UL               // servos released this long before homing at the bottom
+#define SERVO_READY_MS    300UL                // after switching the servos on, before the first pulse
+#define HOME_SPEED_PPS    1500                 // homing speed (15 mm/s at 100 pulses per mm)
+#define HOME_DEBOUNCE     8                    // control cycles a home switch must read the same (2 ms)
+#define SF_SWITCHES       1                    // ServoFlags: home switches on A0-A2 (else the bottom is home)
+#define SF_SON_LOW        2                    //   servo-on is active LOW (else active HIGH: through a ULN2803A)
+#define SF_DIR_INV1       4                    //   bits 2-4: reverse motor 1-3
+#define SF_ESTOP          32                   //   emergency-stop contact on A3 (normally closed to GND)
+#define SF_ALL            63
+#define ESTOP_TRIP_MS     20UL                 // open this long: stop
+#define ESTOP_CLEAR_MS    500UL                // closed this long: released
+#define HS_NONE           0                    // HomeState: not homed, nothing going on
+#define HS_SETTLE         1                    //   servos released, the seat sinks onto its stops
+#define HS_READY          2                    //   servos on, waiting for them to be ready
+#define HS_SEEK           3                    //   driving to the home switches (control interrupt)
+#define HS_HOMED          4                    //   homed: positions are known
+const uint8_t StepPin[NUM_MOTORS] = {2, 4, 6};
+const uint8_t DirPin[NUM_MOTORS]  = {3, 5, 7};
+const uint8_t SonPin[NUM_MOTORS]  = {9, 10, 11};
+const uint8_t HomePin[NUM_MOTORS] = {A0, A1, A2};
+const uint8_t EstopPin = A3;
+bool              EstopActive = false;           // the emergency stop is (was) pressed and not released yet
+unsigned long     EstopOpenSince = 0, EstopClosedSince = 0;
+uint16_t          EstopCount = 0;
+uint16_t          TravelPulses = 10000;        // pulses for the full 0-1023 range (100 mm at 100 pulses per mm)
+uint16_t          AccelK = 500;                // acceleration, 1000 pulses/s^2
+uint8_t           ServoFlags = 0;
+volatile int32_t  StepPos[NUM_MOTORS]  = {0, 0, 0};     // pulses sent, 0 = home (the bottom)
+volatile int32_t  StepVel[NUM_MOTORS]  = {0, 0, 0};     // pulses per tick in Q16, signed - written by the control ISR
+uint32_t          StepAcc[NUM_MOTORS]  = {0, 0, 0};     // (the pulse ISR's own)
+uint8_t           StepHigh[NUM_MOTORS] = {0, 0, 0};
+int8_t            StepDirNow[NUM_MOTORS] = {0, 0, 0};   // the direction output: +1 up, -1 down, 0 not set yet
+uint8_t           DirWait[NUM_MOTORS]  = {0, 0, 0};     // ticks to wait after the direction changes
+int32_t           SrvVel[NUM_MOTORS]   = {0, 0, 0};     // planned speed, pulses/s (control ISR)
+volatile uint8_t  HomeState = HS_NONE;
+volatile uint8_t  HomeWant = 0;                          // motors to switch on once homed (bits 0-2)
+volatile uint8_t  HomeFault = 0;                         // motors whose homing failed (bits 0-2)
+volatile uint8_t  SeekPhase[NUM_MOTORS] = {0, 0, 0};    // 0 done, 1 up off the switch, 2 down to the switch
+volatile int32_t  SeekFrom[NUM_MOTORS]  = {0, 0, 0};
+uint8_t           SeekSame[NUM_MOTORS]  = {0, 0, 0};    // debounce
+unsigned long     HomeSince = 0;
+bool              ServoOnNow = false;
+volatile uint16_t *StepPortSet[NUM_MOTORS], *StepPortClr[NUM_MOTORS], *DirPortSet[NUM_MOTORS], *DirPortClr[NUM_MOTORS];
+uint16_t          StepMask[NUM_MOTORS], DirMask[NUM_MOTORS];
+#endif
 
 long          PidCumError[NUM_MOTORS]      = {0, 0, 0};
 long          PidIntegralLimit[NUM_MOTORS] = {0, 0, 0};
@@ -506,6 +709,10 @@ volatile uint32_t IsrCyclesMax = 0;                            // worst-case ISR
 #define DIS_BOOT    3                                          // not enabled yet after power-up
 #define DIS_TILT    4                                          // 1.8: the seat tilted past the tilt limit
 #define DIS_UPDATE  5                                          // 1.9.2: switched off for a firmware update
+#define DIS_HOME    6                                          // 2.2: servo build - homing failed (no home switch)
+#define DIS_HOMING  7                                          // 2.2: servo build - homing (released / seeking)
+#define DIS_ESTOP   8                                          // 2.2: servo build - the emergency-stop input opened
+#define DIS_PARKED  9                                          // 2.2.0b2: parked by the board (the game stopped, the button)
 
 volatile uint8_t  DisableReason[NUM_MOTORS] = {DIS_BOOT, DIS_BOOT, DIS_BOOT};
 volatile uint16_t CutoffTrips[NUM_MOTORS]   = {0, 0, 0};       // since power-up
@@ -738,6 +945,62 @@ bool          PageHold = false;                          // [kH n]: SimHub's pos
 unsigned long PageHoldUntil = 0;                         // ... until then
 uint32_t      UsbHeldFrames = 0;                         // ... and how many were ignored
 
+//----------------------------------------------------------------------------------------------------------------
+//  2.2.0b2: park on the board - when the game stops sending motion, from a push button on D8, or from the page.
+//  Settings ([w value] then [kb n], the page only, saved at once): EEPROM 230 = 0xBA valid, 231-236 park positions
+//  (3 x int16, pot counts), 237-238 speed (counts/s), 239-240 park on its own after this many seconds (0 = off),
+//  241 flags (bit0 button on D8, bit1 its light on D12), 242 motors in use (bits 0-2), 243 park positions set.
+//----------------------------------------------------------------------------------------------------------------
+#define BP_EE          230
+#define BP_RUN         0                                 // BpState: SimHub (or the page) has the seat
+#define BP_PARKING     1                                 //   gliding down to the park position (the board's ramp)
+#define BP_PARKED      2                                 //   parked: the motors are off
+#define BP_UNPARKING   3                                 //   rising back evenly
+#define BP_WHY_AUTO    1                                 // BpWhy: the game stopped sending motion
+#define BP_WHY_BUTTON  2                                 //   the park button
+#define BP_WHY_PAGE    3                                 //   the page ([kb 'P'] / [kb 'U'])
+#define BP_WHY_ENABLE  4                                 //   Enable Motors ([ena]) while parked
+#define BP_WHY_BOOT    5                                 //   power-up with "park on its own" on: it starts parked
+#define BP_WHY_STOP    6                                 //   stopped on the way (button, [kb 'S'], [dis]): off where it is
+#define BPF_BUTTON     1                                 // BpFlags: a push button from D8 to GND
+#define BPF_LED        2                                 //   its light (or any LED, through 470 ohm) from D12 to GND
+#define BPE_TRIP       1                                 // BpFault: a motor switched off on the way (cutoff, tilt)
+#define BPE_SHORT      2                                 //   a motor stopped more than 15 counts short (against its stop)
+#define BPE_UP         4                                 //   unparking: a motor couldn't get back up - parked again
+#define BP_BUTTON_PIN  8
+#define BP_LED_PIN     12
+#define BP_STILL       3                                 // counts: a position this close to the last one is no motion
+#define BP_TOL         6                                 // counts: there
+#define BP_STALL_MS    800UL                             // not moving (2 counts) this long short of it: against its stop
+#define BP_WAIT_MS     6000UL                            // at most this long after the ramp, parking
+#define BP_UPWAIT_MS   4000UL                            //   ... unparking
+#define BP_UP_TOL      20                                // counts: back up
+#define BP_BTN_MS      150UL                             // the button must read the same this long (a noise spike is shorter)
+#define BP_LIVE_MS     2000UL                            // SimHub sent a position this recently: it is live
+bool          BpValid = false;                           // settings saved (and the park positions of the motors in use)
+int16_t       BpPos[NUM_MOTORS] = {512, 512, 512};       // park positions, pot counts
+uint16_t      BpSpeed = 60;                              // counts/s for the motor with the furthest to go
+uint16_t      BpAutoSec = 0;                             // park on its own after this many seconds without motion (0 = off)
+uint8_t       BpFlags = 0;
+uint8_t       BpUse = 7;                                 // the motors in use
+uint8_t       BpPosSet = 0;                              // the park positions the page has sent (bits 0-2)
+volatile uint8_t BpState = BP_RUN;                       // read by SetTarget() (loop() only, like everything here)
+uint8_t       BpWhy = 0, BpFault = 0, BpMask = 0, BpRefuse = 0;
+int16_t       BpFrom[NUM_MOTORS] = {0, 0, 0}, BpTo[NUM_MOTORS] = {0, 0, 0};
+bool          BpToLive = false;                          // unparking: to SimHub's live position (else the centre)
+unsigned long BpT0 = 0, BpDur = 0, BpSince = 0, BpRampEnd = 0, BpLastStep = 0;
+int16_t       BpStallRef[NUM_MOTORS] = {0, 0, 0};
+unsigned long BpStallSince[NUM_MOTORS] = {0, 0, 0};
+int           CmdTarget[NUM_MOTORS] = {512, 512, 512};   // what the position commands ask for (Target while parked waits)
+int16_t       BpRefT[NUM_MOTORS] = {512, 512, 512};      // motion: the last position that moved more than BP_STILL
+unsigned long BpMoveMillis = 0;                          // ... when (any source) - the "park on its own" clock
+unsigned long BpLastSh[NUM_MOTORS] = {0, 0, 0};          // SimHub's last position for each motor (a gap: a new start)
+uint8_t       BpUnparkReq = 0;                           // SimHub moved while parked on its own: rise (done in loop())
+uint16_t      BpParks = 0, BpUnparks = 0, BpPresses = 0;
+bool          BpBtnRaw = false, BpBtnArmed = false, BpBtnDown = false;
+unsigned long BpBtnSince = 0, BpLedFastUntil = 0;
+bool          BpLedOn = false;
+
 #if IMU_PORT
 const uint32_t ImuBauds[] = {9600, 115200, 230400, 57600, 38400, 19200, 4800};
 #define IMU_NBAUDS 7
@@ -766,8 +1029,8 @@ static inline int BuildFlags()
 #ifdef REVERSE_MOTOR1
     flags |= 1;
 #endif
-#ifdef MODE2
-    flags |= 2;                                // IBT-2 / BTS7960 wiring (MODE1 = PWM + two direction pins)
+#if !SERVO_STEPDIR
+    if (DriverType == DRV_IBT2) { flags |= 2; }   // IBT-2 / BTS7960 wiring (else PWM + direction) - 2.1.2: the setting
 #endif
 #if IMU_PORT
     flags |= 4;                                // listens for the motion sensor on Serial1
@@ -801,6 +1064,9 @@ static inline uint32_t CycleCount()
 
 static inline void SetPwmQ(uint8_t m, int q)
 {
+#if SERVO_STEPDIR
+    (void)m; (void)q; return;                  // 2.2: the servo build has no PWM outputs (D9-D11 are servo-on)
+#endif
     if (PwmHold) { return; }
     if (q < 0) { q = 0; }
     else if (q > PWM_FULL_Q) { q = PWM_FULL_Q; }
@@ -820,6 +1086,9 @@ void ConfigurePwm(uint8_t m, float freqHz)
 
 void ApplyPwmFrequencies()
 {
+#if SERVO_STEPDIR
+    return;                                    // 2.2: no PWM outputs in the servo build
+#endif
     ConfigurePwm(0, (float)Timer1FreqkHz * 1000.0f);
     ConfigurePwm(1, (float)Timer1FreqkHz * 1000.0f);
     ConfigurePwm(2, (float)Timer2FreqkHz * 1000.0f);
@@ -871,9 +1140,14 @@ void UpdatePIDLimits()
 void DisableMotor(uint8_t m)          // brakes on; may be called from the ISR
 {
     Disable[m] = 1;
+#if SERVO_STEPDIR
+    StepVel[m] = 0;                    // 2.2: the pulses stop; the drive holds the actuator where it is
+    HomeWant &= (uint8_t)~(1 << m);    // (and it stays off after homing)
+#else
     digitalWrite(ENApin[m], LOW);
     digitalWrite(ENBpin[m], LOW);
     SetPwmQ(m, 0);
+#endif
 }
 
 void SoftStartFrom(uint8_t m)        // 1.9.1: creep from where the motor is now to its target (loop() only)
@@ -882,8 +1156,11 @@ void SoftStartFrom(uint8_t m)        // 1.9.1: creep from where the motor is now
     // these lines is overwritten (GoalAcc is one 32-bit store) or is a step of a fraction of a count.
     int fb = Feedback_q[m];
     int lo = CutLo[m] << POS_SHIFT, hi = CutHi[m] << POS_SHIFT;
-    SoftOutQ[m] = (fb < lo) ? (lo - fb) : ((fb > hi) ? (fb - hi) : 0);
+    int out = (fb < lo) ? (lo - fb) : ((fb > hi) ? (fb - hi) : 0);
+    bool near = fb < lo + (SOFT_NEAR << POS_SHIFT) || fb > hi - (SOFT_NEAR << POS_SHIFT);   // 2.2.0b4: or just inside
+    SoftOutQ[m] = out > 0 ? out : (near ? 1 : 0);
     OutBack[m] = SoftOutQ[m] > 0 ? 1 : 0;        // 2.1.1: the end-stop exemption, apart from the creep
+    SoftInN[m] = 0;
     SoftBad[m] = 0;
     SoftTicks[m] = 0;
     SoftStart[m] = 1;
@@ -895,14 +1172,43 @@ void SoftStartFrom(uint8_t m)        // 1.9.1: creep from where the motor is now
     SoftSince[m] = millis();
 }
 
+#if SERVO_STEPDIR
+void ServoHomeStart(bool release);
+#endif
+
 void EnableMotor(uint8_t m)           // loop() only
 {
     if (UpdateRunning()) { return; }   // 1.9.2: not during a firmware update
+#if SERVO_STEPDIR
+    if (EstopActive) { DisableReason[m] = DIS_ESTOP; return; }   // 2.2: release the emergency stop first
+    if (HomeState != HS_HOMED)         // 2.2: positions unknown - home first, then switch it on
+    {
+        HomeWant |= (uint8_t)(1 << m);
+        DisableReason[m] = DIS_HOMING;
+        if (HomeState == HS_NONE) { ServoHomeStart(true); }
+        return;
+    }
+    if (HomeFault & (1 << m)) { DisableReason[m] = DIS_HOME; return; }   // no home switch found: home again first
+    Feedback_q[m] = (int)(StepPos[m] * (1023 << POS_SHIFT) / (int32_t)TravelPulses);
+    SrvVel[m] = 0;
+    TiltGraceUntil = millis() + 1500;
+    if (Disable[m] != 0)
+    {
+        SoftStartFrom(m);              // always creeps from where it is to its target
+        OutBack[m] = 0;                // (no end-stop exemption: the servo build has no pots and no end stops)
+        SoftOutQ[m] = 0;
+    }
+    DisableReason[m] = DIS_ON;
+    Disable[m] = 0;
+    return;
+#endif
     TiltGraceUntil = millis() + 1500;  // let the seat come back inside the tilt limit first
     // 1.9.1: no jump - it creeps to its target.  2.1.1: from outside its end stops always, also with the soft start
     // off (a corner that sank while the motors were off comes back slowly instead of being switched off again)
+    // 2.2.0b4: also from just inside an end stop (less than SOFT_NEAR counts): with a noisy pot the next reading may
+    // be past it
     int fbe = Feedback_q[m];
-    bool outside = fbe > (CutHi[m] << POS_SHIFT) || fbe < (CutLo[m] << POS_SHIFT);
+    bool outside = fbe > ((CutHi[m] - SOFT_NEAR) << POS_SHIFT) || fbe < ((CutLo[m] + SOFT_NEAR) << POS_SHIFT);
     if (Disable[m] != 0)
     {
         if (SoftRate > 0 || outside) { SoftStartFrom(m); }
@@ -910,12 +1216,381 @@ void EnableMotor(uint8_t m)           // loop() only
     }
     DisableReason[m] = DIS_ON;
     Disable[m] = 0;
-#ifdef MODE2
-    // IBT-2: pulse the enable low then leave it high to clear any over-temperature shutdown
-    digitalWrite(ENBpin[m], LOW);
-    digitalWrite(ENBpin[m], HIGH);
+#if !SERVO_STEPDIR
+    if (DriverType == DRV_IBT2)
+    {
+        // IBT-2: pulse the enable low then leave it high to clear any over-temperature shutdown
+        digitalWrite(ENBpin[m], LOW);
+        digitalWrite(ENBpin[m], HIGH);
+    }
 #endif
 }
+
+#if SERVO_STEPDIR
+//****************************************************************************************************************
+//    2.2.0b1 SERVO BUILD: pulses, speed planning, homing, settings
+//****************************************************************************************************************
+
+// Fast pin writes for the pulse interrupt: the port's set / reset registers (one store each, no read-modify-write).
+// Ports 0-4 hold every pin the UNO R4 uses; anything else falls back to digitalWrite.
+static inline R_PORT0_Type *PortRegs(uint32_t port)
+{
+    switch (port)
+    {
+        case 0: return (R_PORT0_Type *)(void *)R_PORT0;
+        case 1: return (R_PORT0_Type *)(void *)R_PORT1;
+        case 2: return (R_PORT0_Type *)(void *)R_PORT2;
+        case 3: return (R_PORT0_Type *)(void *)R_PORT3;
+        case 4: return (R_PORT0_Type *)(void *)R_PORT4;
+        default: return nullptr;
+    }
+}
+
+void ServoPinsInit()
+{
+    for (uint8_t m = 0; m < NUM_MOTORS; m++)
+    {
+        pinMode(StepPin[m], OUTPUT); digitalWrite(StepPin[m], LOW);
+        pinMode(DirPin[m], OUTPUT);  digitalWrite(DirPin[m], LOW);
+        pinMode(SonPin[m], OUTPUT);  digitalWrite(SonPin[m], (ServoFlags & SF_SON_LOW) ? HIGH : LOW);   // servo off
+        pinMode(HomePin[m], (ServoFlags & SF_SWITCHES) ? INPUT_PULLUP : INPUT);
+        uint32_t sp = (uint32_t)g_pin_cfg[StepPin[m]].pin, dp = (uint32_t)g_pin_cfg[DirPin[m]].pin;
+        R_PORT0_Type *sb = PortRegs(sp >> 8), *db = PortRegs(dp >> 8);
+        StepMask[m] = (uint16_t)(1u << (sp & 0xFF));
+        DirMask[m]  = (uint16_t)(1u << (dp & 0xFF));
+        StepPortSet[m] = sb ? &sb->POSR : nullptr;
+        StepPortClr[m] = sb ? &sb->PORR : nullptr;
+        DirPortSet[m]  = db ? &db->POSR : nullptr;
+        DirPortClr[m]  = db ? &db->PORR : nullptr;
+        StepDirNow[m] = 0;
+    }
+    pinMode(EstopPin, (ServoFlags & SF_ESTOP) ? INPUT_PULLUP : INPUT);
+    ServoOnNow = false;
+}
+
+static inline void PinFast(volatile uint16_t *reg, uint16_t mask, uint8_t pin, uint8_t level)
+{
+    if (reg) { *reg = mask; }                    // POSR / PORR: one store sets / clears just this pin
+    else { digitalWrite(pin, level); }
+}
+
+void ServoOn(bool on)
+{
+    bool hi = (ServoFlags & SF_SON_LOW) ? !on : on;
+    for (uint8_t m = 0; m < NUM_MOTORS; m++) { digitalWrite(SonPin[m], hi ? HIGH : LOW); }
+    ServoOnNow = on;
+}
+
+// The pulse interrupt, 40 kHz: a phase accumulator per motor; a pulse is one tick high (25 us), and the direction
+// output changes only while the pulse output is low, two ticks before the next pulse.
+void StepIsr(timer_callback_args_t *p_args)
+{
+    (void)p_args;
+    for (uint8_t m = 0; m < NUM_MOTORS; m++)
+    {
+        int32_t v = StepVel[m];
+        if (StepHigh[m])
+        {
+            PinFast(StepPortClr[m], StepMask[m], StepPin[m], LOW);
+            StepHigh[m] = 0;
+            if (v != 0 && ((v > 0) ? 1 : -1) == StepDirNow[m]) { StepAcc[m] += (uint32_t)(v > 0 ? v : -v); }
+            continue;
+        }
+        if (v == 0) { continue; }
+        int8_t want = (v > 0) ? 1 : -1;
+        if (want != StepDirNow[m])
+        {
+            bool lvl = (want > 0) != (((ServoFlags >> 2) >> m) & 1);
+            if (lvl) { PinFast(DirPortSet[m], DirMask[m], DirPin[m], HIGH); }
+            else     { PinFast(DirPortClr[m], DirMask[m], DirPin[m], LOW); }
+            StepDirNow[m] = want;
+            DirWait[m] = 2;
+            StepAcc[m] = 0;
+            continue;
+        }
+        if (DirWait[m]) { DirWait[m]--; continue; }
+        uint32_t a = StepAcc[m] + (uint32_t)(v > 0 ? v : -v);
+        if (a >= 65536u)
+        {
+            a -= 65536u;
+            if (a >= 65536u) { a = 65535u; }    // never more than one pulse owed
+            PinFast(StepPortSet[m], StepMask[m], StepPin[m], HIGH);
+            StepHigh[m] = 1;
+            StepPos[m] += want;
+        }
+        StepAcc[m] = a;
+    }
+}
+
+FspTimer StepTimer;
+
+bool StartStepTimer()
+{
+    uint8_t type = GPT_TIMER;
+    int8_t ch = FspTimer::get_available_timer(type);
+    if (ch < 0) { ch = FspTimer::get_available_timer(type, true); }
+    if (ch < 0) { return false; }
+    if (!StepTimer.begin(TIMER_MODE_PERIODIC, type, ch, (float)STEP_TICK_HZ, 0.0f, StepIsr)) { return false; }
+    if (!StepTimer.setup_overflow_irq(STEP_IRQ_PRIORITY)) { return false; }
+    if (!StepTimer.open()) { return false; }
+    if (!StepTimer.start()) { return false; }
+    return true;
+}
+
+static inline int32_t PulsesToQ4(int32_t p)
+{
+    return p * (1023 << POS_SHIFT) / (int32_t)TravelPulses;    // 32 bits: |p| <= 40 000, x 16 368 < 2^31
+}
+
+static inline bool HomeSwitchOpen(uint8_t m)     // normally closed to GND: open (or a broken wire) = at home
+{
+    return digitalRead(HomePin[m]) == HIGH;
+}
+
+// The control interrupt's part for one motor (instead of the PID): plan a speed towards the smoothed goal that can
+// still stop there, within the acceleration limit, and hand it to the pulse interrupt.
+static inline void ServoControl(uint8_t m)
+{
+    int32_t p = StepPos[m];
+    int fbq = (int)PulsesToQ4(p);
+    Feedback_q[m] = fbq;
+    FbRaw_q[m] = fbq;
+    int fbd = (fbq < 0) ? 0 : fbq;                            // (below zero while homing: the diagnostics' range is unsigned)
+    if (fbd < FbMin_q[m]) { FbMin_q[m] = fbd; }
+    if (fbd > FbMax_q[m]) { FbMax_q[m] = fbd; }
+    int32_t cyc = PID_RATE_HZ / (PIDProcessDivider > 0 ? PIDProcessDivider : 1);
+    int32_t vel;
+    if (HomeState == HS_SEEK && SeekPhase[m] != 0)
+    {
+        bool open = HomeSwitchOpen(m);
+        bool want = (SeekPhase[m] == 1) ? !open : open;      // phase 1 waits for closed, phase 2 for open
+        SeekSame[m] = want ? (uint8_t)(SeekSame[m] + 1) : 0;
+        int32_t moved = p - SeekFrom[m];
+        if (SeekSame[m] >= HOME_DEBOUNCE)
+        {
+            SeekSame[m] = 0;
+            if (SeekPhase[m] == 1) { SeekPhase[m] = 2; SeekFrom[m] = p; }
+            else { SeekPhase[m] = 0; StepVel[m] = 0; StepPos[m] = 0; Feedback_q[m] = 0; }
+        }
+        else if ((SeekPhase[m] == 1 && moved > (int32_t)TravelPulses / 6) ||
+                 (SeekPhase[m] == 2 && -moved > (int32_t)TravelPulses + (int32_t)TravelPulses / 4))
+        {
+            SeekPhase[m] = 0; StepVel[m] = 0; HomeFault |= (uint8_t)(1 << m);   // no switch where there should be one
+        }
+        vel = (SeekPhase[m] == 1) ? HOME_SPEED_PPS : ((SeekPhase[m] == 2) ? -HOME_SPEED_PPS : 0);
+        SrvVel[m] = vel;
+        StepVel[m] = vel * 65536 / STEP_TICK_HZ;
+        PWMout_q[m] = (int)((vel < 0 ? -vel : vel) * PWM_FULL_Q / STEP_MAX_PPS);
+        return;
+    }
+    if (Disable[m] != 0 || HomeState != HS_HOMED)
+    {
+        SrvVel[m] = 0; StepVel[m] = 0; PWMout_q[m] = 0;
+        return;
+    }
+    int32_t goal = (int32_t)Goal_q[m] * (int32_t)TravelPulses / (1023 << POS_SHIFT);   // 32 bits: 16 383 x 32 000 < 2^31
+    if (goal < 0) { goal = 0; } else if (goal > (int32_t)TravelPulses) { goal = TravelPulses; }
+    int32_t err = goal - p;
+    int32_t vmax = (int32_t)PWMmax[m] * STEP_MAX_PPS / 255;
+    if (PowerScale > 7) { vmax >>= 2; }                      // SimHub went quiet: a quarter, like SMC3's low power
+    int32_t acc = (int32_t)AccelK * 1000;
+    int32_t dv = acc / cyc;
+    if (dv < 1) { dv = 1; }
+    int32_t ae = err < 0 ? -err : err;
+    int32_t vstop = (int32_t)sqrtf(2.0f * (float)acc * (float)ae);
+    if (vstop > vmax) { vstop = vmax; }
+    int32_t vdes = (ae <= 1) ? 0 : ((err > 0) ? vstop : -vstop);
+    int32_t v = SrvVel[m];
+    if (v < vdes) { v += dv; if (v > vdes) { v = vdes; } }
+    else if (v > vdes) { v -= dv; if (v < vdes) { v = vdes; } }
+    SrvVel[m] = v;
+    int32_t q = v * 65536 / STEP_TICK_HZ;                  // |v| <= 20 000: < 2^31
+    if (q > 32768) { q = 32768; } else if (q < -32768) { q = -32768; }
+    StepVel[m] = q;
+    PWMout_q[m] = (int)((v < 0 ? -v : v) * PWM_FULL_Q / STEP_MAX_PPS);
+}
+
+// Homing, run from loop(): release (bottom homing) or keep holding (switches), switch on, find zero, then switch
+// on the motors that asked for it - they creep up to their targets.
+void ServoHomeStart(bool release)
+{
+    for (uint8_t m = 0; m < NUM_MOTORS; m++)
+    {
+        StepVel[m] = 0; SrvVel[m] = 0; SeekPhase[m] = 0;
+        if (Disable[m] == 0) { HomeWant |= (uint8_t)(1 << m); }
+        Disable[m] = 1; DisableReason[m] = DIS_HOMING;
+    }
+    HomeFault = 0;
+    HomeSince = millis();
+    if (!(ServoFlags & SF_SWITCHES) && release)
+    {
+        ServoOn(false);
+        HomeState = HS_SETTLE;
+    }
+    else
+    {
+        ServoOn(true);
+        HomeState = HS_READY;
+    }
+}
+
+// Emergency stop (flag bit5): every motor off, the servos released, the positions lost - homing again afterwards
+void EstopTrip()
+{
+    EstopActive = true;
+    if (EstopCount < 65535) { EstopCount++; }
+    for (uint8_t m = 0; m < NUM_MOTORS; m++)
+    {
+        DisableMotor(m);
+        DisableReason[m] = DIS_ESTOP;
+        SeekPhase[m] = 0;
+        SrvVel[m] = 0;
+    }
+    HomeWant = 0;
+    HomeState = HS_NONE;
+    ServoOn(false);
+}
+
+void EstopCheck(unsigned long now)
+{
+    if (!(ServoFlags & SF_ESTOP)) { if (EstopActive) { EstopActive = false; } return; }
+    bool open = digitalRead(EstopPin) == HIGH;          // normally closed to GND: open = pressed (or a broken wire)
+    if (open)
+    {
+        EstopClosedSince = 0;
+        if (!EstopOpenSince) { EstopOpenSince = now ? now : 1; }   // (0 = not open)
+        if (!EstopActive && now - EstopOpenSince >= ESTOP_TRIP_MS) { EstopTrip(); }
+    }
+    else
+    {
+        EstopOpenSince = 0;
+        if (!EstopClosedSince) { EstopClosedSince = now ? now : 1; }
+        if (EstopActive && now - EstopClosedSince >= ESTOP_CLEAR_MS) { EstopActive = false; }   // the motors stay off
+    }
+}
+
+void ServoTask(unsigned long now)
+{
+    if (UpdateRunning()) { return; }
+    EstopCheck(now);
+    if (EstopActive) { return; }
+    if (HomeState == HS_SETTLE && now - HomeSince >= SERVO_SETTLE_MS)
+    {
+        ServoOn(true);
+        HomeState = HS_READY;
+        HomeSince = now;
+    }
+    else if (HomeState == HS_READY && now - HomeSince >= SERVO_READY_MS)
+    {
+        if (ServoFlags & SF_SWITCHES)
+        {
+            for (uint8_t m = 0; m < NUM_MOTORS; m++)
+            {
+                SeekSame[m] = 0;
+                SeekFrom[m] = StepPos[m];
+                SeekPhase[m] = HomeSwitchOpen(m) ? 1 : 2;           // on the switch already: up off it first
+            }
+            HomeState = HS_SEEK;
+        }
+        else
+        {
+            for (uint8_t m = 0; m < NUM_MOTORS; m++) { StepPos[m] = 0; Feedback_q[m] = 0; }
+            HomeState = HS_HOMED;
+        }
+        HomeSince = now;
+    }
+    if (HomeState == HS_SEEK)
+    {
+        bool busy = false;
+        for (uint8_t m = 0; m < NUM_MOTORS; m++) { if (SeekPhase[m] != 0) { busy = true; } }
+        if (!busy)
+        {
+            HomeState = HS_HOMED;
+            for (uint8_t m = 0; m < NUM_MOTORS; m++) { if (HomeFault & (1 << m)) { DisableReason[m] = DIS_HOME; } }
+        }
+    }
+    if (HomeState == HS_HOMED && HomeWant)
+    {
+        uint8_t want = HomeWant;
+        HomeWant = 0;
+        for (uint8_t m = 0; m < NUM_MOTORS; m++)
+        {
+            if (!(want & (1 << m))) { continue; }
+            if (HomeFault & (1 << m)) { DisableReason[m] = DIS_HOME; continue; }
+            EnableMotor(m);                                         // creeps up from zero to its target
+        }
+    }
+}
+
+// [kG1]: release and home again - only with every motor off and SimHub quiet (the page asks for it)
+void ServoRehome()
+{
+    bool simhub = LastUsbTargetMillis && (millis() - LastUsbTargetMillis) < 10000;
+    if (simhub || UpdateRunning() || EstopActive) { return; }
+    for (uint8_t m = 0; m < NUM_MOTORS; m++) { if (Disable[m] == 0) { return; } }
+    HomeWant = 0;
+    HomeState = HS_NONE;
+    ServoHomeStart(true);
+}
+
+void WriteServoSettings()
+{
+    EEPROM.update(SERVO_EE, 0xE5);
+    EEPROM.update(SERVO_EE + 1, (uint8_t)(TravelPulses >> 8)); EEPROM.update(SERVO_EE + 2, (uint8_t)(TravelPulses & 0xFF));
+    EEPROM.update(SERVO_EE + 3, (uint8_t)(AccelK >> 8));       EEPROM.update(SERVO_EE + 4, (uint8_t)(AccelK & 0xFF));
+    EEPROM.update(SERVO_EE + 5, ServoFlags);
+}
+
+void ReadServoSettings()
+{
+    if (EEPROM.read(SERVO_EE) != 0xE5) { return; }
+    uint16_t t = (uint16_t)((EEPROM.read(SERVO_EE + 1) << 8) | EEPROM.read(SERVO_EE + 2));
+    uint16_t a = (uint16_t)((EEPROM.read(SERVO_EE + 3) << 8) | EEPROM.read(SERVO_EE + 4));
+    if (t >= 200 && t <= 32000) { TravelPulses = t; }
+    if (a >= 10 && a <= 5000) { AccelK = a; }
+    ServoFlags = EEPROM.read(SERVO_EE + 5) & SF_ALL;
+}
+
+// f 83 travel pulses, 84 acceleration (1000 pulses/s^2), 86 flags - saved at once; 83 and 86 only with every motor off
+void ServoSetting(uint8_t f, int16_t v)
+{
+    bool allOff = true;
+    for (uint8_t m = 0; m < NUM_MOTORS; m++) { if (Disable[m] == 0) { allOff = false; } }
+    if (f == 83 && allOff && v >= 200 && v <= 32000) { TravelPulses = (uint16_t)v; }
+    else if (f == 84 && v >= 10 && v <= 5000) { AccelK = (uint16_t)v; }
+    else if (f == 86 && allOff && v >= 0 && v <= SF_ALL)
+    {
+        bool sonWasOn = ServoOnNow;
+        ServoFlags = (uint8_t)v;
+        for (uint8_t m = 0; m < NUM_MOTORS; m++)
+        {
+            pinMode(HomePin[m], (ServoFlags & SF_SWITCHES) ? INPUT_PULLUP : INPUT);
+            StepDirNow[m] = 0;                                      // the direction output is set again on the next move
+        }
+        pinMode(EstopPin, (ServoFlags & SF_ESTOP) ? INPUT_PULLUP : INPUT);
+        EstopOpenSince = EstopClosedSince = 0;
+        ServoOn(sonWasOn);
+    }
+    else { return; }
+    WriteServoSettings();
+}
+
+uint8_t ServoStateByte()
+{
+    return (uint8_t)(1 | ((HomeState == HS_HOMED) ? 2 : 0) |
+                     ((HomeState == HS_SETTLE || HomeState == HS_READY || HomeState == HS_SEEK) ? 4 : 0) |
+                     ((ServoFlags & SF_SWITCHES) ? 8 : 0) | ((ServoFlags & SF_SON_LOW) ? 16 : 0) | (ServoOnNow ? 32 : 0) |
+                     ((HomeState == HS_SETTLE) ? 64 : 0) | (EstopActive ? 128 : 0));
+}
+
+uint8_t HomeInputs()
+{
+    uint8_t b = 0;
+    for (uint8_t m = 0; m < NUM_MOTORS; m++) { if (digitalRead(HomePin[m]) == HIGH) { b |= (uint8_t)(1 << m); } }
+    if ((ServoFlags & SF_ESTOP) && digitalRead(EstopPin) == HIGH) { b |= 8; }
+    return b;
+}
+#endif // SERVO_STEPDIR
 
 //****************************************************************************************************************
 //    Target smoothing - identical to SMC3_smooth.ino but in Q12 (count x 4096)
@@ -1041,80 +1716,81 @@ static inline void SetOutputsMotor(uint8_t m)
     }
     bool rev = (PWMrev[m] != 0) && !(ParkMask & (1 << m)) &&     // 2.1.1: not while parking
                (!SoftStart[m] || (fb > clipMax_q && goal < clipMax_q - lagQ) || (fb < clipMin_q && goal > clipMin_q + lagQ));
-#ifdef MODE1
-    if ((fb > clipMax_q) && rev)
+    if (DriverType == DRV_PWMDIR)                   // 2.1.2: a setting (was #ifdef MODE1)
     {
-        out = rev_q;
-        digitalWrite(ENApin[m], LOW);  digitalWrite(ENBpin[m], HIGH);
-        SetPwmQ(m, rev_q);
-    }
-    else if ((fb < clipMin_q) && rev)
-    {
-        out = rev_q;
-        digitalWrite(ENApin[m], HIGH); digitalWrite(ENBpin[m], LOW);
-        SetPwmQ(m, rev_q);
-    }
-    else if ((goal > (fb + dz_q)) || (goal < (fb - dz_q)))
-    {
-        if (out >= 0)
+        if ((fb > clipMax_q) && rev)
         {
-            out += offset_q;
-            if (out > max_q + lift_q) { out = max_q + lift_q; }
-            digitalWrite(ENApin[m], HIGH); digitalWrite(ENBpin[m], LOW);
-        }
-        else
-        {
-            out = -out + offset_q;
-            if (out > max_q) { out = max_q; }
+            out = rev_q;
             digitalWrite(ENApin[m], LOW);  digitalWrite(ENBpin[m], HIGH);
+            SetPwmQ(m, rev_q);
         }
-        SetPwmQ(m, out);
-    }
-    else
-    {
-        digitalWrite(ENApin[m], LOW);  digitalWrite(ENBpin[m], LOW);     // brake
-        out = offset_q;
-        SetPwmQ(m, 0);
-    }
-#endif
-
-#ifdef MODE2
-    if ((fb > clipMax_q) && rev)
-    {
-        out = rev_q;
-        digitalWrite(ENApin[m], LOW);
-        SetPwmQ(m, rev_q);
-    }
-    else if ((fb < clipMin_q) && rev)
-    {
-        out = rev_q;
-        digitalWrite(ENApin[m], HIGH);
-        SetPwmQ(m, PWM_FULL_Q - rev_q);
-    }
-    else if ((goal > (fb + dz_q)) || (goal < (fb - dz_q)))
-    {
-        if (out >= 0)
+        else if ((fb < clipMin_q) && rev)
         {
-            out += offset_q;
-            if (out > max_q + lift_q) { out = max_q + lift_q; }
-            digitalWrite(ENApin[m], HIGH);
-            SetPwmQ(m, PWM_FULL_Q - out);          // motor driven when PWM = 0 (unset)
+            out = rev_q;
+            digitalWrite(ENApin[m], HIGH); digitalWrite(ENBpin[m], LOW);
+            SetPwmQ(m, rev_q);
+        }
+        else if ((goal > (fb + dz_q)) || (goal < (fb - dz_q)))
+        {
+            if (out >= 0)
+            {
+                out += offset_q;
+                if (out > max_q + lift_q) { out = max_q + lift_q; }
+                digitalWrite(ENApin[m], HIGH); digitalWrite(ENBpin[m], LOW);
+            }
+            else
+            {
+                out = -out + offset_q;
+                if (out > max_q) { out = max_q; }
+                digitalWrite(ENApin[m], LOW);  digitalWrite(ENBpin[m], HIGH);
+            }
+            SetPwmQ(m, out);
         }
         else
         {
-            out = -out + offset_q;
-            if (out > max_q) { out = max_q; }
-            digitalWrite(ENApin[m], LOW);
-            SetPwmQ(m, out);                       // motor driven when PWM = 1 (set)
+            digitalWrite(ENApin[m], LOW);  digitalWrite(ENBpin[m], LOW);     // brake
+            out = offset_q;
+            SetPwmQ(m, 0);
         }
     }
-    else
+    else                                            // DRV_IBT2 (was #ifdef MODE2)
     {
-        digitalWrite(ENApin[m], LOW);              // brake
-        out = offset_q;
-        SetPwmQ(m, 0);
+        if ((fb > clipMax_q) && rev)
+        {
+            out = rev_q;
+            digitalWrite(ENApin[m], LOW);
+            SetPwmQ(m, rev_q);
+        }
+        else if ((fb < clipMin_q) && rev)
+        {
+            out = rev_q;
+            digitalWrite(ENApin[m], HIGH);
+            SetPwmQ(m, PWM_FULL_Q - rev_q);
+        }
+        else if ((goal > (fb + dz_q)) || (goal < (fb - dz_q)))
+        {
+            if (out >= 0)
+            {
+                out += offset_q;
+                if (out > max_q + lift_q) { out = max_q + lift_q; }
+                digitalWrite(ENApin[m], HIGH);
+                SetPwmQ(m, PWM_FULL_Q - out);          // motor driven when PWM = 0 (unset)
+            }
+            else
+            {
+                out = -out + offset_q;
+                if (out > max_q) { out = max_q; }
+                digitalWrite(ENApin[m], LOW);
+                SetPwmQ(m, out);                       // motor driven when PWM = 1 (set)
+            }
+        }
+        else
+        {
+            digitalWrite(ENApin[m], LOW);              // brake
+            out = offset_q;
+            SetPwmQ(m, 0);
+        }
     }
-#endif
 
     PWMout_q[m] = out;
 }
@@ -1140,6 +1816,11 @@ void PidIsr(timer_callback_args_t *p_args)
     for (uint8_t m = 0; m < NUM_MOTORS; m++)
     {
         Goal_q[m] = SmoothTarget(m, Target[m]);
+#if SERVO_STEPDIR
+        ServoControl(m);                         // 2.2: speed planning instead of the pot and the PID
+        PWMpid_q[m] = (SrvVel[m] < 0) ? -PWMout_q[m] : PWMout_q[m];   // telemetry: signed, + = up
+        continue;
+#endif
         int fb = analogRead(FeedbackPin[m]);
 
         // diagnostics: pot glitches (a jump no motor could make in 1/4 ms) and the range seen - on the raw readings,
@@ -1181,6 +1862,7 @@ void PidIsr(timer_callback_args_t *p_args)
             int out = (fb < lo) ? (lo - fb) : (fb - hi);
             bool hard = (fb > (CutoffLimitMax[m] << POS_SHIFT)) || (fb < (CutoffLimitMin[m] << POS_SHIFT));
             uint8_t badN = (uint8_t)((SOFT_OUT_MS * (PID_RATE_HZ / 1000) + PIDProcessDivider - 1) / PIDProcessDivider);
+            SoftInN[m] = 0;                     // 2.2.0b4: not back yet
             if (!hard && out <= SoftOutQ[m] + (SOFT_OUT_MARGIN << POS_SHIFT))
             {
                 past = false;
@@ -1195,10 +1877,29 @@ void PidIsr(timer_callback_args_t *p_args)
         else if (!past && SoftOutQ[m] != 0)
         {
             // back inside: once well inside (16 counts) the end stops count as usual again; just inside, pot noise
-            // may still cross the end stop for a moment
+            // may still cross the end stop for a moment.  2.2.0b4: well inside for SOFT_IN_MS in a row - one reading
+            // 16 counts in isn't enough with a noisy pot; a reading back near the end stop starts the wait again
             int lo = CutLo[m] << POS_SHIFT, hi = CutHi[m] << POS_SHIFT;
             int in = (fb - lo < hi - fb) ? (fb - lo) : (hi - fb);
-            SoftOutQ[m] = (in > (16 << POS_SHIFT) || !(SoftStart[m] || OutBack[m])) ? 0 : 1;
+            const uint16_t inN = (uint16_t)((SOFT_IN_MS * (PID_RATE_HZ / 1000) + PIDProcessDivider - 1) / PIDProcessDivider);
+            if (!(SoftStart[m] || OutBack[m]))
+            {
+                SoftOutQ[m] = 0;
+                SoftInN[m] = 0;
+            }
+            else
+            {
+                SoftOutQ[m] = 1;
+                if (in > (SOFT_IN_COUNTS << POS_SHIFT))
+                {
+                    if (SoftInN[m] < 65535) { SoftInN[m]++; }
+                    if (SoftInN[m] >= inN) { SoftOutQ[m] = 0; SoftInN[m] = 0; }
+                }
+                else if (in <= (SOFT_IN_RESET << POS_SHIFT))
+                {
+                    SoftInN[m] = 0;
+                }
+            }
             if (SoftOutQ[m] == 0) { OutBack[m] = 0; }   // 2.1.1: back - the end stops count as usual again
         }
         if (past)
@@ -1539,6 +2240,13 @@ void SeatCommand(uint8_t f, uint8_t c)
             }
             return;
         }
+#if SERVO_STEPDIR
+        else if (f == 83 || f == 84 || f == 86)  // 2.2: servo build settings, saved at once (85 = 'U' is taken)
+        {
+            ServoSetting(f, v);
+            return;
+        }
+#endif
         else if (f == 80 || f == 81)             // the sensor's level (raw angles x100 that count as level), saved at once
         {
             if (v >= -9000 && v <= 9000)
@@ -1605,6 +2313,37 @@ bool UsbDoubleResetSeen()
 #else
     return false;
 #endif
+}
+
+// 2.1.2: the motor driver type
+void ReadDriverType()
+{
+    if (EEPROM.read(DRV_EE) == 0xD2) { DriverType = EEPROM.read(DRV_EE + 1) ? DRV_PWMDIR : DRV_IBT2; }
+}
+
+// [kD n] (the page only): set the driver type.  Only with all three motors off - their outputs are parked low first,
+// so nothing is driven while the meaning of the pins changes - and never while SimHub is sending positions or during
+// a firmware update.  Saved at once.
+void DriverCommand(uint8_t n)
+{
+#if SERVO_STEPDIR
+    (void)n; return;                             // 2.2: the servo build has no H-bridge outputs
+#endif
+    if (n == '0' || n == '1') { n -= '0'; }
+    if (n > 1) { return; }
+    bool simhub = LastUsbTargetMillis && (millis() - LastUsbTargetMillis) < 10000;
+    if (simhub || UpdateRunning()) { return; }
+    for (uint8_t m = 0; m < NUM_MOTORS; m++) { if (Disable[m] == 0) { return; } }
+    // (no lock needed: the interrupt drives only enabled motors, and only loop() - where this runs - enables one)
+    for (uint8_t m = 0; m < NUM_MOTORS; m++)
+    {
+        digitalWrite(ENApin[m], LOW);
+        digitalWrite(ENBpin[m], LOW);
+        SetPwmQ(m, 0);
+    }
+    DriverType = n;
+    EEPROM.update(DRV_EE, 0xD2);
+    EEPROM.update(DRV_EE + 1, n);
 }
 
 void ReadUsbOwner()
@@ -1787,13 +2526,900 @@ void SetTarget(uint8_t m, int value)
     value += Trim[m];                            // 1.9: level trim, then SMC3's clip and the travel limits
     if (value > TargetHi[m]) { value = TargetHi[m]; }
     else if (value < TargetLo[m]) { value = TargetLo[m]; }
-    Target[m] = value;
+    CmdTarget[m] = value;                        // 2.2.0b2: what was asked for ...
+    if (BpState == BP_RUN) { Target[m] = value; }   // ... goes to the motor unless the board parks the seat
 }
 
 static inline bool PageHolds()                   // 1.9: the page has the seat ([kH n]); SimHub's positions wait
 {
     if (PageHold && (long)(PageHoldUntil - millis()) <= 0) { PageHold = false; }
     return PageHold;
+}
+
+//****************************************************************************************************************
+//    2.2.0b2: park on the board.  Every motor in use glides to its park position (pot counts, set by the page),
+//    arriving together and easing in and out, then switches off - the same as the page's Park, but done by the board
+//    itself, so it works without the page.  Started by: "park on its own" - no motion from SimHub (no positions, or
+//    the same position) for BpAutoSec seconds; the park button on D8; the page ([kb 'P']).  Unparked by: SimHub
+//    moving again (after parking on its own); the button; Enable Motors; the page ([kb 'U']).  While the board has
+//    the seat SimHub's positions are kept (CmdTarget) but don't move the motors; unparking rises evenly to SimHub's
+//    live position (or to the centre when SimHub is quiet) and gives the seat back.
+//****************************************************************************************************************
+
+static inline uint8_t EnabledMask()
+{
+    uint8_t mk = 0;
+    for (uint8_t m = 0; m < NUM_MOTORS; m++) { if (Disable[m] == 0) { mk |= (uint8_t)(1 << m); } }
+    return mk;
+}
+
+static inline int BpClampPark(uint8_t m, int v)  // anywhere inside the SMC3 cutoff, PARK_MARGIN in from it
+{
+    int lo = CutoffLimitMin[m] + PARK_MARGIN, hi = CutoffLimitMax[m] - PARK_MARGIN;
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+static inline int BpCentre(uint8_t m)            // where [A/B/C 512] puts the motor (the level seat)
+{
+    int v = 512;
+#ifdef REVERSE_MOTOR1
+    if (m == 0) { v = 1023 - v; }
+#endif
+    v += Trim[m];
+    return v > TargetHi[m] ? TargetHi[m] : (v < TargetLo[m] ? TargetLo[m] : v);
+}
+
+static inline bool BpBoardReady()                // the board may move the seat by itself now
+{
+    if (UpdateRunning()) { return false; }
+#if SERVO_STEPDIR
+    if (HomeState != HS_HOMED || EstopActive) { return false; }
+#endif
+    return true;
+}
+
+void BpRefreshValid()
+{
+    BpValid = EEPROM.read(BP_EE) == 0xBA && BpUse != 0 && (BpPosSet & BpUse) == BpUse;
+}
+
+void WriteBoardPark(uint8_t n)                   // one field, saved at once
+{
+    if (EEPROM.read(BP_EE) != 0xBA)              // first time: every field (the rest at their defaults)
+    {
+        EEPROM.update(BP_EE, 0xBA);
+        n = 255;
+    }
+    if (n == 255 || n < NUM_MOTORS)
+    {
+        for (uint8_t m = 0; m < NUM_MOTORS; m++) { EEPromPut16(BP_EE + 1 + 2 * m, BpPos[m]); }
+        EEPROM.update(BP_EE + 13, BpPosSet);
+    }
+    if (n == 255 || n == 3) { EEPromPut16(BP_EE + 7, (int16_t)BpSpeed); }
+    if (n == 255 || n == 4) { EEPromPut16(BP_EE + 9, (int16_t)BpAutoSec); }
+    if (n == 255 || n == 5) { EEPROM.update(BP_EE + 11, BpFlags); }
+    if (n == 255 || n == 6) { EEPROM.update(BP_EE + 12, BpUse); }
+}
+
+void BpPins()                                    // the button's pull-up and the light, as the flags say
+{
+    if (BpFlags & BPF_BUTTON) { pinMode(BP_BUTTON_PIN, INPUT_PULLUP); }
+    else { pinMode(BP_BUTTON_PIN, INPUT); BpBtnArmed = false; BpBtnDown = false; }
+    if (BpFlags & BPF_LED) { pinMode(BP_LED_PIN, OUTPUT); digitalWrite(BP_LED_PIN, BpLedOn ? HIGH : LOW); }
+    else { digitalWrite(BP_LED_PIN, LOW); pinMode(BP_LED_PIN, INPUT); BpLedOn = false; }
+}
+
+void ReadBoardPark()
+{
+    if (EEPROM.read(BP_EE) == 0xBA)
+    {
+        for (uint8_t m = 0; m < NUM_MOTORS; m++)
+        {
+            int16_t v = EEPromGet16(BP_EE + 1 + 2 * m);
+            BpPos[m] = (v >= 0 && v <= 1023) ? v : 512;
+        }
+        uint16_t sp = (uint16_t)EEPromGet16(BP_EE + 7);
+        BpSpeed = (sp >= 10 && sp <= 300) ? sp : 60;
+        uint16_t as = (uint16_t)EEPromGet16(BP_EE + 9);
+        BpAutoSec = (as <= 3600) ? as : 0;
+        BpFlags = EEPROM.read(BP_EE + 11) & (BPF_BUTTON | BPF_LED);
+        BpUse = EEPROM.read(BP_EE + 12) & 7;
+        BpPosSet = EEPROM.read(BP_EE + 13) & 7;
+    }
+    BpRefreshValid();
+    BpPins();
+}
+
+void BpSetting(uint8_t n, int16_t v)             // [w v][kb n]: 0-2 park position, 3 speed, 4 seconds (0 off), 5 flags, 6 use
+{
+    if (n < NUM_MOTORS)
+    {
+        if (v < 0 || v > 1023) { return; }
+        BpPos[n] = v; BpPosSet |= (uint8_t)(1 << n);
+    }
+    else if (n == 3) { if (v < 10 || v > 300) { return; } BpSpeed = (uint16_t)v; }
+    else if (n == 4) { if (v < 0 || v > 3600) { return; } BpAutoSec = (uint16_t)v; BpMoveMillis = millis(); }
+    else if (n == 5) { BpFlags = (uint8_t)v & (BPF_BUTTON | BPF_LED); BpPins(); }
+    else if (n == 6) { if ((v & 7) == 0 || v > 7) { return; } BpUse = (uint8_t)v; }
+    else { return; }
+    WriteBoardPark(n);
+    BpRefreshValid();
+}
+
+void BpRamp(unsigned long now)                   // the ramp's Target for this moment (eased: smoothstep)
+{
+    float x = BpDur ? (float)(now - BpT0) / (float)BpDur : 1.0f;
+    if (x > 1.0f) { x = 1.0f; }
+    float e = x * x * (3.0f - 2.0f * x);
+    for (uint8_t m = 0; m < NUM_MOTORS; m++)
+    {
+        if (!(BpMask & (1 << m))) { continue; }
+        int to = (BpState == BP_UNPARKING && BpToLive) ? CmdTarget[m] : BpTo[m];
+        float dv = (float)(to - BpFrom[m]) * e;
+        int v = BpFrom[m] + (int)(dv >= 0.0f ? dv + 0.5f : dv - 0.5f);
+        Target[m] = v > TargetHi[m] ? TargetHi[m] : (v < TargetLo[m] ? TargetLo[m] : v);
+    }
+}
+
+void BpStartRamp(unsigned long now)
+{
+    int dist = 0;
+    for (uint8_t m = 0; m < NUM_MOTORS; m++)
+    {
+        if (!(BpMask & (1 << m))) { continue; }
+        int d = BpTo[m] - BpFrom[m];
+        if (d < 0) { d = -d; }
+        if (d > dist) { dist = d; }
+        BpStallRef[m] = (int16_t)(Feedback_q[m] >> POS_SHIFT);
+        BpStallSince[m] = now;
+    }
+    unsigned long dur = (unsigned long)dist * 1250UL / (BpSpeed ? BpSpeed : 60);   // eased: a little longer
+    BpDur = dur < 1000UL ? 1000UL : dur;
+    BpT0 = now;
+    BpLastStep = now;
+    BpRampEnd = 0;
+}
+
+void BpKeepMask()                                // park mode for the motors the board moves (limits, tilt, PWMrev)
+{
+    ParkUntil = millis() + 3000UL;
+    if (ParkMask != BpMask) { ParkMask = BpMask; UpdateLimits(); }
+}
+
+void BpRefused(uint8_t why)
+{
+    BpRefuse = why;
+    BpLedFastUntil = millis() + 1500UL;          // the light flickers: not now
+}
+
+// Park now.  Refused (BpRefuse): 1 no park position from the page yet, 2 update / not homed, 3 no motor on, 4 busy
+bool BpParkStart(uint8_t why)
+{
+    if (BpState != BP_RUN) { BpRefused(4); return false; }
+    if (!BpValid) { BpRefused(1); return false; }
+    if (!BpBoardReady()) { BpRefused(2); return false; }
+    uint8_t mk = BpUse & EnabledMask();
+    if (!mk) { BpRefused(3); return false; }
+    unsigned long now = millis();
+    BpMask = mk;
+    BpKeepMask();                                // limits widened first, so the park position is in reach
+    for (uint8_t m = 0; m < NUM_MOTORS; m++)
+    {
+        if (!(mk & (1 << m))) { continue; }
+        BpFrom[m] = (int16_t)Target[m];
+        BpTo[m] = (int16_t)BpClampPark(m, BpPos[m]);
+    }
+    BpState = BP_PARKING;
+    BpWhy = why; BpFault = 0; BpRefuse = 0;
+    BpSince = now;
+    BpStartRamp(now);
+    return true;
+}
+
+void BpEndParked(uint8_t fault)                  // motors off where they are: parked (also the way out of trouble)
+{
+    for (uint8_t m = 0; m < NUM_MOTORS; m++)
+    {
+        if (!(BpMask & (1 << m))) { continue; }
+        if (Disable[m] == 0) { DisableReason[m] = DIS_PARKED; }
+        DisableMotor(m);
+    }
+    BpFault |= fault;
+    BpState = BP_PARKED;
+    BpSince = millis();
+    if (ParkMask) { ParkMask = 0; UpdateLimits(); }
+}
+
+// Rise again: every motor in use switched on where it is, then up evenly to SimHub's live position or the centre
+bool BpUnparkStart(uint8_t why)
+{
+    if (BpState == BP_PARKING || BpState == BP_UNPARKING) { BpRefused(4); return false; }
+    if (UpdateRunning()) { BpRefused(2); return false; }
+    unsigned long now = millis();
+#if SERVO_STEPDIR
+    if (HomeState != HS_HOMED || EstopActive)    // the positions aren't known: Enable Motors homes first, then creeps
+    {
+        for (uint8_t m = 0; m < NUM_MOTORS; m++) { if (BpUse & (1 << m)) { EnableMotor(m); } }
+        BpState = BP_RUN; BpWhy = why; BpSince = now; BpMoveMillis = now;
+        return true;
+    }
+#endif
+    BpMask = BpUse;
+    BpKeepMask();
+    bool live = LastUsbTargetMillis && (now - LastUsbTargetMillis) < BP_LIVE_MS;
+    BpToLive = live;
+    for (uint8_t m = 0; m < NUM_MOTORS; m++)
+    {
+        if (!(BpMask & (1 << m))) { continue; }
+        int fb = Feedback_q[m] >> POS_SHIFT;
+        if (Disable[m] == 0) { fb = Target[m]; }  // already on (one motor of a few): from where it is being sent
+        int lo = TargetLo[m], hi = TargetHi[m];
+        BpFrom[m] = (int16_t)(fb < lo ? lo : (fb > hi ? hi : fb));
+        BpTo[m] = (int16_t)(live ? CmdTarget[m] : BpCentre(m));
+        Target[m] = BpFrom[m];
+    }
+    BpState = BP_UNPARKING;                      // (before EnableMotor: SimHub's positions wait from now on)
+    BpWhy = why; BpFault = 0; BpRefuse = 0;
+    BpSince = now;
+    for (uint8_t m = 0; m < NUM_MOTORS; m++)
+    {
+        if (!(BpMask & (1 << m)) || Disable[m] == 0) { continue; }
+        SoftStartFrom(m);                        // the goal starts exactly where the motor is (no jump)
+        EnableMotor(m);
+    }
+    BpStartRamp(now);
+    BpUnparks++;
+    return true;
+}
+
+void BpStopHere()                                // the button / [kb 'S'] on the way: off where it is
+{
+    if (BpState == BP_PARKING || BpState == BP_UNPARKING)
+    {
+        BpWhy = BP_WHY_STOP;
+        BpEndParked(0);
+    }
+}
+
+void BpButtonPress()
+{
+    BpPresses++;
+    if (BpState == BP_PARKING || BpState == BP_UNPARKING) { BpStopHere(); return; }
+    if (BpState == BP_PARKED) { BpUnparkStart(BP_WHY_BUTTON); return; }
+    // running: park - or, when the page is moving the seat (its park, Seat setup), switch off where it is
+    if (PageHolds() || ParkMask)
+    {
+        BpMask = BpUse & EnabledMask();
+        if (BpMask) { BpWhy = BP_WHY_STOP; BpFault = 0; BpEndParked(0); }
+        return;
+    }
+    if (BpUse & EnabledMask()) { BpParkStart(BP_WHY_BUTTON); }
+    else { BpUnparkStart(BP_WHY_BUTTON); }       // the motors are off: bring the seat up evenly
+}
+
+void BpButtonTask(unsigned long now)
+{
+    if (!(BpFlags & BPF_BUTTON)) { return; }
+    bool low = digitalRead(BP_BUTTON_PIN) == LOW;  // pressed: the contact pulls D8 to GND
+    if (low != BpBtnRaw) { BpBtnRaw = low; BpBtnSince = now; return; }
+    if (now - BpBtnSince < BP_BTN_MS) { return; }
+    if (!low) { BpBtnArmed = true; BpBtnDown = false; return; }   // released (needed once before the first press)
+    if (!BpBtnArmed || BpBtnDown) { return; }
+    BpBtnDown = true;
+    BpButtonPress();
+}
+
+void BpLedTask(unsigned long now)                // on = parked, blinking = on the way, off = running
+{
+    if (!(BpFlags & BPF_LED)) { return; }
+    bool on;
+    if ((long)(BpLedFastUntil - now) > 0) { on = ((now / 80) & 1) != 0; }
+    else if (BpState == BP_PARKED) { on = true; }
+    else if (BpState == BP_PARKING || BpState == BP_UNPARKING) { on = ((now / 250) & 1) != 0; }
+    else { on = false; }
+    if (on != BpLedOn) { BpLedOn = on; digitalWrite(BP_LED_PIN, on ? HIGH : LOW); }
+}
+
+// a position command for motor m (after SetTarget): motion resets the "park on its own" clock; SimHub moving again
+// unparks a seat that parked on its own
+void BpSawTarget(uint8_t m, bool simhub)
+{
+    unsigned long now = millis();
+    if (simhub)
+    {
+        // the first position after a gap (SimHub just started, or a game after the menus) only says where SimHub is:
+        // what it sends next decides whether it moves (a still neutral position is no reason to rise)
+        bool gap = BpLastSh[m] == 0 || (now - BpLastSh[m]) > 1000UL;
+        BpLastSh[m] = now;
+        if (gap) { BpRefT[m] = (int16_t)CmdTarget[m]; return; }
+    }
+    int d = CmdTarget[m] - BpRefT[m];
+    if (d < 0) { d = -d; }
+    if (d <= BP_STILL) { return; }
+    BpRefT[m] = (int16_t)CmdTarget[m];
+    BpMoveMillis = now;
+    if (simhub && BpState == BP_PARKED && (BpWhy == BP_WHY_AUTO || BpWhy == BP_WHY_BOOT) &&
+        !(BpFault & (BPE_TRIP | BPE_UP)))
+    {
+        BpUnparkReq = BP_WHY_AUTO;
+    }
+}
+
+void BoardParkTask(unsigned long now)            // loop()
+{
+    BpButtonTask(now);
+    if (BpUnparkReq)
+    {
+        uint8_t w = BpUnparkReq;
+        BpUnparkReq = 0;
+        if (BpState == BP_PARKED && !PageHolds()) { BpUnparkStart(w); }
+    }
+    if (BpState == BP_RUN)
+    {
+        if (BpAutoSec && BpValid && BpBoardReady() && !PageHolds() && !ParkMask && !AnySoftStart() &&
+            (BpUse & EnabledMask()) && (now - BpMoveMillis) > (unsigned long)BpAutoSec * 1000UL)
+        {
+            BpParkStart(BP_WHY_AUTO);
+        }
+    }
+    else if (BpState == BP_PARKING || BpState == BP_UNPARKING)
+    {
+        BpKeepMask();
+        // a motor switched off on the way: [dis] (stop, no fault), or a cutoff / tilt trip - all off, parked
+        uint8_t off = BpMask & ~EnabledMask();
+        if (off)
+        {
+            bool cmd = true;
+            for (uint8_t m = 0; m < NUM_MOTORS; m++)
+            {
+                if ((off & (1 << m)) && DisableReason[m] != DIS_COMMAND) { cmd = false; }
+            }
+            if (cmd) { BpWhy = BP_WHY_STOP; }
+            BpEndParked(cmd ? 0 : BPE_TRIP);
+        }
+        else
+        {
+            // a loop pass held up (the WiFi module can block it for a second): the glide waits instead of jumping on
+            if ((now - BpT0) < BpDur && (now - BpLastStep) > 50UL) { BpT0 += now - BpLastStep; }
+            BpLastStep = now;
+            BpRamp(now);
+            if ((now - BpT0) >= BpDur)
+            {
+                if (!BpRampEnd) { BpRampEnd = now; }
+                bool done = true;
+                uint8_t far = 0;
+                for (uint8_t m = 0; m < NUM_MOTORS; m++)
+                {
+                    if (!(BpMask & (1 << m))) { continue; }
+                    int fb = Feedback_q[m] >> POS_SHIFT;
+                    int sf = fb - BpStallRef[m];
+                    if (sf > 2 || sf < -2) { BpStallRef[m] = (int16_t)fb; BpStallSince[m] = now; }
+                    int d = fb - Target[m];
+                    if (d < 0) { d = -d; }
+                    int tol = (BpState == BP_PARKING) ? BP_TOL : BP_UP_TOL;
+                    if (d <= tol) { continue; }
+                    if (d > (BpState == BP_PARKING ? 15 : BP_UP_TOL)) { far |= (uint8_t)(1 << m); }
+                    if (BpState == BP_PARKING && (now - BpRampEnd) > 1000UL && (now - BpStallSince[m]) >= BP_STALL_MS)
+                    {
+                        continue;                // against its stop short of the park position: that's fine
+                    }
+                    done = false;
+                }
+                unsigned long wait = (BpState == BP_PARKING) ? BP_WAIT_MS : BP_UPWAIT_MS;
+                if (done || (now - BpRampEnd) > wait)
+                {
+                    if (BpState == BP_PARKING)
+                    {
+                        BpEndParked(far ? BPE_SHORT : 0);
+                        BpParks++;
+                    }
+                    else if (far)
+                    {
+                        BpEndParked(BPE_UP);     // it can't come back up: off again (rather than trip later)
+                    }
+                    else
+                    {
+                        for (uint8_t m = 0; m < NUM_MOTORS; m++)
+                        {
+                            if (BpMask & (1 << m)) { Target[m] = BpToLive ? CmdTarget[m] : BpTo[m]; }
+                        }
+                        BpState = BP_RUN;        // SimHub has the seat again
+                        BpSince = now;
+                        BpMoveMillis = now;      // "park on its own" waits its full time again
+                        for (uint8_t m = 0; m < NUM_MOTORS; m++) { BpRefT[m] = (int16_t)CmdTarget[m]; }
+                        ParkMask = 0;
+                        UpdateLimits();
+                    }
+                }
+            }
+        }
+    }
+    BpLedTask(now);
+}
+
+//----------------------------------------------------------------------------------------------------------------
+//  2.2.0b3: the Motion Shield's fan (board v0.8).  A 4-pin PWM fan on J_FAN, driven by an EMC2301 fan chip (I2C 0x2F,
+//  26 kHz PWM, counts the fan's speed pulses); the board temperature comes from the NTC between the motor drivers
+//  (10k B3950 with 10k to 5 V, on the ADS1115 at 0x49, input AIN2).  loop() does one I2C transfer every 100 ms at most
+//  (about 0.3 ms each at 100 kHz, never longer than the 3 ms timeout) and decides the speed once a second.
+//  Settings ([w value][kv n], the page only, saved at once): EEPROM 250 = 0xF5 valid, 251 mode, 252 fixed %,
+//  253 lowest running %, 254 hot limit (C), 255 Smart's speed at full motor work (%), 256-260 curve temperatures (C),
+//  261-265 curve speeds (%).
+//----------------------------------------------------------------------------------------------------------------
+#define FAN_EE          250
+#define FAN_ADDR        0x2F                     // EMC2301
+#define FAN_ADC_ADDR    0x49                     // ADS1115 with ADDR on VDD
+#define FAN_M_QUIET     0                        // FanMode: a built-in slow curve
+#define FAN_M_SMART     1                        //   your curve, and faster early while the motors work hard
+#define FAN_M_CURVE     2                        //   your curve
+#define FAN_M_FIXED     3                        //   one speed
+#define FAN_M_FULL      4                        //   full speed
+#define FAN_NPTS        5                        // points on a curve
+#define FP_CHIP         1                        // FanPresent: the fan chip answers
+#define FP_ADC          2                        //   the temperature converter answers
+#define FP_PULLUP       4                        //   SDA and SCL have pull-ups (the shield is there): the bus is in use
+#define FP_LOOKED       8                        //   looked for at power-up
+#define FANF_STALL      1                        // FanFault: it should turn and doesn't (or gives no speed signal)
+#define FANF_SENSOR     2                        //   no sensible temperature: full speed
+#define FANF_HOT        4                        //   at the hot limit: full speed
+#define FANF_NOPWM      8                        //   it keeps turning at 0 %: a fan without speed control (3 wires)?
+#define FANF_WATCH      16                       //   the fan chip's watchdog ran it at full speed (since power-up)
+#define FANF_LOST       32                       //   the fan chip stopped answering (looked for again every 10 s)
+#define FAN_WHY_MODE    0                        // FanWhy: the speed comes from the mode
+#define FAN_WHY_HOT     1                        //   the hot limit
+#define FAN_WHY_SENSOR  2                        //   no temperature
+#define FAN_WHY_KICK    3                        //   starting from standstill: 40 % for 1.5 s
+#define FAN_WHY_TRY     4                        //   the page's "try this speed"
+#define FAN_NO_TEMP     (-32768)
+#define FAN_KICK_PCT    40
+#define FAN_KICK_MS     1500UL
+#define FAN_TRY_MS      8000UL
+#define FAN_UP_STEP     10                       // % per second up (the hot limit, no sensor and Full: at once)
+#define FAN_DOWN_STEP   3                        // % per second down
+#define FAN_HYST_X10    20                       // the curve slows down only once it is 2.0 C cooler
+#define FAN_HOT_HYST    3                        // the hot limit ends 3 C below it
+#define FAN_STALL_PCT   30                       // from this speed a fan must give speed pulses ...
+#define FAN_STALL_MS    6000UL                   // ... within this long
+const uint8_t FanQuietT[FAN_NPTS] = {35, 45, 55, 62, 70};   // Quiet: off when cool, slow until it is really warm
+const uint8_t FanQuietD[FAN_NPTS] = {0, 25, 35, 60, 100};
+uint8_t       FanPresent = 0;
+bool          FanValid = false;                  // settings saved
+uint8_t       FanMode = FAN_M_SMART, FanFixed = 50, FanMinRun = 25, FanHot = 70, FanBoost = 60;
+uint8_t       FanCurveT[FAN_NPTS] = {30, 40, 50, 60, 70};
+uint8_t       FanCurveD[FAN_NPTS] = {0, 30, 45, 70, 100};
+uint8_t       FanOut = 0, FanDrive = 0, FanTarget = 0, FanWhy = 0, FanFault = 0, FanLoad = 0, FanProduct = 0;
+uint8_t       FanStep = 0, FanChipErr = 0, FanAdcErr = 0, FanTempBad = 0, FanTryPct = 0, FanLastSet = 255;
+bool          FanHotOn = false, FanWdOn = false, FanTempOk = false;
+int16_t       FanTemp_x10 = FAN_NO_TEMP, FanCurveTemp_x10 = FAN_NO_TEMP, FanAdcRaw = 0;
+int16_t       FanTempHist[3] = {0, 0, 0};
+float         FanTempF = 0.0f;                   // C, smoothed
+uint8_t       FanTempN = 0;
+uint16_t      FanRpm = 0, FanCount = 0, FanRpmMax = 0, FanStalls = 0, FanWatches = 0, FanBusErrs = 0;
+uint32_t      FanLoadAcc = 0;                    // motor work, % x 256 (fast up, slow down)
+unsigned long FanStepAt = 0, FanCtlAt = 0, FanKickUntil = 0, FanTryUntil = 0, FanLostAt = 0, FanLastWrite = 0;
+unsigned long FanStallSince = 0, FanNoPwmSince = 0, FanFullSince = 0;
+
+#if FAN_CTRL
+bool FanBusErr(uint8_t *run)                     // one failed transfer; 5 in a row: that chip is gone
+{
+    if (FanBusErrs < 65535) { FanBusErrs++; }
+    if (*run < 255) { (*run)++; }
+    return false;
+}
+
+bool FanRestart[2] = {true, true};               // read with a repeated start (else a STOP before the read) - chip, ADC
+
+bool FanReadOnce(uint8_t addr, uint8_t reg, uint8_t *buf, uint8_t n, bool restart)
+{
+    Wire.beginTransmission(addr);
+    Wire.write(reg);
+    if (Wire.endTransmission(!restart) != 0) { return false; }   // the register's address (sendStop = !restart)
+    if (Wire.requestFrom(addr, (size_t)n) != n) { return false; }
+    for (uint8_t i = 0; i < n; i++) { buf[i] = (uint8_t)Wire.read(); }
+    return true;
+}
+
+bool FanRead(uint8_t addr, uint8_t reg, uint8_t *buf, uint8_t n)
+{
+    uint8_t *run = (addr == FAN_ADDR) ? &FanChipErr : &FanAdcErr;
+    bool *rs = &FanRestart[addr == FAN_ADDR ? 0 : 1];
+    if (FanReadOnce(addr, reg, buf, n, *rs)) { *run = 0; return true; }
+    if (*rs && FanReadOnce(addr, reg, buf, n, false)) { *rs = false; *run = 0; return true; }   // no repeated start here:
+    return FanBusErr(run);                                                                  // a STOP between works too
+}
+
+bool FanWrite(uint8_t addr, uint8_t reg, const uint8_t *buf, uint8_t n)
+{
+    uint8_t *run = (addr == FAN_ADDR) ? &FanChipErr : &FanAdcErr;
+    Wire.beginTransmission(addr);
+    Wire.write(reg);
+    for (uint8_t i = 0; i < n; i++) { Wire.write(buf[i]); }
+    if (Wire.endTransmission() != 0) { return FanBusErr(run); }
+    *run = 0;
+    return true;
+}
+
+bool FanWrite8(uint8_t reg, uint8_t v) { return FanWrite(FAN_ADDR, reg, &v, 1); }
+
+// The shield's 4.7k pull-ups: SDA and SCL read high, and rise again at once after being pulled low for a moment.
+// A pin with nothing on it stays low (its own charge), so a board without the shield fails here and A4/A5 are left
+// as inputs.  (Pulling SDA low and letting go with SCL high is a START and a STOP on the bus: harmless.)
+bool FanBusPulledUp()
+{
+    const uint8_t pins[2] = {SDA, SCL};
+    for (uint8_t i = 0; i < 2; i++)
+    {
+        pinMode(pins[i], INPUT);
+        delayMicroseconds(50);
+        if (digitalRead(pins[i]) != HIGH) { return false; }
+        digitalWrite(pins[i], LOW);
+        pinMode(pins[i], OUTPUT);
+        delayMicroseconds(5);
+        pinMode(pins[i], INPUT);
+        delayMicroseconds(20);                   // 4.7k x 100 pF rises in well under 1 us
+        if (digitalRead(pins[i]) != HIGH) { return false; }
+    }
+    return true;
+}
+
+bool FanFindChip()                               // the EMC230x answers with its ids: set it up
+{
+    uint8_t id[2];
+    if (!FanRead(FAN_ADDR, 0xFD, id, 2)) { return false; }          // FDh product, FEh maker
+    if (id[1] != 0x5D || id[0] < 0x34 || id[0] > 0x37) { return false; }   // SMSC/Microchip EMC2305/3/2/1
+    FanProduct = id[0];
+    bool ok = FanWrite8(0x20, 0x40)              // its watchdog only at power-up for now (the board may have restarted
+                                                 // with it running all the time); loop() switches it on again
+           && FanWrite8(0x2A, 0x00)              // PWM polarity normal
+           && FanWrite8(0x2B, 0x00)              // open drain (the fan pulls PWM up itself)
+           && FanWrite8(0x2D, 0x00)              // 26 kHz
+           && FanWrite8(0x31, 0x01)              // ... not divided
+           && FanWrite8(0x32, 0x0B);             // direct drive (no RPM loop), 500 rpm range (x1), 5 edges, 400 ms
+    if (!ok) { return false; }
+    FanPresent |= FP_CHIP;
+    FanFault &= (uint8_t)~FANF_LOST;
+    FanLastSet = 255;                            // write the speed again
+    FanWdOn = false;                             // ... and the watchdog
+    return true;
+}
+
+bool FanFindAdc()
+{
+    uint8_t c[2];
+    if (!FanRead(FAN_ADC_ADDR, 0x01, c, 2)) { return false; }       // its config register answers
+    FanPresent |= FP_ADC;
+    return true;
+}
+
+bool FanAdcStart()                               // one conversion of AIN2 against ground, +-6.144 V, 128 per s (8 ms)
+{
+    const uint8_t cfg[2] = {0xE1, 0x83};
+    return FanWrite(FAN_ADC_ADDR, 0x01, cfg, 2);
+}
+
+void FanAdcSample(int16_t raw)                   // the NTC: 10k B3950 to ground, 10k from 5 V
+{
+    FanAdcRaw = raw;
+    float v = (float)raw * (6.144f / 32768.0f);
+    bool ok = v > 0.05f && v < 4.95f;
+    float t = 0.0f;
+    if (ok)
+    {
+        float r = 10000.0f * v / (5.0f - v);
+        t = 1.0f / (1.0f / 298.15f + logf(r / 10000.0f) / 3950.0f) - 273.15f;
+        ok = t > -30.0f && t < 130.0f;
+    }
+    if (!ok)
+    {
+        if (FanTempBad < 255) { FanTempBad++; }
+        if (FanTempBad >= 3) { FanTempOk = false; FanTemp_x10 = FAN_NO_TEMP; FanTempN = 0; }
+        return;
+    }
+    FanTempBad = 0;
+    int16_t s = (int16_t)lroundf(t * 10.0f);
+    FanTempHist[0] = FanTempHist[1]; FanTempHist[1] = FanTempHist[2]; FanTempHist[2] = s;
+    if (FanTempN < 3) { FanTempN++; }
+    int16_t med = s;
+    if (FanTempN >= 3)                           // the middle one of the last three: a single bad reading counts for nothing
+    {
+        int16_t a = FanTempHist[0], b = FanTempHist[1], c = FanTempHist[2];
+        if (a > b) { int16_t x = a; a = b; b = x; }   // a <= b
+        med = (c <= a) ? a : (c >= b ? b : c);
+    }
+    if (!FanTempOk || FanTemp_x10 == FAN_NO_TEMP) { FanTempF = (float)med / 10.0f; }
+    else { FanTempF += ((float)med / 10.0f - FanTempF) * 0.3f; }   // smoothed over a few seconds
+    FanTemp_x10 = (int16_t)lroundf(FanTempF * 10.0f);
+    FanTempOk = true;
+}
+#endif
+
+uint8_t FanCurveAt(const uint8_t *ct, const uint8_t *cd, int16_t t_x10)   // speed % at this temperature (sorted copy)
+{
+    uint8_t t[FAN_NPTS], d[FAN_NPTS];
+    for (uint8_t i = 0; i < FAN_NPTS; i++) { t[i] = ct[i]; d[i] = cd[i]; }
+    for (uint8_t i = 1; i < FAN_NPTS; i++)
+    {
+        for (uint8_t j = i; j > 0 && t[j - 1] > t[j]; j--)
+        {
+            uint8_t a = t[j]; t[j] = t[j - 1]; t[j - 1] = a;
+            a = d[j]; d[j] = d[j - 1]; d[j - 1] = a;
+        }
+    }
+    if (t_x10 <= (int16_t)t[0] * 10) { return d[0]; }
+    for (uint8_t i = 1; i < FAN_NPTS; i++)
+    {
+        int16_t t1 = (int16_t)t[i] * 10;
+        if (t_x10 <= t1)
+        {
+            int16_t t0 = (int16_t)t[i - 1] * 10;
+            if (t1 <= t0) { return d[i]; }
+            long v = (long)d[i - 1] * 10 + ((long)d[i] - d[i - 1]) * 10 * (t_x10 - t0) / (t1 - t0);
+            return (uint8_t)constrain((v + 5) / 10, 0L, 100L);
+        }
+    }
+    return d[FAN_NPTS - 1];
+}
+
+uint8_t FanSmartBoost()                          // Smart: motor work 20 % or less (holding) -> nothing, 60 % -> FanBoost
+{
+    long w = (long)(FanLoadAcc >> 8);
+    if (w <= 20) { return 0; }
+    long v = (long)FanBoost * (w - 20) / 40;
+    return (uint8_t)constrain(v, 0L, (long)FanBoost);
+}
+
+void WriteFan(uint8_t n)                         // one field, saved at once
+{
+    EEPROM.update(FAN_EE, 0xF5);
+    if (n == 0) { EEPROM.update(FAN_EE + 1, FanMode); }
+    else if (n == 1) { EEPROM.update(FAN_EE + 2, FanFixed); }
+    else if (n == 2) { EEPROM.update(FAN_EE + 3, FanMinRun); }
+    else if (n == 3) { EEPROM.update(FAN_EE + 4, FanHot); }
+    else if (n == 4) { EEPROM.update(FAN_EE + 5, FanBoost); }
+    else if (n >= 5 && n < 5 + FAN_NPTS) { EEPROM.update(FAN_EE + 6 + (n - 5), FanCurveT[n - 5]); }
+    else if (n >= 10 && n < 10 + FAN_NPTS) { EEPROM.update(FAN_EE + 11 + (n - 10), FanCurveD[n - 10]); }
+    FanValid = true;
+}
+
+void ReadFanSettings()                           // a board that never had them keeps the defaults above
+{
+    if (EEPROM.read(FAN_EE) != 0xF5) { return; }
+    uint8_t v = EEPROM.read(FAN_EE + 1); if (v <= FAN_M_FULL) { FanMode = v; }
+    v = EEPROM.read(FAN_EE + 2); if (v <= 100) { FanFixed = v; }
+    v = EEPROM.read(FAN_EE + 3); if (v >= 10 && v <= 60) { FanMinRun = v; }
+    v = EEPROM.read(FAN_EE + 4); if (v >= 40 && v <= 95) { FanHot = v; }
+    v = EEPROM.read(FAN_EE + 5); if (v <= 100) { FanBoost = v; }
+    for (uint8_t i = 0; i < FAN_NPTS; i++)
+    {
+        v = EEPROM.read(FAN_EE + 6 + i); if (v <= 120) { FanCurveT[i] = v; }
+        v = EEPROM.read(FAN_EE + 11 + i); if (v <= 100) { FanCurveD[i] = v; }
+    }
+    FanValid = true;
+}
+
+void FanSetting(uint8_t n, int16_t v)            // [w v][kv n]
+{
+    if (n == 0 && v >= 0 && v <= FAN_M_FULL) { FanMode = (uint8_t)v; WriteFan(n); }
+    else if (n == 1 && v >= 0 && v <= 100) { FanFixed = (uint8_t)v; WriteFan(n); }
+    else if (n == 2 && v >= 10 && v <= 60) { FanMinRun = (uint8_t)v; WriteFan(n); }
+    else if (n == 3 && v >= 40 && v <= 95) { FanHot = (uint8_t)v; WriteFan(n); }
+    else if (n == 4 && v >= 0 && v <= 100) { FanBoost = (uint8_t)v; WriteFan(n); }
+    else if (n >= 5 && n < 5 + FAN_NPTS && v >= 0 && v <= 120) { FanCurveT[n - 5] = (uint8_t)v; WriteFan(n); }
+    else if (n >= 10 && n < 10 + FAN_NPTS && v >= 0 && v <= 100) { FanCurveD[n - 10] = (uint8_t)v; WriteFan(n); }
+    else if (n == 16)                            // try this speed for 8 s (255: stop trying) - not saved
+    {
+        if (v >= 0 && v <= 100) { FanTryPct = (uint8_t)v; FanTryUntil = millis() + FAN_TRY_MS; FanCtlAt = 0; }
+        else { FanTryUntil = 0; FanCtlAt = 0; }
+    }
+    else if (n == 17) { FanLostAt = 0; }         // look for the chip again now (if it isn't there)
+}
+
+void FanTask(unsigned long now);
+
+void FanBegin()                                  // setup(), before WiFi: found? then a first speed at once
+{
+#if FAN_CTRL
+    FanPresent = FP_LOOKED;
+    if (!FanBusPulledUp()) { return; }           // no shield: A4/A5 stay inputs, nothing else happens
+    FanPresent |= FP_PULLUP;
+    Wire.begin();
+    Wire.setClock(100000);
+    Wire.setWireTimeout(3000);                   // never wait longer than 3 ms for the bus
+    if (FanFindAdc() && FanAdcStart())
+    {
+        delay(12);                               // one conversion (8 ms) - setup() only
+        uint8_t b[2];
+        for (uint8_t i = 0; i < 3 && FanRead(FAN_ADC_ADDR, 0x00, b, 2); i++)
+        {
+            FanAdcSample((int16_t)((b[0] << 8) | b[1]));
+            if (i < 2 && FanAdcStart()) { delay(12); } else { break; }
+        }
+    }
+    if (FanFindChip())                           // writing the speed also stops its power-up watchdog
+    {
+        FanCtlAt = 0;
+        FanTask(millis());                       // a first speed from the temperature (no ramp)
+    }
+    else { FanLostAt = millis(); }
+#endif
+}
+
+void FanWatchdogPause()                          // before something that blocks loop() for seconds (a WiFi connect):
+{                                                // the fan keeps its speed instead of going to full speed meanwhile
+#if FAN_CTRL
+    if ((FanPresent & FP_CHIP) && FanWdOn && FanWrite8(0x20, 0x40)) { FanWdOn = false; }   // loop() switches it on again
+#endif
+}
+
+void FanControl(unsigned long now)               // once a second: the speed, from the mode and the temperature
+{
+    uint8_t want = 100, why = FAN_WHY_MODE;
+    if (FanTempOk)                               // the curve's temperature only falls once it is 2 C cooler
+    {
+        if (FanCurveTemp_x10 == FAN_NO_TEMP || FanTemp_x10 > FanCurveTemp_x10) { FanCurveTemp_x10 = FanTemp_x10; }
+        else if (FanTemp_x10 + FAN_HYST_X10 < FanCurveTemp_x10) { FanCurveTemp_x10 = FanTemp_x10 + FAN_HYST_X10; }
+    }
+    else { FanCurveTemp_x10 = FAN_NO_TEMP; }
+    int16_t tc = FanCurveTemp_x10;
+    switch (FanMode)
+    {
+        case FAN_M_QUIET: want = FanCurveAt(FanQuietT, FanQuietD, tc); break;
+        case FAN_M_SMART: want = FanCurveAt(FanCurveT, FanCurveD, tc); { uint8_t b = FanSmartBoost(); if (b > want) { want = b; } } break;
+        case FAN_M_CURVE: want = FanCurveAt(FanCurveT, FanCurveD, tc); break;
+        case FAN_M_FIXED: want = FanFixed; break;
+        default: want = 100; break;
+    }
+    if (FanTryUntil && (long)(FanTryUntil - now) > 0) { want = FanTryPct; why = FAN_WHY_TRY; }
+    else { FanTryUntil = 0; }
+    if (!FanTempOk) { want = 100; why = FAN_WHY_SENSOR; FanFault |= FANF_SENSOR; FanHotOn = false; }
+    else
+    {
+        FanFault &= (uint8_t)~FANF_SENSOR;
+        if (FanTemp_x10 >= (int16_t)FanHot * 10) { FanHotOn = true; }
+        else if (FanTemp_x10 < ((int16_t)FanHot - FAN_HOT_HYST) * 10) { FanHotOn = false; }
+        if (FanHotOn) { want = 100; why = FAN_WHY_HOT; }
+    }
+    if (FanHotOn) { FanFault |= FANF_HOT; } else { FanFault &= (uint8_t)~FANF_HOT; }
+    if (want > 100) { want = 100; }
+    if (want > 0 && want < FanMinRun) { want = FanMinRun; }
+    FanTarget = want;
+    uint8_t was = FanOut;
+    bool atOnce = why == FAN_WHY_HOT || why == FAN_WHY_SENSOR || why == FAN_WHY_TRY || FanMode == FAN_M_FULL || FanCtlAt == 0;
+    if (want >= FanOut)
+    {
+        int u = (int)FanOut + FAN_UP_STEP;
+        if (u < (int)FanMinRun) { u = FanMinRun; }   // from standstill straight to the lowest running speed
+        FanOut = (atOnce || u > (int)want) ? want : (uint8_t)u;
+    }
+    else
+    {
+        int o = atOnce ? want : (int)FanOut - FAN_DOWN_STEP;
+        if (o < (int)want) { o = want; }
+        if (want == 0 && o < (int)FanMinRun) { o = 0; }   // below the lowest running speed: off
+        FanOut = (uint8_t)o;
+    }
+    if (was == 0 && FanOut > 0) { FanKickUntil = now + FAN_KICK_MS; }
+    FanDrive = FanOut;
+    if (FanKickUntil && (long)(FanKickUntil - now) > 0 && FanDrive < FAN_KICK_PCT) { FanDrive = FAN_KICK_PCT; why = FAN_WHY_KICK; }
+    FanWhy = why;
+
+    // does it turn?  From 30 % a fan must give speed pulses within 6 s; at 0 % (after 15 s) it should have slowed
+    bool kicking = FanKickUntil && (long)(FanKickUntil - now) > 0;
+    if (FanDrive >= FAN_STALL_PCT && !kicking && FanRpm == 0)
+    {
+        if (!FanStallSince) { FanStallSince = now; }
+        if ((now - FanStallSince) >= FAN_STALL_MS && !(FanFault & FANF_STALL)) { FanFault |= FANF_STALL; if (FanStalls < 65535) { FanStalls++; } }
+    }
+    else { FanStallSince = 0; if (FanRpm > 0) { FanFault &= (uint8_t)~FANF_STALL; } }
+    if (FanDrive >= 90 && FanRpm > 0)            // its top speed: what "it keeps turning at 0 %" is measured against
+    {
+        if (!FanFullSince) { FanFullSince = now; }
+        if ((now - FanFullSince) >= 5000UL && FanRpm > FanRpmMax) { FanRpmMax = FanRpm; }
+    }
+    else { FanFullSince = 0; }
+    if (FanDrive == 0 && FanRpmMax && FanRpm > (uint16_t)(FanRpmMax * 4UL / 5UL))
+    {
+        if (!FanNoPwmSince) { FanNoPwmSince = now; }
+        if ((now - FanNoPwmSince) >= 15000UL) { FanFault |= FANF_NOPWM; }
+    }
+    else { FanNoPwmSince = 0; if (FanDrive == 0) { FanFault &= (uint8_t)~FANF_NOPWM; } }
+}
+
+void FanTask(unsigned long now)                  // loop(): at most one I2C transfer per 100 ms
+{
+#if FAN_CTRL
+    if (!(FanPresent & FP_PULLUP)) { return; }
+    if (!(FanPresent & FP_CHIP))                 // gone (or never answered): look again every 10 s
+    {
+        if (FanLostAt == 0 || (now - FanLostAt) >= 10000UL)
+        {
+            FanLostAt = now ? now : 1;
+            if (!(FanPresent & FP_ADC)) { FanFindAdc(); }
+            if (FanFindChip()) { FanCtlAt = 0; FanStep = 0; FanStepAt = now; }
+        }
+        return;
+    }
+    // motor work: the drive of every motor that is on, averaged (fast up, slow down: about 3 s / 60 s)
+    static unsigned long loadAt = 0;
+    if (now - loadAt >= 100UL)
+    {
+        loadAt = now;
+        uint32_t sum = 0;
+        for (uint8_t m = 0; m < NUM_MOTORS; m++) { if (Disable[m] == 0) { sum += (uint32_t)ReportPWM(m); } }
+        uint32_t w = sum * 100UL * 256UL / (255UL * NUM_MOTORS);
+        if (w > FanLoadAcc) { FanLoadAcc += (w - FanLoadAcc) / 30; } else { FanLoadAcc -= (FanLoadAcc - w) / 600; }
+        unsigned long ld = (unsigned long)(FanLoadAcc >> 8);
+        FanLoad = (uint8_t)(ld > 100UL ? 100UL : ld);
+    }
+    if (FanCtlAt == 0)                           // right after finding it: decide at once
+    {
+        FanControl(now);
+        FanCtlAt = now ? now : 1;
+        uint8_t set = (uint8_t)(((uint16_t)FanDrive * 255U + 50U) / 100U);
+        if (FanWrite8(0x30, set)) { FanLastSet = set; FanLastWrite = now; }
+        FanStep = 0; FanStepAt = now;
+        return;
+    }
+    if (now - FanStepAt < 100UL) { return; }
+    FanStepAt = now;
+    uint8_t b[2];
+    switch (FanStep)
+    {
+        case 0:                                  // start a temperature conversion
+            if (FanPresent & FP_ADC) { if (!FanAdcStart() && FanAdcErr >= 5) { FanPresent &= (uint8_t)~FP_ADC; FanTempOk = false; FanTemp_x10 = FAN_NO_TEMP; } }
+            else if ((now - FanLostAt) >= 10000UL) { FanLostAt = now; FanFindAdc(); }
+            break;
+        case 1:                                  // ... read it (100 ms later; it takes 8 ms)
+            if (FanPresent & FP_ADC)
+            {
+                if (FanRead(FAN_ADC_ADDR, 0x00, b, 2)) { FanAdcSample((int16_t)((b[0] << 8) | b[1])); }
+                else if (FanAdcErr >= 5) { FanPresent &= (uint8_t)~FP_ADC; FanTempOk = false; FanTemp_x10 = FAN_NO_TEMP; }
+            }
+            break;
+        case 2:                                  // the fan's speed (reading 3Eh latches 3Fh)
+            if (FanRead(FAN_ADDR, 0x3E, b, 2))
+            {
+                FanCount = (uint16_t)(((uint16_t)b[0] << 5) | (b[1] >> 3));
+                unsigned long r = (FanCount == 0 || FanCount >= 0x1FF8) ? 0UL : 3932160UL / FanCount;   // 2-pole fan
+                FanRpm = (uint16_t)(r > 65535UL ? 65535UL : r);
+            }
+            break;
+        case 3:                                  // status (read to clear): bit7 its watchdog ran the fan at full speed
+            if (FanRead(FAN_ADDR, 0x24, b, 1) && (b[0] & 0x80))
+            {
+                if (FanWatches < 65535) { FanWatches++; }
+                FanFault |= FANF_WATCH;
+                FanWdOn = false; FanLastSet = 255;   // set it up again below
+            }
+            break;
+        case 4:                                  // decide, and write the speed when it changes (and every 2 s)
+        {
+            FanControl(now);
+            FanCtlAt = now;
+            uint8_t set = (uint8_t)(((uint16_t)FanDrive * 255U + 50U) / 100U);
+            if (set != FanLastSet || (now - FanLastWrite) >= 2000UL)
+            {
+                if (FanWrite8(0x30, set)) { FanLastSet = set; FanLastWrite = now; }
+            }
+            break;
+        }
+        case 5:                                  // from now on its watchdog runs all the time: 4 s without a word
+            if (!FanWdOn && FanWrite8(0x20, 0x60)) { FanWdOn = true; }   // from the board = full speed (DIS_TO kept)
+            break;
+        default: break;
+    }
+    FanStep = (uint8_t)((FanStep + 1) % 10);     // one round a second
+    if (FanChipErr >= 5)                         // it stopped answering: look for it every 10 s
+    {
+        FanPresent &= (uint8_t)~FP_CHIP;
+        FanFault |= FANF_LOST;
+        FanLostAt = now ? now : 1;
+        FanChipErr = 0;
+        FanRpm = 0;
+    }
+#else
+    (void)now;
+#endif
 }
 
 #if ENABLE_WIFI
@@ -1805,6 +3431,10 @@ void OtaCommand(uint8_t a, uint8_t b);
 void ImuCommand(uint8_t a, uint8_t b);
 static inline uint8_t SensorState();
 void UsbPageCommand(uint8_t n);
+#if ENABLE_WIFI
+void SendBoardPark();                            // 2.2.0b2
+void SendFan();                                  // 2.2.0b3
+#endif
 
 // source 0 = USB (SimHub / SMC3Utils), 1 = TCP (smc3_scope.py).  Same command set on both.
 // "Host alive" for the comms-timeout power reduction = any USB packet, or a position command over TCP
@@ -1846,9 +3476,9 @@ void ParseCommand(const unsigned int *buf, uint8_t source)
 
     switch (buf[0])
     {
-        case 'A': SetTarget(0, word); break;
-        case 'B': SetTarget(1, word); break;
-        case 'C': SetTarget(2, word); break;
+        case 'A': SetTarget(0, word); BpSawTarget(0, source == 0 && !usbPage); break;   // 2.2.0b2: motion?
+        case 'B': SetTarget(1, word); BpSawTarget(1, source == 0 && !usbPage); break;
+        case 'C': SetTarget(2, word); BpSawTarget(2, source == 0 && !usbPage); break;
 
         case 'r':
             if (b1 == 'd')
@@ -1894,12 +3524,20 @@ void ParseCommand(const unsigned int *buf, uint8_t source)
                     }
                     case 'f': SendTwoValues('f', SmoothShift, MaxRate / 100); break;   // 1.6: smoothing, max speed
                     case '!': SendTwoValues('!', BuildFlags(), FW_VERSION_NUM); break; // 1.4: build flags + version
+#if SERVO_STEPDIR
+                    case 'q': SendTwoValues('q', ServoStateByte(), HomeFault | (HomeWant << 3)); break;   // 2.2: servo state
+                    case 'p': SendValue('p', TravelPulses); break;                                         // 2.2: travel pulses
+                    case 'g': SendValue('g', AccelK); break;                                               // 2.2: acceleration
+                    case 'h': SendTwoValues('h', ServoFlags, HomeInputs()); break;                         // 2.2: flags, inputs
+#endif
                     case 'l': SendTwoValues('l', LedView, LedFlags); break;            // 1.8: matrix view + flags
                     case 'i': SendTwoValues('i', SensorState(), TiltLimitDeg); break;  // 1.8: sensor state + tilt limit
 #if ENABLE_WIFI
                     case 'd': if (fromPage) { SendDiag(); } break;         // 1.7: diagnostics frame (the page only)
                     case 'j': if (fromPage) { SendImuInfo(); } break;      // 2.1.1: the motion sensor link (the page only)
                     case 'u': if (fromPage) { SendOtaFrame(); } break;     // 1.9.2: update state + version text
+                    case 'k': if (fromPage) { SendBoardPark(); } break;    // 2.2.0b2: park on the board
+                    case 'v': if (fromPage) { SendFan(); } break;          // 2.2.0b3: the Motion Shield's fan
 #endif
                     default: break;
                 }
@@ -1960,6 +3598,30 @@ void ParseCommand(const unsigned int *buf, uint8_t source)
                 bool simhub = LastUsbTargetMillis && (millis() - LastUsbTargetMillis) < 10000;
                 if ((source == 1 || usbPage) && (b2 == 1 || b2 == '1') && !simhub && !UsbNative) { ModuleRestartReq = true; ModuleRestartUsb = usbPage; }
             }
+#if SERVO_STEPDIR
+            else if (b1 == 'G' && b2 != '=')                     // 2.2: release the servos and home again (the page only)
+            {
+                if (fromPage && (b2 == 1 || b2 == '1')) { ServoRehome(); }
+            }
+#endif
+            else if (b1 == 'b')                                  // 2.2.0b2: park on the board (the page only)
+            {
+                if (fromPage)
+                {
+                    if (b2 == 'P') { BpParkStart(BP_WHY_PAGE); }
+                    else if (b2 == 'U') { BpUnparkStart(BP_WHY_PAGE); }
+                    else if (b2 == 'S') { BpStopHere(); }
+                    else if (b2 < 16) { BpSetting((uint8_t)b2, ValueReg); }
+                }
+            }
+            else if (b1 == 'v')                                  // 2.2.0b3: the Motion Shield's fan (the page only)
+            {
+                if (fromPage && b2 < 32) { FanSetting((uint8_t)b2, ValueReg); }
+            }
+            else if (b1 == 'D' && b2 != '=')                     // 2.1.2: motor driver type (the page only)
+            {
+                if (fromPage) { DriverCommand((uint8_t)b2); }
+            }
             else if (b1 == 'O')                                  // 2.0: who owns the USB connector (the page only)
             {
                 if (fromPage) { UsbOwnerCommand((uint8_t)b2); }
@@ -2008,7 +3670,12 @@ void ParseCommand(const unsigned int *buf, uint8_t source)
         case 'e':
             if (b1 == 'n')
             {
-                if (b2 == 'a') { EnableMotor(0); EnableMotor(1); EnableMotor(2); }
+                if (BpState == BP_PARKED && (b2 == 'a' || (b2 >= '1' && b2 <= '3')))
+                {
+                    BpUnparkStart(BP_WHY_ENABLE);                // 2.2.0b2: parked by the board - rise evenly
+                }
+                else if (BpState != BP_RUN) { }                  // on the way down / up: the board finishes first
+                else if (b2 == 'a') { EnableMotor(0); EnableMotor(1); EnableMotor(2); }
                 else if (b2 == '1') { EnableMotor(0); }
                 else if (b2 == '2') { EnableMotor(1); }
                 else if (b2 == '3') { EnableMotor(2); }
@@ -2607,6 +4274,7 @@ void SendDiag()
         Put16(p, FbMin_q[m]);      p += 2;
         Put16(p, FbMax_q[m]);      p += 2;
         int fb = Feedback_q[m];                    // start a new interval for the per-read values
+        if (fb < 0) { fb = 0; }                    // (2.2 servo build: below zero while homing)
         PotJumpMax_q[m] = 0;
         FbMin_q[m] = fb;
         FbMax_q[m] = fb;
@@ -2773,6 +4441,89 @@ struct OtaCompat
     }
     template <typename T> static int Progress(T &, long) { return OTA_NO_PROGRESS; }
 };
+
+// 2.2.0b3: "SM3V" - the Motion Shield's fan ([rdv], the page only).  Little-endian: 'S' 'M' '3' 'V', uint8 version (1),
+//   uint8 length (43), then uint8 present (bit0 fan chip, bit1 temperature converter, bit2 SDA/SCL pull-ups seen,
+//   bit3 looked) | uint8 mode (0 Quiet, 1 Smart, 2 My curve, 3 Fixed, 4 Full) | uint8 drive % now (with the start
+//   kick) | uint8 speed % (ramped) | uint8 target % | uint8 why (0 the mode, 1 hot limit, 2 no temperature, 3 starting,
+//   4 trying a speed) | uint8 faults (bit0 doesn't turn, bit1 no temperature, bit2 hot, bit3 keeps turning at 0 %,
+//   bit4 watchdog went off, bit5 chip stopped answering) | uint8 motor work % | uint8 settings saved | uint8 chip id |
+//   int16 temperature x10 C (-32768 none) | int16 the curve's temperature x10 | uint16 rpm | uint16 speed count |
+//   int16 converter reading | uint16 top rpm seen | uint8 fixed % | uint8 lowest running % | uint8 hot limit C |
+//   uint8 Smart's top % | uint8 curve temperatures x5 | uint8 curve speeds x5 | uint16 times it didn't turn |
+//   uint16 watchdog times | uint16 I2C errors | uint8 s left trying a speed.
+void SendFan()
+{
+    uint8_t buf[6 + 44];
+    uint8_t *p = buf + 6;
+    unsigned long now = millis();
+    *p++ = FanPresent; *p++ = FanMode; *p++ = FanDrive; *p++ = FanOut; *p++ = FanTarget; *p++ = FanWhy;
+    *p++ = FanFault; *p++ = FanLoad; *p++ = (uint8_t)(FanValid ? 1 : 0); *p++ = FanProduct;
+    Put16(p, FanTemp_x10); p += 2;
+    Put16(p, FanCurveTemp_x10); p += 2;
+    Put16(p, (int)FanRpm); p += 2;
+    Put16(p, (int)FanCount); p += 2;
+    Put16(p, FanAdcRaw); p += 2;
+    Put16(p, (int)FanRpmMax); p += 2;
+    *p++ = FanFixed; *p++ = FanMinRun; *p++ = FanHot; *p++ = FanBoost;
+    for (uint8_t i = 0; i < FAN_NPTS; i++) { *p++ = FanCurveT[i]; }
+    for (uint8_t i = 0; i < FAN_NPTS; i++) { *p++ = FanCurveD[i]; }
+    Put16(p, (int)FanStalls); p += 2;
+    Put16(p, (int)FanWatches); p += 2;
+    Put16(p, (int)FanBusErrs); p += 2;
+    unsigned long left = (FanTryUntil && (long)(FanTryUntil - now) > 0) ? (FanTryUntil - now + 999UL) / 1000UL : 0;
+    *p++ = (uint8_t)left;
+    size_t len = (size_t)(p - (buf + 6));
+    buf[0] = 'S'; buf[1] = 'M'; buf[2] = '3'; buf[3] = 'V';
+    buf[4] = 1;
+    buf[5] = (uint8_t)len;
+    PageWrite(buf, 6 + len);
+}
+
+// 2.2.0b2: "SM3K" - park on the board ([rdk], the page only).  Little-endian: 'S' 'M' '3' 'K', uint8 version (1),
+//   uint8 length (37), then uint8 state (0 running, 1 parking, 2 parked, 3 unparking) | uint8 why (1 the game stopped,
+//   2 the button, 3 the page, 4 Enable Motors, 5 power-up, 6 stopped on the way) | uint8 fault (bit0 a motor switched
+//   off on the way, bit1 one stopped short, bit2 one couldn't get back up) | uint8 motors it moves | uint8 settings
+//   valid (bit0) + park positions set (bits 1-3) | uint8 motors in use | uint8 flags (bit0 button, bit1 light) |
+//   uint8 button (bit0 pressed now, bit1 seen released, bit2 counted as held) | uint8 last refusal (0 none, 1 no park
+//   position, 2 update / not homed, 3 no motor on, 4 busy) | int16 park position x3 | uint16 speed | uint16 seconds
+//   (0 off) | uint16 s since the last motion (65535 more) | uint16 s until it parks on its own (65535 not counting) |
+//   uint16 parks | uint16 unparks | uint16 button presses | uint16 ms in this state / 100 (65535 more) | int16 where
+//   each motor goes x3 (this ramp).
+void SendBoardPark()
+{
+    uint8_t buf[6 + 40];
+    uint8_t *p = buf + 6;
+    unsigned long now = millis();
+    *p++ = BpState; *p++ = BpWhy; *p++ = BpFault; *p++ = BpMask;
+    *p++ = (uint8_t)((EEPROM.read(BP_EE) == 0xBA ? 1 : 0) | (BpPosSet << 1));
+    *p++ = BpUse; *p++ = BpFlags;
+    *p++ = (uint8_t)((BpBtnRaw ? 1 : 0) | (BpBtnArmed ? 2 : 0) | (BpBtnDown ? 4 : 0));
+    *p++ = BpRefuse;
+    for (uint8_t m = 0; m < NUM_MOTORS; m++) { Put16(p, BpPos[m]); p += 2; }
+    Put16(p, BpSpeed); p += 2;
+    Put16(p, BpAutoSec); p += 2;
+    unsigned long still = (now - BpMoveMillis) / 1000UL;
+    Put16(p, (int)(still > 65535UL ? 65535UL : still)); p += 2;
+    unsigned long left = 65535UL;
+    if (BpState == BP_RUN && BpAutoSec && BpValid && (BpUse & EnabledMask()))
+    {
+        unsigned long el = now - BpMoveMillis, lim = (unsigned long)BpAutoSec * 1000UL;
+        left = el >= lim ? 0 : (lim - el + 999UL) / 1000UL;
+    }
+    Put16(p, (int)left); p += 2;
+    Put16(p, BpParks); p += 2;
+    Put16(p, BpUnparks); p += 2;
+    Put16(p, BpPresses); p += 2;
+    unsigned long in = (now - BpSince) / 100UL;
+    Put16(p, (int)(in > 65535UL ? 65535UL : in)); p += 2;
+    for (uint8_t m = 0; m < NUM_MOTORS; m++) { Put16(p, BpTo[m]); p += 2; }
+    size_t len = (size_t)(p - (buf + 6));
+    buf[0] = 'S'; buf[1] = 'M'; buf[2] = '3'; buf[3] = 'K';
+    buf[4] = 1;
+    buf[5] = (uint8_t)len;
+    PageWrite(buf, 6 + len);
+}
 
 void SendOtaFrame()
 {
@@ -3010,6 +4761,7 @@ void ServiceNetwork(unsigned long now)
         }
         if (hostIdle && (now - WifiLastAttempt) > retry)
         {
+            FanWatchdogPause();                 // 2.2.0b3: this blocks for seconds - the fan keeps its speed meanwhile
             bool ok = ConnectWifi();
             if (ModuleRestartAt)
             {
@@ -4134,6 +5886,9 @@ void UpdateMatrix()
         else if (LedView == 2)                   { FramePixel(7, 11, (now % 3000UL) < 150); }   // quiet: heartbeat
         else                                     { DrawBars(blink); }
     }
+#if FW_BETA
+    FramePixel(0, 11, ((now / 500) & 1) != 0);   // 2.2.0b1: the top-right LED blinks - beta firmware
+#endif
     Matrix.renderBitmap(Frame, 8, 12);
 }
 
@@ -4171,6 +5926,11 @@ void setup()
     DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
 #endif
 
+#if SERVO_STEPDIR
+    ReadServoSettings();                        // 2.2: the pins depend on the flags (servo-on level, home switches)
+    ServoPinsInit();                            // servos off: the seat sinks onto its stops while the board starts
+    HomeSince = millis();
+#else
     for (uint8_t m = 0; m < NUM_MOTORS; m++)
     {
         pinMode(ENApin[m], OUTPUT);
@@ -4178,16 +5938,23 @@ void setup()
         digitalWrite(ENApin[m], LOW);
         digitalWrite(ENBpin[m], LOW);
     }
+#endif
     pinMode(LED_BUILTIN, OUTPUT);
 
     analogReadResolution(ADC_BITS);
+#if !SERVO_STEPDIR
     for (uint8_t m = 0; m < NUM_MOTORS; m++) { (void)analogRead(FeedbackPin[m]); }   // configure the pins now, not in the ISR
+#endif
 
     // 1. PWM first - it must get the GPT channels that belong to D9/D10/D11
     ReadEEProm();
     ReadBoardSettings();
     ReadSeatSetup();                            // 1.9: level trim and limits (needs the two above)
     ReadSoftStart();                            // 1.9.1: soft-start speed
+    ReadDriverType();                           // 2.1.2: IBT-2 or PWM + direction
+    ReadBoardPark();                            // 2.2.0b2: park on the board (and the button's pins)
+    ReadFanSettings();                          // 2.2.0b3: the Motion Shield's fan - found, and a first speed, before
+    FanBegin();                                 //   WiFi (whose connect takes seconds)
 #if IMU_PORT
     Serial1.begin(ImuBauds[ImuBaudIdx]);        // the baud rate that worked last time (9600 if never)
     RaiseSerialRxPriority();                     // 1.9.6
@@ -4205,7 +5972,12 @@ void setup()
     for (uint8_t m = 0; m < NUM_MOTORS; m++)
     {
         SetTarget(m, 512);
+        BpRefT[m] = (int16_t)CmdTarget[m];      // 2.2.0b2: motion is measured from here
+#if SERVO_STEPDIR
+        int fb = 0;                             // 2.2: unknown until homed - the bottom
+#else
         int fb = analogRead(FeedbackPin[m]);
+#endif
         int fb10 = constrain(fb >> POS_SHIFT, TargetLo[m], TargetHi[m]);
         GoalAcc[m] = (SoftRate > 0) ? ((long)fb << 8) : ((long)fb10 << 12);
         Goal_q[m] = (SoftRate > 0) ? fb : (fb10 << POS_SHIFT);
@@ -4232,6 +6004,9 @@ void setup()
     {
         UsbPrint(wifiOk ? "SMC3_R4 v" FW_VERSION " WiFi connected, IP " : "SMC3_R4 v" FW_VERSION " WiFi failed, code ");
         UsbPrint(WifiText);
+#if FW_BETA
+        UsbPrint(" BETA - not tested on a rig yet");
+#endif
         UsbPrint(" " FW_CAPS "\r\n");          // 1.9.2: the page finds this text in a .bin to see what it can do
     }
 #if LED_MATRIX
@@ -4240,6 +6015,7 @@ void setup()
 #endif
 #endif
 
+    BpState = BP_RUN; BpWhy = 0; BpFault = 0; BpMask = 0;   // 2.2.0b2 (a fresh start)
     // 4. Control loop
     bool ok = StartPidTimer();
     if (!ok)
@@ -4248,10 +6024,32 @@ void setup()
         while (1) { digitalWrite(LED_BUILTIN, HIGH); delay(100); digitalWrite(LED_BUILTIN, LOW); delay(100); }
     }
 
-    // 5. Enable the motors (same as the original, which enables at startup)
-    for (uint8_t m = 0; m < NUM_MOTORS; m++) { EnableMotor(m); }
+#if SERVO_STEPDIR
+    if (!StartStepTimer())                       // 2.2: the pulse interrupt
+    {
+        while (1) { digitalWrite(LED_BUILTIN, HIGH); delay(100); digitalWrite(LED_BUILTIN, LOW); delay(100); }
+    }
+    HomeWant = 7;                                // home (the servos were released since the board started), then on
+    HomeState = HS_SETTLE;
+    for (uint8_t m = 0; m < NUM_MOTORS; m++) { DisableReason[m] = DIS_HOMING; }
+    if (ServoFlags & SF_SWITCHES) { ServoHomeStart(false); }
+#else
+    // 5. Enable the motors (same as the original, which enables at startup) - 2.2.0b2: unless "park on its own" is
+    //    on: then the board starts parked (the motors off, the seat where it rests) and rises evenly when SimHub
+    //    moves (or the button / Enable Motors)
+    if (BpAutoSec && BpValid)
+    {
+        BpState = BP_PARKED; BpWhy = BP_WHY_BOOT; BpMask = BpUse; BpSince = millis();
+        for (uint8_t m = 0; m < NUM_MOTORS; m++) { DisableReason[m] = DIS_PARKED; }
+    }
+    else
+    {
+        for (uint8_t m = 0; m < NUM_MOTORS; m++) { EnableMotor(m); }
+    }
+#endif
     LastPacketMillis = millis();
     LastPosMillis = millis();
+    BpMoveMillis = millis();
 }
 
 void loop()
@@ -4270,6 +6068,16 @@ void loop()
     PollImu();
     ServiceImu(now);
 #endif
+#if SERVO_STEPDIR
+    ServoTask(now);                             // 2.2: homing
+#endif
+#if FW_BETA
+    {
+        static bool betaLed = false;            // 2.2.0b1: the built-in LED blinks once a second - a beta
+        bool on = ((now / 500) & 1) != 0;
+        if (on != betaLed) { betaLed = on; digitalWrite(LED_BUILTIN, on ? HIGH : LOW); }
+    }
+#endif
 
     if (now - LastMonitorMillis >= 20)          // every 20 ms, like the original
     {
@@ -4279,8 +6087,10 @@ void loop()
 
     // Comms timeout -> quarter power, as in the original (PowerScale 9 instead of 7) - 1.9.1: not while a motor is
     // still creeping to its position after power-up (it may need full power to lift the seat back)
+    BoardParkTask(now);                         // 2.2.0b2: park on the board (the game stopped, the button)
+    FanTask(now);                               // 2.2.0b3: the Motion Shield's fan (one I2C transfer per 100 ms at most)
     if (ParkMask && (long)(ParkUntil - now) <= 0) { ParkMask = 0; UpdateLimits(); }   // 2.1.1: the page went away
-    bool creeping = AnySoftStart();
+    bool creeping = AnySoftStart() || BpState == BP_PARKING || BpState == BP_UNPARKING;   // 2.2.0b2: full power
     PowerScale = ((now - LastPacketMillis) > COMMS_TIMEOUT_MS && !creeping) ? 9 : 7;
     if (creeping)
     {

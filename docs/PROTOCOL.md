@@ -53,10 +53,15 @@ are two separate bytes. The same commands work over USB (SimHub, SMC3Utils) and 
 | `[kZR]` | 2.0 | The page only: restart the board, as its RESET button does - the motors are switched off first and the page's connection closed. Refused while SimHub is sending positions (the last one less than 10 s ago) and during a firmware update. |
 | `[kPm]` | 2.1.1 | Park mode for the motors in m (bits 0-2; 0 = off) for the next 3 s - the page repeats it every second while it parks the seat or sets the park position, and it lapses 3 s after the last one. Those motors' limits become the SMC3 cutoff, 8 counts in from it: they may go past their Clip window, travel limits and end stops. SMC3's PWMrev push back into the Clip window is left out for them and the tilt limits wait (1.5 s after it ends). The diagnostics frame's seat flags say when it is on (bit 5). |
 | `[rdj]` | 2.1.1 | The page only (WiFi, or USB in page mode): one "SM3I" frame (below) - the motion sensor link as the board sees it. |
-| `[kDn]` | 2.2.0b1 (beta) | The page only, with all three motors switched off, not while SimHub sends positions or during an update: the motor driver type. n = 0 IBT-2 / BTS7960 (RPWM on D2 / D4 / D6, LPWM on D9 / D10 / D11, R_EN + L_EN on D3 / D5 / D7 - what `MODE2` builds), 1 PWM + direction (DIR or INA on D2 / D4 / D6, PWM on D9 / D10 / D11, INB on D3 / D5 / D7 - what `MODE1` builds). Saved at once (EEPROM 110-111); a board never told runs what it was built for. `[rd!]` bit1 says which type runs. |
-| `[kf=]` f = 83, 84, 86 | 2.2.0b1 (beta, servo build) | Servo settings, saved at once: 83 = pulses for the full 0-1023 travel, 84 = acceleration in 1000 pulses/s², 86 = flags (bit0 home switches on A0-A2, bit1 servo-on active LOW, bits 2-4 reverse motor 1-3, bit5 emergency-stop contact on A3). |
-| `[kG1]` | 2.2.0b1 (beta, servo build) | The page only, with every motor off and SimHub quiet: release the servos and home again. |
-| `[rdq]` `[rdp]` `[rdg]` `[rdh]` | 2.2.0b1 (beta, servo build) | Read the homing state (bit7 = emergency stop pressed) / the travel in pulses / the acceleration / the flags and inputs (bits 0-2 home switches open, bit3 emergency-stop input open). |
+| `[kDn]` | 2.2.0 | The page only, with all three motors switched off, not while SimHub sends positions or during an update: the motor driver type. n = 0 IBT-2 / BTS7960 (RPWM on D2 / D4 / D6, LPWM on D9 / D10 / D11, R_EN + L_EN on D3 / D5 / D7 - what `MODE2` builds), 1 PWM + direction (DIR or INA on D2 / D4 / D6, PWM on D9 / D10 / D11, INB on D3 / D5 / D7 - what `MODE1` builds). Saved at once (EEPROM 110-111); a board never told runs what it was built for. `[rd!]` bit1 says which type runs. |
+| `[kf=]` f = 83, 84, 86 | 2.2.0 (servo build) | Servo settings, saved at once: 83 = pulses for the full 0-1023 travel, 84 = acceleration in 1000 pulses/s², 86 = flags (bit0 home switches on A0-A2, bit1 servo-on active LOW, bits 2-4 reverse motor 1-3, bit5 emergency-stop contact on A3). |
+| `[kG1]` | 2.2.0 (servo build) | The page only, with every motor off and SimHub quiet: release the servos and home again. |
+| `[rdq]` `[rdp]` `[rdg]` `[rdh]` | 2.2.0 (servo build) | Read the homing state (bit7 = emergency stop pressed) / the travel in pulses / the acceleration / the flags and inputs (bits 0-2 home switches open, bit3 emergency-stop input open). |
+| `[w v][kbn]` | 2.2.0 | The page only: a park-on-the-board setting, saved at once (EEPROM 230-243). n = 0-2 park position of motor 1-3 (pot counts), 3 speed (counts/s, 10-300), 4 park on its own after v seconds without motion (0 = off, up to 3600), 5 flags (bit0 park button on D8, bit1 its light on D12), 6 motors in use (bits 0-2). |
+| `[kbP]` `[kbU]` `[kbS]` | 2.2.0 | The page only: park now (every motor in use glides to its park position, all arriving together, then off), unpark (on where it is, then up evenly to SimHub's position or the centre), stop on the way (off where the seat is). Park and unpark run in park mode (as `[kPm]`). |
+| `[rdk]` | 2.2.0 | The page only: one "SM3K" frame (below) - what the board's park is doing. |
+| `[w v][kvn]` | 2.2.0 | The page only: a fan setting for the Motion Shield, saved at once (EEPROM 250-265). n = 0 mode (0 Quiet, 1 Smart, 2 My curve, 3 Fixed, 4 Full), 1 fixed %, 2 lowest running %, 3 hot limit (°C), 4 Smart's speed at full motor work (%), 5-9 curve temperatures (°C), 10-14 curve speeds (%); 16 try speed v % for 8 s (not saved), 17 look for the fan chip again. |
+| `[rdv]` | 2.2.0 | The page only: one "SM3V" frame (below) - the Motion Shield's fan. |
 
 ### Seat set-up (firmware 1.9)
 
@@ -321,7 +326,7 @@ Written as soon as `[k 82 '=']` changes it.
 
 Written by `[kO 0]` and `[kO 1]`; `[kO 2]` and the double RESET don't change it.
 
-### EEPROM 110-111 (firmware 2.2.0b1, beta): the motor driver type
+### EEPROM 110-111 (firmware 2.2.0): the motor driver type
 
 | Address | Content |
 |---|---|
@@ -344,7 +349,7 @@ Written after the board has joined the network with the name and password compil
 from what is stored. A build that has the placeholders (`YourNetworkName`), or whose details don't work, joins with
 the stored ones. The diagnostics frame copies EEPROM 0-71 only, so the password never leaves the board.
 
-### EEPROM 220-225 (servo build 2.2.0b1, beta): servo settings
+### EEPROM 220-225 (servo build 2.2.0): servo settings
 
 | Address | Content |
 |---|---|
@@ -352,6 +357,61 @@ the stored ones. The diagnostics frame copies EEPROM 0-71 only, so the password 
 | 221-222 | Pulses for the full 0-1023 travel |
 | 223-224 | Acceleration, 1000 pulses/s² |
 | 225 | Flags (as `[k 86 =]`) |
+
+### EEPROM 230-243 (firmware 2.2.0): park on the board
+
+| Address | Content |
+|---|---|
+| 230 | 0xBA = valid |
+| 231-236 | Park position of motor 1-3 (int16, pot counts) |
+| 237-238 | Speed (counts/s) |
+| 239-240 | Park on its own after this many seconds without motion (0 = off) |
+| 241 | Flags: bit0 park button on D8, bit1 its light on D12 |
+| 242 | Motors in use (bits 0-2) |
+| 243 | Park positions set (bits 0-2) |
+
+Written by `[kb n]`. With park on its own on, the board starts parked at power-up (DC build) and rises when SimHub
+moves.
+
+### EEPROM 250-265 (firmware 2.2.0): the Motion Shield's fan
+
+| Address | Content |
+|---|---|
+| 250 | 0xF5 = valid |
+| 251 | Mode |
+| 252 | Fixed speed, % |
+| 253 | Lowest running speed, % |
+| 254 | Hot limit, °C |
+| 255 | Smart's speed at full motor work, % |
+| 256-260 | Curve temperatures, °C |
+| 261-265 | Curve speeds, % |
+
+Written by `[kv n]`. A board without the shield never talks on A4 / A5: it looks for the shield's pull-ups on SDA /
+SCL once at power-up.
+
+### Park frame "SM3K" (`[rdk]`, firmware 2.2.0)
+
+Little-endian: `'S' 'M' '3' 'K'`, uint8 version (1), uint8 length (37), then: uint8 state (0 running, 1 parking,
+2 parked, 3 unparking) | uint8 why (1 the game stopped, 2 the button, 3 the page, 4 Enable Motors, 5 power-up,
+6 stopped on the way) | uint8 fault (bit0 a motor switched off on the way, bit1 one stopped short, bit2 one couldn't
+get back up) | uint8 motors it moves | uint8 settings valid (bit0) + park positions set (bits 1-3) | uint8 motors in
+use | uint8 flags (bit0 button, bit1 light) | uint8 button (bit0 pressed now, bit1 seen released, bit2 counted as
+held) | uint8 last refusal (0 none, 1 no park position, 2 update / not homed, 3 no motor on, 4 busy) | int16 park
+position x3 | uint16 speed | uint16 seconds (0 off) | uint16 s since the last motion (65535 more) | uint16 s until it
+parks on its own (65535 not counting) | uint16 parks | uint16 unparks | uint16 button presses | uint16 ms in this
+state / 100 (65535 more) | int16 where each motor goes x3 (this ramp).
+
+### Fan frame "SM3V" (`[rdv]`, firmware 2.2.0)
+
+Little-endian: `'S' 'M' '3' 'V'`, uint8 version (1), uint8 length (43), then: uint8 present (bit0 fan chip, bit1
+temperature converter, bit2 SDA/SCL pull-ups seen, bit3 looked) | uint8 mode | uint8 drive % now | uint8 speed %
+(ramped) | uint8 target % | uint8 why (0 the mode, 1 hot limit, 2 no temperature, 3 starting, 4 trying a speed) |
+uint8 faults (bit0 doesn't turn, bit1 no temperature, bit2 hot, bit3 keeps turning at 0 %, bit4 watchdog went off,
+bit5 chip stopped answering) | uint8 motor work % | uint8 settings saved | uint8 chip id | int16 temperature x10 °C
+(-32768 none) | int16 the curve's temperature x10 | uint16 rpm | uint16 speed count | int16 converter reading |
+uint16 top rpm seen | uint8 fixed % | uint8 lowest running % | uint8 hot limit °C | uint8 Smart's top % | uint8 curve
+temperatures x5 | uint8 curve speeds x5 | uint16 times it didn't turn | uint16 watchdog times | uint16 I2C errors |
+uint8 s left trying a speed.
 
 ### Firmware update (firmware 1.9.2)
 

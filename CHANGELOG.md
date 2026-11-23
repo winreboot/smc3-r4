@@ -3,6 +3,54 @@
 `smc3_scope` (the page) and `SMC3_R4` (the firmware) are versioned separately. The page works with older
 firmware too; the notes say which firmware a feature needs.
 
+## Page 2.9.8, firmware 2.2.0
+
+The release of page betas 2.9.8b1-b3 and firmware betas 2.2.0b1-b4. Page 2.9.8 works with older firmware too: with
+2.1.1 the page parks the seat as before; park on the board, the park button and the fan need 2.2.0.
+
+- **Park on the board** (firmware 2.2.0): the board parks the seat itself - the same glide as Park, every motor
+  arriving together, then the motors switch off - so it works with the page closed.
+  - **Park on its own** (off unless you choose 10 s to 30 min): when SimHub sends no motion for that long (no
+    positions, or the same position) the seat parks; as soon as SimHub moves again it rises evenly to SimHub's
+    position. With it on, the board also starts parked at power-up and rises when the game moves.
+  - **Park button** on D8 (a momentary button to GND): press to park, press again to rise; on the way a press
+    switches the motors off where the seat is. A press counts after 0.15 s, and a button held at switch-on only after
+    it is let go. **Button light** on D12 (an LED through 470 Ω to GND): on = parked, blinking = on the way.
+  - The **Park position** card has an **On the board** section (the settings and what the board is doing), the page
+    sends the board its park positions, speed and motors in use, and the events list what the board did. Help has the
+    wiring as a drawing and the parts.
+  - `[kb n]`, `[kbP]`, `[kbU]`, `[kbS]`, `[rdk]` ("SM3K"), EEPROM 230-243.
+- **Enable Motors brings the seat up evenly from its end stops.** Whenever a lift that is off rests at or within 24
+  counts of its end stop (or past it), Enable Motors raises the seat evenly with the end stops out of the way (park
+  mode) - also when this page didn't park it, or restarted since. The page keeps "parked" in its settings
+  (`park_parked`), and right after it starts, Enable Motors waits up to 3 s for the board's version and end stops. The
+  events say which lift and why.
+- **Level the park position with the bubble** (with the motion sensor and a Seat setup): while you set the park
+  position, a bubble in the Park position card (and in Seat now) shows roll and pitch. Click or drag it to where it
+  should be, or use the arrow keys (0.2° a press): the lifts move the seat there a step at a time, each step worked
+  out from Seat setup's degrees per count and checked with the sensor.
+  - **Level side to side** goes on until roll is under 0.1°, one lift up and the other down so the height stays.
+  - **Level front to back** says how far it raises the lifts and asks first when that is a lot: with two front lifts
+    their height sets the pitch, so a seat parked lower than level tips front to back.
+  - A lift already on its bottom stays there (pressed on gently) and the other one does it; the message says which.
+    Moving a lift with its arrows, or **Stop**, ends the levelling.
+- **Coming back from the end stops** (firmware 2.2.0): a motor switched on less than 24 counts inside an end stop gets
+  the creep-back allowance too, and the allowance ends only once the motor has stayed 16 counts inside for 0.25 s (a
+  reading within 8 counts of the end stop starts the wait again) - a noisy pot no longer trips the end stop on the
+  way back. The other rules stay: never more than 24 counts further out than where it started, inside the SMC3
+  cutoff, each judged when it lasts 25 ms, and gone after 40 s.
+- **The motor driver type is a setting** (firmware 2.2.0, `[kD n]`, EEPROM 110-111): Settings, Motor drivers - IBT-2 /
+  BTS7960 or PWM + direction, with the motors off, no recompiling.
+- **The servo build** `SMC3_R4_Servo` 2.2.0 (`SERVO_STEPDIR 1`): ball-screw actuators with AC servo drives by pulse +
+  direction, set up in Settings, Servo actuators. It hasn't run on servo actuators yet.
+- **Fan control for the Motion Shield** (firmware 2.2.0, `[kv n]`, `[rdv]` "SM3V", EEPROM 250-265), a controller
+  board in the works: Settings, Fan - Quiet, Smart (your curve, and faster early while the motors work hard), My
+  curve, Fixed, Full; full speed at the hot limit and without a temperature in every mode; the live temperature, rpm
+  and the last 30 minutes. The board runs the fan itself. Without the shield the card says so, and the board leaves
+  A4 / A5 alone.
+- **Firmware 2.2.0 is built in**: the Electronics wizard and All firmware make every build from it (2.1.1 is still
+  listed), and Settings, Updates offers the servo build's file to a board that runs the servo build.
+
 ## Page 2.9.7 (firmware 2.1.1 unchanged)
 
 - **New pictures throughout the page**, all renders made for it in one style - a dark studio backdrop with a blue rim

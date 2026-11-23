@@ -45,11 +45,27 @@ What the R4 hardware adds:
   when switched on (also with the soft start off), with up to PWMrev's drive while it lags - a heavy corner gets back
   up. The board also keeps the motion sensor all the time while it is switched on, and reports its link to the page's
   Motion sensor check.
+- **Park on the board** (2.2.0): the board parks the seat itself - every motor gliding to its park position, all
+  arriving together, then the motors off - when SimHub sends no motion for a time you choose (off unless set), from a
+  **park button** on D8 (to GND; press again to rise) with its light on D12, or when the page asks. It rises evenly
+  as soon as SimHub moves again. Set up in the page's Park position card; the settings live on the board.
+- **Coming back from the end stops with a noisy pot** (2.2.0): a motor switched on at, past or just inside (24 counts)
+  its end stop creeps back with the end stop held off until it has stayed 16 counts inside for 0.25 s.
+- **The motor driver type is a setting** (2.2.0): IBT-2 / BTS7960 or PWM + direction, chosen in the page's Settings,
+  Motor drivers - no rebuilding with `MODE1`.
+- **The servo build** (2.2.0): `SMC3_R4_Servo/SMC3_R4_Servo.ino` is the same sketch with `SERVO_STEPDIR 1`, for
+  ball-screw actuators with AC servo drives (pulse + direction, three per board): homing at the bottom or on
+  switches, an emergency-stop contact on A3, no pots or PID. Set up in the page's Settings, Servo actuators. It
+  hasn't run on servo actuators yet - first runs with the actuators off the rig.
+- **Fan control for the Motion Shield** (2.2.0), a controller board in the works: the shield's 4-pin fan run from
+  the board's temperature (modes and the curve set in the page's Settings, Fan). A board without the shield never
+  talks on A4 / A5.
 
 ### Flashing
 
 1. In the Arduino IDE, use Boards Manager to install **Arduino UNO R4 Boards**, then select **Arduino UNO R4 WiFi**.
-2. Open `SMC3_R4/SMC3_R4.ino` and set **`WIFI_SSID`** and **`WIFI_PASS`** (2.4 GHz only).
+2. Open `SMC3_R4/SMC3_R4.ino` (servo actuators: `SMC3_R4_Servo/SMC3_R4_Servo.ino`) and set **`WIFI_SSID`** and
+   **`WIFI_PASS`** (2.4 GHz only).
 3. Upload. The address scrolls across the matrix at power-up.
 
 **Uploading again once 2.0 runs.** 2.0 has the USB connector on the main chip, and the IDE uploads through the WiFi
@@ -87,7 +103,9 @@ its bootloader. The board restarts with the new firmware and the page checks the
 
 | Option | Default | What it does |
 |---|---|---|
-| `MODE2` / `MODE1` | `MODE2` | `MODE2` = IBT-2 / BTS7960 bridges. `MODE1` = a bridge with PWM and two direction inputs. |
+| `MODE2` / `MODE1` | `MODE2` | `MODE2` = IBT-2 / BTS7960 bridges. `MODE1` = a bridge with PWM and two direction inputs. Since 2.2.0 only the starting value: the page's Settings, Motor drivers changes it. |
+| `SERVO_STEPDIR` | 0 | 2.2.0: 1 = the servo build (pulse + direction for servo drives); `SMC3_R4_Servo.ino` is the sketch with it set. |
+| `FAN_CTRL` | 1 | 2.2.0: run the Motion Shield's fan when the shield is there (found at power-up). 0 leaves A4 / A5 alone always. |
 | `REVERSE_MOTOR1` | off | Mirrors motor 1, as in the original. |
 | `DEFAULT_TIMER1_KHZ`, `DEFAULT_TIMER2_KHZ` | 25 | PWM frequency for motors 1+2 and for motor 3. SMC3Utils and the page can change it. |
 | `TARGET_SMOOTH_SHIFT` | 6 (16 ms) | Default target smoothing: 4 = 4 ms … 8 = 64 ms, 0 = off. It's a setting since 1.6. |
@@ -173,6 +191,9 @@ lapses by itself after 3 s if the page goes away). The commands are in [docs/PRO
 
 | Version | Change |
 |---|---|
+| 2.2.0 | The release of 2.2.0b1-b4. **Park on the board** (`[kb n]`, `[kbP]` `[kbU]` `[kbS]`, `[rdk]` "SM3K", EEPROM 230-243): on its own when SimHub sends no motion (10 s - 60 min, off unless set; with it on the board starts parked at power-up), from a park button on D8 and its light on D12, or from the page; it rises evenly when SimHub moves; diagnostics reason 9 for a motor the board parked. **Coming back from the end stops**: the creep-back exemption also for a motor switched on less than 24 counts inside an end stop, and it ends after 0.25 s 16 counts inside (not at the first such reading). **The motor driver type as a setting** (`[kD n]`, EEPROM 110-111). **The servo build** (`SERVO_STEPDIR 1`: pulses from a 40 kHz interrupt, homing, `[kG1]`, `[rdq]` `[rdp]` `[rdg]` `[rdh]`, EEPROM 220-225). **The Motion Shield's fan** (EMC2301 and the board's NTC on I2C, `[kv n]`, `[rdv]` "SM3V", EEPROM 250-265). `FW_CAPS` `drvsel1`, `boardpark1`, `fan1` (servo build `servo1`). Protocol for SimHub and SMC3Utils unchanged. |
+| 2.1.1 | Park mode (`[kP m]`): the page may take motors past their travel limits, Clip and end stops to park the seat. A motor resting past its end stop creeps back when switched on (also with the soft start off), with up to PWMrev's drive while it lags. The board keeps the motion sensor while Use the sensor is ticked and reports its link (`[rdj]`, "SM3I"). |
+| 2.1 | Games on the LED matrix while idle (ping pong, brick breaker, missile defense, snake, meteor dodge). |
 | 2.0 | **The USB connector is the main chip's** (tested as 2.0b1): the board's USB switch is set at boot and the core's own USB serial port (TinyUSB CDC, `SerialUSB`) is used, so SimHub and the page no longer go through the WiFi chip's bridge - its USB stall, the lost bytes and the chip restarts are out of the path. A new COM port ("UNO R4 WiFi"); the baud rate is ignored. USB writes never block when nothing reads the port. `[kO n]` (the page only): 0 WiFi chip (saved), 1 main chip (saved), 2 WiFi chip until the next reset; two RESET presses within 3 s do the same as 2. EEPROM 108-109; build flags bit 6 (main chip now) and bit 7 (saved). **`[kZ R]`** (tested as 2.0b2): the page's Restart button - motors off, then a reset as with the RESET button. `[kE1]` and `[kZ R]` are refused while SimHub sends positions (the last one less than 10 s ago); `[kE1]` also on the main chip's port. Includes 1.9.7 and 1.9.8. `FW_CAPS` `nativeusb1`, `reboot1`. Protocol for SimHub and SMC3Utils and every saved setting unchanged. |
 | 1.9.8 | Test build, in 2.0: the WiFi chip restart of 1.9.7 left the board off WiFi until RESET - the main chip kept its old link to the chip and the WiFiS3 library's "begun" state, so it never redid the start-up handshake and every `WiFi.begin()` blocked for 15 s and failed. Now the link is closed and the handshake redone before WiFi; after a request over USB WiFi waits up to 25 s for the cable. `[rdd]` frame version 6 reports how the last restart went. `FW_CAPS` `modreset2`. |
 | 1.9.7 | Test build, in 2.0: `[kE1]` (the page only) restarts the board's WiFi/USB chip, which clears its USB stall (the output dies after minutes of streaming; only re-enumerating clears it). At most once per 15 s. `FW_CAPS` `modreset1`. |
