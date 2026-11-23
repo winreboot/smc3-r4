@@ -72,7 +72,7 @@ can use the USB cable instead (page 2.8, firmware 1.9.5; 2.0 recommended - it gi
 | [`scope/`](scope) | `smc3_scope.py`: the page server. It's one file using only the Python standard library, with a Dockerfile and compose files for a NAS or any PC. A ready-made Docker image is on `ghcr.io/winreboot/smc3-scope`; step by step for Windows, Mac, Linux, Raspberry Pi, Docker and Synology: [docs/INSTALL.md](docs/INSTALL.md). |
 | [`tools/simboard.py`](tools/simboard.py) | A simulated rig. You can try everything without hardware, and inject faults (reversed motor, swapped wiring, glitchy pot and more). |
 | [`firmware/SMC3_smooth`](firmware/SMC3_smooth) | The original SMC3 for the **UNO R3**, with target smoothing and the PID fixes, for anyone staying on an R3. |
-| [`docs/`](docs) | [Install step by step](docs/INSTALL.md), screenshots, the [protocol](docs/PROTOCOL.md), the [diagnostics](docs/DIAGNOSTICS.md) file format, an [example diagnostics file](docs/examples/diagnostics-full-check.json) and the [lessons learned](docs/LESSONS-LEARNED.md) on the way. |
+| [`docs/`](docs) | [Install step by step](docs/INSTALL.md), the [Motion Shield](docs/MOTION-SHIELD.md) in the works, screenshots, the [protocol](docs/PROTOCOL.md), the [diagnostics](docs/DIAGNOSTICS.md) file format, an [example diagnostics file](docs/examples/diagnostics-full-check.json) and the [lessons learned](docs/LESSONS-LEARNED.md) on the way. |
 
 > ⚠️ **A motion rig can hurt you.** It moves a person with motors strong enough to lift them. Test with the seat
 > empty, keep hands and feet clear, and keep a hand near the motor power switch whenever you test, tune or flash
@@ -1017,6 +1017,9 @@ The Help section in the page sums everything up, including every LED matrix code
   that is a setting (Settings, Motor drivers). The page's [Electronics design](#electronics-design) draws the
   wiring for each.
 - Optional: a **park button** (momentary, D8 to GND) and its light (an LED from D12 through 470 Ω), firmware 2.2.0.
+- In the works: the **[Motion Shield](docs/MOTION-SHIELD.md)**, a controller board that plugs onto the UNO R4 WiFi in
+  place of the IBT-2 bridges and loose wiring, with a printed enclosure and a control box for 22 mm controls (a first
+  prototype, not built yet).
 - A **12 V adapter** for the board's barrel jack (1 A or more, 5.5 x 2.1 mm plug, centre +), besides the USB cable
   for SimHub: on USB alone the board gets about 4.7 V, and Hall sensors want 5 V.
 - Up to three DC motors with feedback pots, such as worm-gear wiper motors on crank arms or linear actuators, and
